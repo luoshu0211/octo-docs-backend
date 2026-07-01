@@ -141,7 +141,7 @@ spec:
   ports:
     - name: http
       port: 3000
-      targetPort: http
+      targetPort: 3000
     - name: hocuspocus
       port: 1234
-      targetPort: hocuspocus
+      targetPort: 1234
