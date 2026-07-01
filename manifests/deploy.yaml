@@ -1,0 +1,147 @@
+# octo-docs-backend K8s manifest.
+# GitLab CI renders this file, pushes it to deploy-files, and ArgoCD syncs it.
+#
+# Placeholders:
+#   {{REPO_URL}}      image repository without tag or digest
+#   {{IMAGE_DIGEST}}  immutable image digest from the package job
+#   {{BRANCH}}        dev / test / prod
+#
+# ConfigMap and Secret are intentionally not included in ArgoCD sync. The
+# Deployment references them so missing runtime config fails loudly.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: octo-docs-backend-{{BRANCH}}
+  labels:
+    app: octo-docs-backend
+    app.kubernetes.io/name: octo-docs-backend
+    app.kubernetes.io/part-of: octo-docs
+    octo.docs/env: "{{BRANCH}}"
+spec:
+  # The colocated process contains REST plus Hocuspocus WS. Keep one replica and
+  # Recreate until documentName-affinity routing and explicit document locks are
+  # deployed for multi-node operation.
+  replicas: 1
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: octo-docs-backend
+      octo.docs/env: "{{BRANCH}}"
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: octo-docs-backend
+        app.kubernetes.io/name: octo-docs-backend
+        app.kubernetes.io/part-of: octo-docs
+        octo.docs/env: "{{BRANCH}}"
+    spec:
+      imagePullSecrets:
+        - name: tcr-image-xtiao
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: octo-docs-backend
+          image: "{{REPO_URL}}@{{IMAGE_DIGEST}}"
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 3000
+            - name: hocuspocus
+              containerPort: 1234
+          envFrom:
+            - configMapRef:
+                name: octo-docs-backend-config-{{BRANCH}}
+          env:
+            - name: NODE_ENV
+              value: "production"
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: HTTP_PORT
+              value: "3000"
+            - name: HOCUSPOCUS_PORT
+              value: "1234"
+            - name: REDIS_PREFIX
+              value: "octo-docs-{{BRANCH}}"
+            - name: MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: octo-docs-backend-secret
+                  key: MYSQL_PASSWORD
+            - name: COLLAB_TOKEN_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: octo-docs-backend-secret
+                  key: COLLAB_TOKEN_SECRET
+            - name: OCTO_SERVER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: octo-docs-backend-secret
+                  key: OCTO_SERVER_TOKEN
+                  optional: true
+            - name: ATTACHMENT_SIGNING_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: octo-docs-backend-secret
+                  key: ATTACHMENT_SIGNING_SECRET
+            - name: ATTACHMENT_S3_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: octo-docs-backend-secret
+                  key: ATTACHMENT_S3_ACCESS_KEY
+                  optional: true
+            - name: ATTACHMENT_S3_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: octo-docs-backend-secret
+                  key: ATTACHMENT_S3_SECRET_KEY
+                  optional: true
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 2
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: octo-docs-backend-{{BRANCH}}
+  labels:
+    app: octo-docs-backend
+    app.kubernetes.io/name: octo-docs-backend
+    app.kubernetes.io/part-of: octo-docs
+    octo.docs/env: "{{BRANCH}}"
+spec:
+  type: ClusterIP
+  selector:
+    app: octo-docs-backend
+    octo.docs/env: "{{BRANCH}}"
+  ports:
+    - name: http
+      port: 3000
+      targetPort: http
+    - name: hocuspocus
+      port: 1234
+      targetPort: hocuspocus
