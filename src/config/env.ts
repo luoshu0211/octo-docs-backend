@@ -319,6 +319,30 @@ export const config = {
     maxPathDepth: num('DOC_BODY_EDIT_MAX_PATH_DEPTH', 32),
   },
 
+  // Bot/human sheet content read (GET /:docId/sheet). Stage1 read-guard: the
+  // decoded cell + dims payload is bounded to this size and a larger sheet gets
+  // a clear 413 sheet_too_large instead of an unbounded response body. The live
+  // Y.Doc is already capped at maxDocBytes, so the decode + measure is bounded;
+  // paginated reads for oversized sheets are deferred to a later stage.
+  sheetRead: {
+    maxCellBytes: num('SHEET_READ_MAX_CELL_BYTES', 1024 * 1024),
+  },
+
+  // Bot/human sheet content write (PATCH /:docId/sheet). Request-shape bounds
+  // that fail fast at the route gate, BEFORE the no-lock batch validation and
+  // the live write, so an oversized cell batch is rejected without spending that
+  // work. Mirrors docBodyEdit's bounds for the flat-cell write surface; the
+  // global express.json 1mb cap and the post-write maxDocBytes gate remain.
+  sheetWrite: {
+    // Upper bound on cells per PATCH batch (set + delete combined). Well above a
+    // realistic single edit, low enough that a scripted client cannot fan out
+    // unbounded validate/set work under the 1mb body cap.
+    maxCells: num('SHEET_WRITE_MAX_CELLS', 5000),
+    // Upper bound on a single cell's serialized {v,f,s} payload — keeps one cell
+    // (chiefly its opaque style object) from carrying most of the 1mb body.
+    maxCellContentBytes: num('SHEET_WRITE_MAX_CELL_CONTENT_BYTES', 64 * 1024),
+  },
+
   // Typst-based PDF export. The document's persisted state is rendered to Typst
   // source (renderTypst.ts) and compiled to PDF by spawning the standalone
   // `typst` binary (typstService.ts). No resident process; each compile is a
