@@ -55,6 +55,9 @@ LABEL org.opencontainers.image.title="octo-docs-backend" \
 
 WORKDIR /app
 
+# Use TUNA mirror for faster apk downloads in CI
+RUN sed -i 's#https://dl-cdn.alpinelinux.org#https://mirrors.tuna.tsinghua.edu.cn#g' /etc/apk/repositories
+
 # CJK + emoji fonts for server-side PDF export (Typst).
 #
 # The PDF export renders the document to Typst source and compiles it with the
