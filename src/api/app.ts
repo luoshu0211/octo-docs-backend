@@ -6,29 +6,97 @@
  *      themselves and return their own 401, so they are mounted BEFORE
  *      authMiddleware.
  *   2. authMiddleware (octo identity -> req.uid) for the metadata operations.
- *   3. metadata routers (docs / members / invites-admin / attachments).
+ *   3. spaceContextMiddleware (X-Space-Id header -> req.spaceId) for the
+ *      metadata operations; a missing header is a hard 400.
+ *   4. metadata routers (docs / members / invites-admin / attachments).
+ *
+ * A second, bot-facing mount (§ v4.3) re-mounts the same metadata routers under
+ * /v1/bot/docs behind verifyBot (bot token -> req.uid + server-resolved
+ * req.spaceId) instead of authMiddleware + spaceContextMiddleware. The human
+ * mount below is unchanged.
  */
 import express, { type Express, Router, type Request, type Response, type NextFunction } from 'express'
+import { config } from '../config/env.js'
+import { corsMiddleware } from './cors.js'
+import { attachmentBlobGateway, localBlobGatewayEnabled, isSignedBlobRequest } from './routes/attachmentBlob.js'
 import { authMiddleware } from './middleware/auth.js'
+import { spaceContextMiddleware } from './middleware/spaceContext.js'
+import { verifyBotMiddleware } from './middleware/verifyBot.js'
+import { createRateLimiter, type RateLimiterOptions } from './middleware/rateLimit.js'
 import { collabTokenRouter } from './routes/collabToken.js'
 import { docsRouter } from './routes/docs.js'
 import { membersRouter } from './routes/members.js'
+import { forwardGrantRouter } from './routes/forwardGrant.js'
+import { accessRequestsRouter } from './routes/accessRequests.js'
 import { invitesRouter, acceptInviteRouter } from './routes/invites.js'
 import { attachmentsRouter } from './routes/attachments.js'
 import { linkCardRouter } from './routes/linkCard.js'
 import { commentsRouter } from './routes/comments.js'
 import { versionsRouter } from './routes/versions.js'
+import { docContentRouter } from './routes/docContent.js'
+import { docSheetRouter } from './routes/docSheet.js'
+import { docSceneRouter } from './routes/docScene.js'
+import { exportRouter } from './routes/export.js'
+import { boardExportRouter } from './routes/boardExport.js'
 
-export function createApp(): Express {
+export function createApp(opts: { rateLimit?: RateLimiterOptions; trustProxy?: boolean | number | string } = {}): Express {
   const app = express()
+
+  // Trust the reverse proxy (nginx) in front of us so req.ip — and therefore the
+  // per-IP rate limiter below — reflects the real client from X-Forwarded-For
+  // rather than the proxy address. Configurable per deployment (config.trustProxy).
+  app.set('trust proxy', opts.trustProxy ?? config.trustProxy)
+
+  // CORS + preflight (XIN-717). Mounted FIRST — ahead of the body parser, rate
+  // limiter and auth — so a cross-origin OPTIONS preflight from the front-end is
+  // answered 2xx with the CORS headers without being throttled, body-parsed or
+  // rejected by the auth chain, and every response carries Access-Control-Allow-
+  // Origin for the configured origin(s). Covers both the metadata API and the
+  // local-hmac attachment blob gateway below.
+  app.use(corsMiddleware)
+
+  // Self-hosted attachment blob gateway (XIN-717). Only relevant for the
+  // local-hmac driver, where the browser PUTs/GETs the binary directly at this
+  // origin. Mounted before express.json so it can read the raw upload stream;
+  // it claims ONLY signed requests (carrying X-Method + X-Signature) and passes
+  // everything else through, so it never shadows the routes below.
+  //
+  // A per-IP rate limiter runs IN FRONT of the gateway so the blob PUT/GET
+  // surface cannot be flooded to bypass throttling (XIN-728). The limiter is
+  // applied only to requests the gateway actually claims — non-blob requests
+  // (healthz, the metadata/bot mounts, CORS preflight) skip it entirely and keep
+  // their own independent limiter budgets downstream.
+  if (localBlobGatewayEnabled()) {
+    const blobLimiter = createRateLimiter(opts.rateLimit)
+    app.use((req: Request, res: Response, next: NextFunction) => {
+      if (!isSignedBlobRequest(req)) {
+        next()
+        return
+      }
+      blobLimiter(req, res, (err?: unknown) => {
+        if (err) {
+          next(err)
+          return
+        }
+        attachmentBlobGateway(req, res, next)
+      })
+    })
+  }
+
   app.use(express.json({ limit: '1mb' }))
 
-  // health check (no auth)
+  // health check (no auth, and deliberately mounted BEFORE any rate limiter so
+  // liveness/readiness probes are never throttled)
   app.get('/healthz', (_req: Request, res: Response) => {
     res.status(200).json({ ok: true })
   })
 
   const api = Router()
+
+  // 0. per-IP rate limit for the whole human chain (§8.4). Mounted first so it
+  //    also covers the public collab-token / invite-accept routes below and the
+  //    authorizing metadata routers.
+  api.use(createRateLimiter(opts.rateLimit))
 
   // 1. public (identity verified inside the handler/service)
   api.use(collabTokenRouter) // POST /collab-token
@@ -37,22 +105,80 @@ export function createApp(): Express {
   // 2. require octo identity for everything below
   api.use(authMiddleware)
 
-  // 3. metadata operations
+  // 3. require a space context (X-Space-Id header) for the metadata operations
+  api.use(spaceContextMiddleware)
+
+  // 4. metadata operations
   api.use(docsRouter) // / , /:docId
   api.use(membersRouter) // /:docId/members ...
+  api.use(forwardGrantRouter) // /:docId/forward-grant (forward-to-chat authorization, max-merge)
+  api.use(accessRequestsRouter) // /:docId/access-requests ... (screen 4c request/approve/deny)
   api.use(invitesRouter) // /:docId/invites ... (admin)
   api.use(attachmentsRouter) // /:docId/attachments/presign , /:docId/attachments/:attachId
   api.use(linkCardRouter) // /:docId/link-card (OG fetch, §3.5 ⑰)
   api.use(commentsRouter) // /:docId/comments , /:docId/comments/:id
   api.use(versionsRouter) // /:docId/versions ... (snapshot + restore, §4 #4)
+  api.use(docContentRouter) // /:docId/content (bot incremental body edit + live read)
+  api.use(docSheetRouter) // /:docId/sheet (live spreadsheet content read, R-A)
+  api.use(docSceneRouter) // /:docId/scene (live board/Excalidraw scene read + edit)
+  api.use(exportRouter) // /:docId/export/pdf (server-side Typst render)
+  api.use(boardExportRouter) // /:docId/export (server-side whiteboard PNG/SVG, W3)
 
   app.use('/api/v1/docs', api)
 
+  // Bot-facing entry (§ v4.3): the SAME nine metadata routers, re-mounted behind
+  // a bot identity middleware at a physically distinct prefix so nginx can route
+  // /v1/bot/docs -> docs-backend while other /v1/bot/* -> octo-server. No handler
+  // code is copied or forked — each router only reads req.uid / req.spaceId, both
+  // of which verifyBot injects (uid from the bot token, spaceId from octo-server's
+  // server-side reverse lookup). Deliberately excludes the public collab-token /
+  // invite-accept routes (those are a separate user-token path) and does NOT mount
+  // spaceContextMiddleware — the bot space is server-resolved, never header-driven.
+  const botApi = Router()
+  // Same per-IP rate limit for the bot chain (independent budget from the human
+  // mount), mounted ahead of verifyBot so the authorizing bot routes are covered.
+  botApi.use(createRateLimiter(opts.rateLimit))
+  botApi.use(verifyBotMiddleware)
+  botApi.use(docsRouter)
+  botApi.use(membersRouter)
+  botApi.use(forwardGrantRouter)
+  botApi.use(accessRequestsRouter)
+  botApi.use(invitesRouter)
+  botApi.use(attachmentsRouter)
+  botApi.use(linkCardRouter)
+  botApi.use(commentsRouter)
+  botApi.use(versionsRouter)
+  botApi.use(docContentRouter)
+  botApi.use(docSheetRouter)
+  botApi.use(docSceneRouter)
+  botApi.use(boardExportRouter) // /v1/bot/docs/:docId/export (whiteboard PNG/SVG, W3)
+  app.use('/v1/bot/docs', botApi)
+
   // central error handler — unexpected errors => 500 (§8.4 error table).
-  app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+  app.use((err: unknown, req: Request, res: Response, _next: NextFunction) => {
+    if (res.headersSent) return
+    // Body-parser (express.json) failures arrive here as typed errors. Map them
+    // to their contract codes instead of letting them bubble to a 500 (defect ③):
+    //   - malformed JSON body  -> 400 invalid_body
+    //   - body over the size limit -> 413 doc_too_large (sheet_too_large on /sheet)
+    const type = (err as { type?: unknown }).type
+    if (type === 'entity.parse.failed') {
+      res.status(400).json({ error: 'invalid_body' })
+      return
+    }
+    if (type === 'entity.too.large') {
+      // The oversized-body 413 rejection is raised by express.json BEFORE any
+      // route handler runs, so the sheet write path never reaches its own
+      // sheet-specific bounds. Align the error code with the endpoint the client
+      // hit: the sheet content surface (GET/PATCH /:docId/sheet) reports
+      // sheet_too_large — matching its in-handler read guard and issue #69's 1MB
+      // sheet contract — while every other route keeps doc_too_large.
+      const code = req.path.endsWith('/sheet') ? 'sheet_too_large' : 'doc_too_large'
+      res.status(413).json({ error: code })
+      return
+    }
     // eslint-disable-next-line no-console
     console.error('REST error:', err)
-    if (res.headersSent) return
     res.status(500).json({ error: 'internal_error' })
   })
 

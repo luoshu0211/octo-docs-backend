@@ -1,0 +1,109 @@
+# dmwork private CI Dockerfile.
+# GitLab runners should pull base images from the internal TCR mirror instead of Docker Hub.
+
+ARG NODE_IMAGE=tbj7-xtiao-tcr1.tencentcloudcr.com/xtiao-release/node:22-alpine
+ARG NPM_REGISTRY=https://registry.npmmirror.com
+
+FROM ${NODE_IMAGE} AS deps
+
+ARG NPM_REGISTRY
+ENV NPM_CONFIG_REGISTRY=${NPM_REGISTRY}
+ENV npm_config_registry=${NPM_REGISTRY}
+
+WORKDIR /app
+
+COPY package.json package-lock.json ./
+RUN npm ci
+
+FROM ${NODE_IMAGE} AS builder
+
+ARG NPM_REGISTRY
+ENV NPM_CONFIG_REGISTRY=${NPM_REGISTRY}
+ENV npm_config_registry=${NPM_REGISTRY}
+
+WORKDIR /app
+
+COPY --from=deps /app/node_modules ./node_modules
+COPY package.json package-lock.json tsconfig.json ./
+COPY src ./src
+
+RUN npm run build
+
+FROM ${NODE_IMAGE} AS prod-deps
+
+ARG NPM_REGISTRY
+ENV NPM_CONFIG_REGISTRY=${NPM_REGISTRY}
+ENV npm_config_registry=${NPM_REGISTRY}
+
+WORKDIR /app
+
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev && npm cache clean --force
+
+FROM ${NODE_IMAGE} AS runner
+
+ARG GIT_COMMIT=unknown
+ARG GIT_BRANCH=unknown
+ARG GIT_TAG=unknown
+ARG BUILD_DATE=unknown
+
+LABEL org.opencontainers.image.title="octo-docs-backend" \
+      org.opencontainers.image.revision="${GIT_COMMIT}" \
+      org.opencontainers.image.ref.name="${GIT_BRANCH}" \
+      org.opencontainers.image.version="${GIT_TAG}" \
+      org.opencontainers.image.created="${BUILD_DATE}"
+
+WORKDIR /app
+
+# Use TUNA mirror for faster apk downloads in CI
+RUN sed -i 's#https://dl-cdn.alpinelinux.org#https://mirrors.tuna.tsinghua.edu.cn#g' /etc/apk/repositories
+
+# CJK + emoji fonts for server-side PDF export (Typst).
+#
+# The PDF export renders the document to Typst source and compiles it with the
+# standalone `typst` binary (see below). Typst resolves fonts from the system
+# font book, so the image must carry real CJK and emoji faces:
+#   - font-noto-cjk  → Chinese/Japanese/Korean glyphs
+#   - font-noto-emoji → colour emoji (matches what the editor shows)
+RUN apk add --no-cache \
+      font-noto=2026.06.01-r0 \
+      font-noto-cjk=0_git20220127-r1 \
+      font-noto-emoji=2.051-r0
+
+# Typst binary for server-side PDF export (renderTypst.ts / typstService.ts).
+#
+# Typst is a single static Rust binary (~30MB) with no browser or LaTeX
+# dependency and no resident process — each export spawns a short-lived,
+# network-less, sandboxed child. We fetch the musl static release and drop it on
+# PATH. The version is pinned for reproducible builds; bump deliberately.
+# Compile concurrency is capped in typstService.ts (TYPST_EXPORT_MAX_CONCURRENT,
+# default 2).
+ARG TYPST_VERSION=v0.13.1
+RUN apk add --no-cache --virtual .typst-fetch curl=8.21.0-r0 tar=1.35-r5 xz=5.8.3-r0 \
+    && ARCH="$(uname -m)" \
+    && case "$ARCH" in \
+         x86_64) TARGET=x86_64-unknown-linux-musl ;; \
+         aarch64) TARGET=aarch64-unknown-linux-musl ;; \
+         *) echo "unsupported arch $ARCH" && exit 1 ;; \
+       esac \
+    && curl -fsSL "https://github.com/typst/typst/releases/download/${TYPST_VERSION}/typst-${TARGET}.tar.xz" -o /tmp/typst.tar.xz \
+    && tar -xJf /tmp/typst.tar.xz -C /tmp \
+    && install -m 0755 "/tmp/typst-${TARGET}/typst" /usr/local/bin/typst \
+    && rm -rf /tmp/typst.tar.xz "/tmp/typst-${TARGET}" \
+    && apk del .typst-fetch \
+    && typst --version
+
+ENV NODE_ENV=production
+ENV TZ=Asia/Shanghai
+
+RUN addgroup -S octo && adduser -S -u 10001 -G octo octo
+
+COPY --from=prod-deps --chown=octo:octo /app/node_modules ./node_modules
+COPY --from=prod-deps --chown=octo:octo /app/package.json ./package.json
+COPY --from=builder --chown=octo:octo /app/dist ./dist
+
+USER octo
+
+EXPOSE 3000 1234
+
+CMD ["node", "dist/index.js"]

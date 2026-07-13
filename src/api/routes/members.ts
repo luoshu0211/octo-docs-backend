@@ -21,16 +21,31 @@ function parseRole(v: unknown): Role | null {
 
 /** GET members (needs admin). */
 membersRouter.get('/:docId/members', async (req: Request, res: Response) => {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, 'admin')
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'admin')
   if (!guard) return
+  const ownerId = guard.meta.owner_id
   const members = await docMemberRepo.list(req.params.docId!)
-  res.status(200).json({
-    items: members.map((m) => ({
+  // The owner is an implicit admin and intentionally has NO doc_member row
+  // (§4.2 owner => admin; DELETE owner_cannot_be_removed). A plain doc_member
+  // listing therefore omits it, even though `docs get` reports it as ownerId —
+  // an inconsistency between the two reads. Surface the owner explicitly as a
+  // synthesized item so `members list` and `docs get` agree on owner
+  // visibility. This is display-only: no doc_member row is written, so the
+  // implicit-owner semantics above stay intact. doc and sheet share this
+  // endpoint, so both gain the owner row identically.
+  const directMembers = members
+    // Dedup: if a doc_member row for the owner also exists (e.g. a historical
+    // PUT that upserted the owner), drop it so the owner appears exactly once,
+    // always as admin (owner is not downgradable), never as a duplicate row.
+    .filter((m) => m.uid !== ownerId)
+    .map((m) => ({
       uid: m.uid,
       role: roleName(Number(m.role)),
       source: m.source === 2 ? 'invite' : 'direct',
       grantedBy: m.granted_by,
-    })),
+    }))
+  res.status(200).json({
+    items: [{ uid: ownerId, role: 'admin', source: 'owner', grantedBy: null }, ...directMembers],
   })
 })
 
@@ -40,7 +55,7 @@ membersRouter.get('/:docId/members', async (req: Request, res: Response) => {
  * non-existent uid => 404 user_not_found (no ghost member written).
  */
 membersRouter.put('/:docId/members', async (req: Request, res: Response) => {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, 'admin')
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'admin')
   if (!guard) return
   const { uid, role } = req.body ?? {}
   if (typeof uid !== 'string' || uid === '') {
@@ -52,8 +67,13 @@ membersRouter.put('/:docId/members', async (req: Request, res: Response) => {
     res.status(400).json({ error: 'role must be reader|writer|admin' })
     return
   }
-  // verify target uid exists in octo (anti ghost-member).
-  const user = await getOctoIdentity().getUser(uid, req.octoToken)
+  // verify target uid exists in octo (anti ghost-member). On the bot mount
+  // (req.botToken set by verifyBot) resolve with the bot's own token via the
+  // bot user-info route; on the human path resolve with the caller/service
+  // token via GET /v1/users/:uid. Either way a miss => 404 user_not_found.
+  const user = req.botToken
+    ? await getOctoIdentity().getUserAsBot(uid, req.botToken)
+    : await getOctoIdentity().getUser(uid, req.octoToken)
   if (!user) {
     res.status(404).json({ error: 'user_not_found' })
     return
@@ -71,7 +91,7 @@ membersRouter.put('/:docId/members', async (req: Request, res: Response) => {
 
 /** DELETE member (needs admin); owner cannot be removed (§4.5). */
 membersRouter.delete('/:docId/members/:uid', async (req: Request, res: Response) => {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, 'admin')
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'admin')
   if (!guard) return
   const targetUid = req.params.uid!
   if (targetUid === guard.meta.owner_id) {

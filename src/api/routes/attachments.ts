@@ -112,20 +112,27 @@ function dispositionFileName(fileName: string): string {
  * cannot render in the browser; the disposition is baked into the signed URL so
  * object storage replays it as the response header (§3.5). dispositionFileName
  * strips quote/backslash/control chars first, so the file name cannot break out
- * of the quoted-string or inject a CR-LF header. The single read and batch
- * resolve endpoints share this one path so they never drift.
+ * of the quoted-string or inject a CR-LF header. The served Content-Type is also
+ * pinned to the registered `attachment.mime` — the value already vetted by the
+ * denylist/allow-list at presign time — so the GET response can never echo the
+ * attacker-controlled raw PUT header (stored XSS — XIN-726). The inline-vs-
+ * download decision is likewise taken from that trusted registered mime. The
+ * single read and batch resolve endpoints share this one path so they never drift.
  */
 function presignReadUrl(attachment: DocAttachment, ttl: number): string {
   const contentDisposition = isInlineType(attachment.mime)
     ? undefined
     : `attachment; filename="${dispositionFileName(attachment.fileName)}"`
-  return getObjectStore().presignGet(attachment.objectKey, ttl, { contentDisposition })
+  return getObjectStore().presignGet(attachment.objectKey, ttl, {
+    contentDisposition,
+    responseContentType: attachment.mime,
+  })
 }
 
 attachmentsRouter.post('/:docId/attachments/presign', presignHandler)
 
 export async function presignHandler(req: Request, res: Response): Promise<void> {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, 'writer')
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'writer')
   if (!guard) return
 
   const { fileName, mime, sizeBytes } = req.body ?? {}
@@ -210,7 +217,7 @@ export async function presignHandler(req: Request, res: Response): Promise<void>
 attachmentsRouter.get('/:docId/attachments/:attachId', readHandler)
 
 export async function readHandler(req: Request, res: Response): Promise<void> {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, 'reader')
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader')
   if (!guard) return
 
   const attachment = await docAttachmentRepo.getById(req.params.attachId!)
@@ -245,7 +252,7 @@ export async function readHandler(req: Request, res: Response): Promise<void> {
 attachmentsRouter.post('/:docId/attachments/resolve', resolveHandler)
 
 export async function resolveHandler(req: Request, res: Response): Promise<void> {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, 'reader')
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader')
   if (!guard) return
 
   const { attachIds } = req.body ?? {}

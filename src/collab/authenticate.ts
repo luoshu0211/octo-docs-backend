@@ -35,12 +35,17 @@ const unauthorized = () => new AuthError(4401, 'Unauthorized')
 const forbidden = () => new AuthError(4403, 'Forbidden')
 
 export interface AuthContext {
-  user: { id: string }
+  user: { id: string; name?: string }
   role: Role
   permission_epoch: number
+  /** 'document' (4-seg key) or 'whiteboard' (5-seg `:wb:` key, M2). */
+  kind: 'document' | 'whiteboard'
   space: string
   folder: string
-  doc: string
+  /** doc id for documents; undefined for whiteboards (see `board`). */
+  doc?: string
+  /** board id for whiteboards; undefined for documents. */
+  board?: string
 }
 
 export interface AuthInput {
@@ -85,28 +90,32 @@ export async function authenticate(data: AuthInput): Promise<AuthContext> {
   // 4. role from claims (no recompute).
   const role = claims.role
 
-  // 5. parse documentName for downstream routing. Reject whiteboard / malformed.
+  // 5. parse documentName for downstream routing. M2: whiteboard keys are now
+  //    SERVED here (no longer rejected) — both document and whiteboard kinds
+  //    pass; only malformed keys are forbidden.
   let parsed
   try {
     parsed = parseDocumentName(documentName)
   } catch {
     throw forbidden() // 4403
   }
-  if (parsed.kind !== 'document') throw forbidden() // whiteboard => 4403
-  const { space, folder, doc } = parsed
 
   // 6. reader: set readOnly so writes are rejected BEFORE being applied (v4).
   if (role === 'reader') {
     connectionConfig.readOnly = true
   }
 
-  // 7. inject context for downstream hooks.
-  return {
-    user: { id: claims.uid },
+  // 7. inject context for downstream hooks (kind-tagged). The trusted display
+  //    name (resolved at issuance, §4.7(b)) rides along so beforeHandleAwareness
+  //    can stamp the presence frame's user.name; uid stays the identity.
+  const base = {
+    user: { id: claims.uid, ...(claims.name ? { name: claims.name } : {}) },
     role,
     permission_epoch: claims.permission_epoch,
-    space,
-    folder,
-    doc,
+    space: parsed.space,
+    folder: parsed.folder,
   }
+  return parsed.kind === 'whiteboard'
+    ? { ...base, kind: 'whiteboard', board: parsed.board }
+    : { ...base, kind: 'document', doc: parsed.doc }
 }

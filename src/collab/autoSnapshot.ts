@@ -32,11 +32,11 @@
  */
 import * as Y from 'yjs'
 import { config } from '../config/env.js'
-import { persistence } from './persistence.js'
 import { docVersionRepo } from '../db/repos/docVersionRepo.js'
 import { acquireLock, rkey } from '../db/redis.js'
 import { parseDocumentName } from '../permission/documentName.js'
 import { SCHEMA_VERSION } from '../schema/index.js'
+import { WB_SCHEMA_VERSION } from '../whiteboard/schema/index.js'
 import type { AuthContext } from './authenticate.js'
 
 /** Per-document in-memory trigger state (process-local). */
@@ -49,6 +49,13 @@ interface DocAutoState {
   idleTimer: ReturnType<typeof setTimeout> | null
   /** uid of the last writer seen on the store path; 'system' sentinel otherwise. */
   lastWriter: string
+  /**
+   * The LIVE in-memory Y.Doc for this document, captured from the store hook so
+   * a delayed idle frame snapshots the current scene (XIN-656). Read directly —
+   * never via openDirectConnection, which would re-add a connection and is
+   * unsafe to call from inside the unload hook.
+   */
+  liveDoc: Y.Doc | null
 }
 
 const SYSTEM_WRITER = 'system'
@@ -58,22 +65,29 @@ const docState = new Map<string, DocAutoState>()
 function getState(documentName: string): DocAutoState {
   let s = docState.get(documentName)
   if (!s) {
-    s = { lastStoreAt: 0, lastAutoAt: 0, idleTimer: null, lastWriter: SYSTEM_WRITER }
+    s = { lastStoreAt: 0, lastAutoAt: 0, idleTimer: null, lastWriter: SYSTEM_WRITER, liveDoc: null }
     docState.set(documentName, s)
   }
   return s
 }
 
 /**
- * doc_id is the 4th segment of the documentName (docs are created as
- * buildDocumentName(space, folder, docId)), so we derive it without a DB hit —
- * the same identity other code relies on. Whiteboard / malformed keys yield
- * null and are skipped (the document backend does not snapshot them).
+ * doc_id is the 4th segment of a document key, or the board id (5th segment) of
+ * a whiteboard key — both are created with their id as doc_meta.doc_id, so we
+ * derive it without a DB hit. M2 (XIN-26 item 5): whiteboards keep the same auto
+ * crash-recovery snapshots as documents, hence the whiteboard branch here.
+ * Malformed keys yield null and are skipped. `schemaVersion` tracks the KIND's
+ * schema line, strictly isolated (§11.5 / §6): whiteboard boards stamp
+ * WB_SCHEMA_VERSION, rich-text docs stamp the ProseMirror SCHEMA_VERSION.
  */
-function deriveDocId(documentName: string): string | null {
+function deriveSnapshotTarget(
+  documentName: string,
+): { docId: string; schemaVersion: number } | null {
   try {
     const parsed = parseDocumentName(documentName)
-    return parsed.kind === 'document' ? parsed.doc : null
+    return parsed.kind === 'document'
+      ? { docId: parsed.doc, schemaVersion: SCHEMA_VERSION }
+      : { docId: parsed.board, schemaVersion: WB_SCHEMA_VERSION }
   } catch {
     return null
   }
@@ -81,20 +95,25 @@ function deriveDocId(documentName: string): string | null {
 
 /**
  * Snapshot the CURRENT live authoritative state into a KIND_AUTO row (with
- * same-transaction pruning). Mirrors createVersionHandler's live fetch + empty
- * Y.Doc fallback so a brand-new doc still records a valid (empty) snapshot.
- * Returns true if a row was written.
+ * same-transaction pruning). Encodes the LIVE in-memory Y.Doc handed in by the
+ * store/unload hook, mirroring createVersionHandler's live-state capture: a
+ * board's drawn scene is snapshotted even before the debounced store flushes it
+ * to the row (XIN-656), and a brand-new doc still records a valid (empty)
+ * snapshot. Returns true if a row was written.
  */
-async function writeAutoSnapshot(documentName: string, createdBy: string): Promise<boolean> {
-  const docId = deriveDocId(documentName)
-  if (!docId) return false
-  const live = await persistence.fetch(documentName)
-  const state = live ?? Y.encodeStateAsUpdate(new Y.Doc())
+async function writeAutoSnapshot(
+  documentName: string,
+  createdBy: string,
+  liveDoc: Y.Doc,
+): Promise<boolean> {
+  const target = deriveSnapshotTarget(documentName)
+  if (!target) return false
+  const state = Y.encodeStateAsUpdate(liveDoc)
   await docVersionRepo.createAutoWithPrune({
-    docId,
+    docId: target.docId,
     documentName,
     state,
-    schemaVersion: SCHEMA_VERSION,
+    schemaVersion: target.schemaVersion,
     createdBy,
     retainCount: config.autoSnapshot.retainCount,
     retainDays: config.autoSnapshot.retainDays,
@@ -105,17 +124,21 @@ async function writeAutoSnapshot(documentName: string, createdBy: string): Promi
 /**
  * afterStoreDocument: record the store, run the min-interval fallback, and
  * (re)arm the idle timer. lastContext carries the last writer's uid (§5.2);
- * absent (e.g. server-internal write) => 'system'.
+ * absent (e.g. server-internal write) => 'system'. `liveDoc` is the live
+ * in-memory Y.Doc from the hook — retained so a later idle frame snapshots the
+ * current scene, and passed straight to the snapshot write here (XIN-656).
  */
 export async function handleAfterStore(
   documentName: string,
   lastContext: AuthContext | undefined,
+  liveDoc: Y.Doc,
 ): Promise<void> {
   if (!config.autoSnapshot.enabled) return
   try {
     const now = Date.now()
     const s = getState(documentName)
     s.lastStoreAt = now
+    s.liveDoc = liveDoc
     const writer = lastContext?.user?.id
     if (writer) s.lastWriter = writer
 
@@ -125,7 +148,7 @@ export async function handleAfterStore(
     if (now - s.lastAutoAt >= config.autoSnapshot.minIntervalMs) {
       const key = rkey('autosnap', 'mininterval', documentName)
       if (await acquireLock(key, config.autoSnapshot.minIntervalMs)) {
-        if (await writeAutoSnapshot(documentName, s.lastWriter)) s.lastAutoAt = Date.now()
+        if (await writeAutoSnapshot(documentName, s.lastWriter, liveDoc)) s.lastAutoAt = Date.now()
       }
     }
 
@@ -156,10 +179,14 @@ async function fireIdle(documentName: string, armedAt: number): Promise<void> {
   // A newer store re-armed a later timer; this stale firing is a no-op.
   if (s.lastStoreAt !== armedAt) return
   if (!config.autoSnapshot.enabled) return
+  // The live doc was captured on the store that armed this timer; without it we
+  // cannot encode the scene (should not happen, since the timer is only armed
+  // from handleAfterStore, which always sets it).
+  if (!s.liveDoc) return
   try {
     const key = rkey('autosnap', 'idle', documentName)
     if (!(await acquireLock(key, config.autoSnapshot.idleMs))) return
-    if (await writeAutoSnapshot(documentName, s.lastWriter)) s.lastAutoAt = Date.now()
+    if (await writeAutoSnapshot(documentName, s.lastWriter, s.liveDoc)) s.lastAutoAt = Date.now()
   } catch (err) {
     logFailure('idle', documentName, err)
   }
@@ -169,9 +196,10 @@ async function fireIdle(documentName: string, armedAt: number): Promise<void> {
  * beforeUnloadDocument: clear the idle timer, flush a final frame if there are
  * edits since the last auto (avoid losing the last burst), then drop the
  * per-doc state. Dedups on the idle key so a multi-node unload race resolves to
- * a single frame.
+ * a single frame. `liveDoc` is the live doc being unloaded — encoded directly
+ * (never via openDirectConnection, which would re-add a connection mid-unload).
  */
-export async function handleBeforeUnload(documentName: string): Promise<void> {
+export async function handleBeforeUnload(documentName: string, liveDoc: Y.Doc): Promise<void> {
   const s = docState.get(documentName)
   if (!s) return
   if (s.idleTimer) {
@@ -182,7 +210,7 @@ export async function handleBeforeUnload(documentName: string): Promise<void> {
     if (config.autoSnapshot.enabled && s.lastStoreAt > s.lastAutoAt) {
       const key = rkey('autosnap', 'idle', documentName)
       if (await acquireLock(key, config.autoSnapshot.idleMs)) {
-        await writeAutoSnapshot(documentName, s.lastWriter)
+        await writeAutoSnapshot(documentName, s.lastWriter, liveDoc)
       }
     }
   } catch (err) {

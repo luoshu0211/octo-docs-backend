@@ -54,6 +54,8 @@ Key design invariants (from the contract):
 - **Node.js ≥ 20** (developed on v22), npm.
 - **MySQL 8** (authoritative store).
 - **Redis 5+** (pub/sub broadcast bus, epoch cache, connection registry).
+- **`typst` binary** (only for PDF export) — a single static Rust binary; see
+  [PDF export (Typst)](#pdf-export-typst).
 
 MySQL and Redis are only needed to **run the server** and for integration
 flows. The **unit test suite runs fully offline** (mocks / in-memory).
@@ -71,8 +73,15 @@ Copy `.env.example` to `.env` and adjust. Summary:
 | `REDIS_*` (incl. `REDIS_PREFIX`) | broadcast bus / cache / registry | §5 |
 | `COLLAB_TOKEN_SECRET` / `COLLAB_TOKEN_TTL_SECONDS` | collab JWT signing + TTL (5 min) | §4.4 |
 | `OCTO_IDENTITY_MODE` (`http`/`middleware`) / `OCTO_SERVER_BASE_URL` | octo identity integration | §4.7 |
+| `OCTO_SERVER_TOKEN` | service token for octo-server lookups on the human path (optional). The bot path (`/v1/bot/docs`) resolves the anti ghost-member existence check via the bot's own token against the bot user-info route, so this service token is no longer required for bot member-add or forward-grant | §4.7 / v4.3 bot API |
 | `MAX_DOC_BYTES` | single-doc size hard cap (~10MB) | §9.5 |
 | `ATTACHMENT_BUCKET` | object-storage bucket (presign stub) | §3.5 |
+| `TYPST_EXPORT_BINARY` | path to the `typst` binary (empty ⇒ resolved from `PATH`) | PDF export |
+| `TYPST_EXPORT_MAX_CONCURRENT` / `TYPST_EXPORT_MAX_QUEUE` | compile concurrency + queue bound (over queue ⇒ 503) | PDF export |
+| `TYPST_EXPORT_COMPILE_TIMEOUT_MS` | hard per-compile timeout (child killed on expiry) | PDF export |
+| `TYPST_EXPORT_MAX_IMAGE_BYTES` | per-attachment image download cap for embedding | PDF export |
+| `TYPST_EXPORT_MAX_IMAGE_COUNT` | max images embedded per export (count bound) | PDF export |
+| `TYPST_EXPORT_MAX_IMAGE_TOTAL_BYTES` | aggregate byte budget across embedded images per export | PDF export |
 
 ---
 
@@ -101,6 +110,97 @@ npm run dev
 npm run build
 npm start
 ```
+
+## PDF export (Typst)
+
+Documents are exported to PDF server-side by rendering the persisted document to
+[Typst](https://typst.app) source and compiling it with the standalone `typst`
+binary:
+
+```
+POST /api/v1/docs/:docId/export/pdf   (reader role)  →  application/pdf
+```
+
+The request pipeline is: authorise (reader) → load the authoritative persisted
+Y.Doc → convert to ProseMirror JSON → render to Typst source (`src/export/
+renderTypst.ts`) → compile with a short-lived `typst` child process
+(`src/export/typstService.ts`). Typst has **no resident process** and **no
+network access** at compile time, so image bytes are pre-downloaded
+(size-bounded) into a per-compile sandbox root that `typst --root` cannot escape.
+
+### Installing the `typst` binary
+
+Typst is a single static Rust binary (~30MB) with no browser or LaTeX
+dependency. Install it on the machine that runs this backend:
+
+```bash
+# macOS
+brew install typst
+
+# Linux (musl static release; pick your arch)
+curl -fsSL https://github.com/typst/typst/releases/download/v0.13.1/typst-x86_64-unknown-linux-musl.tar.xz \
+  | tar -xJ -C /tmp \
+  && sudo install -m 0755 /tmp/typst-x86_64-unknown-linux-musl/typst /usr/local/bin/typst
+
+typst --version   # verify
+```
+
+The bundled `Dockerfile` already installs the pinned `typst` binary plus the
+Noto CJK and emoji fonts. If you run the backend **outside** the image (e.g.
+directly on a host), install `typst` as above and make sure the host has CJK and
+emoji fonts (`Noto Sans CJK` / `Noto Color Emoji`, or the platform equivalents
+like PingFang / Apple Color Emoji on macOS) — Typst resolves fonts from the
+system font book, so glyph coverage follows the host's installed fonts.
+
+Set `TYPST_EXPORT_BINARY` if the binary is not on `PATH`; tune
+`TYPST_EXPORT_MAX_CONCURRENT` / `TYPST_EXPORT_MAX_QUEUE` /
+`TYPST_EXPORT_COMPILE_TIMEOUT_MS` / `TYPST_EXPORT_MAX_IMAGE_BYTES` /
+`TYPST_EXPORT_MAX_IMAGE_COUNT` / `TYPST_EXPORT_MAX_IMAGE_TOTAL_BYTES` as needed.
+
+## Sheet size dimensions (read payload vs storage)
+
+A spreadsheet (`doc_type = 'sheet'`) is bounded by **two independent byte
+dimensions**. They measure different serializations of the same sheet, use
+different caps, and are NOT comparable — mixing them up is the source of the
+apparent "dead zone" myth, so they are documented together here.
+
+| Dimension | What it measures | How | Cap (env) | Where enforced |
+| --- | --- | --- | --- | --- |
+| **Read payload** | The JSON body a `GET /:docId/sheet` returns | `Buffer.byteLength(JSON.stringify({ sheetCells, sheetDims }))` | `SHEET_READ_MAX_CELL_BYTES` (default **1 MB**) → `config.sheetRead.maxCellBytes` | Read gate `docSheet.ts` → **413 `sheet_too_large`**; write gate `editDocSheet.ts` measures it the SAME way and pre-rejects a write that would exceed it |
+| **Storage** | The persisted Y.Doc binary update | `Y.encodeStateAsUpdate(doc).length` | `MAX_DOC_BYTES` (default **10 MB**) → `config.maxDocBytes` | `persistence.store`; write gate `editDocSheet.ts` → **413 `doc_too_large`** |
+
+Key points:
+
+- **The write cap is aligned to the read cap.** `editDocSheet` rejects a write
+  whose post-edit *read payload* would exceed `maxCellBytes` (`sheet_too_large`)
+  *before* it touches the live Y.Doc. This guarantees **every sheet written
+  through the REST/PATCH path is whole-read-readable** — there is no
+  write-but-not-readable state reachable via normal writes.
+
+- **The two dimensions are different sizes for the same sheet.** The storage
+  binary carries CRDT metadata (client IDs, clocks, deletion tombstones from
+  edited/deleted cells) that the decoded `{sheetCells, sheetDims}` read payload
+  does not. So a sheet whose *storage* is, say, 1.05 MB can still have a *read
+  payload* well under 1 MB and therefore **whole-reads 200, not 413**. That is
+  correct behaviour, not a gap: the read 413 is governed only by the read-payload
+  dimension, never by storage bytes.
+
+- **Whole-read 413 is not a dead end.** A sheet whose read payload exceeds
+  `maxCellBytes` (only reachable by seeding the live Y.Doc *outside* the write
+  gate — e.g. a version-restore of a historic oversized snapshot, or an import)
+  returns 413 `sheet_too_large` on a whole read, but the **paginated read
+  (`?limit=`/`?cursor=`) retrieves it page by page**, each page bounded by
+  `maxCellBytes`. No cell is unreachable.
+
+- **413 observability.** Both size-413 bodies name the dimension they measured so
+  a caller sees at a glance which cap tripped and how far past it the payload sits:
+  - `sheet_too_large` (read gate and write gate) → `{ error, payloadBytes, limit }`
+    (read-payload dimension; the read gate also adds a `hint` to paginate).
+  - `doc_too_large` (write gate) → `{ error, docBytes, limit }` (storage dimension).
+
+  A caller that sees `sheet_too_large` therefore knows to switch to a paginated
+  read; one that sees `doc_too_large` knows the sheet has hit the hard storage
+  cap and must be trimmed.
 
 ## Tests
 

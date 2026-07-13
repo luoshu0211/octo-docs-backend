@@ -28,7 +28,43 @@ function bool(name: string, fallback: boolean): boolean {
   return v === '1' || v.toLowerCase() === 'true'
 }
 
+/**
+ * Parse the comma-separated `CORS_ALLOWED_ORIGINS` allowlist into trimmed,
+ * non-empty entries (XIN-717). Lives here (not in api/cors.ts) so the config
+ * module stays the single leaf that reads env, with no import cycle back from
+ * api/cors.ts. The single value `*` (reflect any origin) is preserved verbatim.
+ */
+export function parseAllowedOrigins(raw: string): string[] {
+  return raw
+    .split(',')
+    .map((o) => o.trim())
+    .filter((o) => o !== '')
+}
+
 export type OctoIdentityMode = 'http' | 'middleware'
+
+/**
+ * Parse the Express `trust proxy` setting from env (§8.4). The REST API runs
+ * behind nginx (see app.ts), so `req.ip` must be derived from the
+ * X-Forwarded-For chain, not the socket peer — otherwise every client collapses
+ * to the proxy address and the per-IP rate limiter shares one bucket across all
+ * traffic. Accepted forms:
+ *   - unset / '' -> 1 (trust exactly one proxy hop: the standard single-nginx
+ *     topology this service documents)
+ *   - 'true' / 'false' -> boolean (avoid 'true' in prod: it is permissive and
+ *     lets clients spoof X-Forwarded-For)
+ *   - an integer -> number of trusted hops in front of the app
+ *   - anything else -> passed through verbatim (a preset like 'loopback' or a
+ *     subnet/CIDR list Express understands)
+ */
+export function parseTrustProxy(raw: string): boolean | number | string {
+  const v = raw.trim()
+  if (v === '') return 1
+  if (v.toLowerCase() === 'true') return true
+  if (v.toLowerCase() === 'false') return false
+  if (/^\d+$/.test(v)) return Number(v)
+  return v
+}
 
 /** Dev-only fallback secret; must never reach production (see requireSafeSigningSecret). */
 const DEV_SIGNING_SECRET = 'dev-only-change-me'
@@ -56,28 +92,40 @@ export function requireSafeSigningSecret(secret: string): string {
  * absolute `ws://`/`wss://` URL — a relative path would resolve against the REST
  * API origin and never reach the WS port.
  *
- * PHASE 1 (this change): soft-warn only, never fail-fast. During the compat
- * window the frontend still falls back to its build-time env when the field is
- * absent, so an unset/invalid value must not crash the backend. A follow-up
- * cleanup issue flips this to fail-fast once the frontend drops that fallback
- * (mirrors requireSafeSigningSecret's fail-fast contract). Returns '' to mean
- * "omit the field"; callers must not emit an empty or malformed URL.
+ * Production fail-fast (mirrors requireSafeSigningSecret's production-gated
+ * contract): the compat window is over — the frontend has dropped its build-time
+ * WS fallback, so an unset or malformed value leaves clients with no way to reach
+ * the collab WS and no one would notice. In production (`NODE_ENV=production`)
+ * that config is fatal: the process refuses to start with a clear error. Outside
+ * production the value stays soft (warn, normalise to '') so local dev and the
+ * test suite still boot without the var. Returns '' to mean "omit the field";
+ * callers must not emit an empty or malformed URL.
  */
 export function resolveCollabPublicWsUrl(raw: string): string {
   const value = raw.trim()
   if (value === '') {
+    if (process.env.NODE_ENV === 'production') {
+      throw new Error(
+        'COLLAB_TOKEN_PUBLIC_WS_URL must be set in production (refusing to run: clients cannot reach the collab WS without it)',
+      )
+    }
     // eslint-disable-next-line no-console
     console.warn(
-      '[config] COLLAB_TOKEN_PUBLIC_WS_URL is not set; collab-token responses will omit collabWsUrl ' +
-        'and clients fall back to their build-time WS env (compatibility phase).',
+      '[config] COLLAB_TOKEN_PUBLIC_WS_URL is not set; collab-token responses will omit collabWsUrl. ' +
+        'This is fatal in production — set an absolute ws:// or wss:// URL there.',
     )
     return ''
   }
   if (!/^wss?:\/\//i.test(value)) {
+    if (process.env.NODE_ENV === 'production') {
+      throw new Error(
+        `COLLAB_TOKEN_PUBLIC_WS_URL must be an absolute ws:// or wss:// URL, got: ${value} (refusing to run)`,
+      )
+    }
     // eslint-disable-next-line no-console
     console.warn(
       `[config] COLLAB_TOKEN_PUBLIC_WS_URL must be an absolute ws:// or wss:// URL, got: ${value}. ` +
-        'Ignoring it; collabWsUrl will be omitted this phase.',
+        'Ignoring it; collabWsUrl will be omitted. This is fatal in production.',
     )
     return ''
   }
@@ -88,6 +136,11 @@ export const config = {
   hostname: str('HOSTNAME', 'octo-docs-local'),
   hocuspocusPort: num('HOCUSPOCUS_PORT', 1234),
   httpPort: num('HTTP_PORT', 3000),
+
+  // Express `trust proxy` value. The REST API sits behind nginx, so this must be
+  // set for req.ip (and thus the per-IP rate limiter) to see the real client
+  // rather than the proxy. Defaults to 1 (one nginx hop); see parseTrustProxy.
+  trustProxy: parseTrustProxy(str('TRUST_PROXY', '')),
 
   mysql: {
     host: str('MYSQL_HOST', '127.0.0.1'),
@@ -104,23 +157,54 @@ export const config = {
     prefix: str('REDIS_PREFIX', 'octo-docs'),
   },
 
+  // Per-IP request throttle applied to the REST route chains (§8.4). Guards the
+  // authenticated/authorizing metadata endpoints on both the human (/api/v1/docs)
+  // and bot (/v1/bot/docs) mounts against abuse. Keyed on the real client IP,
+  // which requires `trustProxy` above to be set correctly for the deployment.
+  // Defaults are generous enough not to affect normal interactive/bot usage;
+  // tune down only if abuse is observed. The /healthz probe is mounted ahead of
+  // the limiter and stays unthrottled.
+  rateLimit: {
+    // Rolling window length.
+    windowMs: num('RATE_LIMIT_WINDOW_MS', 60_000),
+    // Max requests per IP per window before a 429 is returned.
+    max: num('RATE_LIMIT_MAX', 300),
+  },
+
   collabToken: {
     secret: str('COLLAB_TOKEN_SECRET', 'dev-only-change-me'),
     ttlSeconds: num('COLLAB_TOKEN_TTL_SECONDS', 300),
     // Public, browser-reachable collab WS origin surfaced to clients as
     // `collabWsUrl` in the collab-token response (§4.4). Absolute ws://|wss://
-    // only (WS runs on its own :1234 origin, not reverse-proxied). Empty (unset
-    // or malformed) => field omitted; validated soft (warn, never fail) during
-    // the compat phase — see resolveCollabPublicWsUrl.
+    // only (WS runs on its own :1234 origin, not reverse-proxied). REQUIRED in
+    // production: unset/malformed is fatal (fail-fast, refuses to start). Soft
+    // (warn => omit) outside production only — see resolveCollabPublicWsUrl.
     publicWsUrl: resolveCollabPublicWsUrl(str('COLLAB_TOKEN_PUBLIC_WS_URL', '')),
+  },
+
+  // Cross-Origin Resource Sharing (XIN-717). The front-end runs on its own
+  // origin and calls the REST API — and, with the local-hmac driver pointed at
+  // the docs-backend origin, the presigned attachment PUT/GET — cross-origin, so
+  // the browser preflights with OPTIONS and blocks any response without a
+  // matching Access-Control-Allow-Origin. Configure the allowed FE origin(s)
+  // here (comma-separated exact origins, e.g. `http://192.168.214.189:3010`, or
+  // the single value `*` to reflect any origin). Empty (default) allows no
+  // cross-origin request — set it per environment at deploy time. See src/api/cors.ts.
+  cors: {
+    allowedOrigins: parseAllowedOrigins(str('CORS_ALLOWED_ORIGINS', '')),
   },
 
   octoIdentity: {
     mode: str('OCTO_IDENTITY_MODE', 'http') as OctoIdentityMode,
     serverBaseUrl: str('OCTO_SERVER_BASE_URL', 'http://127.0.0.1:8080'),
-    // Optional service token sent as the `token` header on octo-server lookups
-    // (e.g. GET /v1/users/:uid, which requires auth). Empty = not configured;
-    // callers then fall back to the authenticated user's own session token.
+    // Service token sent as the `token` header on octo-server lookups (e.g.
+    // GET /v1/users/:uid, which requires auth) on the HUMAN path. Empty = not
+    // configured; callers then fall back to the authenticated user's own session
+    // token. OPTIONAL for the human path (/api/v1/docs). No longer required for
+    // the bot path (/v1/bot/docs): the bot resolves the target user with its own
+    // bearer token via GET /v1/bot/user/info (see octoIdentity.getUserAsBot), so
+    // the anti ghost-member existence check in members/forwardGrant works with
+    // OCTO_SERVER_TOKEN empty.
     serviceToken: str('OCTO_SERVER_TOKEN', ''),
   },
 
@@ -137,6 +221,28 @@ export const config = {
     // change for existing MinIO/local-hmac deployments. Leading/trailing slashes
     // are normalised; the prefix is part of the signed key (see objectStore.ts).
     keyPrefix: str('ATTACHMENT_KEY_PREFIX', ''),
+    // Public, browser-reachable base URL the 'local-hmac' driver bakes into the
+    // signed PUT/GET URL host (§3.5). The front-end issues the presigned PUT (and
+    // later GET) directly, so this host MUST resolve from the end-user browser.
+    // The historical default baked a fixed `https://<bucket>.object-store.local`
+    // origin into every signed URL — an internal placeholder alias the browser
+    // cannot resolve (ERR_NAME_NOT_RESOLVED), so the direct PUT never lands and
+    // collaborators see no image (XIN-713). Set this to a host the browser can
+    // actually reach — e.g. the docs-backend origin that fronts object storage
+    // (`http://<host>:<httpPort>`), or a real object-store endpoint — and the
+    // signed URL becomes `<publicBaseUrl>/<key>?X-...`. An optional path segment
+    // (e.g. `.../attachments`) is supported and stripped before signature
+    // verification, so the signed key stays the pure object key. Empty (default)
+    // preserves the legacy object-store.local host for back-compat.
+    publicBaseUrl: str('ATTACHMENT_PUBLIC_BASE_URL', ''),
+    // Filesystem directory the self-hosted local-hmac blob gateway stores and
+    // serves uploaded bytes from (XIN-717). Only used when driver is
+    // 'local-hmac' AND publicBaseUrl points at this backend origin — then the
+    // browser PUTs/GETs the binary directly here and the gateway persists it
+    // under this directory. Empty (default) falls back to
+    // `<os.tmpdir()>/octo-docs-attachments`. Not used by the s3/minio drivers
+    // (those upload straight to object storage).
+    localDir: str('ATTACHMENT_LOCAL_DIR', ''),
     // S3-compatible (MinIO/S3/COS) driver settings. Used only when driver is
     // 's3'/'minio'. The endpoint is the PUBLIC, browser-reachable origin baked
     // into the signed URL host (never a docker-internal alias). Credentials come
@@ -240,6 +346,146 @@ export const config = {
 
   // §9.5 single-document Yjs state hard cap.
   maxDocBytes: num('MAX_DOC_BYTES', 10 * 1024 * 1024),
+
+  // Bot incremental doc-body edit request-shape bounds (PATCH /:docId/content).
+  // These fail fast at the route shape gate, BEFORE the no-lock op resolution +
+  // PMNode.fromJSON + Y.Doc hydration in editDocBody, so an oversized batch is
+  // rejected without spending that CPU/memory. The global express.json 1mb cap
+  // and the post-apply maxDocBytes gate remain; these close the gap in between.
+  docBodyEdit: {
+    // Upper bound on ops per PATCH batch. Well above any realistic single edit
+    // (a document restructure touches a handful of blocks), low enough that a
+    // scripted bot cannot fan out unbounded resolution work under the 1mb cap.
+    maxOps: num('DOC_BODY_EDIT_MAX_OPS', 500),
+    // Upper bound on a single op's serialized `content` payload. Keeps one op
+    // from carrying most of the 1mb body as nodes that must each be parsed.
+    maxOpContentBytes: num('DOC_BODY_EDIT_MAX_OP_CONTENT_BYTES', 256 * 1024),
+    // Upper bound on a block-path length. Real ProseMirror nesting (doc > list >
+    // listItem > paragraph > ...) stays in single digits; 32 is generous while
+    // capping the per-index descent work resolveBlockPath does per anchor.
+    maxPathDepth: num('DOC_BODY_EDIT_MAX_PATH_DEPTH', 32),
+  },
+
+  // Bot/human sheet content read (GET /:docId/sheet). maxCellBytes bounds a
+  // single response body: the whole-sheet read returns 413 sheet_too_large above
+  // it, and — since Stage3 — it also caps each page of a paginated read, so no
+  // one page can exceed it either. Paginated reads (query ?limit= / ?cursor=)
+  // lift the whole-sheet 413 wall for opted-in callers by slicing an oversized
+  // grid into byte-bounded pages; a caller passing neither param keeps the exact
+  // Stage1 whole-sheet behavior (backward compatible). The live Y.Doc is already
+  // capped at maxDocBytes, so every decode + measure below is bounded.
+  sheetRead: {
+    maxCellBytes: num('SHEET_READ_MAX_CELL_BYTES', 1024 * 1024),
+    // Cells per page when a caller opts into pagination without an explicit
+    // ?limit. The byte cap above is the hard bound; this is the count default.
+    defaultPageLimit: num('SHEET_READ_DEFAULT_PAGE_LIMIT', 1000),
+    // Upper bound a caller's ?limit is clamped to, so a large limit can never
+    // force an unbounded per-page slice (the byte cap still governs regardless).
+    maxPageLimit: num('SHEET_READ_MAX_PAGE_LIMIT', 10000),
+  },
+
+  // Bot/human sheet content write (PATCH /:docId/sheet). Request-shape bounds
+  // that fail fast at the route gate, BEFORE the no-lock batch validation and
+  // the live write, so an oversized cell batch is rejected without spending that
+  // work. Mirrors docBodyEdit's bounds for the flat-cell write surface; the
+  // global express.json 1mb cap and the post-write maxDocBytes gate remain.
+  sheetWrite: {
+    // Upper bound on cells per PATCH batch (set + delete combined). Well above a
+    // realistic single edit, low enough that a scripted client cannot fan out
+    // unbounded validate/set work under the 1mb body cap.
+    maxCells: num('SHEET_WRITE_MAX_CELLS', 5000),
+    // Upper bound on a single cell's serialized {v,f,s} payload — keeps one cell
+    // (chiefly its opaque style object) from carrying most of the 1mb body.
+    maxCellContentBytes: num('SHEET_WRITE_MAX_CELL_CONTENT_BYTES', 64 * 1024),
+  },
+
+  // Bot board-scene write (PATCH /:docId/scene). Request-shape bounds that fail
+  // fast at the route gate, BEFORE the no-lock batch validation and the live
+  // write, so an oversized element batch is rejected without spending that work.
+  // Mirrors docBodyEdit / sheetWrite for the whiteboard element surface; the
+  // global express.json 1mb cap and the post-write maxDocBytes gate remain.
+  boardSceneWrite: {
+    // Upper bound on the number of scene ops per PATCH batch — upsert elements +
+    // deleted ids + file entries combined. Well above a realistic single edit,
+    // low enough that a scripted client cannot fan out unbounded validate/apply
+    // work under the 1mb body cap.
+    maxElements: num('BOARD_SCENE_WRITE_MAX_ELEMENTS', 5000),
+    // Upper bound on a single element's / file ref's serialized payload — keeps
+    // one element (chiefly a freedraw `points` array) from carrying most of the
+    // 1mb body as a single object that must be normalized.
+    maxElementContentBytes: num('BOARD_SCENE_WRITE_MAX_ELEMENT_CONTENT_BYTES', 128 * 1024),
+  },
+
+  // Typst-based PDF export. The document's persisted state is rendered to Typst
+  // source (renderTypst.ts) and compiled to PDF by spawning the standalone
+  // `typst` binary (typstService.ts). No resident process; each compile is a
+  // short-lived sandboxed child. These bounds cap concurrency, queueing, compile
+  // time and per-image download size.
+  typstExport: {
+    // Path to the `typst` binary; empty => resolved from PATH.
+    binaryPath: str('TYPST_EXPORT_BINARY', ''),
+    // Max concurrent typst compiles; the rest queue.
+    maxConcurrent: num('TYPST_EXPORT_MAX_CONCURRENT', 2),
+    // Max compiles allowed to WAIT; over this the route returns 503.
+    maxQueue: num('TYPST_EXPORT_MAX_QUEUE', 10),
+    // Hard per-compile timeout; on expiry the child process is killed.
+    compileTimeoutMs: num('TYPST_EXPORT_COMPILE_TIMEOUT_MS', 20_000),
+    // Max image bytes downloaded per attachment for embedding (DoS bound).
+    maxImageBytes: num('TYPST_EXPORT_MAX_IMAGE_BYTES', 10 * 1024 * 1024),
+    // Max number of images embedded in one export (count bound). Prevents a doc
+    // with many image attachments from forcing count x maxImageBytes downloads.
+    maxImageCount: num('TYPST_EXPORT_MAX_IMAGE_COUNT', 50),
+    // Aggregate byte budget across all embedded images in one export. Once the
+    // running total would exceed this, remaining images are dropped.
+    maxImageTotalBytes: num('TYPST_EXPORT_MAX_IMAGE_TOTAL_BYTES', 50 * 1024 * 1024),
+    // Per-formula fallback bound: after a whole-document compile failure the
+    // route probes individual formulas (one `typst` compile each) to isolate
+    // the broken one. Cap how many formulas may be probed and the total wall
+    // clock spent probing, so a doc with thousands of formulas can't hold a
+    // scarce compile slot indefinitely. When the budget is spent the route
+    // skips straight to the whole-document verbatim fallback.
+    maxFormulaProbes: num('TYPST_EXPORT_MAX_FORMULA_PROBES', 40),
+    formulaProbeBudgetMs: num('TYPST_EXPORT_FORMULA_PROBE_BUDGET_MS', 15_000),
+  },
+
+  // W3 server-side whiteboard image export. The decoded Excalidraw scene is
+  // serialized to SVG in-process (whiteboard/exportScene.ts) and, for PNG,
+  // rasterized with @napi-rs/canvas (Skia; prebuilt musl binary, no browser, no
+  // resident process). Embedded image elements have their bytes pre-downloaded
+  // (size-bounded, best-effort) like the Typst path and composited onto the PNG
+  // canvas directly. These bounds cap the work one export can force.
+  boardExport: {
+    // Max image bytes downloaded per image element for embedding (DoS bound).
+    maxImageBytes: num('BOARD_EXPORT_MAX_IMAGE_BYTES', 10 * 1024 * 1024),
+    // Max number of image elements whose bytes are embedded in one export.
+    maxImageCount: num('BOARD_EXPORT_MAX_IMAGE_COUNT', 50),
+    // Aggregate byte budget across all embedded images in one export.
+    maxImageTotalBytes: num('BOARD_EXPORT_MAX_IMAGE_TOTAL_BYTES', 50 * 1024 * 1024),
+    // Target raster width (px) for PNG output; the SVG is scaled to fit this.
+    // 0 => render at the scene's natural pixel size.
+    pngWidth: num('BOARD_EXPORT_PNG_WIDTH', 2000),
+    // Max SVG canvas dimension (px, each axis). The scene bounding box is
+    // attacker-controlled, so clamp the emitted width/height to keep a
+    // pathological/overflowing scene from producing a giant (or Infinity) canvas.
+    maxSvgDimension: num('BOARD_EXPORT_MAX_SVG_DIMENSION', 12_000),
+    // Max PNG output pixel area (width*height). Bounds the rasterized bitmap so a
+    // single reader GET cannot force a multi-GB allocation (OOM); oversize scenes
+    // are downscaled uniformly to fit. ~40M px ≈ 160MB RGBA peak.
+    maxPngPixels: num('BOARD_EXPORT_MAX_PNG_PIXELS', 40_000_000),
+    // Max DECODED pixel area (width*height) of a source image element before the
+    // PNG compositor decodes it. maxImageBytes caps only the *compressed* source,
+    // so a highly compressed bomb (e.g. 30000x30000 PNG < 10MB) would decode to a
+    // multi-GB bitmap and OOM the process on loadImage. The intrinsic size is read
+    // from the header before decoding; an oversize source degrades to a
+    // placeholder (best-effort). ~40M px ≈ 160MB RGBA peak per image.
+    maxSourceImagePixels: num('BOARD_EXPORT_MAX_SOURCE_IMAGE_PIXELS', 40_000_000),
+    // Concurrency gate for the PNG raster path (CPU/memory-heavy, synchronous
+    // Skia compositing). At most maxConcurrent PNG rasters run at once; up to
+    // maxQueue more wait, and further requests get 503 export_busy — so a burst
+    // of `?format=png` GETs can't saturate CPU/RAM and cascade into an OOM.
+    maxConcurrentPngExports: num('BOARD_EXPORT_MAX_CONCURRENT_PNG', 4),
+    maxQueuedPngExports: num('BOARD_EXPORT_MAX_QUEUED_PNG', 16),
+  },
 
   // §5.7 A4 auto-save version history. Backend-autonomous KIND_AUTO snapshots
   // triggered off the Hocuspocus store path (idle timer + min-interval fallback
