@@ -194,6 +194,18 @@ export const config = {
     allowedOrigins: parseAllowedOrigins(str('CORS_ALLOWED_ORIGINS', '')),
   },
 
+  // Public, browser-facing octo-web origin used to mint absolute doc share
+  // links (the `shareUrl` field on doc lifecycle responses). A caller — a bot
+  // via octo-cli, the OpenClaw octo plugin, or any integration — can pass this
+  // URL straight through to chat instead of hand-assembling a link (which
+  // produced broken links). The minted URL mirrors octo-web's authoritative
+  // buildDocLink: `<webOrigin>/d/<docId>?sp=<spaceId>`. Set it to the origin the
+  // end-user browser loads octo-web from, e.g. `http://192.168.214.189:3010`.
+  // Empty (default) safely degrades: shareUrl becomes an origin-relative,
+  // path-only `/d/<docId>?sp=<spaceId>` rather than baking in a wrong host.
+  // See src/util/docShareLink.ts.
+  webOrigin: str('OCTO_WEB_ORIGIN', ''),
+
   octoIdentity: {
     mode: str('OCTO_IDENTITY_MODE', 'http') as OctoIdentityMode,
     serverBaseUrl: str('OCTO_SERVER_BASE_URL', 'http://127.0.0.1:8080'),
@@ -424,6 +436,13 @@ export const config = {
   typstExport: {
     // Path to the `typst` binary; empty => resolved from PATH.
     binaryPath: str('TYPST_EXPORT_BINARY', ''),
+    // Directory of embedded OSS CJK fonts (Noto Sans/Serif CJK SC == Source Han
+    // Sans/Serif, SIL OFL) passed to typst as `--font-path`. Empty => typst uses
+    // only its system font book. Set it so CJK faces the document maps to are
+    // found deterministically regardless of the host's installed fonts; typst
+    // subset-embeds just the used glyphs into the PDF. The Dockerfile points
+    // this at the image's font dir.
+    fontPath: str('TYPST_EXPORT_FONT_PATH', ''),
     // Max concurrent typst compiles; the rest queue.
     maxConcurrent: num('TYPST_EXPORT_MAX_CONCURRENT', 2),
     // Max compiles allowed to WAIT; over this the route returns 503.

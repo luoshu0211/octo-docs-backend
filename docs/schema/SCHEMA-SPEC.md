@@ -27,8 +27,11 @@
 | v13 | `inlineMath` + `blockMath` 节点（attr `latex`） | shipped | `src/schema/index.ts`（nodes 段） |
 | v14 | 自建 `fileAttachment` 块 atom（attrs attachId/fileName/mime/sizeBytes；data-attach-id/data-file-name/data-mime/data-size-bytes round-trip） | shipped | `src/schema/index.ts`（nodes 段）；前端 `FileAttachment.ts` |
 | v15 | 自建 `bookmark` 块 atom（attrs url/title/description/image/siteName/fetchedAt；data-url/data-title/data-description/data-image/data-site-name/data-fetched-at round-trip） | shipped | `src/schema/index.ts`（nodes 段）；前端 `Bookmark.ts` |
+| v16 | `fontFamily` ATTR（挂在 `textStyle` mark 上，非新 mark；复刻 v7 fontSize 路径——挂 inline `style="font-family:…"`，`textStyle` 现同时携带 `color` v3 + `fontSize` v7 + `fontFamily` v16） | shipped | `src/schema/index.ts`（`textStyle` marks 段） |
+| v17 | `lineHeight` + `spaceBefore` + `spaceAfter` ATTR（heading / paragraph，非新 node/mark；unitless 行距 + margin-top/bottom；与 v5 textAlign 合并进单一 inline `style` 串，两端 sanitize） | shipped | `src/schema/index.ts`（`getBlockAttrs`/`setBlockAttrs` + paragraph/heading）；前端 `LineHeight` 扩展 |
+| v18 | `indent` ATTR（heading / paragraph，非新 node/mark；整数缩进 level，默认 0=无缩进；`margin-left: level*2em` 追加到 v17 共享 style 串之后，level 同时以 `data-indent` round-trip；clamp `[0,8]`，parse+render+JSON 写入路径三处 sanitize） | shipped | `src/schema/index.ts`（`getBlockAttrs`/`setBlockAttrs`/`sanitizeIndent` + paragraph/heading）；前端 `ParagraphIndent` 扩展 |
 
-当前 `SCHEMA_VERSION = 15`（`src/schema/index.ts:67`）—— v5–v15 已与前端 `@octo/docs-schema` **原子同落**，后端 `buildSchema()` 现已镜像前端完整 node/mark 集合。
+当前 `SCHEMA_VERSION = 18`（`src/schema/index.ts`）—— v5–v15 已与前端 `@octo/docs-schema` **原子同落**；v16 为「正文字体」特性的前后端共享契约（后端 `buildSchema()` 在 `textStyle` mark 上新增 `fontFamily` attr），已合入 main。v17 在 v16 之上新增 block-spacing attrs。v18 为「段落缩进」特性的前后端共享契约（PM 发号，后端不自行发号）：`buildSchema()` 在 heading/paragraph 上新增 `indent` attr（单调递增、砍号留 gap、不回收），v18 为 v17 的真超集。
 
 ### byte-align 校正（对齐前端 `getSchema()` dump，schemaVersion=15 / tiptap 3.22.2）
 
@@ -63,8 +66,32 @@ PM 的单一权威发号表如下。5–13 由前端（Ploy）落地，14 / 15 �
 | 13 | math（KaTeX） | node | 前端 Ploy | landed |
 | 14 | **fileAttachment** | **node（后端拥有 attr 契约）** | **后端 Boris** | landed |
 | 15 | **bookmark** | **node（后端拥有 attr 契约）** | **后端 Boris** | landed |
+| 16 | fontFamily | mark/attr（挂 `textStyle`，复刻 v7 fontSize） | 前后端共享契约 | landed |
+| 17 | **lineHeight + spaceBefore + spaceAfter**（heading / paragraph attr） | **attr（后端拥有 style 序列化契约）** | **后端 Boris + 前端** | landed（PM 发号 v17） |
+| 18 | **indent**（heading / paragraph attr） | **attr（后端拥有 style 序列化契约）** | **后端 + 前端 Ploy** | landed（PM 发号 v18） |
 
 发号冻结依据见 `src/schema/index.ts` 文件头注释。
+
+## v17 · block-spacing attr 契约（后端拥有 style 序列化）
+
+`heading` / `paragraph` 新增三个全局 attr，均默认 `null`，与 v5 `textAlign` 一样承载于同一条 inline `style`：
+
+- `lineHeight` — unitless CSS 倍数（如 `"1.5"`）→ `line-height:…`。sanitize：`^\d+(\.\d+)?$` 且 `0 < n ≤ 10`，否则落回 `null`。
+- `spaceBefore` — `^\d+(\.\d+)?(px|em)$` 且 `0 ≤ n ≤ 1000` → `margin-top:…`。
+- `spaceAfter` — 同上 → `margin-bottom:…`。
+
+**canonical style 序列化**（前端 `LineHeight` 扩展 `renderHTML` 必须逐字对齐，否则 HTML import/export 漂移）：仅对非 `null` attr 输出声明，**固定顺序 `[text-align, line-height, margin-top, margin-bottom]`**，每条写作 `prop: value`（冒号后单空格），以 `"; "`（分号 + 单空格）连接，**无尾分号**。示例：`text-align: center`；`line-height: 1.5`；`text-align: right; line-height: 2; margin-top: 8px; margin-bottom: 12px`。定义见 `src/schema/index.ts` 的 `setBlockAttrs` / `getBlockAttrs`。attr 以 node attr 承载，Y.Doc round-trip 与 DOM 序列化无关；style 串仅管 HTML import/export。校验在 parse+render **两端**执行，hostile style 既进不了 Y.Doc 也序列化不出去。
+
+## v18 · indent attr 契约（后端拥有 style 序列化）
+
+`heading` / `paragraph` 新增一个全局 attr `indent`，**默认 `0`（=无缩进，与其它 block attr 的 `null` 同义 sentinel）**，与 v5 `textAlign` / v17 block-spacing 一样承载于同一条 inline `style`：
+
+- `indent` — 整数缩进 **level**（非 CSS 长度）。sanitize：coerce → 四舍五入 → clamp 到 `[0, 8]`，非数字落回 `0`。渲染时 `margin-left: level * 2em`（`INDENT_STEP_EM = 2`），**追加到 v17 声明之后**，即固定顺序扩为 `[text-align, line-height, margin-top, margin-bottom, margin-left]`。
+- level 额外以 `data-indent="<level>"` 属性 round-trip；import 时 `getBlockAttrs` 以 `data-indent` 为权威（`margin-left` 的 em 值仅表现层），与前端 `ParagraphIndent` 的 `parseHTML` 一致。
+- 校验在 parse + render + **JSON 写入路径**（`sanitizeBlockAttrValues`）三处执行，hostile / 越界 indent 既进不了 Y.Doc 也序列化不出去。attr 以 node attr 承载，Y.Doc round-trip 与 DOM 序列化无关。
+- 前端契约：`packages/docs/src/editor/ParagraphIndent.ts`（`indent` global attr on paragraph+heading，`increaseIndent`/`decreaseIndent`，clamp 同为 `[0,8]`，step 2em），live + preview 两套 extension set 均注册。列表 `listItem` **不**加此 attr，Tab/Shift-Tab sink/lift 行为不变。
+
+
 
 ## 后端拥有的节点契约（14 / 15）
 
@@ -85,7 +112,7 @@ PM 的单一权威发号表如下。5–13 由前端（Ploy）落地，14 / 15 �
 
 ## 当前状态与落地协议
 
-- `SCHEMA_VERSION` **当前 = 15**（`src/schema/index.ts:67`）。v5–v15 已与前端 `@octo/docs-schema` **原子同落**：前后端在同一时刻都到达 15，`buildSchema()` 现已定义完整 node/mark 集合（lists/taskList/blockquote/codeBlock/horizontalRule + emoji/mention/details/callout/inlineMath/blockMath + fileAttachment/bookmark，marks 含 underline/superscript/subscript，`textStyle` 携带 color+fontSize），与前端 Tiptap 配置 byte 对齐。
+- `SCHEMA_VERSION` **当前 = 16**（`src/schema/index.ts`）。v5–v15 已与前端 `@octo/docs-schema` **原子同落**：前后端在同一时刻都到达 15，`buildSchema()` 现已定义完整 node/mark 集合（lists/taskList/blockquote/codeBlock/horizontalRule + emoji/mention/details/callout/inlineMath/blockMath + fileAttachment/bookmark，marks 含 underline/superscript/subscript，`textStyle` 携带 color+fontSize）。**v16** 在 `textStyle` mark 上新增 `fontFamily` attr（复刻 v7 fontSize 路径），为「正文字体」特性的前后端共享契约，发号钉死不横跳。
 - 14 / 15 的 attr 契约（后端拥有）见上「后端拥有的节点契约」；前端 `FileAttachment.ts` / `Bookmark.ts` / `Callout.ts` 已逐字 byte-align。
 - batch3 后端工作（附件 presign 白名单放开 + link-card OG 接口）与 schema 解耦、先行实现：link-card 路由见 `src/api/routes/linkCard.ts`，安全出站抓取见 `src/util/ogFetch.ts`（SSRF 防护见 `src/util/ssrfGuard.ts`）。
 - 后续 bump（v16+）时的同步动作：
