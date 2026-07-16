@@ -111,6 +111,7 @@ ENV TZ=Asia/Shanghai
 
 RUN addgroup -S octo && adduser -S -u 10001 -G octo octo
 
+COPY --chown=octo:octo migrations ./migrations
 COPY --from=prod-deps --chown=octo:octo /app/node_modules ./node_modules
 COPY --from=prod-deps --chown=octo:octo /app/package.json ./package.json
 COPY --from=builder --chown=octo:octo /app/dist ./dist
@@ -119,4 +120,4 @@ USER octo
 
 EXPOSE 3000 1234
 
-CMD ["node", "dist/index.js"]
+CMD ["sh", "-c", "npm run migrate && exec node dist/index.js"]
