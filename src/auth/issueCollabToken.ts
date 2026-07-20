@@ -20,6 +20,10 @@ import { signCollabToken, type CollabTokenResult } from './collabToken.js'
 import { getOctoIdentity } from './octoIdentity.js'
 import { parseDocumentName } from '../permission/documentName.js'
 import { resolveRole, resolveDocMetaByName } from '../permission/resolveRole.js'
+import { docViewHistoryRepo } from '../db/repos/docViewHistoryRepo.js'
+import { config } from '../config/env.js'
+import { effectiveRole, SHARE_SCOPE_ANYONE } from '../permission/shareScope.js'
+import { HTML_DOC_TYPE } from '../db/docType.js'
 
 export type IssueResult =
   | { ok: true; result: CollabTokenResult }
@@ -31,8 +35,17 @@ export type IssueResult =
  *   - documentName malformed      => 403
  *   - doc/board missing/deleted   => 404
  *   - role === none               => 403 (no token)
+ *
+ * `viewerSpaceId` is the space the caller is CURRENTLY working in (the
+ * `X-Space-Id` header the front-end injects on the collab-token request). It is
+ * used only for the recent-view fallback ingest below, to keep the WRITE space
+ * consistent with the READ space — see that block for the contract.
  */
-export async function issueCollabToken(octoToken: string, documentName: string): Promise<IssueResult> {
+export async function issueCollabToken(
+  octoToken: string,
+  documentName: string,
+  viewerSpaceId?: string,
+): Promise<IssueResult> {
   // Layer-1: octo identity -> trusted uid (never trust a client-supplied uid).
   const identity = await getOctoIdentity().verifyToken(octoToken)
   if (!identity) return { ok: false, status: 401, error: 'login_required' }
@@ -78,8 +91,62 @@ export async function issueCollabToken(octoToken: string, documentName: string):
   }
 
   // Authorization: resolveRole = doc_member + owner (same model for docs/boards).
-  const role = await resolveRole(uid, meta.doc_id)
+  const direct = await resolveRole(uid, meta.doc_id)
+
+  // #64: space-scoped share. Only when the doc is anyone_in_space do we resolve
+  // the requester's Space membership — restricted docs (the default/common case)
+  // add ZERO new IO here. collab-token issuance is human-only, so this is the
+  // human isSpaceMember path (fail-closed false on any lookup error). The result
+  // is both merged into the effective role and baked into the token as the
+  // space_member claim, so the live-socket write recheck (§5.3) can re-derive
+  // access on a scope narrowing without a fresh membership call.
+  let spaceMember = false
+  if (meta.share_scope === SHARE_SCOPE_ANYONE) {
+    spaceMember = await getOctoIdentity().isSpaceMember(uid, meta.space_id, octoToken)
+  }
+  const role = effectiveRole(direct, spaceMember, meta.share_scope, meta.share_role)
   if (role === 'none') return { ok: false, status: 403, error: 'forbidden' }
+
+  // Security clamp (chokepoint = token issuance, where meta.doc_type is known):
+  // an html doc's body is rendered by the external octo-doc service, so its Yjs
+  // collab channel must be read-only — a signed writable token would let a
+  // client mutate a body the backend does not own. Clamp any would-be writable
+  // role (author/admin/editor) to 'reader', the role authenticate.ts already
+  // treats as readOnly=true, so the whole downstream write-reject path engages
+  // with no further change.
+  const effRole = meta.doc_type === HTML_DOC_TYPE ? 'reader' : role
+
+  // FEAT-B recent-view fallback ingest (MF2, default-on). Every document open —
+  // read-only INCLUDED — passes through here, so this is the reliable "open ==
+  // viewed" seam even if the front-end never calls POST /docs/{id}/view. We now
+  // hold a trusted uid + doc_id + role(!=none), everything the UPSERT needs.
+  // Best-effort: fire-and-forget (never awaited) so it can't slow or fail token
+  // issuance, and a failure only warns. It shares the (uid, doc_id) PK with the
+  // explicit endpoint, so a front-end that ALSO calls view never double-counts.
+  //
+  // SPACE 口径统一 (XIN-1237): recent-view is READ scoped to the viewer's CURRENT
+  // space (GET /docs/recent filters doc_view_history.space_id = X-Space-Id). To
+  // stay readable, the WRITE must land in that SAME space. So when the caller
+  // supplies its current space (viewerSpaceId, from the collab-token request's
+  // X-Space-Id header), record under it. This is what lets a doc opened from a
+  // chat share link (standalone page) show up in the viewer's current-space
+  // recent-view. Only when it is absent (legacy client that doesn't send the
+  // header) do we fall back to the document's home space (meta.space_id) — the
+  // pre-fix behavior, so same-space opens do not regress.
+  const trimmedViewerSpace = typeof viewerSpaceId === 'string' ? viewerSpaceId.trim() : ''
+  const ingestSpaceId = trimmedViewerSpace !== '' ? trimmedViewerSpace : meta.space_id
+  void docViewHistoryRepo
+    .upsertViewWithPrune({
+      uid,
+      docId: meta.doc_id,
+      spaceId: ingestSpaceId,
+      retainCount: config.docView.retainCount,
+      retainDays: config.docView.retainDays,
+    })
+    .catch((err) => {
+      // eslint-disable-next-line no-console
+      console.warn(`[octo-docs] recent-view fallback ingest failed for ${meta.doc_id}:`, err)
+    })
 
   // Sign with the document's current epoch (§4.4 / §4.5). The token carries the
   // exact connection documentName (incl. the `:wb:` whiteboard form) so the WS
@@ -87,9 +154,10 @@ export async function issueCollabToken(octoToken: string, documentName: string):
   const result = signCollabToken({
     uid,
     documentName,
-    role,
+    role: effRole,
     permission_epoch: meta.permission_epoch,
     ...(displayName !== '' ? { name: displayName } : {}),
+    ...(spaceMember ? { space_member: true } : {}),
   })
   return { ok: true, result }
 }

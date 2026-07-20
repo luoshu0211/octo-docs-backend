@@ -20,7 +20,7 @@
  * inside editBoardScene, because the live write bypasses onAuthenticate — the same
  * safety contract the doc-body / sheet writes enforce.
  */
-import { Router, type Request, type Response } from 'express'
+import { Router, type Router as ExpressRouter, type Request, type Response } from 'express'
 import { requireDocRole } from '../guard.js'
 import { readLiveBoard } from '../../collab/liveBoardWrite.js'
 import { editBoardScene } from '../services/editBoardScene.js'
@@ -34,7 +34,7 @@ import { WB_SCHEMA_VERSION } from '../../whiteboard/schema/index.js'
 import type { BoardOps } from '../../whiteboard/boardEdit.js'
 import { config } from '../../config/env.js'
 
-export const docSceneRouter = Router()
+export const docSceneRouter: ExpressRouter = Router()
 
 /**
  * Reject a target whose doc_type is not 'board'. Writes a 409 unsupported_doc_type
@@ -68,7 +68,7 @@ function readBaseVersion(req: Request): string | null {
 docSceneRouter.get('/:docId/scene', getDocSceneHandler)
 
 export async function getDocSceneHandler(req: Request, res: Response): Promise<void> {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader')
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader', { isBot: req.botToken !== undefined, token: req.octoToken })
   if (!guard) return
   if (!requireBoardDocType(res, guard.meta.doc_type)) return
 
@@ -153,7 +153,7 @@ function checkOpsBounds(ops: BoardOps): { status: number; error: string } | null
 docSceneRouter.patch('/:docId/scene', patchDocSceneHandler)
 
 export async function patchDocSceneHandler(req: Request, res: Response): Promise<void> {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'writer')
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'writer', { isBot: req.botToken !== undefined, token: req.octoToken })
   if (!guard) return
   if (!requireBoardDocType(res, guard.meta.doc_type)) return
 
@@ -182,6 +182,8 @@ export async function patchDocSceneHandler(req: Request, res: Response): Promise
       clientBaseVersion: parseBaseVersion(baseVersionRaw),
       ops,
       authorizedEpoch: guard.meta.permission_epoch,
+      isBot: req.botToken !== undefined,
+      token: req.octoToken,
     })
     if (result.ok) {
       res.status(200).json({

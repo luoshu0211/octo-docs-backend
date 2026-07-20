@@ -23,7 +23,7 @@
  * — exactly how the HTML path treats an unresolved attachment. In prod (S3/MinIO)
  * the signed GET URL is a real endpoint and the bytes embed normally.
  */
-import { Router, type Request, type Response } from 'express'
+import { Router, type Router as ExpressRouter, type Request, type Response } from 'express'
 import { requireDocRole } from '../guard.js'
 import { persistence } from '../../collab/persistence.js'
 import { yDocStateToProsemirrorJSON } from '../../agent/conversion.js'
@@ -41,7 +41,7 @@ import {
   type TypstImageInput,
 } from '../../export/typstService.js'
 
-export const exportRouter = Router()
+export const exportRouter: ExpressRouter = Router()
 
 const EMPTY_DOC = { type: 'doc', content: [] }
 
@@ -272,7 +272,7 @@ function contentDisposition(title: string): string {
 exportRouter.post('/:docId/export/pdf', exportPdfHandler)
 
 export async function exportPdfHandler(req: Request, res: Response): Promise<void> {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader')
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader', { isBot: req.botToken !== undefined, token: req.octoToken })
   if (!guard) return
 
   // Gate the whole pipeline (prep + compile) behind the queue, matching the

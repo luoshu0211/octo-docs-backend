@@ -19,6 +19,7 @@
 --   yjs_update_log        OPTIONAL incremental log (incremental-log model only)
 --   doc_attachment        OPTIONAL attachment reference table (§3.5)
 --   doc_version           version history snapshots (snapshot + restore, §4 #4)
+--   card_action_receipt   signed card-action callback idempotency receipts
 
 -- 文档元数据（业务库）
 CREATE TABLE doc_meta (
@@ -29,17 +30,33 @@ CREATE TABLE doc_meta (
   space_id      VARCHAR(64)  NOT NULL,            -- 所属 docs 空间（documentName 第 2 段 {space}），多租隔离维度
   folder_id     VARCHAR(64)  NOT NULL DEFAULT 'f_default', -- docs 原生文件夹（documentName 第 3 段 {folder}）；v2.0：不再是 octo group_no，仅做组织/归类，不派生权限（见 §4 / §8.1）。**非空保留默认值 `f_default`**（省略 folderId 的新建文档归此保留文件夹）；**documentName 第 3 段必须等于本列值**（键与 folder_id 恒一致，见 §8.1）
   doc_type      VARCHAR(32)  NOT NULL DEFAULT 'doc', -- doc / template ...
+  octo_doc_slug VARCHAR(128) NULL DEFAULT NULL, -- octo-doc 正文 slug；doc_type='html' 时用于路由回 octo-doc
   status        TINYINT      NOT NULL DEFAULT 1,  -- 1=正常 0=已删除(软删) 2=归档
   permission_epoch BIGINT    NOT NULL DEFAULT 0,   -- 权限版本号（单调递增，权威落 DB；v2.0 按 doc_member 变更 +1，见 §4.5）
+  share_scope   TINYINT      NOT NULL DEFAULT 0,   -- 分享范围：0=restricted(默认) 1=anyone_in_space（#64 空间级分享，见 §4/§5）
+  share_role    TINYINT      NOT NULL DEFAULT 1,   -- anyone_in_space 生效时的角色：1=read 2=edit；restricted 时忽略（#64）
   created_at    DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   updated_at    DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
   created_by    VARCHAR(64)  NOT NULL,
   updated_by    VARCHAR(64)  NOT NULL DEFAULT '',
   PRIMARY KEY (doc_id),
   UNIQUE KEY uk_document_name (document_name),    -- document_name 全局唯一
+  -- octo_doc_slug is unique PER SPACE, not globally (P0 tenant isolation): the
+  -- composite key lets space A and space B each register the same slug while
+  -- the per-space upsert stays deterministic. nullable octo_doc_slug (non-html
+  -- rows) allows multiple NULLs, so non-html rows never collide. The
+  -- 2026-07-13-add-doc-meta-octo-doc-slug upgrade adds this composite key
+  -- directly, keeping fresh and upgraded DBs identical.
+  UNIQUE KEY uk_octo_doc_slug (space_id, octo_doc_slug),
   KEY idx_space (space_id, status, updated_at),
   KEY idx_folder (folder_id, status, updated_at),
-  KEY idx_owner (owner_id, status, updated_at)
+  KEY idx_owner (owner_id, status, updated_at),
+  -- #64 defense-in-depth: keep a fresh DB's DB-level invariants identical to an
+  -- upgraded one (the 2026-07-14-add-doc-share-scope upgrade adds these same two
+  -- CHECKs). Authoritative validation lives in the PUT /share handler; these are
+  -- the backstop so a raw UPDATE with an out-of-enum value fails on BOTH paths.
+  CONSTRAINT chk_doc_meta_share_scope CHECK (share_scope IN (0, 1)),
+  CONSTRAINT chk_doc_meta_share_role  CHECK (share_role  IN (1, 2))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- 文档自治成员（v2.0 新增，替代 v1.x 的 doc_acl —— 见下方迁移说明）
@@ -207,4 +224,34 @@ CREATE TABLE doc_version (
   PRIMARY KEY (id),
   KEY idx_doc_ver (doc_id, id),                         -- 列表/游标分页（按 id 倒序）
   KEY idx_doc_kind (doc_id, kind, id)                   -- 按 kind 过滤（如排除 auto）
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- 每用户文档浏览记录（"最近查看"，FEAT-B）。net-new 表，无历史回填。
+-- 一个 (uid, doc_id, space_id) 至多一行：同 space 重复打开走 UPSERT 刷新 viewed_at，
+-- 绝不新增行（幂等去重）；同一文档从不同 space 打开各留一行，per-space 独立（P1-b）。
+-- uid 恒由鉴权推导（NEVER client-supplied）。文档删除/失权由查询时 JOIN 过滤兜底
+-- （见 src/db/repos/docViewHistoryRepo.ts listRecent），本表不设硬 FK、不级联删；
+-- 残留行由写入时同步保留裁剪（DOC_VIEW_RETAIN_COUNT / DOC_VIEW_RETAIN_DAYS）慢慢清。
+CREATE TABLE doc_view_history (
+  uid        VARCHAR(64) NOT NULL,               -- 查看者 uid（鉴权推导）
+  doc_id     VARCHAR(64) NOT NULL,               -- 被查看文档（doc_meta.doc_id）
+  space_id   VARCHAR(64) NOT NULL,               -- 记录时所属 space（X-Space-Id 强作用域）
+  viewed_at  DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
+                                    ON UPDATE CURRENT_TIMESTAMP(3), -- 最近一次查看时间
+  PRIMARY KEY (uid, doc_id, space_id),            -- 去重键：每个(用户,文档,space)至多一行，per-space 独立
+  KEY idx_uid_space_viewed (uid, space_id, viewed_at) -- 主查询：某用户某 space 内 viewed_at DESC + keyset
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- 签名 card-action 回调（文档 approve/deny 按钮）的幂等收据表。
+-- octo-server 至少投递一次（超时/崩溃/丢响应会重投同一 event_id），本表以 event_id
+-- 为主键：claim 首个写入者执行域决策并 finalize 存下 response，任何重投直接 replay
+-- 该 response 而不再重复状态跃迁。与 upgrade 迁移
+-- migrations/upgrades/2026-07-15-add-card-action-receipt.sql 保持完全一致，
+-- 供全新部署从本 schema.sql 建库时同样创建（否则签名回调全部 503）。
+CREATE TABLE card_action_receipt (
+  event_id   VARCHAR(32)  NOT NULL,               -- octo callback event_id（十进制字符串；不强转数字）
+  response   TEXT         NULL,                    -- JSON DecisionResult；claim 到 finalize 之间为 NULL
+  created_at DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (event_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

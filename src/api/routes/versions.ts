@@ -24,7 +24,7 @@
  * admin-only is UX; this is the authority. A safety snapshot of the pre-restore
  * state is recorded first so the restore is itself undoable.
  */
-import { Router, type Request, type Response } from 'express'
+import { Router, type Router as ExpressRouter, type Request, type Response } from 'express'
 import { requireDocRole } from '../guard.js'
 import { docVersionRepo, KIND_NAMED } from '../../db/repos/docVersionRepo.js'
 import { readLiveDocState } from '../../collab/liveDocRead.js'
@@ -42,7 +42,7 @@ import {
   BoardSnapshotInvalidError,
 } from '../../collab/versionRestore.js'
 
-export const versionsRouter = Router()
+export const versionsRouter: ExpressRouter = Router()
 
 const MAX_NAME_LEN = 256
 
@@ -99,7 +99,7 @@ function parseVersionId(raw: string | undefined): number | null {
 versionsRouter.get('/:docId/versions', listVersionsHandler)
 
 export async function listVersionsHandler(req: Request, res: Response): Promise<void> {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader')
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader', { isBot: req.botToken !== undefined, token: req.octoToken })
   if (!guard) return
 
   const cursorRaw = req.query.cursor
@@ -138,7 +138,7 @@ export async function listVersionsHandler(req: Request, res: Response): Promise<
 versionsRouter.post('/:docId/versions', createVersionHandler)
 
 export async function createVersionHandler(req: Request, res: Response): Promise<void> {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'writer')
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'writer', { isBot: req.botToken !== undefined, token: req.octoToken })
   if (!guard) return
   const kind = contentKindFromDocType(guard.meta.doc_type)
 
@@ -180,7 +180,7 @@ export async function createVersionHandler(req: Request, res: Response): Promise
 versionsRouter.get('/:docId/versions/:versionId/state', getVersionStateHandler)
 
 export async function getVersionStateHandler(req: Request, res: Response): Promise<void> {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader')
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader', { isBot: req.botToken !== undefined, token: req.octoToken })
   if (!guard) return
   const kind = contentKindFromDocType(guard.meta.doc_type)
 
@@ -269,7 +269,7 @@ export async function getVersionStateHandler(req: Request, res: Response): Promi
 versionsRouter.patch('/:docId/versions/:versionId', renameVersionHandler)
 
 export async function renameVersionHandler(req: Request, res: Response): Promise<void> {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'writer')
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'writer', { isBot: req.botToken !== undefined, token: req.octoToken })
   if (!guard) return
 
   const versionId = parseVersionId(req.params.versionId)
@@ -299,7 +299,7 @@ export async function renameVersionHandler(req: Request, res: Response): Promise
 versionsRouter.delete('/:docId/versions/:versionId', deleteVersionHandler)
 
 export async function deleteVersionHandler(req: Request, res: Response): Promise<void> {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'admin')
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'admin', { isBot: req.botToken !== undefined })
   if (!guard) return
 
   const versionId = parseVersionId(req.params.versionId)
@@ -323,7 +323,7 @@ export async function restoreVersionHandler(req: Request, res: Response): Promis
   const docId = req.params.docId!
   // Initial authorization (admin-only). The authoritative recheck happens again
   // under the row lock inside the service — this is the cheap pre-check / 404 pass.
-  const guard = await requireDocRole(res, req.uid!, docId, req.spaceId!, 'admin')
+  const guard = await requireDocRole(res, req.uid!, docId, req.spaceId!, 'admin', { isBot: req.botToken !== undefined })
   if (!guard) return
   const kind = contentKindFromDocType(guard.meta.doc_type)
 

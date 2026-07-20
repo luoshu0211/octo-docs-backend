@@ -28,6 +28,7 @@ import { docsRouter } from './routes/docs.js'
 import { membersRouter } from './routes/members.js'
 import { forwardGrantRouter } from './routes/forwardGrant.js'
 import { accessRequestsRouter } from './routes/accessRequests.js'
+import { cardActionDecideHandler, CARD_ACTION_DECIDE_PATH } from './routes/cardActionDecide.js'
 import { invitesRouter, acceptInviteRouter, botAcceptInviteRouter } from './routes/invites.js'
 import { attachmentsRouter } from './routes/attachments.js'
 import { linkCardRouter } from './routes/linkCard.js'
@@ -38,6 +39,8 @@ import { docSheetRouter } from './routes/docSheet.js'
 import { docSceneRouter } from './routes/docScene.js'
 import { exportRouter } from './routes/export.js'
 import { boardExportRouter } from './routes/boardExport.js'
+import { importRouter } from './routes/import.js'
+import { sanitizeUrlForLog } from './accessLog.js'
 
 export function createApp(opts: { rateLimit?: RateLimiterOptions; trustProxy?: boolean | number | string } = {}): Express {
   const app = express()
@@ -46,6 +49,28 @@ export function createApp(opts: { rateLimit?: RateLimiterOptions; trustProxy?: b
   // per-IP rate limiter below — reflects the real client from X-Forwarded-For
   // rather than the proxy address. Configurable per deployment (config.trustProxy).
   app.set('trust proxy', opts.trustProxy ?? config.trustProxy)
+
+  // Route access log. Mounted FIRST so it covers EVERY request — including the
+  // HMAC card-action callback and CORS preflight — and logs one line per request
+  // on response finish: method, sanitized path, status, latency. This is a route
+  // log (not a business log): it always fires regardless of handler outcome, so a
+  // decide callback that 401s (bad signature) / 503s (grant failed) / 200s is
+  // visible in the access log even when business-level console logs are dropped
+  // by the log pipeline.
+  //
+  // Secrets are stripped before logging. `req.originalUrl` carries the full query
+  // string, which for the blob gateway includes short-lived HMAC `X-Signature`
+  // (and AWS-style `X-Amz-*`) params; invite tokens ride in the path. We redact
+  // both so signed URLs / invite links can never be replayed from log access.
+  app.use((req: Request, res: Response, next: NextFunction) => {
+    const startedAt = Date.now()
+    res.on('finish', () => {
+      const ms = Date.now() - startedAt
+      // eslint-disable-next-line no-console
+      console.log(`[octo-docs] ${req.method} ${sanitizeUrlForLog(req.originalUrl)} ${res.statusCode} ${ms}ms`)
+    })
+    next()
+  })
 
   // CORS + preflight (XIN-717). Mounted FIRST — ahead of the body parser, rate
   // limiter and auth — so a cross-origin OPTIONS preflight from the front-end is
@@ -82,6 +107,22 @@ export function createApp(opts: { rateLimit?: RateLimiterOptions; trustProxy?: b
       })
     })
   }
+
+  // Signed card-action callback (docs approve/deny). HMAC-authenticated, so it
+  // sits OUTSIDE the auth/space chain; it reads the RAW body for signature
+  // verification, so it MUST be mounted before the global express.json below.
+  //
+  // A per-IP rate limiter runs IN FRONT of the HMAC verify so an attacker
+  // cannot flood the signature-check path (each request forces a sha256 + HMAC
+  // compute) or brute-force signatures unthrottled. It gets its own limiter
+  // instance so its budget is independent of the blob gateway's above.
+  const cardActionLimiter = createRateLimiter(opts.rateLimit)
+  app.post(
+    CARD_ACTION_DECIDE_PATH,
+    cardActionLimiter,
+    express.raw({ type: 'application/json', limit: '64kb' }),
+    cardActionDecideHandler,
+  )
 
   app.use(express.json({ limit: '1mb' }))
 
@@ -123,6 +164,7 @@ export function createApp(opts: { rateLimit?: RateLimiterOptions; trustProxy?: b
   api.use(docSceneRouter) // /:docId/scene (live board/Excalidraw scene read + edit)
   api.use(exportRouter) // /:docId/export/pdf (server-side Typst render)
   api.use(boardExportRouter) // /:docId/export (server-side whiteboard PNG/SVG, W3)
+  api.use(importRouter) // /:docId/import/docx (server-side .docx -> ProseMirror JSON)
 
   app.use('/api/v1/docs', api)
 

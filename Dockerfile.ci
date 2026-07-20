@@ -40,6 +40,39 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 
+FROM ${NODE_IMAGE} AS typst-fetch
+
+# Fetch the pinned Typst release from this project's Generic Package Registry.
+# Keep the job token in this throw-away stage so it is absent from the runtime
+# image history and filesystem.
+ARG TYPST_VERSION=0.13.1
+ARG TYPST_PACKAGE_BASE=https://codex.mlamp.cn/api/v4/projects/dmwork%2Focto-docs-backend/packages/generic/typst
+ARG TYPST_SHA256_AMD64=7d214bfeffc2e585dc422d1a09d2b144969421281e8c7f5d784b65fc69b5673f
+ARG TYPST_SHA256_ARM64=4f5b7ee6e57fb639019ee0f6bffcf940edad228ede6ff5269a9f05a1544ceed4
+ARG GITLAB_TOKEN
+
+RUN sed -i 's#https://dl-cdn.alpinelinux.org#https://mirrors.tuna.tsinghua.edu.cn#g' /etc/apk/repositories \
+    && apk add --no-cache curl=8.21.0-r0 tar=1.35-r5 xz=5.8.3-r0 \
+    && ARCH="$(uname -m)" \
+    && case "$ARCH" in \
+         x86_64) TARGET=x86_64-unknown-linux-musl; TYPST_SHA256="$TYPST_SHA256_AMD64" ;; \
+         aarch64) TARGET=aarch64-unknown-linux-musl; TYPST_SHA256="$TYPST_SHA256_ARM64" ;; \
+         *) echo "unsupported arch $ARCH" && exit 1 ;; \
+       esac \
+    && curl -fsSL \
+         --retry 5 \
+         --retry-all-errors \
+         --retry-delay 3 \
+         --connect-timeout 15 \
+         --max-time 300 \
+         --header "JOB-TOKEN: ${GITLAB_TOKEN}" \
+         "${TYPST_PACKAGE_BASE}/${TYPST_VERSION}/typst-${TARGET}.tar.xz" \
+         -o /tmp/typst.tar.xz \
+    && echo "${TYPST_SHA256}  /tmp/typst.tar.xz" | sha256sum -c - \
+    && tar -xJf /tmp/typst.tar.xz -C /tmp \
+    && install -m 0755 "/tmp/typst-${TARGET}/typst" /usr/local/bin/typst \
+    && typst --version
+
 FROM ${NODE_IMAGE} AS runner
 
 ARG GIT_COMMIT=unknown
@@ -70,34 +103,15 @@ RUN apk add --no-cache \
       font-noto-cjk=0_git20220127-r1 \
       font-noto-emoji=2.051-r0
 
-# Typst binary for server-side PDF export (renderTypst.ts / typstService.ts).
-#
-# Typst is a single static Rust binary (~30MB) with no browser or LaTeX
-# dependency and no resident process — each export spawns a short-lived,
-# network-less, sandboxed child. We fetch the musl static release and drop it on
-# PATH. The version is pinned for reproducible builds; bump deliberately.
-# Compile concurrency is capped in typstService.ts (TYPST_EXPORT_MAX_CONCURRENT,
-# default 2).
-ARG TYPST_VERSION=v0.13.1
-RUN apk add --no-cache --virtual .typst-fetch curl=8.21.0-r0 tar=1.35-r5 xz=5.8.3-r0 \
-    && ARCH="$(uname -m)" \
-    && case "$ARCH" in \
-         x86_64) TARGET=x86_64-unknown-linux-musl ;; \
-         aarch64) TARGET=aarch64-unknown-linux-musl ;; \
-         *) echo "unsupported arch $ARCH" && exit 1 ;; \
-       esac \
-    && curl -fsSL "https://github.com/typst/typst/releases/download/${TYPST_VERSION}/typst-${TARGET}.tar.xz" -o /tmp/typst.tar.xz \
-    && tar -xJf /tmp/typst.tar.xz -C /tmp \
-    && install -m 0755 "/tmp/typst-${TARGET}/typst" /usr/local/bin/typst \
-    && rm -rf /tmp/typst.tar.xz "/tmp/typst-${TARGET}" \
-    && apk del .typst-fetch \
-    && typst --version
+# Typst is downloaded and checksum-verified in a throw-away authenticated stage.
+COPY --from=typst-fetch /usr/local/bin/typst /usr/local/bin/typst
 
 ENV NODE_ENV=production
 ENV TZ=Asia/Shanghai
 
 RUN addgroup -S octo && adduser -S -u 10001 -G octo octo
 
+COPY --chown=octo:octo migrations ./migrations
 COPY --from=prod-deps --chown=octo:octo /app/node_modules ./node_modules
 COPY --from=prod-deps --chown=octo:octo /app/package.json ./package.json
 COPY --from=builder --chown=octo:octo /app/dist ./dist
@@ -106,4 +120,4 @@ USER octo
 
 EXPOSE 3000 1234
 
-CMD ["node", "dist/index.js"]
+CMD ["sh", "-c", "npm run migrate && exec node dist/index.js"]

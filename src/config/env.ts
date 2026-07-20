@@ -22,6 +22,11 @@ function num(name: string, fallback: number): number {
   return n
 }
 
+function numMin(name: string, fallback: number, min: number): number {
+  const n = num(name, fallback)
+  return Math.max(min, n)
+}
+
 function bool(name: string, fallback: boolean): boolean {
   const v = process.env[name]
   if (v === undefined || v === '') return fallback
@@ -218,6 +223,36 @@ export const config = {
     // the anti ghost-member existence check in members/forwardGrant works with
     // OCTO_SERVER_TOKEN empty.
     serviceToken: str('OCTO_SERVER_TOKEN', ''),
+    // Space-membership check cache TTL (#64). isSpaceMember(uid, spaceId, token)
+    // is resolved server-side by reusing POST /v1/auth/verify?include=context
+    // (the caller's own session token -> its server-validated `spaces` list) only
+    // for anyone_in_space docs; results are coalesced + cached per {uid, spaceId}
+    // for this many seconds to bound the extra octo-server QPS on hot shared
+    // docs while keeping membership-grant latency low. A membership REVOCATION
+    // is not epoch-bounded on the live socket (design §5.3 case 3); this cache
+    // only affects fresh REST/issuance checks. Default 30 s.
+    membershipCacheTtlSeconds: num('SPACE_MEMBERSHIP_CACHE_TTL_SECONDS', 30),
+  },
+
+  // Outbound IM notification via octo-server's internal notify API (docs-notify
+  // producer, octo-server PR #584 / docs-notify-contract.md). When a doc event
+  // fires (currently: an access request is submitted) we POST a structured
+  // `docs_card` to octo-server, which server-templates an octo/v1 card and
+  // delivers it as a DM from the shared notification bot. This is the ONLY
+  // outbound IM path docs-backend has; it augments — never replaces — the
+  // pull-based pending list. See api/services/docsNotify.ts.
+  notify: {
+    // Docs-specific ingress token for POST /v1/internal/notify (docs_card). Sent
+    // as `X-Internal-Token`; must equal octo-server's `OCTO_DOCS_NOTIFY_TOKEN`
+    // (which is required to DIFFER from NOTIFY_INTERNAL_TOKEN). Empty here =
+    // outbound docs notifications disabled (best-effort no-op). Never logged.
+    docsToken: str('OCTO_DOCS_NOTIFY_TOKEN', ''),
+    // `service` label echoed on every notify request (octo-server logs/metrics).
+    service: str('NOTIFY_SERVICE_NAME', 'docs-service'),
+    // HMAC-SHA256 secret (≥32 bytes) octo-server signs card-action callbacks
+    // with; must equal the route's `secret_env` value in OCTO_CARD_ACTION_ROUTES.
+    // Empty = the decide endpoint rejects all callbacks (fail-closed). Never logged.
+    cardActionSecret: str('OCTO_DOCS_CARD_ACTION_SECRET', ''),
   },
 
   attachments: {
@@ -506,6 +541,40 @@ export const config = {
     maxQueuedPngExports: num('BOARD_EXPORT_MAX_QUEUED_PNG', 16),
   },
 
+  // docx-import untrusted-zip extraction limits. The extractor walks the zip
+  // WITHOUT touching the filesystem (entries stay in memory) and enforces these
+  // ceilings before any XML/media is handed downstream.
+  docxImport: {
+    // Max size of the uploaded .docx itself (compressed). Over this the route
+    // rejects before reading a byte of zip content.
+    maxUploadBytes: numMin('DOCX_IMPORT_MAX_UPLOAD_BYTES', 25 * 1024 * 1024, 1),
+    // Max TOTAL uncompressed bytes across all entries. The primary zip-bomb
+    // ceiling (a 1MB zip can inflate to gigabytes). Sum is tracked as entries
+    // inflate; the extractor aborts the instant this is crossed.
+    maxTotalUncompressedBytes: numMin('DOCX_IMPORT_MAX_TOTAL_UNCOMPRESSED_BYTES', 200 * 1024 * 1024, 1),
+    // Max uncompressed bytes for any SINGLE entry (word/document.xml can be big;
+    // this stops one crafted member from exhausting memory on its own).
+    maxEntryUncompressedBytes: numMin('DOCX_IMPORT_MAX_ENTRY_UNCOMPRESSED_BYTES', 100 * 1024 * 1024, 1),
+    // Max per-entry compression ratio (uncompressed/compressed). A ratio far
+    // above what real DEFLATE achieves on office XML flags a zip bomb early,
+    // before the absolute size ceilings are even reached.
+    maxCompressionRatio: numMin('DOCX_IMPORT_MAX_COMPRESSION_RATIO', 200, 1),
+    // Max number of entries in the archive (defends the entry-count DoS where a
+    // zip packs millions of tiny members).
+    maxEntries: numMin('DOCX_IMPORT_MAX_ENTRIES', 4096, 1),
+    // Max number of embedded media files (word/media/*) we will accept + upload.
+    maxMediaFiles: numMin('DOCX_IMPORT_MAX_MEDIA_FILES', 256, 0),
+    // Hard wall-clock ceiling for the WHOLE extract+parse. zip bombs and
+    // pathological XML burn CPU/time, not just bytes; on expiry the import is
+    // aborted regardless of how much has been read.
+    timeoutMs: numMin('DOCX_IMPORT_TIMEOUT_MS', 30_000, 1_000),
+    // Max concurrent imports (each holds an inflated document in memory); the
+    // rest queue. Mirrors the pdfExport back-pressure discipline.
+    maxConcurrent: numMin('DOCX_IMPORT_MAX_CONCURRENT', 2, 1),
+    // Max imports allowed to WAIT in the queue; over this the route returns 503.
+    maxQueue: numMin('DOCX_IMPORT_MAX_QUEUE', 10, 1),
+  },
+
   // §5.7 A4 auto-save version history. Backend-autonomous KIND_AUTO snapshots
   // triggered off the Hocuspocus store path (idle timer + min-interval fallback
   // + unload flush). Shipped behind a default-OFF gate (gray release); when
@@ -523,5 +592,19 @@ export const config = {
     retainCount: num('AUTO_RETAIN_COUNT', 50),
     // retention: drop auto rows older than this many days.
     retainDays: num('AUTO_RETAIN_DAYS', 7),
+  },
+
+  // FEAT-B recent-view retention. doc_view_history rows are pruned synchronously
+  // (piggyback) inside the same transaction as each ingest UPSERT, per uid, so a
+  // returned ingest leaves the window already trimmed (deterministic for tests).
+  // Pruning is capacity maintenance ONLY — query-time visibility filtering
+  // (status=1 + permission predicate) is what makes revoked/deleted docs vanish;
+  // correctness never depends on pruning. Test envs can lower these to build a
+  // prune scenario without inserting hundreds of rows.
+  docView: {
+    // retention: keep at most the most-recent N view rows per user (0 = unbounded).
+    retainCount: num('DOC_VIEW_RETAIN_COUNT', 200),
+    // retention: drop view rows older than this many days (0 = unbounded).
+    retainDays: num('DOC_VIEW_RETAIN_DAYS', 90),
   },
 } as const

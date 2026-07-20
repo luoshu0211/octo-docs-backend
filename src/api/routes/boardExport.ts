@@ -22,7 +22,7 @@
  * Mounted on BOTH the human /api/v1/docs chain and the bot /v1/bot/docs chain
  * (app.ts), so it reads req.uid / req.spaceId from whichever identity ran.
  */
-import { Router, type Request, type Response } from 'express'
+import { Router, type Router as ExpressRouter, type Request, type Response } from 'express'
 import { requireDocRole } from '../guard.js'
 import { readLiveDocState } from '../../collab/liveDocRead.js'
 import {
@@ -45,7 +45,7 @@ import { docAttachmentRepo } from '../../db/repos/docAttachmentRepo.js'
 import { getObjectStore } from '../../storage/objectStore.js'
 import { config } from '../../config/env.js'
 
-export const boardExportRouter = Router()
+export const boardExportRouter: ExpressRouter = Router()
 
 type ExportFormat = 'png' | 'svg'
 
@@ -183,7 +183,7 @@ async function resolveSceneImages(
 boardExportRouter.get('/:docId/export', exportBoardHandler)
 
 export async function exportBoardHandler(req: Request, res: Response): Promise<void> {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader')
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader', { isBot: req.botToken !== undefined, token: req.octoToken })
   if (!guard) return
   if (!requireBoardDocType(res, guard.meta.doc_type)) return
 

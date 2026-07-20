@@ -12,7 +12,7 @@
  * role + permission_epoch recheck happens again under the row lock inside the
  * editDocBody service, because the live write path bypasses onAuthenticate.
  */
-import { Router, type Request, type Response } from 'express'
+import { Router, type Router as ExpressRouter, type Request, type Response } from 'express'
 import { requireDocRole } from '../guard.js'
 import { readLiveForEdit } from '../../collab/liveDocWrite.js'
 import { editDocBody } from '../services/editDocBody.js'
@@ -20,7 +20,7 @@ import { encodeBaseVersion, parseBaseVersion, type DocEditOp } from '../../colla
 import { SCHEMA_VERSION } from '../../schema/index.js'
 import { config } from '../../config/env.js'
 
-export const docContentRouter = Router()
+export const docContentRouter: ExpressRouter = Router()
 
 /**
  * The only doc_type this rich-text body-edit surface accepts. board/whiteboard
@@ -146,7 +146,7 @@ function checkOpsBounds(ops: DocEditOp[]): { status: number; error: string } | n
 docContentRouter.get('/:docId/content', getDocContentHandler)
 
 export async function getDocContentHandler(req: Request, res: Response): Promise<void> {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader')
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader', { isBot: req.botToken !== undefined, token: req.octoToken })
   if (!guard) return
   if (!requireBodyEditableDocType(res, guard.meta.doc_type)) return
 
@@ -167,7 +167,7 @@ export async function getDocContentHandler(req: Request, res: Response): Promise
 docContentRouter.patch('/:docId/content', patchDocContentHandler)
 
 export async function patchDocContentHandler(req: Request, res: Response): Promise<void> {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'writer')
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'writer', { isBot: req.botToken !== undefined, token: req.octoToken })
   if (!guard) return
   if (!requireBodyEditableDocType(res, guard.meta.doc_type)) return
 
@@ -196,6 +196,8 @@ export async function patchDocContentHandler(req: Request, res: Response): Promi
       clientBaseVersion: parseBaseVersion(baseVersionRaw),
       ops,
       authorizedEpoch: guard.meta.permission_epoch,
+      isBot: req.botToken !== undefined,
+      token: req.octoToken,
     })
     if (result.ok) {
       res.status(200).json({

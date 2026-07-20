@@ -18,13 +18,13 @@
  * shared grantForwardAccess service. upsertDirect (admin precise set) is NOT
  * touched — this is a physically separate write path.
  */
-import { Router, type Request, type Response } from 'express'
+import { Router, type Router as ExpressRouter, type Request, type Response } from 'express'
 import { requireDocRole } from '../guard.js'
 import { getOctoIdentity } from '../../auth/octoIdentity.js'
 import { roleToNumber } from '../../permission/role.js'
 import { grantForwardAccess } from '../services/grantForward.js'
 
-export const forwardGrantRouter = Router()
+export const forwardGrantRouter: ExpressRouter = Router()
 
 /** Only reader|writer are grantable via forward (no commenter, admin not forward-grantable). */
 function parseGrantRole(v: unknown): 'reader' | 'writer' | null {
@@ -34,7 +34,7 @@ function parseGrantRole(v: unknown): 'reader' | 'writer' | null {
 forwardGrantRouter.post('/:docId/forward-grant', async (req: Request, res: Response) => {
   // Authorization to GRANT: only admin/owner may forward-grant (owner => admin).
   // requireDocRole writes 404/409/403 and returns null when blocked.
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'admin')
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'admin', { isBot: req.botToken !== undefined })
   if (!guard) return
 
   const { uid, role } = req.body ?? {}
