@@ -21,6 +21,7 @@ import { roleAtLeast } from '../../permission/role.js'
 import { fetchExternalImage } from '../../util/fetchExternalImage.js'
 import { LinkCardError } from '../../util/ssrfGuard.js'
 import { sniffImageMime } from '../../import/docx/media.js'
+import { sanitizeSvg, InvalidSvgError, MAX_SANITIZED_SVG_BYTES } from '../../util/sanitizeSvg.js'
 
 export const attachmentsRouter: ExpressRouter = Router()
 
@@ -125,7 +126,7 @@ function dispositionFileName(fileName: string): string {
  * download decision is likewise taken from that trusted registered mime. The
  * single read and batch resolve endpoints share this one path so they never drift.
  */
-function presignReadUrl(attachment: DocAttachment, ttl: number): string {
+export function presignAttachmentReadUrl(attachment: DocAttachment, ttl: number): string {
   const contentDisposition = isInlineType(attachment.mime)
     ? undefined
     : `attachment; filename="${dispositionFileName(attachment.fileName)}"`
@@ -136,6 +137,100 @@ function presignReadUrl(attachment: DocAttachment, ttl: number): string {
 }
 
 attachmentsRouter.post('/:docId/attachments/presign', presignHandler)
+
+/**
+ * SVG cannot use the generic direct-to-storage presign flow because the backend
+ * would never see the active XML. This endpoint receives the raw SVG, sanitizes
+ * it, uploads only the sanitized bytes, and then registers the attachment.
+ */
+attachmentsRouter.post('/:docId/attachments/svg', svgUploadHandler)
+
+export async function svgUploadHandler(req: Request, res: Response): Promise<void> {
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'writer', {
+    isBot: req.botToken !== undefined,
+    token: req.octoToken,
+  })
+  if (!guard) return
+
+  const declaredLength = Number(req.headers['content-length'] ?? 0)
+  if (Number.isFinite(declaredLength) && declaredLength > MAX_SANITIZED_SVG_BYTES) {
+    res.status(413).json({ error: 'size_too_large' })
+    return
+  }
+
+  const chunks: Buffer[] = []
+  let received = 0
+  try {
+    for await (const chunk of req) {
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+      received += bytes.length
+      if (received > MAX_SANITIZED_SVG_BYTES) {
+        res.status(413).json({ error: 'size_too_large' })
+        return
+      }
+      chunks.push(bytes)
+    }
+  } catch {
+    res.status(400).json({ error: 'upload_read_failed' })
+    return
+  }
+  if (received === 0) {
+    res.status(400).json({ error: 'invalid_svg' })
+    return
+  }
+
+  let bytes: Buffer
+  try {
+    bytes = sanitizeSvg(Buffer.concat(chunks, received))
+  } catch (err) {
+    res.status(400).json({ error: err instanceof InvalidSvgError ? err.code : 'invalid_svg' })
+    return
+  }
+
+  const docId = guard.meta.doc_id
+  const attachId = newAttachId()
+  const rawName = req.headers['x-file-name']
+  let decodedName = 'image.svg'
+  if (typeof rawName === 'string') {
+    try { decodedName = decodeURIComponent(rawName) } catch { /* use safe fallback */ }
+  }
+  const safeName = sanitizeFileName(decodedName)
+  const objectKey = `${docId}/${attachId}/${safeName}`
+  const mime = 'image/svg+xml'
+  const ttl = config.attachments.uploadUrlTtlSeconds
+  const upload = getObjectStore().presignPut(objectKey, mime, ttl)
+
+  try {
+    const upstream = await fetch(upload.uploadUrl, {
+      method: 'PUT',
+      headers: { ...(upload.headers ?? {}), 'Content-Type': mime },
+      body: new Uint8Array(bytes),
+    })
+    if (!upstream.ok) throw new Error(`storage upload failed (${upstream.status})`)
+    await docAttachmentRepo.register({
+      attachId,
+      docId,
+      objectKey,
+      mime,
+      sizeBytes: bytes.length,
+      fileName: safeName,
+      createdBy: req.uid!,
+    })
+  } catch {
+    res.status(502).json({ error: 'upload_failed' })
+    return
+  }
+
+  const attachment = await docAttachmentRepo.getById(attachId)
+  res.status(201).json({
+    attachId,
+    objectKey,
+    mime,
+    sizeBytes: bytes.length,
+    fileName: safeName,
+    url: attachment ? presignAttachmentReadUrl(attachment, config.attachments.readUrlTtlSeconds) : null,
+  })
+}
 
 export async function presignHandler(req: Request, res: Response): Promise<void> {
   const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'writer', { isBot: req.botToken !== undefined, token: req.octoToken })
@@ -234,7 +329,7 @@ export async function readHandler(req: Request, res: Response): Promise<void> {
   }
 
   const ttl = config.attachments.readUrlTtlSeconds
-  const url = presignReadUrl(attachment, ttl)
+  const url = presignAttachmentReadUrl(attachment, ttl)
 
   res.status(200).json({
     attachId: attachment.attachId,
@@ -310,7 +405,7 @@ export async function resolveHandler(req: Request, res: Response): Promise<void>
     // RES-3: same presign + Content-Disposition path as the single read endpoint.
     items.push({
       attachId: attachment.attachId,
-      url: presignReadUrl(attachment, ttl),
+      url: presignAttachmentReadUrl(attachment, ttl),
       expiresInSec: ttl,
       mime: attachment.mime,
       sizeBytes: attachment.sizeBytes,
@@ -424,9 +519,11 @@ export async function copyHandler(req: Request, res: Response): Promise<void> {
       fail('source_not_found')
       continue
     }
-    // Re-validate the source type against the CURRENT policy (denylist beats allow-list) and the
-    // size tier — a previously-stored type that is no longer permitted must not be re-hosted.
-    if (mimeBlocked(src.mime) || !mimeAllowed(src.mime)) {
+    // Re-validate the source type against the CURRENT policy. SVG is the sole blocked MIME that
+    // may be copied: it entered through the dedicated sanitizer endpoint and is sanitized again
+    // by copyStoredObject below. All other blocked types remain denied.
+    const sourceMime = baseMime(src.mime)
+    if ((mimeBlocked(src.mime) && sourceMime !== 'image/svg+xml') || !mimeAllowed(src.mime)) {
       fail('mime_not_allowed')
       continue
     }
@@ -443,7 +540,7 @@ export async function copyHandler(req: Request, res: Response): Promise<void> {
         sourceDocId: ref.docId,
         sourceAttachId: ref.attachId,
         attachId,
-        url: presignReadUrl(created, ttl),
+        url: presignAttachmentReadUrl(created, ttl),
         mime: created.mime,
         sizeBytes: created.sizeBytes,
         fileName: created.fileName,
@@ -494,7 +591,7 @@ async function readCapped(resp: Awaited<ReturnType<typeof fetch>>, cap: number):
  * Never touches a client-supplied URL — only object keys the DB already vouches for. Returns the
  * new attachId.
  */
-async function copyStoredObject(
+export async function copyStoredObject(
   src: DocAttachment,
   targetDocId: string,
   uid: string,
@@ -514,28 +611,50 @@ async function copyStoredObject(
   if (Number.isFinite(declared) && declared > cap) {
     throw new Error('copied bytes exceed size cap')
   }
-  const bytes = await readCapped(getResp, cap)
+  let bytes = await readCapped(getResp, cap)
+  // Re-sanitize copied SVG bytes so legacy objects that predate the sanitized upload endpoint
+  // cannot bypass the current policy through cross-document copy.
+  if (baseMime(src.mime) === 'image/svg+xml') {
+    bytes = sanitizeSvg(bytes)
+    if (bytes.length > cap) throw new Error('sanitized SVG exceeds size cap')
+  }
 
   const attachId = newAttachId()
   // src.fileName was sanitized at its own register time; keep it (it is already a safe segment).
   const objectKey = `${targetDocId}/${attachId}/${src.fileName}`
-  await docAttachmentRepo.register({
-    attachId,
-    docId: targetDocId,
-    objectKey,
-    mime: src.mime,
-    sizeBytes: bytes.length,
-    fileName: src.fileName,
-    createdBy: uid,
-  })
-  const put = store.presignPut(objectKey, src.mime, config.attachments.uploadUrlTtlSeconds)
-  const putResp = await fetch(put.uploadUrl, {
-    method: 'PUT',
-    body: bytes,
-    headers: { 'Content-Type': src.mime, ...(put.headers ?? {}) },
-  })
-  if (!putResp.ok) throw new Error(`target write failed: ${putResp.status}`)
-  return attachId
+  try {
+    const put = store.presignPut(objectKey, src.mime, config.attachments.uploadUrlTtlSeconds)
+    const putResp = await fetch(put.uploadUrl, {
+      method: 'PUT',
+      body: new Uint8Array(bytes),
+      headers: { 'Content-Type': src.mime, ...(put.headers ?? {}) },
+    })
+    if (!putResp.ok) throw new Error(`target write failed: ${putResp.status}`)
+    await docAttachmentRepo.register({
+      attachId,
+      docId: targetDocId,
+      objectKey,
+      mime: src.mime,
+      sizeBytes: bytes.length,
+      fileName: src.fileName,
+      createdBy: uid,
+    })
+    return attachId
+  } catch (err) {
+    await Promise.allSettled([
+      docAttachmentRepo.deleteById(attachId),
+      store.delete(objectKey),
+    ])
+    throw err
+  }
+}
+
+/** Compensate a successful copy when the enclosing document edit does not commit. */
+export async function cleanupCopiedAttachment(attachId: string): Promise<void> {
+  const attachment = await docAttachmentRepo.getById(attachId)
+  if (!attachment) return
+  await getObjectStore().delete(attachment.objectKey)
+  await docAttachmentRepo.deleteById(attachId)
 }
 
 /**
@@ -589,11 +708,28 @@ export async function ingestHandler(req: Request, res: Response): Promise<void> 
 
   for (const sourceUrl of unique) {
     try {
-      const { bytes } = await fetchExternalImage(sourceUrl, maxImage)
-      // Magic-number sniff: the declared Content-Type / extension is never trusted.
-      const mime = sniffImageMime(bytes)
-      if (!mime) { notIngested.push({ sourceUrl, reason: 'not_an_image' }); continue }
-      if (mimeBlocked(mime) || !mimeAllowed(mime)) { notIngested.push({ sourceUrl, reason: 'mime_not_allowed' }); continue }
+      const fetched = await fetchExternalImage(sourceUrl, maxImage)
+      let bytes = fetched.bytes
+      // Magic-number/content sniff: the declared Content-Type and URL extension are advisory only.
+      // Raster formats use their binary magic. A real SVG root is parsed and sanitized before it
+      // can reach storage; active/malformed XML fails closed as not_an_image.
+      let mime = sniffImageMime(bytes)
+      // sniffImageMime deliberately recognizes an SVG *candidate* because SVG
+      // has no binary magic. Candidate recognition is never a sanitation
+      // boundary: every SVG must still pass the active-XML sanitizer here.
+      if (!mime || mime === 'image/svg+xml') {
+        try {
+          bytes = sanitizeSvg(bytes)
+          mime = 'image/svg+xml'
+        } catch {
+          notIngested.push({ sourceUrl, reason: 'not_an_image' })
+          continue
+        }
+      }
+      if ((mimeBlocked(mime) && mime !== 'image/svg+xml') || !mimeAllowed(mime)) {
+        notIngested.push({ sourceUrl, reason: 'mime_not_allowed' })
+        continue
+      }
       if (bytes.length > maxImage) { notIngested.push({ sourceUrl, reason: 'size_too_large' }); continue }
 
       const attachId = newAttachId()
@@ -605,12 +741,12 @@ export async function ingestHandler(req: Request, res: Response): Promise<void> 
       const store = getObjectStore()
       const put = store.presignPut(objectKey, mime, config.attachments.uploadUrlTtlSeconds)
       const putResp = await fetch(put.uploadUrl, {
-        method: 'PUT', body: bytes, headers: { 'Content-Type': mime, ...(put.headers ?? {}) },
+        method: 'PUT', body: new Uint8Array(bytes), headers: { 'Content-Type': mime, ...(put.headers ?? {}) },
       })
       if (!putResp.ok) { notIngested.push({ sourceUrl, reason: 'store_failed' }); continue }
       const created = await docAttachmentRepo.getById(attachId)
       if (!created) { notIngested.push({ sourceUrl, reason: 'store_failed' }); continue }
-      mappings.push({ sourceUrl, attachId, url: presignReadUrl(created, ttl), mime, sizeBytes: bytes.length })
+      mappings.push({ sourceUrl, attachId, url: presignAttachmentReadUrl(created, ttl), mime, sizeBytes: bytes.length })
     } catch (err) {
       // SSRF-blocked / oversized / dead host / bad scheme all land here; keep the original URL.
       const reason = err instanceof LinkCardError ? err.code : 'fetch_failed'
@@ -624,7 +760,7 @@ export async function ingestHandler(req: Request, res: Response): Promise<void> 
 /** A safe object-key file segment for an ingested image: basename from the URL path, sanitized,
  * with an extension coerced from the sniffed mime. Never uses a client-controlled path. */
 function safeImageFileName(sourceUrl: string, mime: string): string {
-  const ext = mime === 'image/jpeg' ? 'jpg' : mime.split('/')[1] || 'img'
+  const ext = mime === 'image/jpeg' ? 'jpg' : mime === 'image/svg+xml' ? 'svg' : mime.split('/')[1] || 'img'
   let base = 'image'
   try {
     const p = new URL(sourceUrl).pathname.split('/').filter(Boolean).pop() || ''

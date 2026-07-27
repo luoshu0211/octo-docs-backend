@@ -123,6 +123,18 @@ describe('renderTypst — latexToTypstMath', () => {
     )
   })
 
+  it('converts a left-braced matrix piecewise function to Typst cases()', () => {
+    const latex = 'f \\left(x\\right) = \\left\\{\\begin{matrix} 1 & x > 0 \\\\ 0 & x = 0 \\\\ - 1 & x < 0 \\end{matrix}\\right.'
+    const out = m(latex)
+    expect(out).toBe('f (x) = cases(1 quad x > 0, 0 quad x = 0, - 1 quad x < 0)')
+    expect(out).not.toContain('\\begin{matrix}')
+
+    // Do not overmatch an ordinary unfenced matrix: it remains mat(), not cases().
+    expect(m('\\begin{matrix} 1 & 2 \\\\ 3 & 4 \\end{matrix}')).toBe(
+      'mat(delim: #none, 1, 2; 3, 4)',
+    )
+  })
+
   it('multiplies two matrices without dropping either (adjacent envs)', () => {
     expect(m('\\begin{pmatrix} a & b \\\\ c & d \\end{pmatrix}\\begin{pmatrix} x \\\\ y \\end{pmatrix}')).toBe(
       'lr(size: #88%, ( mat(delim: #none, a, b; c, d) ))lr(size: #88%, ( mat(delim: #none, x; y) ))',
@@ -165,6 +177,15 @@ describe('renderTypst — latexToTypstMath', () => {
 
 // ── inline mark rendering ────────────────────────────────────────────────────
 describe('renderTypst — marks', () => {
+  it('adds deterministic Hangul fallbacks after an explicit source font', () => {
+    const out = __test.renderTextNode({
+      type: 'text', text: '한국어',
+      marks: [{ type: 'textStyle', attrs: { fontFamily: 'Times New Roman', fontSize: '16px' } }],
+    })
+    expect(out).toContain('font: ("Times New Roman", "Noto Sans CJK KR", "Apple SD Gothic Neo")')
+    expect(out).toContain('size: 12.00pt')
+  })
+
   it('renders bold/italic/underline/strike/sup/sub as Typst functions', () => {
     expect(__test.wrapMark({ type: 'bold' }, 'x')).toBe('#text(weight: "bold", stroke: 0.02em)[x]')    // Italic on CJK: skew-synthesized slant wrapping an emph (Latin still italic).
     expect(__test.wrapMark({ type: 'italic' }, 'x')).toBe('#box(skew(ax: -12deg)[#emph[x]])')
@@ -311,6 +332,10 @@ describe('renderTypst — marks', () => {
     expect(m('\\alpha2')).toBe('alpha 2')
     // Still separated from a preceding identifier as before.
     expect(m('\\cos\\theta')).toBe('cos theta')
+  })
+
+  it('preserves widehat semantics instead of rendering the command name literally', () => {
+    expect(m('x \\widehat{\\left\\{2\\right\\}}')).toBe('x hat(brace.l 2 brace.r)')
   })
 
   it('bounds deeply nested brace groups without overflowing the stack', () => {
@@ -462,6 +487,55 @@ describe('renderTypst — nodes', () => {
     // the __capImage helper, so we assert no #figure(__capImage(...)) call).
     expect(out).not.toContain('__capImage("')
     expect(out).not.toContain('#figure(')
+  })
+
+  it('uses the image align attr for raster and SVG assets instead of Typst figure centering', () => {
+    const attachments = new Map<string, ResolvedAttachment>([
+      ['png-left', { url: '', fileName: 'left.png', mime: 'image/png', sizeBytes: 1 }],
+      ['svg-center', { url: '', fileName: 'center.svg', mime: 'image/svg+xml', sizeBytes: 1 }],
+      ['svg-right', { url: '', fileName: 'right.svg', mime: 'image/svg+xml', sizeBytes: 1 }],
+    ])
+    const out = renderTypst(doc([
+      { type: 'image', attrs: { attachId: 'png-left', align: 'left' } },
+      { type: 'image', attrs: { attachId: 'svg-center', align: 'center', width: 80 } },
+      { type: 'image', attrs: { attachId: 'svg-right', align: 'right' } },
+    ]), {
+      title: 'T',
+      attachments,
+      imagePaths: new Map([
+        ['png-left', 'left.png'],
+        ['svg-center', 'center.svg'],
+        ['svg-right', 'right.svg'],
+      ]),
+    })
+
+    expect(out).toContain('#align(left)[#figure(__capImage("left.png"))]')
+    expect(out).toContain('#align(center)[#figure(__capImage("center.svg", w: 60.0pt))]')
+    expect(out).toContain('#align(right)[#figure(__capImage("right.svg"))]')
+  })
+
+  it('defaults an image without align to the editor left alignment, not Typst center', () => {
+    const out = renderTypst(doc([
+      { type: 'image', attrs: { attachId: 'plain' } },
+    ]), {
+      title: 'T',
+      attachments: new Map([['plain', { url: '', fileName: 'plain.png', mime: 'image/png', sizeBytes: 1 }]]),
+      imagePaths: new Map([['plain', 'plain.png']]),
+    })
+    expect(out).toContain('#align(left)[#figure(__capImage("plain.png"))]')
+  })
+
+  it('inherits paragraph alignment for legacy/imported image children when image align is absent', () => {
+    const out = renderTypst(doc([
+      { type: 'paragraph', attrs: { textAlign: 'right' }, content: [
+        { type: 'image', attrs: { attachId: 'legacy' } },
+      ] },
+    ]), {
+      title: 'T',
+      attachments: new Map([['legacy', { url: '', fileName: 'legacy.svg', mime: 'image/svg+xml', sizeBytes: 1 }]]),
+      imagePaths: new Map([['legacy', 'legacy.svg']]),
+    })
+    expect(out).toContain('#align(right)[#figure(__capImage("legacy.svg"))]')
   })
 
   it('clamps pathological table span attrs (DoS guard)', () => {

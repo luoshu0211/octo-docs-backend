@@ -5,6 +5,7 @@ import {
   probeFailingFormulas,
   isSupportedImage,
   sniffImageExt,
+  prepareTypstImage,
 } from '../src/api/routes/export.js'
 
 // The PDF export must only download images the document actually references,
@@ -57,10 +58,11 @@ describe('collectReferencedAttachIds', () => {
 // bytes so a bad upload is dropped like any other unresolved image.
 describe('isSupportedImage', () => {
   const bytes = (...b: number[]) => Buffer.from([...b, ...new Array(Math.max(0, 12 - b.length)).fill(0)])
-  it('accepts PNG/JPEG/GIF magic bytes', () => {
+  it('accepts PNG/JPEG/GIF magic bytes and an SVG root', () => {
     expect(isSupportedImage(bytes(0x89, 0x50, 0x4e, 0x47))).toBe(true) // PNG
     expect(isSupportedImage(bytes(0xff, 0xd8, 0xff))).toBe(true) // JPEG
     expect(isSupportedImage(bytes(0x47, 0x49, 0x46, 0x38))).toBe(true) // GIF
+    expect(isSupportedImage(Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"/>'))).toBe(true)
   })
   it('rejects non-image or truncated buffers', () => {
     expect(isSupportedImage(Buffer.from('not an image at all'))).toBe(false)
@@ -89,6 +91,7 @@ describe('sniffImageExt', () => {
     expect(sniffImageExt(bytes(0x89, 0x50, 0x4e, 0x47))).toBe('png')
     expect(sniffImageExt(bytes(0xff, 0xd8, 0xff))).toBe('jpg')
     expect(sniffImageExt(bytes(0x47, 0x49, 0x46, 0x38))).toBe('gif')
+    expect(sniffImageExt(Buffer.from('<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg"/>'))).toBe('svg')
   })
   it('picks jpg for JPEG bytes even when the upload claims png (the 500 repro)', () => {
     // Real regression: `111.png` (mime image/png) whose bytes are actually JPEG.
@@ -99,6 +102,22 @@ describe('sniffImageExt', () => {
     expect(sniffImageExt(Buffer.from('not an image'))).toBeNull()
     expect(sniffImageExt(Buffer.from([0x89, 0x50]))).toBeNull()
     expect(sniffImageExt(Buffer.alloc(0))).toBeNull()
+  })
+})
+
+describe('prepareTypstImage — SVG export', () => {
+  it('keeps a real SVG extension and supplies sanitized SVG bytes to Typst', () => {
+    const input = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"><script>alert(1)</script><rect width="20" height="10" fill="red"/></svg>')
+    const prepared = prepareTypstImage(input)
+    expect(prepared?.ext).toBe('svg')
+    expect(prepared?.bytes.toString('utf8')).toContain('<rect')
+    expect(prepared?.bytes.toString('utf8')).not.toContain('<script')
+    // Regression guard: SVG XML must never be put in a fake .png input.
+    expect(prepared?.bytes.subarray(0, 4).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47]))).toBe(false)
+  })
+
+  it('rejects malformed/active XML rather than passing it to Typst', () => {
+    expect(prepareTypstImage(Buffer.from('<!DOCTYPE svg [<!ENTITY x SYSTEM "file:///etc/passwd">]><svg>&x;</svg>'))).toBeNull()
   })
 })
 
@@ -135,18 +154,15 @@ describe('collectFormulaLatex', () => {
   })
 })
 
-// The probe compiles each formula in isolation and MUST stay bounded: it holds
-// a scarce compile slot, so an unbounded probe over thousands of formulas is a
-// DoS. These tests assert the count/budget guards short-circuit before spawning
-// any compile, which is the security-relevant invariant (they do not depend on
-// a real `typst` binary being present).
+// Attribution is batched and MUST stay bounded: it holds a scarce compile slot,
+// so an unbounded search is a DoS. On exhaustion unresolved formulas are marked
+// verbatim; already-proven formulas can remain math in the partial retry.
 describe('probeFailingFormulas — bounding', () => {
-  it('abandons probing (exhausted) without compiling when the formula count exceeds the cap', async () => {
+  it('conservatively returns all formulas when no probe compile is allowed', async () => {
     const many = Array.from({ length: 100 }, (_, i) => `x_${i}`)
-    const { failing, exhausted } = await probeFailingFormulas(many, 't', { maxProbes: 40, budgetMs: 15_000 })
-    // Over the cap -> bail out immediately, no formula marked, defer to whole-doc verbatim.
+    const { failing, exhausted } = await probeFailingFormulas(many, 't', { maxProbes: 0, budgetMs: 15_000 })
     expect(exhausted).toBe(true)
-    expect(failing.size).toBe(0)
+    expect(failing).toEqual(new Set(many))
   })
 
   it('does not exhaust for an empty formula set', async () => {
@@ -156,7 +172,8 @@ describe('probeFailingFormulas — bounding', () => {
   })
 
   it('treats a zero probe budget as immediately exhausted', async () => {
-    const { exhausted } = await probeFailingFormulas(['a', 'b'], 't', { maxProbes: 0, budgetMs: 15_000 })
+    const { failing, exhausted } = await probeFailingFormulas(['a', 'b'], 't', { maxProbes: 40, budgetMs: 0 })
     expect(exhausted).toBe(true)
+    expect(failing).toEqual(new Set(['a', 'b']))
   })
 })

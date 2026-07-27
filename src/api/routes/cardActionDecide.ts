@@ -28,6 +28,7 @@ import {
 import { docCardActionReceiptRepo } from '../../db/repos/docCardActionReceiptRepo.js'
 import { resolveRole } from '../../permission/resolveRole.js'
 import { grantForwardAccess } from '../services/grantForward.js'
+import { syncDecisionCards } from '../services/docsDecisionCardSync.js'
 
 /**
  * Exact callback path. octo-server signs the canonical over the PATH of the
@@ -145,6 +146,19 @@ function fieldOrData(req: DecisionRequest, key: 'doc_id' | 'request_id'): string
   return typeof fromData === 'string' ? fromData : ''
 }
 
+// Input id the deny dialog submits the reviewer's reason under — the cross-repo
+// contract with octo-server (pkg/cardtmpl DocsDenyReasonInputID). Approve submits
+// this as "" harmlessly. Capped to the decision_note column bound; octo-server
+// already enforces its own (4 KiB) submit cap, this is a defensive DB-side guard.
+const DENY_REASON_INPUT_ID = 'deny_reason'
+const MAX_DECISION_NOTE_CHARS = 500
+
+/** Reviewer's decision note from the card inputs (empty when absent/blank). */
+function decisionNote(req: DecisionRequest): string {
+  const raw = req.inputs[DENY_REASON_INPUT_ID]
+  return typeof raw === 'string' ? raw.trim().slice(0, MAX_DECISION_NOTE_CHARS) : ''
+}
+
 /** Compute the authoritative decision AND apply the grant side-effect exactly once.
  *
  * The grant is gated strictly on `transitioned === true` — i.e. THIS execution is the
@@ -199,6 +213,9 @@ async function computeDecision(req: DecisionRequest): Promise<DecisionResult> {
     requestId,
     status: targetStatus,
     decidedBy: req.operator_uid,
+    // The reviewer's reason (deny dialog). Persisted atomically with the status
+    // flip; on approve the card submits "" so this is a no-op there.
+    note: decisionNote(req),
   })
   if (!transitioned) {
     // The pending→terminal CAS did not fire — THIS execution is NOT the decider,
@@ -244,6 +261,25 @@ async function computeDecision(req: DecisionRequest): Promise<DecisionResult> {
       grantedBy: req.operator_uid,
     })
   }
+
+  // Sibling-card sync (task docs-access-decision-card-sync): drive every OTHER
+  // approver's card to terminal. octo-server's finalizer terminalizes the clicked
+  // card; this covers the rest. Gated on transitioned===true so it fires exactly
+  // once (the sole decider execution) and never on a redelivery/replay. On this
+  // card-callback path the finalizer already handled the decider's clicked card,
+  // so it is skipped here (deciderCardHandledExternally: true). Fire-and-forget:
+  // never blocks or fails the callback response, and the 409/receipt guards stay
+  // the authoritative protection.
+  void syncDecisionCards({
+    requestId,
+    spaceId: meta.space_id,
+    docId,
+    title: meta.title,
+    deciderUid: req.operator_uid,
+    deciderCardHandledExternally: true,
+    denied: req.decision === 'deny',
+    denyReason: decisionNote(req),
+  }).catch(() => {})
 
   return {
     disposition: 'applied',

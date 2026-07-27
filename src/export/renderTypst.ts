@@ -478,6 +478,50 @@ function escMathLiteral(c: string): string {
  * past the limit the remaining inner text is emitted escaped-verbatim.
  */
 const MAX_MATH_NESTING = 32
+
+/**
+ * Normalize the LaTeX form commonly emitted for piecewise functions:
+ *
+ *   \left\{\begin{matrix} value & condition \\ ... \end{matrix}\right.
+ *
+ * A plain `matrix` is intentionally unfenced, while the surrounding left-only
+ * brace carries the piecewise meaning. If the two parts are converted
+ * independently, Typst receives an unmatched `{` plus `mat(...)` and rejects
+ * the formula. Rewrite only this exact left-brace/invisible-right wrapper to a
+ * `cases` environment; ordinary matrices remain matrices and the existing
+ * environment parser below still owns row/cell conversion.
+ */
+function normalizePiecewiseMatrices(latex: string): string {
+  return latex.replace(
+    /\\left\s*\\\{\s*\\begin\s*\{matrix\}([\s\S]*?)\\end\s*\{matrix\}\s*\\right\s*\./g,
+    (_match, body: string) => `\\begin{cases}${body}\\end{cases}`,
+  )
+}
+
+function normalizeOfficeLatex(latex: string): string {
+  let out = latex
+    .replace(/\\textrm\s*\{\s*\}/g, ' ')
+    .replace(/\^(?:\{\s*\})|_(?:\{\s*\})/g, '')
+    // Word's linear OMML conversion sometimes spells a log base as the literal
+    // glyph command sequence "\\backslash \\log \\underline {b}". It is still
+    // semantic math, not authored source text: restore the standard TeX form.
+    .replace(/\\backslash\s+\\log\s+\\underline\s+\\left\\\{\s*([^{}]+?)\s*\\right\\\}/g, '\\log_{$1}')
+
+  // Office can wrap one equation in dozens of one-cell matrix shells. They have
+  // no semantic content, shrink every nested level, and make an otherwise normal
+  // equation illegible. Remove only an outer environment whose body is exactly
+  // one other environment; real multi-cell matrices are untouched.
+  const wrapper = /^\s*\\begin\{(matrix|pmatrix|bmatrix|Bmatrix|vmatrix|Vmatrix)\}\s*([\s\S]*)\s*\\end\{\1\}\s*$/
+  for (let n = 0; n < 64; n++) {
+    const m = wrapper.exec(out)
+    if (!m) break
+    const body = m[2]!.trim()
+    if (!/^\\begin\{(?:matrix|pmatrix|bmatrix|Bmatrix|vmatrix|Vmatrix)\}/.test(body)) break
+    out = body
+  }
+  return out
+}
+
 function latexToTypstMath(latex: string, depth = 0): string {
   let i = 0
   // Defensive: strip ASCII control characters (TAB, form-feed, CR, etc.) from
@@ -488,7 +532,7 @@ function latexToTypstMath(latex: string, depth = 0): string {
   // gets split into "r a c ...") and can emit stray tokens
   // like `cs` that Typst rejects as an unknown variable, garbling the whole
   // PDF. Dropping them lets the rest of the formula still render.
-  const src = latex
+  const src = normalizePiecewiseMatrices(normalizeOfficeLatex(latex))
     // TAB and CR are legitimate-ish whitespace in hand-written LaTeX; normalize
     // them to a space so a corrupted `	o`→TAB still reads as a token break
     // rather than gluing identifiers together.
@@ -606,7 +650,10 @@ function latexToTypstMath(latex: string, depth = 0): string {
       i++
       if (c === ',' || c === ';' || c === ' ' || c === '!' || c === ':') return ' '
       if (c === '\\') return '\\ '
-      if (c === '{' || c === '}') return c
+      // Escaped TeX braces are visible delimiters. Raw `{`/`}` are grouping
+      // syntax in Typst math, so emit the corresponding symbols explicitly.
+      if (c === '{') return 'brace.l '
+      if (c === '}') return 'brace.r '
       return escMathLiteral(c)
     }
     let name = ''
@@ -732,6 +779,7 @@ function latexToTypstMath(latex: string, depth = 0): string {
         return `binom(${a.trim() || 'zws'}, ${b.trim() || 'zws'})`
       }
       case 'text':
+      case 'textrm':
       case 'mathrm':
       case 'operatorname': {
         while (i < len && /\s/.test(src[i]!)) i++
@@ -753,14 +801,29 @@ function latexToTypstMath(latex: string, depth = 0): string {
       case 'right': {
         const d = src[i]; i++
         if (d === '.') return ''
-        if (d === '\\') return readCommand()
+        if (d === '\\') {
+          // `\left\{` / `\right\}` use an escaped single-character delimiter.
+          // readCommand() expects its cursor on the backslash, but the cursor is
+          // already past it here; consuming through readCommand skipped the
+          // brace and emitted an empty text token. Decode the delimiter directly.
+          const escaped = src[i]
+          if (escaped === '{') { i++; return 'brace.l ' }
+          if (escaped === '}') { i++; return ' brace.r' }
+          return readCommand()
+        }
         // Escape the delimiter: a raw `#`/`$`/`\` (e.g. `\left#`) would break
         // out of the `$...$` span into Typst code mode and crash the compile.
         return d ? escMathLiteral(d) : ''
       }
-      case 'hat': return decorate('hat', readGroupArg())
+      case 'hat':
+      case 'widehat':
+        // Typst's hat() stretches to the argument width, so it is the semantic
+        // equivalent of both TeX \hat and \widehat. Leaving \widehat unknown
+        // renders the command name literally ("widehat2") in exported PDFs.
+        return decorate('hat', readGroupArg())
       case 'bar':
-      case 'overline': return decorate('overline', readGroupArg())
+      case 'overline':
+      case 'underline': return decorate(name === 'underline' ? 'underline' : 'overline', readGroupArg())
       case 'vec': return decorate('arrow', readGroupArg())
       case 'dot': return decorate('dot', readGroupArg())
       case 'ddot': return decorate('dot.double', readGroupArg())
@@ -1086,7 +1149,23 @@ function renderTextNode(node: PMNode): string {
     const cb = b.type === 'code' ? 0 : 1
     return ca - cb
   })
-  for (const mark of marks) out = wrapMark(mark, out)
+  for (const originalMark of marks) {
+    let mark = originalMark
+    // Keep the authored font first, but append deterministic Hangul-capable
+    // fallbacks only for runs that actually contain Korean. This avoids
+    // changing every Latin/CJK font declaration while preventing a source face
+    // such as Times New Roman from dropping Hangul glyphs.
+    if (mark.type === 'textStyle' && /[가-힣]/.test(node.text ?? '') && mark.attrs?.fontFamily) {
+      mark = {
+        ...mark,
+        attrs: {
+          ...mark.attrs,
+          fontFamily: `${String(mark.attrs.fontFamily)}, Noto Sans CJK KR, Apple SD Gothic Neo`,
+        },
+      }
+    }
+    out = wrapMark(mark, out)
+  }
   return out
 }
 
@@ -1103,12 +1182,26 @@ interface RenderCtx {
    *  reliably resolve a `layout()` measurement inside deeply nested `1fr`
    *  columns — so a plain page cap let deep-nested images overflow their cell. */
   inCell?: boolean
+  /** Alignment inherited from a containing text block. Images are block nodes in
+   *  the canonical schema, but imported/legacy PM JSON can still place one in a
+   *  paragraph; preserve that paragraph's alignment as a fallback. */
+  imageAlign?: 'left' | 'center' | 'right'
 }
 
 function alignArg(attrs: Record<string, unknown> | undefined): string {
   const a = attrs?.textAlign as string | null | undefined
   if (!a || !VALID_TEXT_ALIGNS.has(a)) return ''
   return a === 'justify' ? '' : a // justify handled via par(justify) globally; l/r/c map directly
+}
+
+function imageAlignArg(attrs: Record<string, unknown> | undefined, inherited?: string): 'left' | 'center' | 'right' {
+  const own = attrs?.align
+  if (own === 'left' || own === 'center' || own === 'right') return own
+  if (inherited === 'left' || inherited === 'center' || inherited === 'right') return inherited
+  // The editor's unaligned image wrapper is fit-content at the left margin.
+  // Typst figures center themselves by default, so make the product default
+  // explicit instead of relying on Typst's different default.
+  return 'left'
 }
 
 /**
@@ -1173,13 +1266,15 @@ function renderImage(node: PMNode, ctx: RenderCtx): string {
   if (!path) return ''
   if (meta?.mime && !meta.mime.startsWith('image/')) return ''
   const width = attrs.width != null ? String(attrs.width) : null
+  const align = imageAlignArg(attrs, ctx.imageAlign)
+  const figure = (image: string): string => `\n#align(${align})[#figure(${image})]\n`
   const m = width && /^(\d+(?:\.\d+)?)(px|%)?$/.exec(width)
   if (m) {
     const num = parseFloat(m[1]!)
     if (Number.isFinite(num) && num > 0) {
       // Explicit width, but never let it exceed the content width.
       const w = m[2] === '%' ? `${Math.min(num, 100)}%` : `${(num * 0.75).toFixed(1)}pt`
-      return `\n#figure(__capImage("${esc(path)}", w: ${w}))\n`
+      return figure(`__capImage("${esc(path)}", w: ${w})`)
     }
   }
   // Inside a table cell, constrain to the cell width (100%). Typst resolves
@@ -1187,11 +1282,11 @@ function renderImage(node: PMNode, ctx: RenderCtx): string {
   // column, whereas the `layout()` cap could not — so this stops nested-cell
   // images from overflowing their cell / overlapping the table borders.
   if (ctx.inCell) {
-    return `\n#figure(__capImage("${esc(path)}", w: 100%))\n`
+    return figure(`__capImage("${esc(path)}", w: 100%)`)
   }
   // No explicit width: cap to the page content width so large images don't
   // overflow, but don't upscale small ones (max-width: 100% behavior).
-  return `\n#figure(__capImage("${esc(path)}"))\n`
+  return figure(`__capImage("${esc(path)}")`)
 }
 
 function humanSize(bytes: number): string {
@@ -1233,8 +1328,12 @@ function renderNode(node: PMNode, ctx: RenderCtx): string {
     case 'text':
       return renderTextNode(node)
     case 'paragraph': {
-      const body = renderChildren(node, c)
       const al = alignArg(attrs)
+      const childCtx: RenderCtx = {
+        ...c,
+        imageAlign: al === 'left' || al === 'center' || al === 'right' ? al : c.imageAlign,
+      }
+      const body = renderChildren(node, childCtx)
       const aligned = al ? `#align(${al})[${body}]` : body
       const inner = applyParSpacing(attrs, aligned)
       return `\n${inner}\n`
@@ -1348,10 +1447,19 @@ let verbatimFormulaSet: Set<string> | null = null
  *  Oversized formulas (or once the per-doc budget is exhausted) skip conversion
  *  and fall back to verbatim text, so a huge `latex` attr can't hang the loop. */
 function safeMath(latex: string): string {
+  // Keep the persisted value as the lookup key. Sanitization below intentionally
+  // changes the rendered value, but probeFailingFormulas reports RAW strings;
+  // looking up the sanitized value would miss corrupt formulas containing C0
+  // bytes and could make the partial retry fail again.
+  const rawLatex = latex
   // Per-formula fallback: this exact formula was probed as compile-breaking, so
   // emit it verbatim while the rest of the document still converts to real math.
-  if (verbatimFormulaSet && verbatimFormulaSet.has(latex)) {
-    return `"${esc(latex)}"`
+  if (verbatimFormulaSet && verbatimFormulaSet.has(rawLatex)) {
+    // Verbatim text must itself be compile-safe: retain the exact raw value only
+    // for identity, while removing illegal control bytes from visible output.
+    // eslint-disable-next-line no-control-regex -- intentionally strips C0 control chars
+    const visible = rawLatex.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, '').replace(/[\t\r]/g, ' ')
+    return `"${esc(visible)}"`
   }
   // Defensive: strip C0 control characters (except none are legal in KaTeX
   // source). Corrupt data — e.g. a seed that stored `\to`/`\frac` as a non-raw
@@ -1544,7 +1652,7 @@ function preamble(title: string): string {
     // CJK-first stack, with an emoji font appended so emoji nodes and callout
     // icons (ℹ️⚠️💡✅) render in colour. macOS: Apple Color Emoji; Linux image:
     // Noto Color Emoji (installed in the Dockerfile).
-    '  font: ("Noto Sans CJK SC", "PingFang SC", "Microsoft YaHei", "Noto Sans", "Helvetica Neue", "Arial", "Noto Color Emoji", "Apple Color Emoji"),',
+    '  font: ("Times New Roman", "Noto Serif CJK SC", "Noto Sans CJK KR", "Apple SD Gothic Neo", "SimSun", "Songti SC", "Noto Serif", "Noto Color Emoji", "Apple Color Emoji"),',
     '  size: 11pt,',
     '  lang: "zh",',
     ')',
@@ -1581,7 +1689,7 @@ function preamble(title: string): string {
     '  let nat = measure(image(path))',
     '  let target = if w != none {',
     '    if type(w) == length and w > avail { avail } else { w }',
-    '  } else if nat.width > avail { avail } else { nat.width }',
+    '  } else if nat.width > avail { avail } else if nat.width < 48pt { calc.min(48pt, avail) } else { nat.width }',
     '  image(path, width: target)',
     '})',
     `#set document(title: "${esc(title)}")`,
