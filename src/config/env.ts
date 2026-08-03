@@ -34,6 +34,23 @@ function bool(name: string, fallback: boolean): boolean {
 }
 
 /**
+ * Strict boolean env parser. Unlike bool(), this rejects anything that is not
+ * exactly true|false|1|0 (case-insensitive, trimmed) rather than treating every
+ * unrecognized value as false. Use this for flags whose SAFE value is `true`
+ * (e.g. TLS cert verification), where bool()'s "unknown => false" fallback would
+ * silently flip the flag to its UNSAFE side on an operator typo (=treu, =yes,
+ * =on, =TRUE␣). Mirrors num(), which already throws on a non-number.
+ */
+function strictBool(name: string, fallback: boolean): boolean {
+  const raw = process.env[name]
+  if (raw === undefined || raw === '') return fallback
+  const v = raw.trim().toLowerCase()
+  if (v === 'true' || v === '1') return true
+  if (v === 'false' || v === '0') return false
+  throw new Error(`Env var ${name} must be one of true|false|1|0, got: ${raw}`)
+}
+
+/**
  * Parse the comma-separated `CORS_ALLOWED_ORIGINS` allowlist into trimmed,
  * non-empty entries (XIN-717). Lives here (not in api/cors.ts) so the config
  * module stays the single leaf that reads env, with no import cycle back from
@@ -137,6 +154,30 @@ export function resolveCollabPublicWsUrl(raw: string): string {
   return value
 }
 
+/**
+ * Validate the card display timezone at config load.
+ *
+ * `Intl.DateTimeFormat` throws `RangeError` for anything that is not a
+ * recognised IANA zone (`Asia/Shangai`, `UTC+8`, a trailing space …). Card
+ * timestamps are rendered on the access-decision callback path, so an unvalidated
+ * typo would surface as a permanent 503 loop *after* the grant has committed —
+ * the receipt never finalizes, the cards never terminalize, and the same typo
+ * silently kills the notification paths that swallow their errors. A cosmetic
+ * field must not be able to wedge a functional path, so fail loudly at boot
+ * instead (same convention as the signing-secret / collab-WS guards above).
+ */
+export function resolveCardDisplayTimeZone(raw: string): string {
+  const value = raw.trim()
+  try {
+    new Intl.DateTimeFormat('en-CA', { timeZone: value })
+  } catch {
+    throw new Error(
+      `CARD_DISPLAY_TIME_ZONE must be a valid IANA time zone (e.g. Asia/Shanghai, UTC), got: ${JSON.stringify(raw)} (refusing to run)`,
+    )
+  }
+  return value
+}
+
 export const config = {
   hostname: str('HOSTNAME', 'octo-docs-local'),
   hocuspocusPort: num('HOCUSPOCUS_PORT', 1234),
@@ -160,6 +201,69 @@ export const config = {
     host: str('REDIS_HOST', '127.0.0.1'),
     port: num('REDIS_PORT', 6379),
     prefix: str('REDIS_PREFIX', 'octo-docs'),
+  },
+
+  // Full-text search (P4). OpenSearch holds the doc/sheet/board body index
+  // (`octo-doc`, written by the independent octo-doc-indexer); the backend only
+  // READS it. MySQL computes the visibility constraint (private doc_id set +
+  // isSpaceMember), which is pushed down into the OS query as a filter so OS
+  // returns only hits the caller may see and paginates them. No permissions live
+  // in OS. Disabled by default (gray release): with SEARCH_ENABLED=false the POST
+  // /docs/search route returns 503 and never connects to OpenSearch.
+  search: {
+    // Master switch. false => POST /docs/search returns 503 (search unavailable).
+    enabled: bool('SEARCH_ENABLED', false),
+    // OpenSearch node URL(s). Accepts a single URL or a comma-separated list for
+    // a multi-node cluster (the SDK round-robins across them and fails over on
+    // per-request errors). Same cluster the indexer writes to.
+    opensearchNode: str('OPENSEARCH_NODE', 'http://127.0.0.1:9200'),
+    // Index the indexer writes doc bodies to.
+    opensearchIndex: str('OPENSEARCH_INDEX', 'octo-doc'),
+    // Optional basic-auth credentials. Empty (default) => no auth header.
+    opensearchUsername: str('OPENSEARCH_USERNAME', ''),
+    opensearchPassword: str('OPENSEARCH_PASSWORD', ''),
+    // TLS escape hatch for an https node with an untrusted (e.g. self-signed)
+    // cert. Default true = verify against the system trust store (self-signed is
+    // rejected). Set to false ONLY for a trusted internal https endpoint you
+    // can't otherwise validate; ignored for http nodes.
+    opensearchTlsRejectUnauthorized: strictBool('OPENSEARCH_TLS_REJECT_UNAUTHORIZED', true),
+    // Upper bound a caller's pageSize is clamped to. Must be >= 1: numMin rejects
+    // 0/negative/fractional/Infinity (SEARCH_PAGE_SIZE_MAX=0 would make every
+    // search return an empty page while total reports a positive count).
+    pageSizeMax: numMin('SEARCH_PAGE_SIZE_MAX', 50, 1),
+    // Upper bound on the size of the visibleDocIds set pushed down as an OS
+    // `terms doc_id` filter. Guards against exceeding OpenSearch's
+    // `index.max_terms_count` (default 65536): an oversized terms clause is
+    // rejected by OS with an opaque error, so we bound it here and return a
+    // deterministic 503 instead. Keep this <= the index's configured
+    // max_terms_count. Must be >= 1: numMin rejects 0/negative (0 would trip
+    // VisibleTermsTooLargeError on every non-empty set → search 503s permanently).
+    maxVisibleTerms: numMin('SEARCH_MAX_VISIBLE_TERMS', 65536, 1),
+    // --- Producer side: the afterStoreDocument hook sends a tiny
+    // {documentName,kind,ts} signal to a Kafka topic (config.kafka.topic) for a
+    // separate indexer (consumer group) to consume. Default OFF (gray release):
+    // while disabled the hook is inert, so nothing is produced before a consumer
+    // exists.
+    indexEnabled: bool('SEARCH_INDEX_ENABLED', false),
+  },
+
+  // Kafka producer for the search doc-index signal channel (see
+  // search/docIndexQueue.ts). Only the doc-index producer uses Kafka; the
+  // consumer/retry/DLQ topics live in the separate octo-doc-indexer service.
+  kafka: {
+    // Comma-separated broker list (host:port,host:port). Default is a single
+    // local broker; set per environment at deploy time.
+    brokers: str('KAFKA_BROKERS', '127.0.0.1:9092')
+      .split(',')
+      .map((b) => b.trim())
+      .filter((b) => b !== ''),
+    // Topic the doc-index signal is produced to. MUST match the indexer's
+    // DOCINDEX_KAFKA_TOPIC. Change only in lockstep with the indexer deployment.
+    topic: str('DOCINDEX_KAFKA_TOPIC', 'octo.docindex.v1'),
+    // Produce ack level: 1 = leader ack (default, best-effort side channel), 0 =
+    // fire-and-forget, -1 = all in-sync replicas. Kept low since the signal is
+    // best-effort and the consumer re-reads authoritative data by key anyway.
+    acks: num('KAFKA_ACKS', 1),
   },
 
   // Per-IP request throttle applied to the REST route chains (§8.4). Guards the
@@ -254,6 +358,14 @@ export const config = {
     // Empty = the decide endpoint rejects all callbacks (fail-closed). Never logged.
     cardActionSecret: str('OCTO_DOCS_CARD_ACTION_SECRET', ''),
   },
+
+  // IANA zone used to render user-visible card timestamps. Card copy is zh-CN
+  // while the container image sets no TZ (the deployment compose defaults it to
+  // UTC), so formatting in the process-local zone would render decision times
+  // hours off. Pinning it here keeps card output deployment-independent and lets
+  // tests assert a fixed literal. VALIDATED at load: an invalid zone would make
+  // Intl.DateTimeFormat throw on the decision path, so it must fail at boot.
+  cardDisplayTimeZone: resolveCardDisplayTimeZone(str('CARD_DISPLAY_TIME_ZONE', 'Asia/Shanghai')),
 
   attachments: {
     bucket: str('ATTACHMENT_BUCKET', 'octo-docs-attachments'),
