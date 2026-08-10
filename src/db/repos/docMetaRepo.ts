@@ -6,7 +6,9 @@
  * persistence key, unique). See appendix B for the naming convention.
  */
 import { query, transaction, type Tx } from '../pool.js'
+import { docTypeUsesOctoDocSlug } from '../docType.js'
 import { SHARE_SCOPE_ANYONE, SHARE_ROLE_EDIT } from '../../permission/shareScope.js'
+import { STORED_ROLE_VALUES } from '../../permission/role.js'
 
 /**
  * True when a thrown DB error is a duplicate-key violation. mysql2 surfaces it
@@ -74,6 +76,9 @@ export interface CreateDocInput {
   createdBy: string
 }
 
+const VALID_STORED_ROLES_SQL = STORED_ROLE_VALUES.join(', ')
+const validMemberRole = `dm.role IN (${VALID_STORED_ROLES_SQL})`
+
 export const docMetaRepo = {
   async create(input: CreateDocInput): Promise<void> {
     await query(
@@ -88,13 +93,54 @@ export const docMetaRepo = {
         input.spaceId,
         input.folderId,
         input.docType,
-        input.docType === 'html' ? (input.octoDocSlug ?? null) : null,
+        // octo_doc_slug is persisted for the slug-registered kinds (html and
+        // html_ppt bot rows) and NULL for everything else. Human-created rows of
+        // either kind pass no slug, so they also store NULL. Using the shared
+        // predicate (not a hardcoded 'html') keeps a future bot PPT registration
+        // from silently dropping its slug here.
+        docTypeUsesOctoDocSlug(input.docType) ? (input.octoDocSlug ?? null) : null,
         input.createdBy,
       ],
     )
   },
 
+  /**
+   * Transaction-scoped twin of {@link create}: insert the doc_meta row on the tx
+   * connection so it participates in the caller's atomic create (PPT human create
+   * inserts doc_meta, membership, and PPT state in ONE transaction, so a partial
+   * failure rolls all of them back — no orphan doc_meta row).
+   */
+  async createTx(tx: Tx, input: CreateDocInput): Promise<void> {
+    await tx.query(
+      `INSERT INTO doc_meta
+         (doc_id, document_name, title, owner_id, space_id, folder_id, doc_type, octo_doc_slug, status, permission_epoch, created_by, updated_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, '')`,
+      [
+        input.docId,
+        input.documentName,
+        input.title,
+        input.ownerId,
+        input.spaceId,
+        input.folderId,
+        input.docType,
+        docTypeUsesOctoDocSlug(input.docType) ? (input.octoDocSlug ?? null) : null,
+        input.createdBy,
+      ],
+    )
+  },
+
+  /** Transaction-scoped twin of {@link getByDocId} (reads own uncommitted write). */
+  async getByDocIdTx(tx: Tx, docId: string): Promise<DocMeta | null> {
+    const rows = await tx.query<DocMeta>('SELECT * FROM doc_meta WHERE doc_id = ? LIMIT 1', [docId])
+    return rows[0] ?? null
+  },
+
   async upsertHtmlByOctoDocSlug(input: CreateDocInput & { octoDocSlug: string }): Promise<{ meta: DocMeta; created: boolean }> {
+    // NOTE (R1 scope): the `doc_type = 'html'` predicates in this method and in
+    // getByOctoDocSlug are INTENTIONALLY html-only. PPT bot register (R2-B2)
+    // adds a `doc_type`-parametrized slug-upsert path; broadening these clauses
+    // to also match html_ppt now would let an html create resolve a PPT row (or
+    // vice-versa) sharing a slug, so they stay kind-scoped until R2 wires PPT.
     // Tenant isolation (P0): resolve the slug WITHIN the caller's space only. A
     // slug is unique per (space_id, octo_doc_slug), so a same-slug row in another
     // space is invisible here and can never be updated/revived across tenants.
@@ -315,10 +361,11 @@ export const docMetaRepo = {
     // SHARE_SCOPE_ANYONE is a numeric constant, inlined (no extra bind).
     const includeSpaceShare = params.owner !== 'me' && params.isSpaceMember === true
     let visibility: string
+    let ownerSet: string[] | null = null
     // Bind values contributed by the visibility clause, in placeholder order.
     const visibilityArgs: unknown[] = []
     if (params.owner === 'me') {
-      const ownerSet = [
+      ownerSet = [
         params.uid,
         ...(params.ownedBots ?? []).filter((b) => typeof b === 'string' && b !== ''),
       ].filter((v, i, arr) => arr.indexOf(v) === i)
@@ -326,10 +373,10 @@ export const docMetaRepo = {
       visibility = `m.owner_id IN (${ownerSet.map(() => '?').join(', ')})`
       visibilityArgs.push(...ownerSet)
     } else if (includeSpaceShare) {
-      visibility = `(m.owner_id = ? OR dm.uid IS NOT NULL OR m.share_scope = ${SHARE_SCOPE_ANYONE})`
+      visibility = `(m.owner_id = ? OR ${validMemberRole} OR m.share_scope = ${SHARE_SCOPE_ANYONE})`
       visibilityArgs.push(params.uid)
     } else {
-      visibility = '(m.owner_id = ? OR dm.uid IS NOT NULL)'
+      visibility = `(m.owner_id = ? OR ${validMemberRole})`
       visibilityArgs.push(params.uid)
     }
     // Placeholders in `base`, in order: JOIN `dm.uid = ?`, then the optional
@@ -360,31 +407,29 @@ export const docMetaRepo = {
 
     // tie-break on doc_id keeps offset paging stable when rows share updated_at.
     // role projection MUST mirror the write side (effectiveRole, shareScope.ts):
-    // owner => admin(3); otherwise the MAX of the direct doc_member role and the
-    // share-derived role. When the caller is a confirmed Space member and the doc
-    // is anyone_in_space, an EDIT share yields writer(2) / any other share yields
-    // reader(1) — so a share-only doc (no doc_member row => dm.role NULL) is
-    // labeled writer, not silently reader (Number(null)=0). GREATEST(COALESCE...)
-    // keeps the share path RAISE-only: a direct writer/admin is never lowered by a
-    // reader share. The share arm is only present on the same includeSpaceShare
-    // gate as the visibility predicate, so a non-member never gets a share label.
-    // SHARE_SCOPE_ANYONE / SHARE_ROLE_EDIT are numeric constants inlined (no bind),
-    // so the leading owner-uid bind is identical whether or not the arm is present.
+    // Stored commenter=4 is not privilege-ordered, so the share merge uses an
+    // explicit writer/admin set instead of a raw numeric GREATEST.
+    const roleOwnerPredicate = ownerSet
+      ? `m.owner_id IN (${ownerSet.map(() => '?').join(', ')})`
+      : 'm.owner_id = ?'
+    const roleOwnerArgs: unknown[] = ownerSet ?? [params.uid]
     const roleExpr = includeSpaceShare
-      ? `CASE WHEN m.owner_id = ? THEN 3
-              ELSE GREATEST(
-                COALESCE(dm.role, 0),
-                CASE WHEN m.share_scope = ${SHARE_SCOPE_ANYONE}
-                     THEN (CASE WHEN m.share_role = ${SHARE_ROLE_EDIT} THEN 2 ELSE 1 END)
-                     ELSE 0 END
-              ) END`
-      : 'CASE WHEN m.owner_id = ? THEN 3 ELSE dm.role END'
+      ? `CASE WHEN ${roleOwnerPredicate} THEN 3
+              WHEN m.share_scope = ${SHARE_SCOPE_ANYONE} AND m.share_role = ${SHARE_ROLE_EDIT}
+                THEN CASE WHEN dm.role = 3 THEN 3 WHEN dm.role = 2 THEN 2 ELSE 2 END
+              WHEN m.share_scope = ${SHARE_SCOPE_ANYONE}
+                THEN CASE WHEN dm.role = 3 THEN 3 WHEN dm.role = 2 THEN 2 WHEN dm.role = 4 THEN 4 WHEN dm.role = 1 THEN 1 ELSE 1 END
+              WHEN dm.role = 3 THEN 3 WHEN dm.role = 2 THEN 2 WHEN dm.role = 4 THEN 4 WHEN dm.role = 1 THEN 1
+              ELSE NULL END`
+      : `CASE WHEN ${roleOwnerPredicate} THEN 3
+              WHEN dm.role = 3 THEN 3 WHEN dm.role = 2 THEN 2 WHEN dm.role = 4 THEN 4 WHEN dm.role = 1 THEN 1
+              ELSE NULL END`
     const items = await query<DocMeta & { role: number }>(
       `SELECT m.*, ${roleExpr} AS role
        ${base}
        ORDER BY m.updated_at ${order}, m.doc_id ${order}
        LIMIT ${pageSize} OFFSET ${offset}`,
-      [params.uid, ...args],
+      [...roleOwnerArgs, ...args],
     )
     return { total, items }
   },
@@ -452,7 +497,7 @@ export const docMetaRepo = {
     // isn't in this set, so it can't be searched even if OS still holds a stale
     // copy. SHARE_SCOPE_ANYONE is a numeric constant, inlined (no extra bind).
     const spaceShare = params.isSpaceMember === true ? ` OR m.share_scope = ${SHARE_SCOPE_ANYONE}` : ''
-    where.push(`(m.owner_id IN (${ownerPlaceholders}) OR dm.uid IS NOT NULL${spaceShare})`)
+    where.push(`(m.owner_id IN (${ownerPlaceholders}) OR ${validMemberRole}${spaceShare})`)
     args.push(...ownerSet)
 
     // Cap rows at limit+1 (when a limit is given) so overflow is detectable by

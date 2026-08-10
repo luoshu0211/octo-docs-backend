@@ -426,6 +426,15 @@ export const config = {
       // endpoint host itself, which is correct for MinIO/S3 and COS accessed
       // directly on its origin endpoint.
       signingHost: str('ATTACHMENT_S3_SIGNING_HOST', ''),
+      // Internal (container-network) endpoint for server-side PUT/DELETE/GET.
+      // In containerised deployments the public browser-reachable endpoint
+      // (e.g. http://127.0.0.1:28090) is not reachable from inside the
+      // backend container; set this to the in-cluster S3/MinIO address
+      // (e.g. http://minio:9000) so server-side media operations stay on
+      // the container network. Browser-facing presignPut/presignGet URLs
+      // always use the public endpoint above. Empty (default) falls back
+      // to the public endpoint for all operations (single-network/dev).
+      internalEndpoint: str('ATTACHMENT_S3_INTERNAL_ENDPOINT', ''),
     },
     // Secret keying the HMAC signature over (objectKey + expiry). Dev fallback;
     // MUST be overridden in production (enforced via requireSafeSigningSecret).
@@ -718,5 +727,20 @@ export const config = {
     retainCount: num('DOC_VIEW_RETAIN_COUNT', 200),
     // retention: drop view rows older than this many days (0 = unbounded).
     retainDays: num('DOC_VIEW_RETAIN_DAYS', 90),
+  },
+
+  // R3-B1 PPT (html_ppt) source/bootstrap loading (XIN-1495 §4 / §8).
+  // GET /api/v1/ppt/docs/:docId/source access + cache policy knobs. The bootstrap
+  // payload embeds SHORT-LIVED signed asset GET URLs (never a long-lived token in
+  // the URL) minted through the shared object-store presigner, and published
+  // content is served `private, no-cache` + ETag (revalidate every use) while
+  // draft/live and any bootstrap are private/no-store.
+  ppt: {
+    // TTL for the signed asset GET URLs embedded in a bootstrap payload. Mirrors
+    // C's 15-minute authorized-render window (asset_sig.go); short enough that a
+    // leaked URL expires quickly, long enough to load a deck's media once. The
+    // frontend refreshes via one bootstrap re-fetch when a URL 403/404s
+    // (PPT-ASSET-001), so this is a soft ceiling, not a hard session bound.
+    assetUrlTtlSeconds: numMin('PPT_ASSET_URL_TTL_SECONDS', 900, 1),
   },
 } as const

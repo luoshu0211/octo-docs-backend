@@ -11,7 +11,8 @@
 --
 -- Tables:
 --   doc_meta              business metadata (title/owner/space/folder/epoch)
---   doc_member            document-autonomous membership (reader/writer/admin)
+--   docs_metadata         deployment-level compatibility markers
+--   doc_member            document-autonomous membership (reader/commenter/writer/admin)
 --   doc_invite            link invites
 --   doc_invite_redemption invite redemption ledger (idempotency / audit)
 --   yjs_document          Y.Doc binary authoritative state (single merged row)
@@ -60,12 +61,23 @@ CREATE TABLE doc_meta (
   CONSTRAINT chk_doc_meta_share_role  CHECK (share_role  IN (1, 2))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- Deployment-level compatibility markers. Role values use append-v1:
+-- reader=1, writer=2, admin=3, commenter=4 (comparison rank is separate).
+CREATE TABLE docs_metadata (
+  meta_key   VARCHAR(64)  NOT NULL,
+  meta_value VARCHAR(255) NOT NULL,
+  updated_at DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (meta_key)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+INSERT INTO docs_metadata (meta_key, meta_value) VALUES ('role_encoding', 'append-v1');
+
 -- 文档自治成员（v2.0 新增，替代 v1.x 的 doc_acl —— 见下方迁移说明）
 -- 把 uid 按 role 直接授到某 doc；resolveRole 仅查此表 + owner（§4.2），不再做 octo 群继承。
 CREATE TABLE doc_member (
   doc_id        VARCHAR(64)  NOT NULL,            -- 关联 doc_meta.doc_id
   uid           VARCHAR(64)  NOT NULL,            -- 被授权的 Octo user id（可信 uid，来源见 §4.4 / §4.6）
-  role          TINYINT      NOT NULL,            -- 1=reader 2=writer 3=admin
+  role          TINYINT      NOT NULL,            -- 1=reader 2=writer 3=admin 4=commenter
   granted_by    VARCHAR(64)  NOT NULL,            -- 授权人 uid（直接添加为 owner/admin；链接邀请为 doc_invite.created_by）
   source        TINYINT      NOT NULL DEFAULT 1,  -- 1=direct(直接添加) 2=invite(经 doc_invite 接受)
   invite_token  VARCHAR(64)  NOT NULL DEFAULT '', -- 经邀请加入时记录来源 token（审计/回收），direct 为空
@@ -80,7 +92,7 @@ CREATE TABLE doc_member (
 CREATE TABLE doc_invite (
   invite_token  VARCHAR(64)  NOT NULL,            -- 邀请 token（高熵随机串，进 URL）
   doc_id        VARCHAR(64)  NOT NULL,            -- 关联 doc_meta.doc_id
-  role          TINYINT      NOT NULL DEFAULT 2,  -- 授予 role：1=reader 2=writer(默认) 3=admin
+  role          TINYINT      NOT NULL DEFAULT 2,  -- 授予 role：1=reader 2=writer(默认) 3=admin 4=commenter
   max_uses      INT          NOT NULL DEFAULT 0,  -- 最大可用次数；0 表示不限次（按 expires_at 控制）
   used_count    INT          NOT NULL DEFAULT 0,  -- 已被接受次数（每成功 accept +1，原子自增并校验上限）
   expires_at    DATETIME(3)  NULL,                -- 过期时间；NULL 表示不过期（仍可被 revoke）
@@ -107,12 +119,13 @@ CREATE TABLE doc_invite_redemption (
 CREATE TABLE doc_access_request (
   doc_id         VARCHAR(64)  NOT NULL,            -- 关联 doc_meta.doc_id
   uid            VARCHAR(64)  NOT NULL,            -- 申请人可信 uid（authMiddleware 注入，绝非请求体）
-  requested_role TINYINT      NOT NULL DEFAULT 1,  -- 1=reader 2=writer（无 commenter/admin 申请）
+  requested_role TINYINT      NOT NULL DEFAULT 1,  -- 1=reader 2=writer 4=commenter（无 admin 申请）
   reason         VARCHAR(512) NOT NULL DEFAULT '',
   status         TINYINT      NOT NULL DEFAULT 1,  -- 1=pending 2=approved 3=denied 4=cancelled
   request_id     VARCHAR(64)  NOT NULL,            -- 高熵 id，供 approve/deny 路由寻址
   decided_by     VARCHAR(64)  NOT NULL DEFAULT '', -- 处理人 uid
   decision_note  VARCHAR(512) NOT NULL DEFAULT '', -- 处理人拒绝理由（卡片 inputs["deny_reason"] 原样传入，存前截断）
+  bot_uids       JSON         NULL,                -- 申请人携带的本人 Space Bot 快照（JSON 字符串数组）；空/NULL=零 Bot，兼容旧行为。批准时逐个复用 forward-grant 授同一角色
   created_at     DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   updated_at     DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
   PRIMARY KEY (doc_id, uid),                       -- 一个 uid 对一个 doc 至多一条申请（重复申请 UPDATE 复用）
@@ -276,4 +289,51 @@ CREATE TABLE doc_access_notify_card (
   created_at    DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   updated_at    DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
   PRIMARY KEY (request_id, recipient_uid)            -- leftmost prefix serves the decision-time lookup by request_id
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ---------------------------------------------------------------------------
+-- Bento PPT (`html_ppt`) — R2-B1 (XIN-1514): human create + templates +
+-- idempotency. These tables are PPT-owned and never touch the legacy doc/Yjs
+-- paths. Kept in lockstep with migrations/upgrades/2026-08-05-add-ppt-create-tables.sql
+-- so a fresh build from this schema.sql and an upgraded DB are identical.
+-- ---------------------------------------------------------------------------
+
+-- Per-document PPT state that does not belong on the shared doc_meta row: the
+-- originating template, the Bento format/sync versions, the draft/live/published
+-- counters, and the initial materialized BentoDoc the create endpoint mints.
+CREATE TABLE ppt_doc_state (
+  doc_id                VARCHAR(64)  NOT NULL,             -- FK-by-convention to doc_meta.doc_id (html_ppt row)
+  template_id           VARCHAR(64)  NOT NULL,             -- one of the four fixed bundled templates
+  draft_revision        BIGINT       NOT NULL DEFAULT 0,   -- monotonic draft save counter (R2-B2 advances)
+  snapshot_version      BIGINT       NOT NULL DEFAULT 0,   -- authoritative live snapshot version (R4 advances)
+  published_version_seq BIGINT       NULL DEFAULT NULL,    -- latest published version seq (R5), NULL until first publish
+  ppt_format_version    INT          NOT NULL DEFAULT 1,   -- BentoDoc FORMAT_VERSION at create
+  bento_sync_pv         INT          NOT NULL DEFAULT 2,   -- Bento SYNC_V (relay protocol version)
+  draft_doc             MEDIUMTEXT   NOT NULL,             -- materialized starter BentoDoc JSON (template stripped)
+  created_at            DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at            DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (doc_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Scoped idempotency replay/conflict store for the PPT write endpoints. Keyed by
+-- (space_id, scope, uid, idempotency_key): the same Idempotency-Key is independent
+-- across spaces, across operation kinds ('create' in R2-B1; register/publish reuse
+-- this table via distinct scopes later), AND across users. `uid` is part of the
+-- key on purpose — the created deck is owned by / grants admin to the caller and
+-- the stored response carries that identity, so scoping without uid would let a
+-- different user in the same space replay the first user's doc response (a
+-- cross-user identity leak). A placeholder row (response_status = 0) reserves the
+-- key before the side effect; complete fills the real response.
+CREATE TABLE ppt_idempotency (
+  space_id        VARCHAR(64)  NOT NULL,                   -- enforced X-Space-Id (server-derived), tenant scope
+  scope           VARCHAR(32)  NOT NULL,                   -- operation namespace: 'create' | 'register' | 'publish'
+  uid             VARCHAR(64)  NOT NULL,                   -- authenticated caller (owner of the created deck)
+  idempotency_key VARCHAR(255) NOT NULL,                   -- client Idempotency-Key header
+  request_hash    CHAR(64)     NOT NULL,                   -- sha256(hex) of the canonical request payload
+  response_status INT          NOT NULL DEFAULT 0,         -- stored HTTP status; 0 while the row is a placeholder
+  response_body   MEDIUMTEXT   NULL DEFAULT NULL,          -- stored enveloped `data` payload (JSON); NULL until complete
+  doc_id          VARCHAR(64)  NULL DEFAULT NULL,          -- created doc id, when the op created one
+  created_at      DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at      DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (space_id, scope, uid, idempotency_key)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

@@ -18,16 +18,16 @@
  */
 import { signCollabToken, type CollabTokenResult } from './collabToken.js'
 import { getOctoIdentity } from './octoIdentity.js'
-import { parseDocumentName } from '../permission/documentName.js'
+import { parseDocumentName, isDocTypeConsistentWithName } from '../permission/documentName.js'
 import { resolveRole, resolveDocMetaByName } from '../permission/resolveRole.js'
 import { docViewHistoryRepo } from '../db/repos/docViewHistoryRepo.js'
 import { config } from '../config/env.js'
 import { effectiveRole, SHARE_SCOPE_ANYONE } from '../permission/shareScope.js'
-import { HTML_DOC_TYPE } from '../db/docType.js'
+import { HTML_DOC_TYPE, HTML_PPT_DOC_TYPE } from '../db/docType.js'
 
 export type IssueResult =
   | { ok: true; result: CollabTokenResult }
-  | { ok: false; status: 401 | 403 | 404; error: string }
+  | { ok: false; status: 401 | 403 | 404 | 422; error: string }
 
 /**
  * Issue a collab token for (octoToken, documentName).
@@ -84,10 +84,29 @@ export async function issueCollabToken(
   // anymore. A null here means the well-formed key addresses no live row.
   const meta = await resolveDocMetaByName(documentName)
   if (!meta) return { ok: false, status: 404, error: 'not_found' }
-  // The `:wb:` namespace addresses boards only — a resolved row that is not a
-  // board (corrupt key/row pairing) is "no such whiteboard".
-  if (parsed.kind === 'whiteboard' && meta.doc_type !== 'board') {
+  // A namespaced key must address a row of the matching kind. This is the shared
+  // cross-type guard (§5): a `:wb:` key on a non-board row, a `:ppt:` key on a
+  // non-`html_ppt` row, or a `:html:` key on a non-`html` row is a corrupt
+  // key/row pairing and resolves to "no such document". Previously only the
+  // whiteboard arm was hand-rolled here; the `:ppt:`/`:html:` arms had the hole
+  // the helper was written to close. Not reachable by any current mint path, but
+  // the one site that could serve a corrupt pairing is now closed.
+  if (!isDocTypeConsistentWithName(parsed, meta.doc_type)) {
     return { ok: false, status: 404, error: 'not_found' }
+  }
+
+  // HTML has its own body/comment backend and no Yjs collaboration design.
+  // html_ppt (Bento slide-deck) is an EXPLICIT sibling here: it uses the Bento
+  // frame protocol over its OWN relay + `POST /api/v1/ppt/docs/collab-token`
+  // endpoint, never the Hocuspocus/Yjs token. Reject BOTH before role resolution
+  // so no html / html_ppt role can mint a Hocuspocus token (§1.2 / §6).
+  if (meta.doc_type === HTML_DOC_TYPE || meta.doc_type === HTML_PPT_DOC_TYPE) {
+    // eslint-disable-next-line no-console
+    console.warn('[octo-docs] collab-token rejected: doc type does not support Hocuspocus collaboration', {
+      docId: meta.doc_id,
+      docType: meta.doc_type,
+    })
+    return { ok: false, status: 422, error: 'unsupported_document_type' }
   }
 
   // Authorization: resolveRole = doc_member + owner (same model for docs/boards).
@@ -107,15 +126,6 @@ export async function issueCollabToken(
   const role = effectiveRole(direct, spaceMember, meta.share_scope, meta.share_role)
   if (role === 'none') return { ok: false, status: 403, error: 'forbidden' }
 
-  // Security clamp (chokepoint = token issuance, where meta.doc_type is known):
-  // an html doc's body is rendered by the external octo-doc service, so its Yjs
-  // collab channel must be read-only — a signed writable token would let a
-  // client mutate a body the backend does not own. Clamp any would-be writable
-  // role (author/admin/editor) to 'reader', the role authenticate.ts already
-  // treats as readOnly=true, so the whole downstream write-reject path engages
-  // with no further change.
-  const effRole = meta.doc_type === HTML_DOC_TYPE ? 'reader' : role
-
   // FEAT-B recent-view fallback ingest (MF2, default-on). Every document open —
   // read-only INCLUDED — passes through here, so this is the reliable "open ==
   // viewed" seam even if the front-end never calls POST /docs/{id}/view. We now
@@ -134,19 +144,54 @@ export async function issueCollabToken(
   // header) do we fall back to the document's home space (meta.space_id) — the
   // pre-fix behavior, so same-space opens do not regress.
   const trimmedViewerSpace = typeof viewerSpaceId === 'string' ? viewerSpaceId.trim() : ''
-  const ingestSpaceId = trimmedViewerSpace !== '' ? trimmedViewerSpace : meta.space_id
-  void docViewHistoryRepo
-    .upsertViewWithPrune({
+  // recent-view ingest is a best-effort side effect and MUST NOT influence token
+  // issuance (no added latency, no thrown error). It is fired non-awaited inside
+  // its own async block; every await + the isSpaceMember lookup live in there, so
+  // the signing path below stays zero-blocking and a failure only warns.
+  //
+  // Space membership gate (load-bearing): X-Space-Id is a client-injected header
+  // that also leaks via share links, so it is only a RESOURCE SELECTOR, never a
+  // credential. Having a role on THIS doc (doc_member / owner / share) does NOT
+  // imply membership of the header space — a doc_member or invited reader may not
+  // belong to trimmedViewerSpace at all. So a NON-EMPTY header is only honored
+  // after isSpaceMember confirms the caller actually belongs to it; otherwise we
+  // SKIP this write entirely (we do NOT fall back to meta.space_id, which could
+  // still be a space the caller is not a member of). An empty header (legacy
+  // client) keeps the pre-fix fallback to the document's home space.
+  void (async () => {
+    let ingestSpaceId: string | null
+    if (trimmedViewerSpace === '') {
+      // Legacy client: no viewer space supplied — record under the document's
+      // home space (unchanged pre-fix behavior, no regression for same-space opens).
+      ingestSpaceId = meta.space_id
+    } else if (spaceMember === true && trimmedViewerSpace === meta.space_id) {
+      // Reuse the already-confirmed membership from the anyone_in_space branch
+      // ONLY when it is a positive result for THIS exact space. A `false`/unset
+      // spaceMember is NOT "confirmed non-member" (it may simply never have been
+      // queried), so it can never short-circuit the check below.
+      ingestSpaceId = trimmedViewerSpace
+    } else {
+      // Confirm membership of the viewer's current space before writing under it.
+      // isSpaceMember fails closed to `false` on any lookup error; a rejected
+      // promise would bubble, so it is caught to `false`. Non-member / unconfirmed
+      // => skip the write (never fall back to meta.space_id).
+      const member = await getOctoIdentity()
+        .isSpaceMember(uid, trimmedViewerSpace, octoToken)
+        .catch(() => false)
+      ingestSpaceId = member ? trimmedViewerSpace : null
+    }
+    if (ingestSpaceId === null) return
+    await docViewHistoryRepo.upsertViewWithPrune({
       uid,
       docId: meta.doc_id,
       spaceId: ingestSpaceId,
       retainCount: config.docView.retainCount,
       retainDays: config.docView.retainDays,
     })
-    .catch((err) => {
-      // eslint-disable-next-line no-console
-      console.warn(`[octo-docs] recent-view fallback ingest failed for ${meta.doc_id}:`, err)
-    })
+  })().catch((err) => {
+    // eslint-disable-next-line no-console
+    console.warn(`[octo-docs] recent-view fallback ingest failed for ${meta.doc_id}:`, err)
+  })
 
   // Sign with the document's current epoch (§4.4 / §4.5). The token carries the
   // exact connection documentName (incl. the `:wb:` whiteboard form) so the WS
@@ -154,7 +199,7 @@ export async function issueCollabToken(
   const result = signCollabToken({
     uid,
     documentName,
-    role: effRole,
+    role,
     permission_epoch: meta.permission_epoch,
     ...(displayName !== '' ? { name: displayName } : {}),
     ...(spaceMember ? { space_member: true } : {}),

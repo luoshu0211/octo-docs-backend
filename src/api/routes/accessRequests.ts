@@ -27,19 +27,24 @@ import {
 } from '../../db/repos/docAccessRequestRepo.js'
 import { requireDocRole, requireSameSpace } from '../guard.js'
 import { resolveRole } from '../../permission/resolveRole.js'
-import { grantForwardAccess } from '../services/grantForward.js'
+import { grantRequestWithBots } from '../services/grantRequestWithBots.js'
+import { logBotGrantSummary } from '../services/botGrantAudit.js'
+import { getOctoIdentity } from '../../auth/octoIdentity.js'
+import { parseRequestBotUids, BotUidsValidationError } from '../../util/botUids.js'
 import { notifyDocAccessRequested } from '../services/docsNotify.js'
 import { syncDecisionCards } from '../services/docsDecisionCardSync.js'
-import { roleAtLeast, roleToNumber, type Role } from '../../permission/role.js'
+import { isAccessRequestRole, roleAtLeast, roleToNumber, roleFromNumber } from '../../permission/role.js'
+
 
 export const accessRequestsRouter: ExpressRouter = Router()
 
-const roleName = (n: number): string => (n === 2 ? 'writer' : 'reader')
-
-/** Only reader|writer can be requested / approved (no commenter/admin). */
-function parseReqRole(v: unknown, fallback: 'reader' | 'writer' = 'reader'): 'reader' | 'writer' {
-  return v === 'reader' || v === 'writer' ? v : fallback
+const roleName = (n: number): 'reader' | 'commenter' | 'writer' => {
+  const role = roleFromNumber(n)
+  if (!isAccessRequestRole(role)) throw new Error(`invalid requested_role ${n}`)
+  return role
 }
+
+type AccessRequestRole = 'reader' | 'commenter' | 'writer'
 
 /**
  * The decider's own session token, when this request carries one. The REST
@@ -55,8 +60,8 @@ function callerSessionToken(req: Request): string | undefined {
 
 /**
  * POST submit — any authenticated octo user (no doc role required). Idempotent
- * by (doc_id, uid). If the caller already holds >= the requested role, returns
- * 200 already_granted without writing a row.
+ * by (doc_id, uid). If the caller already holds >= the requested role and no
+ * bots are requested, returns 200 already_granted without writing a row.
  */
 accessRequestsRouter.post('/:docId/access-requests', async (req: Request, res: Response) => {
   const docId = req.params.docId!
@@ -81,15 +86,58 @@ accessRequestsRouter.post('/:docId/access-requests', async (req: Request, res: R
     return
   }
 
-  const requestedRole: Role = parseReqRole((req.body ?? {}).requestedRole)
+  const suppliedRole = (req.body ?? {}).requestedRole
+  const requestedRole = suppliedRole === undefined ? 'reader' : suppliedRole
+  if (!isAccessRequestRole(requestedRole)) {
+    res.status(400).json({ error: 'requestedRole must be reader|commenter|writer' })
+    return
+  }
+
   const reasonRaw = (req.body ?? {}).reason
   const reason = typeof reasonRaw === 'string' ? reasonRaw.slice(0, 512) : ''
 
-  // Already sufficiently privileged => no-op idempotent success (no request row).
+  // Strict-parse the optional Space-bot snapshot: omitted => []; otherwise it
+  // MUST be an array of trimmed, non-empty, ≤64-char, non-duplicate uids, total
+  // ≤50 — any violation is a 400 (never a silent drop/truncate). The owned-set
+  // subset gate runs later, only if the caller is not already privileged.
+  let requestedBotUids: string[]
+  try {
+    requestedBotUids = parseRequestBotUids((req.body ?? {}).botUids)
+  } catch (err) {
+    if (err instanceof BotUidsValidationError) {
+      res.status(400).json({ error: err.message })
+      return
+    }
+    throw err
+  }
+
+  // Preserve the legacy no-op only for human-only requests. A bot-bearing
+  // request must remain pending so an admin explicitly approves the bot grants.
   const current = await resolveRole(req.uid!, docId)
-  if (roleAtLeast(current, requestedRole)) {
+  if (requestedBotUids.length === 0 && roleAtLeast(current, requestedRole)) {
     res.status(200).json({ status: 'already_granted', role: current })
     return
+  }
+
+  // Admit ONLY bots the caller actually owns in THIS doc's Space —
+  // octo-server's owned_bots_by_space[doc.space_id], resolved from the caller's
+  // own session token (never client-supplied, never a third party's bots).
+  // FAIL-CLOSED: a bot mount (no session token) or unresolvable context yields
+  // an empty owned set, so any submitted bot is rejected (403).
+  let botUids: string[] = []
+  if (requestedBotUids.length > 0) {
+    const owned = new Set(
+      await getOctoIdentity().ownedBotsInSpace(req.uid!, meta.space_id, req.octoToken ?? ''),
+    )
+    const rejected = requestedBotUids.filter((b) => !owned.has(b))
+    if (rejected.length > 0) {
+      // Any bot the caller does not own here is a hard 403, not a silent narrow:
+      // failing loudly keeps the boundary auditable. A transport failure
+      // (owned=[]) also lands here rather than authorizing anything.
+      res.status(403).json({ error: 'bot_not_owned_in_space', botUids: rejected })
+      return
+    }
+    botUids = requestedBotUids
   }
 
   const out = await docAccessRequestRepo.submit({
@@ -97,6 +145,7 @@ accessRequestsRouter.post('/:docId/access-requests', async (req: Request, res: R
     uid: req.uid!,
     requestedRoleNum: roleToNumber(requestedRole),
     reason,
+    botUids,
   })
 
   // Best-effort second-phase push: notify owner+admins with a docs-notify card
@@ -111,6 +160,7 @@ accessRequestsRouter.post('/:docId/access-requests', async (req: Request, res: R
     title: meta.title,
     requesterUid: req.uid!,
     reason,
+    botUids,
   }).catch(() => {})
 
   res.status(201).json({ requestId: out.requestId, status: 'pending' })
@@ -134,6 +184,7 @@ accessRequestsRouter.get('/:docId/access-requests', async (req: Request, res: Re
       uid: r.uid,
       requestedRole: roleName(Number(r.requested_role)),
       reason: r.reason,
+      botUids: r.bot_uids,
       createdAt: r.created_at,
     })),
   })
@@ -161,8 +212,18 @@ accessRequestsRouter.post(
       res.status(404).json({ error: 'not_found' })
       return
     }
-    // Approver picks the level; default to what was requested.
-    const grantRole = parseReqRole((req.body ?? {}).role, roleName(Number(request.requested_role)) as 'reader' | 'writer')
+    // Omitted role approves the requested tier; an explicit invalid tier fails closed.
+    const suppliedRole = (req.body ?? {}).role
+    let grantRole: AccessRequestRole
+    if (suppliedRole === undefined) {
+      grantRole = roleName(Number(request.requested_role))
+    } else if (isAccessRequestRole(suppliedRole)) {
+      grantRole = suppliedRole
+    } else {
+      res.status(400).json({ error: 'role must be reader|commenter|writer' })
+      return
+    }
+
 
     // Transition pending -> approved first; grant only on a genuine transition.
     const decided = await docAccessRequestRepo.decide({
@@ -178,18 +239,29 @@ accessRequestsRouter.post(
       return
     }
 
-    const result = await grantForwardAccess({
+    const result = await grantRequestWithBots({
       docId: guard.meta.doc_id,
+      requestId: req.params.requestId!,
       documentName: guard.meta.document_name,
       uid: request.uid,
       roleNum: roleToNumber(grantRole),
       grantedBy: req.uid!,
+      // Stored, already-admissible snapshot from submit time; re-normalized
+      // fail-closed by the repo read path so a corrupt DB value grants no bot.
+      botUids: request.bot_uids,
     })
-    // Drive every approver's sibling card to terminal (task
-    // docs-access-decision-card-sync). Best-effort, fired after the decision
-    // commits. This is the REST path (no card-callback finalizer), so the decider
-    // (req.uid) is an approver holding a live card and must be terminalized too —
-    // deciderCardHandledExternally omitted (false).
+    const hadBots = (request.bot_uids?.length ?? 0) > 0
+    if (hadBots) {
+      logBotGrantSummary({
+        source: 'rest',
+        docId: guard.meta.doc_id,
+        requestId: req.params.requestId!,
+        result,
+      })
+    }
+    // Best-effort sibling-card sync. REST path has no card-callback finalizer, so
+    // the decider (req.uid) holds a live card and is terminalized here too
+    // (deciderCardHandledExternally omitted).
     void syncDecisionCards({
       requestId: req.params.requestId!,
       spaceId: guard.meta.space_id,
@@ -197,12 +269,24 @@ accessRequestsRouter.post(
       title: guard.meta.title,
       deciderUid: req.uid!,
       denied: false,
-      // This request IS authenticated, so the approver name can resolve with the
-      // decider's own session token instead of depending on OCTO_SERVER_TOKEN.
       callerToken: callerSessionToken(req),
       decidedAtSeconds: Math.floor(Date.now() / 1000),
     }).catch(() => {})
-    res.status(200).json({ ok: true, role: result.finalRole })
+    // Response shape (per scheme): zero-bot requests keep the legacy { ok, role }
+    // byte-for-byte (no empty field). Only when the request carried bots do we add
+    // botGrantResult, with failures itemized as { uid, reason:'grant_failed' }.
+    res.status(200).json({
+      ok: true,
+      role: result.requesterRole,
+      ...(hadBots
+        ? {
+            botGrantResult: {
+              succeeded: result.botsSucceeded,
+              failed: result.botsFailed.map((uid) => ({ uid, reason: 'grant_failed' as const })),
+            },
+          }
+        : {}),
+    })
   },
 )
 

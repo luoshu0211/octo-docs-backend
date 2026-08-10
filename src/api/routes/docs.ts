@@ -7,11 +7,11 @@ import { docMetaRepo } from '../../db/repos/docMetaRepo.js'
 import { DocOwnershipError } from '../../db/repos/docMetaRepo.js'
 import { docMemberRepo } from '../../db/repos/docMemberRepo.js'
 import { docViewHistoryRepo } from '../../db/repos/docViewHistoryRepo.js'
-import { normalizeTypeFilter, HTML_DOC_TYPE } from '../../db/docType.js'
+import { normalizeTypeFilter, isDocType, HTML_DOC_TYPE, HTML_PPT_DOC_TYPE } from '../../db/docType.js'
 import { buildDocumentName, buildHtmlDocumentName, DocumentNameError } from '../../permission/documentName.js'
 import { enqueueDocIndex, isSearchIndexedDoc } from '../../search/docIndexQueue.js'
 import { refreshAndPublish, bumpEpoch } from '../../permission/epoch.js'
-import { ROLE_ADMIN } from '../../permission/role.js'
+import { ROLE_ADMIN, roleFromNumber, type Role } from '../../permission/role.js'
 import {
   parseShareScope,
   parseShareRole,
@@ -32,9 +32,8 @@ export const docsRouter: ExpressRouter = Router()
 
 const DEFAULT_FOLDER = 'f_default'
 
-/** Serialize the numeric doc_member role to the wire string enum (§3 wire). */
-const roleName = (n: number): 'admin' | 'writer' | 'reader' =>
-  n === 3 ? 'admin' : n === 2 ? 'writer' : 'reader'
+/** Serialize a validated persisted role to the wire enum. */
+const roleName = (n: number): Role | undefined => roleFromNumber(n)
 
 /** Normalize a repeated query param (`?creator=a&creator=b`) to a string[]. */
 function toStringArray(v: unknown): string[] {
@@ -101,6 +100,14 @@ export function buildCreatedDocumentName(
   // documentName 3rd segment MUST equal folder_id (§8.1 invariant).
   if (docType === WHITEBOARD_DOC_TYPE) return buildWhiteboardName(spaceId, folder, docId)
   if (docType === HTML_DOC_TYPE) return buildHtmlDocumentName(spaceId, folder, docId)
+  if (docType === HTML_PPT_DOC_TYPE) {
+    // Defense-in-depth: html_ppt keys are minted via buildPptDocumentName in the
+    // /api/v1/ppt create path, never here. The legacy create handler rejects
+    // html_ppt up front (422), so this throw is only reached if a future caller
+    // wires html_ppt into this builder by mistake — fail loud instead of minting
+    // a 4-seg document key that would route the deck into the Yjs path.
+    throw new DocumentNameError('html_ppt documentName must be built via buildPptDocumentName')
+  }
   return buildDocumentName(spaceId, folder, docId)
 }
 
@@ -140,6 +147,22 @@ export async function createDocHandler(req: Request, res: Response) {
   }
   const folder = typeof folderId === 'string' && folderId !== '' ? folderId : DEFAULT_FOLDER
   const resolvedDocType = typeof docType === 'string' && docType !== '' ? docType : 'doc'
+  if (resolvedDocType === HTML_PPT_DOC_TYPE) {
+    // html_ppt (Bento slide-deck) is created ONLY through /api/v1/ppt/** (§3.1 /
+    // §5.2), never the legacy /api/v1/docs create path. Reject as wrong-kind so a
+    // PPT row is never minted here with a 4-seg document key (which would route
+    // the deck into the Yjs/ProseMirror collab + version path).
+    res.status(422).json({ error: 'unsupported_document_type' })
+    return
+  }
+  if (!isDocType(resolvedDocType)) {
+    // Make the wrong-kind gate TOTAL, not exact-match-on-html_ppt: any doc_type
+    // outside DOC_TYPES would otherwise be persisted verbatim into
+    // doc_meta.doc_type (VARCHAR, no CHECK constraint) and fall through to a
+    // 4-seg Yjs document. Reject unknown types up front.
+    res.status(400).json({ error: 'invalid_doc_type' })
+    return
+  }
   if (resolvedDocType === HTML_DOC_TYPE) {
     if (!req.botToken) {
       res.status(400).json({ error: 'html registration requires bot mount' })
@@ -323,18 +346,20 @@ export async function listDocsHandler(req: Request, res: Response) {
   const isSpaceMember = owner === 'me' ? false : await resolveViewerSpaceMembership(req)
 
   const { total, items } = await docMetaRepo.listForUser({ uid, spaceId, isSpaceMember, folderId, owner, ownedBots, q, types, page, pageSize, sort })
-  res.status(200).json({
-    total,
-    items: items.map((d) => ({
+  const visibleItems = items.flatMap((d) => {
+    const role = roleName(Number(d.role))
+    if (!role) return []
+    return [{
       docId: d.doc_id,
       title: d.title,
       ownerId: d.owner_id,
       docType: d.doc_type,
       ...(d.octo_doc_slug ? { octoDocSlug: d.octo_doc_slug } : {}),
-      role: roleName(Number(d.role)),
+      role,
       updatedAt: d.updated_at,
-    })),
+    }]
   })
+  res.status(200).json({ total, items: visibleItems })
 }
 
 docsRouter.get('/', listDocsHandler)
@@ -531,24 +556,25 @@ export async function listRecentHandler(req: Request, res: Response) {
       if (name !== '') editorNameByUid.set(u.uid, name)
     }
   }
-  res.status(200).json({
-    total: result.total,
-    items: result.items.map((d) => ({
+  const visibleItems = result.items.flatMap((d) => {
+    const role = roleName(Number(d.role))
+    if (!role) return []
+    return [{
       docId: d.doc_id,
       title: d.title,
       ownerId: d.owner_id,
       docType: d.doc_type,
       ...(d.octo_doc_slug ? { octoDocSlug: d.octo_doc_slug } : {}),
-      role: roleName(Number(d.role)),
+      role,
       updatedAt: d.updated_at,
       updatedBy:
         d.updated_by === ''
           ? null
           : { uid: d.updated_by, name: editorNameByUid.get(d.updated_by) ?? d.updated_by },
       viewedAt: new Date(d.viewed_at).toISOString(),
-    })),
-    nextCursor: result.nextCursor,
+    }]
   })
+  res.status(200).json({ total: result.total, items: visibleItems, nextCursor: result.nextCursor })
 }
 
 docsRouter.get('/recent', listRecentHandler)
