@@ -66,6 +66,8 @@ spec:
               value: "1234"
             - name: REDIS_PREFIX
               value: "octo-docs-{{BRANCH}}"
+            - name: NODE_OPTIONS
+              value: "--max-old-space-size=1536"
             - name: MYSQL_PASSWORD
               valueFrom:
                 secretKeyRef:
@@ -118,10 +120,10 @@ spec:
           resources:
             requests:
               cpu: 250m
-              memory: 512Mi
+              memory: 768Mi
             limits:
               cpu: "1"
-              memory: 1Gi
+              memory: 2Gi
 
 ---
 apiVersion: v1
