@@ -18,11 +18,13 @@
  * supported. The two listeners are colocated here for a runnable scaffold.
  */
 import { Redis } from 'ioredis'
+import type { Server } from 'node:http'
 // B3: load .env before config/env.js is evaluated (must be the first import).
 import './config/loadEnv.js'
 import { config } from './config/env.js'
 import { createServer, setEpochWatermark } from './collab/server.js'
 import { createApp } from './api/app.js'
+import { attachBindGuard } from './api/bindGuard.js'
 import { createPptRelay } from './ppt/relay/index.js'
 import { epochInvalidateChannel, currentEpoch, invalidateEpochCache, type InvalidateEvent } from './permission/epoch.js'
 import { closePool, query } from './db/pool.js'
@@ -51,6 +53,24 @@ async function main(): Promise<void> {
   await assertAppendV1RoleEncoding({
     query: (sql, params) => query<Record<string, unknown>>(sql, params),
   })
+
+  // Validate every port BEFORE binding anything, so a misconfiguration is a boot
+  // failure with an actionable message rather than a raw EADDRINUSE after two
+  // sockets are already up. The internal port must collide with NEITHER the
+  // public REST port nor the Hocuspocus port.
+  if (config.internalHttpPort > 0) {
+    const clash: Array<[string, number]> = [
+      ['HTTP_PORT', config.httpPort],
+      ['HOCUSPOCUS_PORT', config.hocuspocusPort],
+    ].filter(([, port]) => port === config.internalHttpPort) as Array<[string, number]>
+    if (clash.length > 0) {
+      throw new Error(
+        `INTERNAL_HTTP_PORT (${config.internalHttpPort}) must differ from ` +
+          clash.map(([name, port]) => `${name} (${port})`).join(' and ') +
+          ' (refusing to run: the two-port split would silently collapse onto one listener)',
+      )
+    }
+  }
 
   const hocuspocus = createServer()
 
@@ -107,11 +127,50 @@ async function main(): Promise<void> {
   // eslint-disable-next-line no-console
   console.log(`[octo-docs] Hocuspocus listening on :${config.hocuspocusPort}`)
 
-  const app = createApp()
+  const app = createApp({ surface: config.internalHttpPort > 0 ? 'public' : 'all' })
   const httpServer = app.listen(config.httpPort, () => {
     // eslint-disable-next-line no-console
     console.log(`[octo-docs] REST API listening on :${config.httpPort}`)
   })
+  // A bind failure on the PUBLIC port must kill the process: the
+  // uncaughtException handler above is deliberately non-fatal, so without this
+  // an EADDRINUSE would be logged while the process kept running with no REST
+  // API at all. Post-bind socket errors (EMFILE/ENFILE at accept) stay
+  // non-fatal — see the long rationale in bindGuard.ts; killing an
+  // already-serving node would also bypass the graceful shutdown below and lose
+  // unflushed Yjs docs.
+  attachBindGuard(httpServer, `REST API :${config.httpPort}`)
+
+  // Optional second listener for the internal-only surface (one service, two
+  // ports). Disabled unless INTERNAL_HTTP_PORT is set, so an existing deployment
+  // keeps a single all-surfaces listener exactly as before.
+  //
+  // When enabled, this port serves ONLY /internal/html (the html service
+  // registering published docs) and `httpPort` keeps serving every route that has
+  // an out-of-network caller — the human API, the PPT surface, the blob gateway,
+  // /v1/bot/docs and the HMAC card-action callback. This port must never be
+  // published to the host or added to an nginx upstream; the internal token check
+  // still runs on it (the split reduces reachability, it does not grant trust).
+  let internalServer: Server | undefined
+  if (config.internalHttpPort > 0) {
+    const internalApp = createApp({ surface: 'internal', trustProxy: config.internalTrustProxy })
+    internalServer = internalApp.listen(config.internalHttpPort, config.internalHttpHost, () => {
+      // eslint-disable-next-line no-console
+      console.log(
+        `[octo-docs] Internal API listening on ${config.internalHttpHost}:${config.internalHttpPort}`,
+      )
+    })
+    // Fail fast instead of half-serving. Without this an EADDRINUSE / EACCES on
+    // the internal port is swallowed by the non-fatal uncaughtException handler
+    // above: the process would keep serving the public surface, /healthz would
+    // still answer 200, orchestration would call the container healthy — and
+    // /internal/html would be unreachable on BOTH ports. A visible crashloop
+    // beats a silently degraded pod. Post-bind socket errors stay non-fatal.
+    attachBindGuard(
+      internalServer,
+      `internal listener ${config.internalHttpHost}:${config.internalHttpPort}`,
+    )
+  }
 
   // R4-B1: the Bento-frame PPT relay is hosted INSIDE B — attached to the REST
   // HTTP server on the `/api/v1/ppt/collab` upgrade path (owner-locked "no second
@@ -145,6 +204,7 @@ async function main(): Promise<void> {
       // become primary writer immediately without waiting for the lock TTL.
       pptRelay.close()
       httpServer.close()
+      internalServer?.close()
       sub.disconnect()
       await closeRedis()
       await closeKafkaProducer()

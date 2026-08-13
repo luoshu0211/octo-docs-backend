@@ -22,6 +22,48 @@
  * authMiddleware. The bot keeps the shared `docsRouter` (collection + single-doc)
  * and its current same-space isolation unchanged — it never uses the human-only
  * DocumentResourceRouter (open-context / docId-first collab-token).
+ *
+ * SURFACE SPLIT (`opts.surface`, one service / two ports)
+ * -------------------------------------------------------
+ * A deployment can serve the mounts above on two DIFFERENT listeners from this
+ * one process (see config.internalHttpPort and src/index.ts):
+ *
+ *   'internal' — routes whose ONLY caller is another service inside our own
+ *                network, authenticated by the shared internal token:
+ *                  /internal/html/**   (the html service registering published
+ *                                       docs with docs-backend)
+ *   'public'   — EVERYTHING else, i.e. every route that has a caller outside the
+ *                container network today:
+ *                  /api/v1/docs/**   (human session token, browser via nginx)
+ *                  /api/v1/ppt/**    (human session token + X-Space-Id)
+ *                  signed attachment blob gateway (browser PUT/GETs the binary
+ *                                                  directly at this origin)
+ *                  /v1/bot/docs/**   (bot token — published through the public
+ *                                     gateway today; bot clients are not all
+ *                                     in-network, so moving it would 404 them)
+ *                  /api/v1/card-actions/decide (HMAC callback from octo-server,
+ *                                     which is not necessarily on our network)
+ *
+ * The membership rule is deliberately conservative: a route only moves to the
+ * internal surface when EVERY caller is provably in-network. `/v1/bot/docs` and
+ * the card-action callback fail that test (bot-token clients and octo-server can
+ * live off-network), so they stay on the public surface and their own token/HMAC
+ * verify remains the authenticator — which it already is today. Reachability is
+ * only narrowed where it costs no reachable caller.
+ *
+ * `/healthz` is mounted on BOTH so each listener is independently probeable.
+ * 'all' (the default) mounts everything on one listener — the historical
+ * behaviour, and what every deployment that does not set INTERNAL_HTTP_PORT
+ * keeps getting.
+ *
+ * Each surface builds its OWN middleware instances (access log, CORS, rate
+ * limiters), so the two listeners never share a rate-limit budget. Handler code
+ * is untouched: this is purely which routers get mounted where.
+ *
+ * The split reduces attack surface; it is NOT an authentication boundary. The
+ * internal route keeps its own verify step (the internal token), because a
+ * compromised sibling container inside the same network can still reach the
+ * internal port.
  */
 import express, { type Express, Router, type Request, type Response, type NextFunction } from 'express'
 import { config } from '../config/env.js'
@@ -52,13 +94,27 @@ import { importRouter } from './routes/import.js'
 import { createPptRouter, pptErrorHandler } from './ppt/envelope.js'
 import { sanitizeUrlForLog } from './accessLog.js'
 
-export function createApp(opts: { rateLimit?: RateLimiterOptions; trustProxy?: boolean | number | string } = {}): Express {
+/** Which audience's routes a given listener serves. See the module comment. */
+export type AppSurface = 'public' | 'internal' | 'all'
+
+export function createApp(
+  opts: { rateLimit?: RateLimiterOptions; trustProxy?: boolean | number | string; surface?: AppSurface } = {},
+): Express {
   const app = express()
+  const surface: AppSurface = opts.surface ?? 'all'
+  const servePublic = surface !== 'internal'
+  const serveInternal = surface !== 'public'
 
   // Trust the reverse proxy (nginx) in front of us so req.ip — and therefore the
   // per-IP rate limiter below — reflects the real client from X-Forwarded-For
   // rather than the proxy address. Configurable per deployment (config.trustProxy).
-  app.set('trust proxy', opts.trustProxy ?? config.trustProxy)
+  //
+  // The internal listener is deliberately NOT proxied by nginx (that is the point
+  // of the split), so it defaults to NOT trusting X-Forwarded-For: honouring that
+  // header there would let any in-network caller spoof its source IP and evade the
+  // per-IP rate limiter. An explicit opts.trustProxy still wins for deployments
+  // that do front the internal port with a mesh sidecar.
+  app.set('trust proxy', opts.trustProxy ?? (surface === 'internal' ? false : config.trustProxy))
 
   // Route access log. Mounted FIRST so it covers EVERY request — including the
   // HMAC card-action callback and CORS preflight — and logs one line per request
@@ -101,7 +157,7 @@ export function createApp(opts: { rateLimit?: RateLimiterOptions; trustProxy?: b
   // applied only to requests the gateway actually claims — non-blob requests
   // (healthz, the metadata/bot mounts, CORS preflight) skip it entirely and keep
   // their own independent limiter budgets downstream.
-  if (localBlobGatewayEnabled()) {
+  if (servePublic && localBlobGatewayEnabled()) {
     const blobLimiter = createRateLimiter(opts.rateLimit)
     app.use((req: Request, res: Response, next: NextFunction) => {
       // Never let the query-param HMAC gateway claim a PPT path: it terminates
@@ -134,13 +190,25 @@ export function createApp(opts: { rateLimit?: RateLimiterOptions; trustProxy?: b
   // cannot flood the signature-check path (each request forces a sha256 + HMAC
   // compute) or brute-force signatures unthrottled. It gets its own limiter
   // instance so its budget is independent of the blob gateway's above.
-  const cardActionLimiter = createRateLimiter(opts.rateLimit)
-  app.post(
-    CARD_ACTION_DECIDE_PATH,
-    cardActionLimiter,
-    express.raw({ type: 'application/json', limit: '64kb' }),
-    cardActionDecideHandler,
-  )
+  //
+  // PUBLIC surface (deliberate — do not "move it inside"): the caller is
+  // octo-server, which is NOT necessarily deployed on our container network. If
+  // this route were internal-only, enabling the split would 404 every 同意/拒绝
+  // tap in any cross-network topology. The authenticator here is the HMAC over
+  // the raw body + timestamp freshness + an idempotency receipt — not network
+  // position — and the route is already publicly reachable today, so keeping it
+  // public is not a posture regression. The signed canonical covers the PATH
+  // only (see cardActionDecide.ts), so repointing host/port never invalidates a
+  // signature either way.
+  if (servePublic) {
+    const cardActionLimiter = createRateLimiter(opts.rateLimit)
+    app.post(
+      CARD_ACTION_DECIDE_PATH,
+      cardActionLimiter,
+      express.raw({ type: 'application/json', limit: '64kb' }),
+      cardActionDecideHandler,
+    )
+  }
 
   const jsonBodyParser = express.json({ limit: '1mb' })
   app.use((req, res, next) => {
@@ -222,9 +290,12 @@ export function createApp(opts: { rateLimit?: RateLimiterOptions; trustProxy?: b
   api.use(boardExportRouter) // /:docId/export (server-side whiteboard PNG/SVG, W3)
   api.use(importRouter) // /:docId/import/docx (server-side .docx -> ProseMirror JSON)
 
-  app.use('/api/v1/docs', api)
+  // Mounted only on the public surface: this is the browser-facing human API.
+  if (servePublic) app.use('/api/v1/docs', api)
 
-  app.use('/internal/html', createRateLimiter(opts.rateLimit), internalHtmlRegistrationRouter)
+  // Internal surface: the html service registers published docs here with the
+  // shared internal token — no browser ever calls it.
+  if (serveInternal) app.use('/internal/html', createRateLimiter(opts.rateLimit), internalHtmlRegistrationRouter)
 
   // Bot-facing entry (§ v4.3): the SAME nine metadata routers, re-mounted behind
   // a bot identity middleware at a physically distinct prefix so nginx can route
@@ -258,7 +329,15 @@ export function createApp(opts: { rateLimit?: RateLimiterOptions; trustProxy?: b
   botApi.use(exportRouter) // /v1/bot/docs/:docId/export/file?format=... and legacy PDF
   botApi.use(boardExportRouter) // /v1/bot/docs/:docId/export (whiteboard PNG/SVG, W3)
   botApi.use(importRouter) // /v1/bot/docs/:docId/import/{docx|markdown|xlsx}
-  app.use('/v1/bot/docs', botApi)
+  // PUBLIC surface (deliberate): this prefix is published through the public
+  // gateway today — that is its entire reason for existing (see the comment
+  // above: nginx routes /v1/bot/docs -> docs-backend). Its clients are bot-token
+  // holders that are not all in-network (octo-server, bot integrations, and the
+  // user-visible /v1/bot/docs/:docId/export/file links), and an off-network one
+  // cannot be repointed at all. Moving it behind the internal port would hard-404
+  // every such caller the moment the split is enabled, so it stays public and
+  // verifyBot remains the authenticator — exactly as it is today.
+  if (servePublic) app.use('/v1/bot/docs', botApi)
 
   // PPT contract surface (§3 / §4). Mounted as its OWN router so `/api/v1/ppt/**`
   // uses the C-style `{data}`/`{error}` envelope and error enum, while the legacy
@@ -274,22 +353,24 @@ export function createApp(opts: { rateLimit?: RateLimiterOptions; trustProxy?: b
   // must apply their own auth guards and must NOT assume `req.uid` is set — a
   // handler copied from the legacy routers (which read `req.uid!`) would run
   // unauthenticated. PPT auth lands per-endpoint inside createPptRouter in R2+.
-  const pptApi = Router()
-  // The 429 body MUST be the C-style envelope, not the legacy bare
-  // `{ error: 'rate_limited' }` — a throttle is ordinary production behavior and
-  // the canonical path, so a PPT client reading `body.error.code` must not break
-  // on it. RATE_LIMITED (429) exists in the enum for exactly this.
-  pptApi.use(createRateLimiter({ ...opts.rateLimit, message: { error: { code: 'RATE_LIMITED', message: 'rate limited' } } }))
-  pptApi.use(createPptRouter())
-  app.use('/api/v1/ppt', pptApi)
-  // Belt-and-braces: register the envelope error handler at app level too, scoped
-  // to the same prefix. A mounted Router has arity 3, so an error raised by any
-  // app-level middleware BEFORE the mount would otherwise skip the router-scoped
-  // handler and fall through to the global bare-JSON handler. This app-level
-  // registration uses Express's own case-insensitive mount matching (no path
-  // string of our own to keep in sync) and renders ANY pre-mount error for a PPT
-  // path as the C-style envelope, not just the body-parser types.
-  app.use('/api/v1/ppt', pptErrorHandler)
+  if (servePublic) {
+    const pptApi = Router()
+    // The 429 body MUST be the C-style envelope, not the legacy bare
+    // `{ error: 'rate_limited' }` — a throttle is ordinary production behavior and
+    // the canonical path, so a PPT client reading `body.error.code` must not break
+    // on it. RATE_LIMITED (429) exists in the enum for exactly this.
+    pptApi.use(createRateLimiter({ ...opts.rateLimit, message: { error: { code: 'RATE_LIMITED', message: 'rate limited' } } }))
+    pptApi.use(createPptRouter())
+    app.use('/api/v1/ppt', pptApi)
+    // Belt-and-braces: register the envelope error handler at app level too, scoped
+    // to the same prefix. A mounted Router has arity 3, so an error raised by any
+    // app-level middleware BEFORE the mount would otherwise skip the router-scoped
+    // handler and fall through to the global bare-JSON handler. This app-level
+    // registration uses Express's own case-insensitive mount matching (no path
+    // string of our own to keep in sync) and renders ANY pre-mount error for a PPT
+    // path as the C-style envelope, not just the body-parser types.
+    app.use('/api/v1/ppt', pptErrorHandler)
+  }
 
   // central error handler — unexpected errors => 500 (§8.4 error table).
   app.use((err: unknown, req: Request, res: Response, _next: NextFunction) => {
