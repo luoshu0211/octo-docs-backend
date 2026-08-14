@@ -50,6 +50,12 @@ spec:
               containerPort: 3000
             - name: hocuspocus
               containerPort: 1234
+            # Internal-only service-to-service surface (INTERNAL_HTTP_PORT), serves
+            # only /internal/html. Must NEVER be added to an Ingress or nginx
+            # upstream; only reachable via the ClusterIP Service below for
+            # in-cluster callers (e.g. the html service). See docs/DEPLOYMENT.md.
+            - name: internal
+              containerPort: 9090
           envFrom:
             - configMapRef:
                 name: octo-docs-backend-config-{{BRANCH}}
@@ -64,6 +70,8 @@ spec:
               value: "3000"
             - name: HOCUSPOCUS_PORT
               value: "1234"
+            - name: INTERNAL_HTTP_PORT
+              value: "9090"
             - name: REDIS_PREFIX
               value: "octo-docs-{{BRANCH}}"
             - name: NODE_OPTIONS
@@ -147,3 +155,8 @@ spec:
     - name: hocuspocus
       port: 1234
       targetPort: 1234
+    # ClusterIP-only; not fronted by any Ingress/nginx rule. Reachable in-cluster
+    # (e.g. by the html Service) as octo-docs-backend-{{BRANCH}}:9090.
+    - name: internal
+      port: 9090
+      targetPort: 9090
