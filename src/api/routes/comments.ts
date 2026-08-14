@@ -24,6 +24,7 @@ import { Router, type Router as ExpressRouter, type Request, type Response } fro
 import { requireDocRole } from '../guard.js'
 import { roleAtLeast } from '../../permission/role.js'
 import { docCommentRepo, type DocComment } from '../../db/repos/docCommentRepo.js'
+import { getOctoIdentity } from '../../auth/octoIdentity.js'
 import {
   resolveAnchorFromLiveDoc,
   AmbiguousAnchorError,
@@ -126,19 +127,31 @@ function parseOccurrence(raw: unknown): number | undefined | typeof INVALID_DISA
   return n
 }
 
-/** Serialize a stored comment for the wire (anchors -> base64). */
-function serialize(c: DocComment) {
+/**
+ * Serialize a stored comment for the wire (anchors -> base64). `names` maps
+ * author/resolver uids to display names resolved from the user directory.
+ *
+ * A uid that the directory could NOT resolve to a real name yields `null` (NOT
+ * the raw uid) — this is deliberate: the client falls through `authorName ||
+ * names.get(uid) || uid`, and its `names` map carries a bot-name backfill the
+ * directory lacks (bots have no `name` on GET /v1/users/:uid). Returning the uid
+ * here would shadow that richer client fallback and regress bot authors to a raw
+ * uid. So: real name -> string; unresolved -> null (client resolves or shows uid).
+ */
+function serialize(c: DocComment, names: Map<string, string>) {
   return {
     id: c.id,
     docId: c.docId,
     parentId: c.parentId,
     authorUid: c.authorUid,
+    authorName: names.get(c.authorUid) ?? null,
     body: c.body,
     anchorStart: c.anchorStart ? c.anchorStart.toString('base64') : null,
     anchorEnd: c.anchorEnd ? c.anchorEnd.toString('base64') : null,
     anchorText: c.anchorText,
     resolved: c.resolved,
     resolvedBy: c.resolvedBy,
+    resolvedByName: c.resolvedBy ? (names.get(c.resolvedBy) ?? null) : null,
     resolvedAt: c.resolvedAt,
     createdAt: c.createdAt,
     updatedAt: c.updatedAt,
@@ -148,6 +161,38 @@ function serialize(c: DocComment) {
 commentsRouter.get('/:docId/comments/markers', listCommentMarkersHandler)
 commentsRouter.get('/:docId/comments/:id/thread', getCommentThreadHandler)
 commentsRouter.get('/:docId/comments', listCommentsHandler)
+
+/**
+ * Resolve author (and resolver) display names server-side so the client shows a
+ * human name even for authors who are no longer in the space member list — that
+ * reverse-lookup (names.get(uid) || uid) is exactly why a former member's comment
+ * rendered as a raw 32-char uid. Mirrors the docs.ts creator/editor name pattern:
+ * batch the distinct uids through the directory with the caller's own token.
+ * Best-effort by contract: on any directory failure this resolves to an empty map
+ * so serialize() falls back to the uid and comment loading never fails.
+ */
+async function resolveCommentAuthorNames(
+  comments: readonly DocComment[],
+  callerToken: string | undefined,
+): Promise<Map<string, string>> {
+  const names = new Map<string, string>()
+  const uids = new Set<string>()
+  for (const c of comments) {
+    if (c.authorUid) uids.add(c.authorUid)
+    if (c.resolvedBy) uids.add(c.resolvedBy)
+  }
+  if (uids.size === 0) return names
+  try {
+    const users = await getOctoIdentity().getUsers([...uids], callerToken)
+    for (const u of users) {
+      const name = typeof u.name === 'string' ? u.name.trim() : ''
+      if (name !== '') names.set(u.uid, name)
+    }
+  } catch {
+    // Directory unavailable: leave `names` empty; serialize() falls back to uid.
+  }
+  return names
+}
 
 /** Fetch one grouped root by marker id without walking paginated thread pages. */
 export async function getCommentThreadHandler(req: Request, res: Response): Promise<void> {
@@ -164,7 +209,15 @@ export async function getCommentThreadHandler(req: Request, res: Response): Prom
     return
   }
   const replies = await docCommentRepo.listReplies(id)
-  res.status(200).json({ ...serialize(root), replies: replies.map(serialize) })
+  // Same server-side display-name resolution as the list endpoint: without it a
+  // former member's comment renders as a raw uid on the single-thread path too.
+  // Best-effort — a directory hiccup must never fail thread loading; serialize()
+  // falls back to the uid when a name is missing.
+  const names = await resolveCommentAuthorNames([root, ...replies], req.octoToken)
+  res.status(200).json({
+    ...serialize(root, names),
+    replies: replies.map((r) => serialize(r, names)),
+  })
 }
 
 /** Paginated lightweight marker feed; every page contains unresolved roots only. */
@@ -215,9 +268,12 @@ export async function listCommentsHandler(req: Request, res: Response): Promise<
     if (group) group.push(reply)
     else byParent.set(reply.parentId!, [reply])
   }
+  // Resolve display names server-side (see resolveCommentAuthorNames) for both
+  // roots and their replies in one batch.
+  const names = await resolveCommentAuthorNames([...roots, ...replies], req.octoToken)
   const items = roots.map((root) => ({
-    ...serialize(root),
-    replies: (byParent.get(root.id) ?? []).map(serialize),
+    ...serialize(root, names),
+    replies: (byParent.get(root.id) ?? []).map((r) => serialize(r, names)),
   }))
   const nextCursor = roots.length === limit ? roots[roots.length - 1]!.id : null
 
