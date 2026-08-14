@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest'
 import { parseMarkdownToPmDoc, type PmNode } from '../src/import/markdown/markdown.js'
 import { isSafeHref, isSafeCssColor } from '../src/import/markdown/html-inline.js'
 import { stripFrontMatter } from '../src/import/markdown/frontmatter.js'
+import { buildSchema } from '../src/schema/index.js'
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -190,6 +191,32 @@ describe('parseMarkdownToPmDoc — inline marks', () => {
     const r = parse('`code`')
     const p = firstBlock(r)
     expect(p.content![0].marks).toContainEqual({ type: 'code' })
+  })
+
+  it.each([
+    ['bold', '**before `code` after**'],
+    ['italic', '*before `code` after*'],
+    ['strikethrough', '~~before `code` after~~'],
+    ['combined emphasis', '***before `code` after***'],
+    ['link', '[before `code` after](https://example.com)'],
+  ])('keeps inline code schema-compatible inside %s', (_label, markdown) => {
+    const r = parse(markdown)
+    const code = firstBlock(r).content!.find((node) => node.text === 'code')
+
+    expect(code?.marks).toEqual([{ type: 'code' }])
+    expect(() => buildSchema().nodeFromJSON(r.doc).check()).not.toThrow()
+  })
+
+  it('keeps emphasized inline code schema-compatible inside a table cell', () => {
+    const r = parse('| Value |\n| --- |\n| **before `code` after** |')
+    const code = firstBlock(r)
+      .content![1]
+      .content![0]
+      .content![0]
+      .content!.find((node) => node.text === 'code')
+
+    expect(code?.marks).toEqual([{ type: 'code' }])
+    expect(() => buildSchema().nodeFromJSON(r.doc).check()).not.toThrow()
   })
 
   it('parses strikethrough', () => {
@@ -529,6 +556,21 @@ describe('parseMarkdownToPmDoc — HTML blocks', () => {
     const table = firstBlock(r)
     expect(table.type).toBe('table')
     expect(table.content![0].content![0].attrs?.colspan).toBe(2)
+  })
+
+  it.each([
+    ['outer bold', '<strong><code>x</code></strong>'],
+    ['outer link', '<a href="https://example.com"><code>x</code></a>'],
+    ['outer italic in heading', '<h2><em><code>x</code></em></h2>'],
+    ['nested bold inside code', '<code><strong>x</strong></code>'],
+  ])('keeps raw HTML table inline code schema-compatible with %s', (_label, content) => {
+    const block = content.startsWith('<h2>') ? content : `<p>${content}</p>`
+    const r = parse(`<table><tr><td>${block}</td></tr></table>`)
+    const table = firstBlock(r)
+    const code = table.content![0].content![0].content![0].content!.find((node) => node.text === 'x')
+
+    expect(code?.marks).toEqual([{ type: 'code' }])
+    expect(() => buildSchema().nodeFromJSON(r.doc).check()).not.toThrow()
   })
 })
 

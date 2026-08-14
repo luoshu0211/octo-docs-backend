@@ -50,7 +50,11 @@ function parseHtmlDocument(html: string): DomDocument | null {
 
 function domInlineToNodes(root: DomElement): PmNode[] {
   const out: PmNode[] = []
-  const walk = (node: DomNode, marks: Array<{ type: string; attrs?: Record<string, unknown> }>) => {
+  const walk = (
+    node: DomNode,
+    marks: Array<{ type: string; attrs?: Record<string, unknown> }>,
+    inCode = false,
+  ) => {
     if (node.nodeType === 3) {
       if (node.textContent) out.push({ type: 'text', text: node.textContent, ...(marks.length ? { marks } : {}) })
       return
@@ -59,11 +63,14 @@ function domInlineToNodes(root: DomElement): PmNode[] {
     const el = node as DomElement
     const tag = el.tagName.toLowerCase()
     let next = marks
-    if (tag === 'strong' || tag === 'b') next = [...marks, { type: 'bold' }]
+    const nextInCode = inCode || tag === 'code'
+    // The shared schema makes code exclusive with every other mark. Once a code ancestor is
+    // entered, keep the whole subtree code-only so nested tags cannot reintroduce bold/link/etc.
+    if (nextInCode) next = [{ type: 'code' }]
+    else if (tag === 'strong' || tag === 'b') next = [...marks, { type: 'bold' }]
     else if (tag === 'em' || tag === 'i') next = [...marks, { type: 'italic' }]
     else if (tag === 'u') next = [...marks, { type: 'underline' }]
     else if (tag === 's' || tag === 'del') next = [...marks, { type: 'strike' }]
-    else if (tag === 'code') next = [...marks, { type: 'code' }]
     else if (tag === 'sub') next = [...marks, { type: 'subscript' }]
     else if (tag === 'sup') next = [...marks, { type: 'superscript' }]
     else if (tag === 'mark') {
@@ -88,7 +95,7 @@ function domInlineToNodes(root: DomElement): PmNode[] {
       const href = isSafeHref(el.getAttribute('href'))
       if (href) next = [...marks, { type: 'link', attrs: { href } }]
     }
-    for (const child of Array.from(el.childNodes)) walk(child, next)
+    for (const child of Array.from(el.childNodes)) walk(child, next, nextInCode)
   }
   for (const child of Array.from(root.childNodes)) walk(child, [])
   return out
