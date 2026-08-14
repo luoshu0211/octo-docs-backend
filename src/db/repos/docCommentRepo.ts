@@ -242,6 +242,52 @@ export const docCommentRepo = {
     return rows.map(mapRow)
   },
 
+  /**
+   * Rewrite the anchors of many thread roots in ONE transaction.
+   *
+   * Batched, not looped: a single row insert can shift dozens of anchors, and applying them one at a
+   * time leaves the set half migrated on any partial failure — some comments moved, some not, with
+   * nothing recording which. All-or-nothing is the only state a client can reason about.
+   *
+   * `anchor_text` is deliberately NOT touched. That snapshot is the evidence trail: if an anchor is
+   * ever rewritten to the wrong place, the preserved original text stops agreeing with whatever now
+   * sits at the new coordinate, which makes the mistake visible instead of silent. Refreshing it here
+   * would erase exactly that signal. (schema.sql also documents it as display/audit only.)
+   *
+   * Scoped by `doc_id` in the WHERE clause as defence in depth: the route already verified every id
+   * belongs to this document, but a cross-document write must not be reachable by a single bad param.
+   * Replies are excluded via `parent_id IS NULL` — the schema CHECK requires their anchors to stay
+   * NULL, so an UPDATE that set them would be rejected by the database anyway; failing to match is the
+   * safer of the two.
+   *
+   * No row count is returned: `Tx` exposes only `query`, and more importantly the route has already
+   * confirmed every id exists, belongs to this doc, and is a live thread root — so a zero-match here
+   * would mean a concurrent delete, not a caller mistake. Re-deriving that in the repo would duplicate
+   * a check the route cannot skip anyway.
+   */
+  async updateAnchors(
+    docId: string,
+    anchors: ReadonlyArray<{ id: number; anchorStart: Buffer; anchorEnd: Buffer }>,
+  ): Promise<void> {
+    if (anchors.length === 0) return
+    // Lock in a DETERMINISTIC order, not the caller's array order. Each UPDATE takes a row lock held
+    // until the transaction commits, so two concurrent batches that share rows and arrive in opposite
+    // order deadlock: A holds 7 and waits for 8 while B holds 8 and waits for 7. The caller's order is
+    // the client's payload order, which for this endpoint is whatever order the sheet's structural edit
+    // happened to enumerate comments in — two users editing the same sheet routinely produce different
+    // ones. Sorting by id here (rather than asking callers to) makes every batch in the process acquire
+    // locks along the same path, which is what removes the cycle; a caller cannot opt out of it.
+    const ordered = [...anchors].sort((a, b) => a.id - b.id)
+    await transaction(async (tx) => {
+      for (const a of ordered) {
+        await tx.query(
+          'UPDATE doc_comment SET anchor_start = ?, anchor_end = ? WHERE id = ? AND doc_id = ? AND parent_id IS NULL AND deleted = 0',
+          [a.anchorStart, a.anchorEnd, a.id, docId],
+        )
+      }
+    })
+  },
+
   async updateBody(id: number, body: string): Promise<void> {
     await query('UPDATE doc_comment SET body = ? WHERE id = ?', [body, id])
   },

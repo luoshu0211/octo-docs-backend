@@ -359,6 +359,174 @@ export async function createCommentHandler(req: Request, res: Response): Promise
   res.status(201).json({ id })
 }
 
+/** Max anchors accepted in one re-anchor batch. One structural edit affects at most a screenful of
+ *  comments in practice; the cap keeps a malformed client from asking for an unbounded transaction. */
+const MAX_REANCHOR_BATCH = 200
+
+// The `\\:` escapes the colon so Express treats it as a literal character rather than the start of a
+// route param. Measured against the Express version in use:
+//   POST /docs/abc/comments:reanchor    -> 200
+//   POST /docs/abc/comments%3Areanchor  -> 404   (only the literal colon matches)
+//   POST /docs/abc/comments/reanchor    -> 404
+// So CLIENTS MUST SEND A LITERAL COLON. Wrapping the path in encodeURIComponent — an easy "cleanup" for
+// someone hardening URL building — turns every call into a silent 404 with no server-side trace. Unit
+// tests cannot catch this: they invoke the handler directly and never touch the router.
+commentsRouter.post('/:docId/comments\\:reanchor', reanchorCommentsHandler)
+
+/**
+ * POST /:docId/comments:reanchor — rewrite the anchors of existing thread roots in one transaction.
+ *
+ * Exists because a structural sheet edit (insert/remove/move a row or column) shifts the cells that
+ * comments point at. Without this the client can compute the new coordinates perfectly and still have
+ * nowhere to put them: PATCH accepts only `body` and `resolved`, and anchors were previously writable
+ * only at create time.
+ *
+ * ── PERMISSION: author OR writer ───────────────────────────────────────────────────────────────
+ * Not author-only, and not writer-only:
+ *   - Author-only breaks the ordinary case. Creating a comment needs only `commenter`, which sits
+ *     BETWEEN reader and writer (see roleRank in permission/role.ts — storage 1/2/3/4 is not the
+ *     ranking), so an author may hold no writer role at all, and a comment whose author has left
+ *     could never be re-anchored by anyone.
+ *   - Writer-only is what the operation actually is for everybody else: re-anchoring repairs an INDEX,
+ *     it does not touch the author's words. `resolved` is already writer-gated for the same reason,
+ *     while `body` — the author's actual speech — stays author-only.
+ * A writer can already delete the very row a comment points at, so allowing them to fix the resulting
+ * anchor adds no capability they did not have.
+ *
+ * ── anchor_text IS NEVER TOUCHED ───────────────────────────────────────────────────────────────
+ * The request body has no field for it and this handler never writes it. The stored snapshot is the
+ * evidence trail: if an anchor is ever rewritten to the wrong cell, the frozen original text stops
+ * agreeing with whatever now occupies the new coordinate, and the mistake becomes visible. Letting a
+ * re-anchor refresh it would delete precisely that signal.
+ *
+ * ── NO doc_type GATE ──────────────────────────────────────────────────────────────────────────
+ * Deliberately does NOT call requireAnchorResolvableDocType. That guard exists for the anchorText
+ * resolution path, which must parse a ProseMirror document and therefore only works on `doc`. Here the
+ * client supplies finished anchor bytes and the server never interprets them, so the guard would add
+ * nothing — and applying it would 409 every sheet, i.e. exactly the case this endpoint is for.
+ */
+export async function reanchorCommentsHandler(req: Request, res: Response): Promise<void> {
+  const docId = req.params.docId!
+  // Commenter floor, matching every other mutation in this module (create :230, patch, delete) and the
+  // contract at the top of this file: "Readers are read-only." An earlier version of this handler used
+  // `reader` here, justified by a claim that creating a comment needs only reader — that claim was
+  // false (create requires `commenter`), and it made this the one write path in the module a read-only
+  // member could reach. Correcting the floor costs nothing: creating a comment already requires
+  // `commenter`, so an author is necessarily at least a commenter and the author-OR-writer split below
+  // still lets an author repair their own anchor without any writer role.
+  const guard = await requireDocRole(req, res, docId, 'commenter')
+  if (!guard) return
+
+  // Same guard the create path uses, and for the same two reasons: it narrows doc_type for the
+  // validator below, and it refuses a doc whose type this build does not know about rather than
+  // guessing how to treat its anchors. Note this is NOT the 'doc'-only gate used by the anchorText
+  // resolution path — every known type including `sheet` passes here, which is what this endpoint
+  // needs (a 'doc'-only gate would 409 exactly the case it exists for).
+  if (!isDocType(guard.meta.doc_type)) {
+    res.status(409).json({ error: 'unsupported_doc_type' })
+    return
+  }
+
+  const raw = (req.body as { anchors?: unknown })?.anchors
+  if (!Array.isArray(raw) || raw.length === 0) {
+    res.status(400).json({ error: 'anchors required' })
+    return
+  }
+  if (raw.length > MAX_REANCHOR_BATCH) {
+    res.status(400).json({ error: 'too_many_anchors' })
+    return
+  }
+
+  // Decode and validate EVERY entry before writing anything: a partially applied batch is a state no
+  // client can reason about, so a single bad entry rejects the whole request.
+  const decoded: Array<{ id: number; anchorStart: Buffer; anchorEnd: Buffer }> = []
+  const seen = new Set<number>()
+  for (const entry of raw) {
+    // `Array.isArray` above says nothing about the ELEMENTS: `{"anchors":[null]}` would dereference
+    // null below and throw out of this handler, and an async throw in Express 4 never reaches the
+    // error middleware — the socket is left open and the client hangs. Reject the element shape here,
+    // before any field access, so a malformed body is a 400 like every other bad input.
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
+      res.status(400).json({ error: 'invalid_id' })
+      return
+    }
+    const e = entry as { id?: unknown; anchorStart?: unknown; anchorEnd?: unknown }
+    const id = typeof e.id === 'number' && Number.isSafeInteger(e.id) && e.id > 0 ? e.id : null
+    if (id === null) {
+      res.status(400).json({ error: 'invalid_id' })
+      return
+    }
+    // A repeated id in one batch has no defined outcome (last write wins by accident) — refuse it
+    // rather than silently pick one.
+    if (seen.has(id)) {
+      res.status(400).json({ error: 'duplicate_id' })
+      return
+    }
+    seen.add(id)
+    // Same validator the create path uses, so one code path owns "what is a well-formed anchor".
+    // It is doc_type aware, but only for BOARD anchors: a board doc requires a board-shaped anchor and
+    // a non-board doc rejects one. Sheet anchors (`sheetId!row:col`, plus the orphan and file-level
+    // forms) are not JSON, so parseBoardAnchor returns null for them and they pass untouched —
+    // verified by probe against the real validator for all three forms.
+    const validated = validateExplicitCommentAnchors(guard.meta.doc_type, e.anchorStart, e.anchorEnd)
+    // Absent and malformed both land here: unlike create there is no "no anchor" case, since supplying
+    // one is the entire point of the call.
+    if (!validated.ok) {
+      res.status(400).json({ error: validated.error })
+      return
+    }
+    decoded.push({ id, anchorStart: validated.start, anchorEnd: validated.end })
+  }
+
+  // Authorise per comment, still before any write. A writer passes for every comment in the doc; a
+  // non-writer passes only for the ones they authored.
+  const isWriter = roleAtLeast(guard.role, 'writer')
+  for (const { id } of decoded) {
+    const comment = await docCommentRepo.getById(id)
+    // Cross-doc / missing / deleted => 404, and do not leak which of the three it was.
+    if (!comment || comment.docId !== docId || comment.deleted) {
+      res.status(404).json({ error: 'not_found' })
+      return
+    }
+    // Replies carry no anchor by schema invariant; asking to re-anchor one is a client bug.
+    if (comment.parentId !== null) {
+      res.status(400).json({ error: 'only a thread root has an anchor' })
+      return
+    }
+    if (!isWriter && comment.authorUid !== req.uid) {
+      res.status(403).json({ error: 'forbidden' })
+      return
+    }
+  }
+
+  // Wrap the write. This handler is `async` and Express 4 does not route a rejected promise to the
+  // central error handler at app.ts:213 — the rejection escapes to process-level `unhandledRejection`,
+  // which index.ts:36-38 deliberately logs and keeps serving. Nothing ever writes to `res`, so the
+  // client does not get a 500: it waits for its own timeout on a request that will never answer.
+  // `createCommentHandler:100` already maps unexpected failures to 500 internal_error for exactly this
+  // reason; the same treatment belongs here. (patch/delete in this module share the gap — same class of
+  // bug, pre-existing, not touched by this PR.)
+  try {
+    await docCommentRepo.updateAnchors(docId, decoded)
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error('[octo-docs] reanchor failed:', err)
+    res.status(500).json({ error: 'internal_error' })
+    return
+  }
+  // Every other mutation handler in this file publishes here so the collab server can push
+  // `comment.changed` to the OTHER connected clients. Skipping it would defeat the endpoint on the
+  // exact path it exists for: user A's structural edit commits the new coordinates, while user B —
+  // same sheet open elsewhere — keeps rendering pins at the pre-edit cells with no event to tell it
+  // otherwise. That silent two-client disagreement is worse than the bug this endpoint fixes, because
+  // one of the two screens is now wrong with no visible cause. One publish per affected thread root,
+  // matching PATCH's granularity so existing subscribers need no change.
+  for (const { id } of decoded) {
+    void publishCommentMutation(guard.meta.document_name, docId, id, 'updated')
+  }
+  res.status(200).json({ updated: decoded.length })
+}
+
 commentsRouter.patch('/:docId/comments/:id', patchCommentHandler)
 
 export async function patchCommentHandler(req: Request, res: Response): Promise<void> {
