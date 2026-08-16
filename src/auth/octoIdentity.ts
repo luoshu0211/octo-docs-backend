@@ -21,6 +21,95 @@ export interface OctoUser {
   avatar?: string
 }
 
+/**
+ * octo-server user `status` value that marks an ENABLED account (XIN-1850
+ * frozen batch contract). Only enabled users are grantable; every other status
+ * is treated exactly like a missing user (anti ghost-member), mirroring the
+ * scalar single-user semantics octo-server enforces at the source.
+ */
+export const OCTO_USER_STATUS_ENABLED = 1
+
+/**
+ * Max uids docs-backend may send to octo-server in a single batch user-info
+ * request (`POST /v1/users/batch` / `POST /v1/bot/users/batch`). MUST mirror
+ * octo-server's `MaxBatchUserUIDs`, which octo-server PR #772 (XIN-1862) lowered
+ * from 1000 -> 200 to bound the forward-grant rate-limit amplification.
+ *
+ * octo-server rejects any over-cap batch with 400. Under this module's
+ * fail-closed batch semantics that 400 would sink the WHOLE forward shard for
+ * any group > 200 recipients — exactly the large-group case forward-grant
+ * exists for. So `getUsersBatch`/`getUsersAsBotBatch` sub-chunk the uid set to
+ * <= this cap and issue one octo-server request per chunk. forward-grant/batch's
+ * own 1000 request cap and the frontend 1000 shard are UNCHANGED, so a shard is
+ * at most ceil(1000/200)=5 sub-calls. Keep in sync if octo-server changes
+ * `MaxBatchUserUIDs`.
+ */
+export const OCTO_SERVER_BATCH_MAX_UIDS = 200
+
+/**
+ * Split `uids` into sequential, non-overlapping sub-chunks of at most
+ * OCTO_SERVER_BATCH_MAX_UIDS, preserving order. An empty input yields no chunks
+ * (the caller then issues zero octo-server requests and returns an empty map).
+ */
+function chunkUids(uids: string[]): string[][] {
+  const chunks: string[][] = []
+  for (let i = 0; i < uids.length; i += OCTO_SERVER_BATCH_MAX_UIDS) {
+    chunks.push(uids.slice(i, i + OCTO_SERVER_BATCH_MAX_UIDS))
+  }
+  return chunks
+}
+
+/**
+ * The leading space-scope prefix octo-server's BOT routes strip before resolving
+ * an identity: `s<digits>_` (e.g. `s1_alice` -> `alice`). MUST mirror
+ * octo-server `modules/bot_api` (PR #772). Only the bot batch/user routes strip;
+ * the human `/v1/users/batch` route does NOT, so this is applied on the bot path
+ * only (`getUsersAsBotBatch`). See `stripBotSpacePrefix` below.
+ */
+const BOT_SPACE_PREFIX_RE = /^s\d+_/
+
+/**
+ * Return the BASE uid octo-server's bot routes key a resolved user by, i.e. the
+ * requested uid with any leading `s<digits>_` space prefix removed. A bare
+ * (unprefixed) uid is returned unchanged.
+ */
+function stripBotSpacePrefix(uid: string): string {
+  return uid.replace(BOT_SPACE_PREFIX_RE, '')
+}
+
+/**
+ * Parse an octo-server batch user-info body (`POST /v1/users/batch` /
+ * `POST /v1/bot/users/batch`, XIN-1850) into a uid-keyed lookup of the
+ * GRANTABLE users only. Enforces the two failure granularities the batch
+ * forward-grant path relies on:
+ *
+ *   - BATCH-level malformed (body not an object, or `users` not an array) =>
+ *     return `null` so the caller fails CLOSED before any write, instead of
+ *     silently treating every uid as missing.
+ *   - PER-ROW not-grantable (malformed row, absent uid, or non-enabled status)
+ *     => the row is simply omitted from the map, so the handler reports that
+ *     uid as `user_not_found`. `missing_uids` needs no special handling: a uid
+ *     that is absent from `users` is likewise absent from the map.
+ */
+function parseBatchUsers(body: unknown): Map<string, OctoUser> | null {
+  if (!body || typeof body !== 'object') return null
+  const users = (body as { users?: unknown }).users
+  if (!Array.isArray(users)) return null
+  const out = new Map<string, OctoUser>()
+  for (const row of users) {
+    if (!row || typeof row !== 'object') continue
+    const r = row as { uid?: unknown; status?: unknown; name?: unknown; avatar?: unknown }
+    if (typeof r.uid !== 'string' || r.uid === '') continue
+    if (r.status !== OCTO_USER_STATUS_ENABLED) continue
+    out.set(r.uid, {
+      uid: r.uid,
+      name: typeof r.name === 'string' ? r.name : '',
+      avatar: typeof r.avatar === 'string' ? r.avatar : undefined,
+    })
+  }
+  return out
+}
+
 export interface OctoIdentity {
   /**
    * (a) Resolve an octo session token to a trusted uid. Returns null when the
@@ -71,6 +160,36 @@ export interface OctoIdentity {
 
   /** (b) Batch profile lookup for awareness cursors (§4.7(b)). */
   getUsers(uids: string[], callerToken?: string): Promise<OctoUser[]>
+
+  /**
+   * (b-batch) Resolve MANY uids in a single call against octo-server's
+   * `POST /v1/users/batch` (XIN-1850), for the human forward-grant batch path.
+   * Returns a uid-keyed lookup of the GRANTABLE users (present AND enabled) —
+   * NOT a positional array — so callers test presence by uid, never by index.
+   * A uid that is missing / disabled / malformed is simply absent from the map
+   * (=> per-item `user_not_found`).
+   *
+   * Returns `null` when the batch call itself fails or the body is malformed at
+   * the batch level (transport error, non-200, or `users` not an array), so the
+   * caller can FAIL CLOSED before any write rather than guessing per uid.
+   */
+  getUsersBatch(
+    uids: string[],
+    callerToken?: string,
+    signal?: AbortSignal,
+  ): Promise<Map<string, OctoUser> | null>
+
+  /**
+   * (b-batch-bot) Bot-path counterpart of getUsersBatch: resolves many uids in
+   * one call against octo-server's `POST /v1/bot/users/batch` (XIN-1850),
+   * authenticating with the bot's own bearer token (the authBot realm). Same
+   * uid-keyed grantable-only lookup and same fail-closed `null` contract.
+   */
+  getUsersAsBotBatch(
+    uids: string[],
+    botToken: string,
+    signal?: AbortSignal,
+  ): Promise<Map<string, OctoUser> | null>
 
   /**
    * (#64) Is the caller (`uid`, holding `token`) an ACTIVE member of Space
@@ -264,6 +383,89 @@ export class HttpOctoIdentity implements OctoIdentity {
     return results.filter((u): u is OctoUser => u !== null)
   }
 
+  async getUsersBatch(
+    uids: string[],
+    callerToken?: string,
+    signal?: AbortSignal,
+  ): Promise<Map<string, OctoUser> | null> {
+    // octo-server requires auth on /v1/users/batch: prefer a configured service
+    // token, else fall back to the caller's own session token. Never logged.
+    const token = config.octoIdentity.serviceToken || callerToken || ''
+    const merged = new Map<string, OctoUser>()
+    // Sub-chunk to <= OCTO_SERVER_BATCH_MAX_UIDS per octo-server request so a
+    // large forward-grant shard never trips octo-server's over-cap 400. Sequential
+    // (at most ceil(1000/200)=5 calls) to avoid hammering the identity endpoint.
+    for (const chunk of chunkUids(uids)) {
+      let res: Response
+      try {
+        res = await fetch(`${this.baseUrl}/v1/users/batch`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', ...(token ? { token } : {}) },
+          body: JSON.stringify({ uids: chunk }),
+          // Caller-provided deadline: an abort reclaims the socket instead of
+          // leaving an in-flight request against a stalled identity endpoint.
+          ...(signal ? { signal } : {}),
+        })
+      } catch {
+        // Identity source unreachable => fail closed (null), never "all missing".
+        return null
+      }
+      if (!res.ok) return null
+      const parsed = parseBatchUsers(await res.json().catch(() => null))
+      // Any chunk that fails batch-level parsing sinks the WHOLE call (fail
+      // closed): never merge a partial map that would under-report grantees.
+      if (parsed === null) return null
+      for (const [uid, user] of parsed) merged.set(uid, user)
+    }
+    return merged
+  }
+
+  async getUsersAsBotBatch(
+    uids: string[],
+    botToken: string,
+    signal?: AbortSignal,
+  ): Promise<Map<string, OctoUser> | null> {
+    // The bot resolves the batch with its own bearer token against the authBot
+    // realm — no OCTO_SERVER_TOKEN needed. An empty token can never
+    // authenticate, so fail closed before any IO.
+    if (!botToken) return null
+    const merged = new Map<string, OctoUser>()
+    // Same <= OCTO_SERVER_BATCH_MAX_UIDS sequential sub-chunking + fail-closed
+    // merge as getUsersBatch, against the bot batch route.
+    for (const chunk of chunkUids(uids)) {
+      let res: Response
+      try {
+        res = await fetch(`${this.baseUrl}/v1/bot/users/batch`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${botToken}` },
+          body: JSON.stringify({ uids: chunk }),
+          ...(signal ? { signal } : {}),
+        })
+      } catch {
+        return null
+      }
+      if (!res.ok) return null
+      const parsed = parseBatchUsers(await res.json().catch(() => null))
+      if (parsed === null) return null
+      // octo-server's bot batch route strips a leading `s<digits>_` space prefix
+      // and keys resolved users by the BASE uid (PR #772). The forward-grant
+      // batch handler looks up `lookup.get(g.uid)` with the ORIGINAL requested
+      // string, so key each resolved user under the uid the caller actually SENT
+      // — matching the base uid octo-server returned. This keeps the response
+      // uid == request uid contract and mirrors the single bot route, without
+      // collapsing distinct requested strings (`s1_alice`, `s2_alice`, bare
+      // `alice`) that share one base uid: each requested uid gets its own entry.
+      // A requested uid whose base has no grantable row is simply left absent
+      // (downstream user_not_found). The human `getUsersBatch` path does NOT
+      // strip, so this aliasing is bot-path only.
+      for (const requestedUid of chunk) {
+        const user = parsed.get(requestedUid) ?? parsed.get(stripBotSpacePrefix(requestedUid))
+        if (user) merged.set(requestedUid, user)
+      }
+    }
+    return merged
+  }
+
   async ownedBotsInSpace(uid: string, spaceId: string, token: string): Promise<string[]> {
     // A missing principal/space can own no admissible bots, and an absent token
     // cannot authorize the verify call. Short out before any IO (fail-closed).
@@ -397,6 +599,22 @@ export class MiddlewareOctoIdentity implements OctoIdentity {
 
   getUsers(uids: string[], callerToken?: string): Promise<OctoUser[]> {
     return this.delegate.getUsers(uids, callerToken)
+  }
+
+  getUsersBatch(
+    uids: string[],
+    callerToken?: string,
+    signal?: AbortSignal,
+  ): Promise<Map<string, OctoUser> | null> {
+    return this.delegate.getUsersBatch(uids, callerToken, signal)
+  }
+
+  getUsersAsBotBatch(
+    uids: string[],
+    botToken: string,
+    signal?: AbortSignal,
+  ): Promise<Map<string, OctoUser> | null> {
+    return this.delegate.getUsersAsBotBatch(uids, botToken, signal)
   }
 
   isSpaceMember(uid: string, spaceId: string, token: string): Promise<boolean> {
