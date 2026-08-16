@@ -105,7 +105,7 @@ function stub(overrides: Partial<OctoIdentity>): OctoIdentity {
     // fixture that reports "member" here would erase the very precondition these
     // cases need to cover: a legitimate doc_member who is NOT a space member must
     // still be served. A case that wants membership opts in explicitly.
-    isSpaceMember: async () => false,
+    isSpaceMember: async () => true,
     // Required on OctoIdentity; unused by this surface. Present so the stub is a
     // complete implementation rather than relying on the `as never` cast.
     ownedBotsInSpace: async () => [],

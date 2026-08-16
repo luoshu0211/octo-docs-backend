@@ -141,6 +141,7 @@ async function setup(
       role: o.role,
       permission_epoch: o.epoch ?? liveEpoch,
       snapshotVersion: 0,
+      homeSpaceVerified: true,
       ...(o.name ? { name: o.name } : {}),
     }).ticket
 
@@ -180,6 +181,7 @@ async function setup(
 
 afterEach(async () => {
   while (harnesses.length) await harnesses.pop()!.close()
+  config.collabToken.allowLegacyWithoutHomeSpaceProof = false
 })
 
 /** Send hello and drain the replay up to `ready`, returning the ready frame. */
@@ -211,6 +213,58 @@ const OPS_FRAME = (k: number, frameId: string, epoch = 0, ops: unknown[] = [{ op
 })
 
 describe('PPT relay: connect / replay / ready (PPT-WS-001)', () => {
+  it('rejects a pre-hotfix direct-role ticket without verified home-Space proof', async () => {
+    const h = await setup()
+    const legacyTicket = jwt.sign({
+      uid: 'u_legacy',
+      docId: DOC,
+      documentName: DOCNAME,
+      role: 'writer',
+      permission_epoch: 0,
+      jti: randomUUID(),
+    }, config.collabToken.secret, {
+      algorithm: 'HS256',
+      audience: PPT_RELAY_TICKET_AUD,
+      expiresIn: 30,
+    })
+    const c = await h.connect({ uid: 'u_legacy', role: 'writer', ticket: legacyTicket })
+    expect((await c.closed).code).toBe(4401)
+  })
+
+  it('accepts a pre-hotfix ticket on initial connect only during the rollout window', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    config.collabToken.allowLegacyWithoutHomeSpaceProof = true
+    const h = await setup()
+    const legacyTicket = jwt.sign({
+      uid: 'u_legacy',
+      docId: DOC,
+      documentName: DOCNAME,
+      role: 'writer',
+      permission_epoch: 0,
+      jti: randomUUID(),
+    }, config.collabToken.secret, {
+      algorithm: 'HS256',
+      audience: PPT_RELAY_TICKET_AUD,
+      expiresIn: 30,
+    })
+    const c = await h.connect({ uid: 'u_legacy', role: 'writer', ticket: legacyTicket })
+    const { ready } = await helloReady(c)
+    expect(ready).toMatchObject({ ctl: 'ready', role: 'writer' })
+    expect(warn).toHaveBeenCalledWith(
+      '[octo-docs] legacy_home_space_token_accepted',
+      { credentialKind: 'ppt_ticket' },
+    )
+    warn.mockRestore()
+  })
+
+  it('relay shutdown drains an already-connected socket', async () => {
+    const h = await setup()
+    const c = await h.connect({ uid: 'u_live', role: 'writer' })
+    await helloReady(c)
+    h.relay.close()
+    expect((await c.closed).code).toBe(1001)
+  })
+
   it('every role connects and receives replay -> ready with its role/epoch/snapshotVersion', async () => {
     const h = await setup()
     for (const role of ['reader', 'commenter', 'writer', 'admin'] as Role[]) {
@@ -1083,6 +1137,7 @@ describe('PPT relay: share-aware role re-resolution (B6 / P1-7)', () => {
       role: 'writer',
       permission_epoch: 0,
       snapshotVersion: 0,
+      homeSpaceVerified: true,
       spaceMember: true,
     }).ticket
     const c = await h.connect({ uid: 'u_share', role: 'writer', ticket })
@@ -1103,6 +1158,7 @@ describe('PPT relay: share-aware role re-resolution (B6 / P1-7)', () => {
       role: 'writer',
       permission_epoch: 0,
       snapshotVersion: 0,
+      homeSpaceVerified: true,
       spaceMember: false,
     }).ticket
     const c = await h.connect({ uid: 'u_out', role: 'writer', ticket })
@@ -1633,6 +1689,7 @@ describe('PPT relay: round-6 fixes (XIN-1693)', () => {
       role: 'writer',
       permission_epoch: 0,
       snapshotVersion: 0,
+      homeSpaceVerified: true,
       spaceMember: true,
     }).ticket
     const c = await h.connect({ uid: 'u_share', role: 'writer', ticket })
@@ -1671,6 +1728,7 @@ describe('PPT relay: round-6 fixes (XIN-1693)', () => {
       role: 'writer',
       permission_epoch: 0,
       space_member: true,
+      home_space_verified: true,
       jti: randomUUID(),
     }, config.collabToken.secret, {
       algorithm: 'HS256',
@@ -1704,6 +1762,7 @@ describe('PPT relay: round-6 fixes (XIN-1693)', () => {
       role: 'writer',
       permission_epoch: 0,
       space_member: true,
+      home_space_verified: true,
       jti: randomUUID(),
     }, config.collabToken.secret, {
       algorithm: 'HS256',
@@ -2290,7 +2349,7 @@ describe('PPT relay: ordering-model redesign (XIN-1739)', () => {
   /** Sign a fresh single-use ticket (the client mints this via the collab-token endpoint). */
   const freshTicket = (o: { uid: string; role: Role; spaceMember: boolean; epoch?: number; ttl?: number }): string =>
     jwt.sign(
-      { uid: o.uid, docId: DOC, documentName: DOCNAME, role: o.role, permission_epoch: o.epoch ?? 0, space_member: o.spaceMember, jti: randomUUID() },
+      { uid: o.uid, docId: DOC, documentName: DOCNAME, role: o.role, permission_epoch: o.epoch ?? 0, space_member: o.spaceMember, home_space_verified: true, jti: randomUUID() },
       config.collabToken.secret,
       { algorithm: 'HS256', audience: PPT_RELAY_TICKET_AUD, expiresIn: o.ttl ?? 30 },
     )
@@ -2335,12 +2394,47 @@ describe('PPT relay: ordering-model redesign (XIN-1739)', () => {
     expect((await c.closed).code).toBe(4403)
   })
 
+  it('P1-3: a pre-hotfix reauth ticket without home-Space proof fails closed', async () => {
+    const h = await setup({ roleProvider: async () => 'writer' })
+    const c = await h.connect({ uid: 'u_share', role: 'writer', ticket: freshTicket({ uid: 'u_share', role: 'writer', spaceMember: true }) })
+    await helloReady(c)
+    const legacyReauth = jwt.sign(
+      { uid: 'u_share', docId: DOC, documentName: DOCNAME, role: 'writer', permission_epoch: 0, space_member: true, jti: randomUUID() },
+      config.collabToken.secret,
+      { algorithm: 'HS256', audience: PPT_RELAY_TICKET_AUD, expiresIn: 30 },
+    )
+    c.send({ t: 'reauth', pv: 2, ticket: legacyReauth })
+    expect((await c.closed).code).toBe(4403)
+  })
+
+  it('P1-3: accepts a pre-hotfix reauth ticket only during the rollout window', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    config.collabToken.allowLegacyWithoutHomeSpaceProof = true
+    const h = await setup({ roleProvider: async () => 'writer' })
+    const c = await h.connect({ uid: 'u_share', role: 'writer', ticket: freshTicket({ uid: 'u_share', role: 'writer', spaceMember: true }) })
+    await helloReady(c)
+    const legacyReauth = jwt.sign(
+      { uid: 'u_share', docId: DOC, documentName: DOCNAME, role: 'writer', permission_epoch: 0, space_member: true, jti: randomUUID() },
+      config.collabToken.secret,
+      { algorithm: 'HS256', audience: PPT_RELAY_TICKET_AUD, expiresIn: 30 },
+    )
+    c.send({ t: 'reauth', pv: 2, ticket: legacyReauth })
+    c.send(OPS_FRAME(10, 'legacy-reauth-proof'))
+    const out = await c.recvUntil((m) => m.ctl === 'ack' || m.ctl === 'refused')
+    expect(out[out.length - 1]).toMatchObject({ ctl: 'ack', k: 10 })
+    expect(warn).toHaveBeenCalledWith(
+      '[octo-docs] legacy_home_space_token_accepted',
+      { credentialKind: 'ppt_ticket' },
+    )
+    warn.mockRestore()
+  })
+
   it('P1-3: a reauth for a DIFFERENT uid/doc is rejected (identity is immutable across reauth)', async () => {
     const h = await setup({ roleProvider: async () => 'writer' })
     const c = await h.connect({ uid: 'u_share', role: 'writer', ticket: freshTicket({ uid: 'u_share', role: 'writer', spaceMember: true }) })
     await helloReady(c)
     const foreign = jwt.sign(
-      { uid: 'someone_else', docId: DOC, documentName: DOCNAME, role: 'writer', permission_epoch: 0, space_member: true, jti: randomUUID() },
+      { uid: 'someone_else', docId: DOC, documentName: DOCNAME, role: 'writer', permission_epoch: 0, space_member: true, home_space_verified: true, jti: randomUUID() },
       config.collabToken.secret,
       { algorithm: 'HS256', audience: PPT_RELAY_TICKET_AUD, expiresIn: 30 },
     )
@@ -2488,7 +2582,7 @@ describe('PPT relay: round-18 fixes (XIN-1754)', () => {
   /** Sign a fresh single-use ticket (mirrors the ordering-model block's helper). */
   const freshTicket = (o: { uid: string; role: Role; spaceMember: boolean; epoch?: number; ttl?: number }): string =>
     jwt.sign(
-      { uid: o.uid, docId: DOC, documentName: DOCNAME, role: o.role, permission_epoch: o.epoch ?? 0, space_member: o.spaceMember, jti: randomUUID() },
+      { uid: o.uid, docId: DOC, documentName: DOCNAME, role: o.role, permission_epoch: o.epoch ?? 0, space_member: o.spaceMember, home_space_verified: true, jti: randomUUID() },
       config.collabToken.secret,
       { algorithm: 'HS256', audience: PPT_RELAY_TICKET_AUD, expiresIn: o.ttl ?? 30 },
     )

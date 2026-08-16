@@ -31,7 +31,7 @@ vi.mock('../src/db/pool.js', () => ({
     fn({
       query: async (sql: string) => {
         if (/SELECT/i.test(sql) && /document_name/i.test(sql)) {
-          return [{ doc_id: 'd1', document_name: 'Doc', owner_id: 'owner', status: 1, doc_type: txDocType.value }]
+          return [{ doc_id: 'd1', document_name: 'Doc', owner_id: 'owner', status: 1, doc_type: txDocType.value, space_id: 's_home' }]
         }
         if (/SELECT/i.test(sql) && /permission_epoch/i.test(sql)) {
           return [{ permission_epoch: 1 }]
@@ -87,6 +87,7 @@ function stub(overrides: Partial<OctoIdentity>): OctoIdentity {
     verifyBot: async () => null,
     getUser: async (): Promise<OctoUser | null> => null,
     getUsers: async (): Promise<OctoUser[]> => [],
+    isSpaceMember: async () => false,
     ...overrides,
   }
 }
@@ -196,11 +197,11 @@ describe('bot invite accept /v1/bot/docs/invites/:token/accept (docs #61)', () =
 describe('human invite accept /api/v1/docs/invites/:token/accept stays unchanged', () => {
   it('still accepts via the octo session token path and lands the human uid', async () => {
     getForUpdateTx.mockResolvedValue(validInvite())
-    setOctoIdentity(stub({ verifyToken: async () => ({ uid: 'u_1' }) }))
+    setOctoIdentity(stub({ verifyToken: async () => ({ uid: 'u_1' }), isSpaceMember: async () => true }))
 
     const res = await fetch(`${base}/api/v1/docs/invites/tok123/accept`, {
       method: 'POST',
-      headers: { token: 'user-tok' },
+      headers: { token: 'user-tok', 'X-Space-Id': 's_home' },
     })
 
     expect(res.status).toBe(200)

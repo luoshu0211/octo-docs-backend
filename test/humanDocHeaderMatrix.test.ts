@@ -152,7 +152,7 @@ beforeEach(() => {
     verifyBot: async () => null,
     getUser: async () => null,
     getUsers: async () => [],
-    isSpaceMember: async () => false,
+    isSpaceMember: async (_uid, spaceId) => spaceId === 's_home',
   })
 })
 
@@ -172,22 +172,24 @@ async function request(method: string, path: string, space: 'missing' | 'correct
 }
 
 describe('Human single-document X-Space-Id tri-state router matrix (remove-sp Step 2)', () => {
-  it.each(routes)('%s has identical authorization with missing/correct/wrong headers', async (_name, method, path) => {
+  it.each(routes)('%s enforces the Human home-Space gate before authorization', async (_name, method, path) => {
     const outcomes = await Promise.all([
       request(method, path, 'missing'),
       request(method, path, 'correct'),
       request(method, path, 'wrong'),
     ])
     expect(outcomes).toEqual([
+      { status: 400, body: { error: 'space_required' } },
       { status: 403, body: { error: 'forbidden' } },
-      { status: 403, body: { error: 'forbidden' } },
-      { status: 403, body: { error: 'forbidden' } },
+      { status: 404, body: { error: 'not_found' } },
     ])
   })
 
-  it.each(['missing', 'correct', 'wrong'] as const)('authorized metadata GET is header-independent with %s header', async (space) => {
+  it('allows authorized metadata only from the verified home Space', async () => {
     vi.mocked(resolveRole).mockResolvedValue('reader')
-    expect(await request('GET', `/${DOC_ID}`, space)).toEqual({
+    expect(await request('GET', `/${DOC_ID}`, 'missing')).toEqual({ status: 400, body: { error: 'space_required' } })
+    expect(await request('GET', `/${DOC_ID}`, 'wrong')).toEqual({ status: 404, body: { error: 'not_found' } })
+    expect(await request('GET', `/${DOC_ID}`, 'correct')).toEqual({
       status: 200,
       body: expect.objectContaining({ docId: DOC_ID, spaceId: 's_home', role: 'reader' }),
     })
@@ -199,36 +201,34 @@ describe('Human single-document X-Space-Id tri-state router matrix (remove-sp St
       .toEqual({ status: 404, body: { error: 'not_found' } })
   })
 
-  it.each(['missing', 'correct', 'wrong'] as const)('open-context 403 names the doc and nothing else, with %s header', async (space) => {
-    const outcome = await request('GET', `/${DOC_ID}/open-context`, space)
-    // Product decision (leader): the no-access landing must name the document it asks the viewer to
-    // request access to, so this ONE 403 carries `title`. Header-independence is the property under
-    // test here — the disclosure must not vary with X-Space-Id, since this route has no same-space
-    // gate and a 403 can reach a caller from any Space.
-    expect(outcome).toEqual({ status: 403, body: { error: 'forbidden', title: 'Secret title' } })
-    // Everything that would let a refused caller act on the doc, or locate it, still stays out.
-    expect(outcome.body).not.toHaveProperty('homeSpaceId')
-    expect(outcome.body).not.toHaveProperty('documentName')
-    expect(outcome.body).not.toHaveProperty('role')
-    expect(outcome.body).not.toHaveProperty('permissionEpoch')
-    expect(outcome.body).not.toHaveProperty('folderId')
+  it('open-context exposes title only after verified home-Space membership', async () => {
+    expect(await request('GET', `/${DOC_ID}/open-context`, 'missing'))
+      .toEqual({ status: 400, body: { error: 'space_required' } })
+    expect(await request('GET', `/${DOC_ID}/open-context`, 'wrong'))
+      .toEqual({ status: 404, body: { error: 'not_found' } })
+    expect(await request('GET', `/${DOC_ID}/open-context`, 'correct'))
+      .toEqual({ status: 403, body: { error: 'forbidden', title: 'Secret title' } })
   })
 
-  it.each(['missing', 'correct', 'wrong'] as const)('docId collab-token returns non-leaking 403 with %s header', async (space) => {
-    expect(await request('POST', `/${DOC_ID}/collab-token`, space))
+  it('docId collab-token enforces the same home-Space gate', async () => {
+    expect(await request('POST', `/${DOC_ID}/collab-token`, 'missing'))
+      .toEqual({ status: 403, body: { error: 'space_required' } })
+    expect(await request('POST', `/${DOC_ID}/collab-token`, 'wrong'))
+      .toEqual({ status: 403, body: { error: 'forbidden' } })
+    expect(await request('POST', `/${DOC_ID}/collab-token`, 'correct'))
       .toEqual({ status: 403, body: { error: 'forbidden' } })
   })
 
-  it('access-request submit is header-independent on the Human mount', async () => {
+  it('access-request submit requires the verified document home Space', async () => {
     const outcomes = await Promise.all([
       request('POST', `/${DOC_ID}/access-requests`, 'missing'),
       request('POST', `/${DOC_ID}/access-requests`, 'correct'),
       request('POST', `/${DOC_ID}/access-requests`, 'wrong'),
     ])
     expect(outcomes).toEqual([
+      { status: 400, body: { error: 'space_required' } },
       { status: 201, body: { requestId: 'r_1', status: 'pending' } },
-      { status: 201, body: { requestId: 'r_1', status: 'pending' } },
-      { status: 201, body: { requestId: 'r_1', status: 'pending' } },
+      { status: 404, body: { error: 'not_found' } },
     ])
   })
 
@@ -238,16 +238,18 @@ describe('Human single-document X-Space-Id tri-state router matrix (remove-sp St
       .toEqual({ status: 404, body: { error: 'not_found' } })
   })
 
-  it.each(['missing', 'correct', 'wrong'] as const)('open-context reveals archived state only to an authorized caller with %s header', async (space) => {
+  it('open-context reveals archived state only from the verified home Space', async () => {
     vi.mocked(docMetaRepo.getByDocId).mockResolvedValue({ ...meta, status: 2 } as never)
     vi.mocked(resolveRole).mockResolvedValue('reader')
-    expect(await request('GET', `/${DOC_ID}/open-context`, space))
+    expect(await request('GET', `/${DOC_ID}/open-context`, 'correct'))
       .toEqual({ status: 409, body: { error: 'conflict' } })
+    expect(await request('GET', `/${DOC_ID}/open-context`, 'wrong'))
+      .toEqual({ status: 404, body: { error: 'not_found' } })
   })
 
   it('docId collab-token uses canonical DB claims and rejects archived documents', async () => {
     vi.mocked(resolveRole).mockResolvedValue('admin')
-    const issued = await request('POST', `/${DOC_ID}/collab-token`, 'wrong')
+    const issued = await request('POST', `/${DOC_ID}/collab-token`, 'correct')
     expect(issued.status).toBe(200)
     const claims = verifyCollabToken((issued.body as { token: string }).token)
     expect(claims).toMatchObject({
@@ -260,7 +262,7 @@ describe('Human single-document X-Space-Id tri-state router matrix (remove-sp St
     })
 
     vi.mocked(docMetaRepo.getByDocId).mockResolvedValue({ ...meta, status: 2 } as never)
-    expect(await request('POST', `/${DOC_ID}/collab-token`, 'missing'))
+    expect(await request('POST', `/${DOC_ID}/collab-token`, 'correct'))
       .toEqual({ status: 409, body: { error: 'conflict' } })
   })
 })

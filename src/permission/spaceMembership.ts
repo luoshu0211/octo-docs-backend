@@ -39,7 +39,15 @@ export async function confirmSpaceMembership(uid: string, spaceId: string, token
   if (uid === '' || spaceId === '' || token === '') return false
   try {
     return await getOctoIdentity().isSpaceMember(uid, spaceId, token)
-  } catch {
+  } catch (err) {
+    // Keep the public boundary fail-closed, but leave an operator-visible signal
+    // that distinguishes an identity dependency failure from a confirmed
+    // non-membership. Never log the session token or raw user/Space identifiers.
+    // eslint-disable-next-line no-console
+    console.warn('[octo-docs] space_membership_verify_error', {
+      reason: 'identity_call_threw',
+      error: err instanceof Error ? err.name : 'unknown',
+    })
     return false
   }
 }

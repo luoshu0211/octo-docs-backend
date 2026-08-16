@@ -57,6 +57,8 @@ export interface CollabClaims {
    * — derived server-side at issuance from isSpaceMember / the bot's space.
    */
   space_member?: boolean
+  /** Emergency proof that issuance verified current Space == document home Space. */
+  home_space_verified?: boolean
   /**
    * (remove-sp §7) Wire version. Absent on legacy v1 tokens; `2` on v2. The WS
    * verifier keys the docId/homeSpaceId/canonical-documentName binding on this
@@ -84,6 +86,8 @@ export interface CollabClaimsV2 {
   permissionEpoch: number
   name?: string
   spaceMember?: boolean
+  /** Emergency proof that issuance verified current Space == document home Space. */
+  homeSpaceVerified?: boolean
 }
 
 export interface CollabTokenResult {
@@ -145,6 +149,7 @@ export function signCollabToken(claims: CollabClaims): CollabTokenResult {
       // canonical "false" so an old token (no claim) and a non-member both
       // fail-closed on the share path (design §5.2f / O1).
       ...(claims.space_member === true ? { space_member: true } : {}),
+      ...(claims.home_space_verified === true ? { home_space_verified: true } : {}),
     },
     config.collabToken.secret,
     { algorithm: 'HS256', audience: LEGACY_COLLAB_AUD, expiresIn: ttl },
@@ -172,6 +177,7 @@ export function signCollabTokenV2(claims: CollabClaimsV2): CollabTokenResult {
       permissionEpoch: claims.permissionEpoch,
       ...(name !== undefined ? { name } : {}),
       ...(claims.spaceMember === true ? { spaceMember: true } : {}),
+      ...(claims.homeSpaceVerified === true ? { homeSpaceVerified: true } : {}),
     },
     config.collabToken.secret,
     { algorithm: 'HS256', expiresIn: ttl },
@@ -243,6 +249,7 @@ function verifyLegacyV1(d: Record<string, unknown>): CollabClaims {
   // so a token minted before this claim existed grants no share-derived access
   // but keeps its direct `role` (design §5.2f / O1).
   const spaceMember = d.space_member === true
+  const homeSpaceVerified = d.home_space_verified === true
   return {
     uid,
     documentName,
@@ -250,6 +257,7 @@ function verifyLegacyV1(d: Record<string, unknown>): CollabClaims {
     permission_epoch,
     ...(typeof name === 'string' && name !== '' ? { name } : {}),
     ...(spaceMember ? { space_member: true } : {}),
+    ...(homeSpaceVerified ? { home_space_verified: true } : {}),
   }
 }
 
@@ -278,6 +286,7 @@ function verifyV2(d: Record<string, unknown>): CollabClaims {
   }
   const name = d.name
   const spaceMember = d.spaceMember === true
+  const homeSpaceVerified = d.homeSpaceVerified === true
   return {
     uid,
     documentName,
@@ -288,5 +297,6 @@ function verifyV2(d: Record<string, unknown>): CollabClaims {
     homeSpaceId,
     ...(typeof name === 'string' && name !== '' ? { name } : {}),
     ...(spaceMember ? { space_member: true } : {}),
+    ...(homeSpaceVerified ? { home_space_verified: true } : {}),
   }
 }

@@ -114,7 +114,9 @@ export const acceptInviteRouter: ExpressRouter = Router()
 
 acceptInviteRouter.post('/invites/:inviteToken/accept', async (req: Request, res: Response) => {
   const octoToken = extractOctoToken(req)
-  const out = await acceptInvite(octoToken, req.params.inviteToken!)
+  const rawSpace = req.header('X-Space-Id')
+  const viewerSpaceId = typeof rawSpace === 'string' ? rawSpace.trim() : ''
+  const out = await acceptInvite(octoToken, req.params.inviteToken!, Date.now(), viewerSpaceId)
   if (!out.ok) {
     res.status(out.status).json({ error: out.error })
     return

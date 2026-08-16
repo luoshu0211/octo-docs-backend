@@ -22,8 +22,9 @@ import { parseDocumentName, isDocTypeConsistentWithName } from '../permission/do
 import { resolveRole, resolveDocMetaByName } from '../permission/resolveRole.js'
 import { docMetaRepo } from '../db/repos/docMetaRepo.js'
 import { recordVerifiedRecentView } from '../api/services/recordRecentView.js'
-import { effectiveRole, SHARE_SCOPE_ANYONE } from '../permission/shareScope.js'
+import { effectiveRole } from '../permission/shareScope.js'
 import { HTML_DOC_TYPE, HTML_PPT_DOC_TYPE } from '../db/docType.js'
+import { confirmSpaceMembership } from '../permission/spaceMembership.js'
 
 export type IssueResult =
   | { ok: true; result: CollabTokenResult }
@@ -109,6 +110,12 @@ export async function issueCollabToken(
     return { ok: false, status: 422, error: 'unsupported_document_type' }
   }
 
+  const currentSpace = typeof viewerSpaceId === 'string' ? viewerSpaceId.trim() : ''
+  if (currentSpace === '') return { ok: false, status: 403, error: 'space_required' }
+  if (!(await confirmSpaceMembership(uid, currentSpace, octoToken)) || currentSpace !== meta.space_id) {
+    return { ok: false, status: 403, error: 'forbidden' }
+  }
+
   // Authorization: resolveRole = doc_member + owner (same model for docs/boards).
   const direct = await resolveRole(uid, meta.doc_id)
 
@@ -119,10 +126,7 @@ export async function issueCollabToken(
   // is both merged into the effective role and baked into the token as the
   // space_member claim, so the live-socket write recheck (§5.3) can re-derive
   // access on a scope narrowing without a fresh membership call.
-  let spaceMember = false
-  if (meta.share_scope === SHARE_SCOPE_ANYONE) {
-    spaceMember = await getOctoIdentity().isSpaceMember(uid, meta.space_id, octoToken)
-  }
+  const spaceMember = true
   const role = effectiveRole(direct, spaceMember, meta.share_scope, meta.share_role)
   if (role === 'none') return { ok: false, status: 403, error: 'forbidden' }
 
@@ -144,6 +148,7 @@ export async function issueCollabToken(
     docId: meta.doc_id,
     viewerSpaceId,
     token: octoToken,
+    verifiedViewerSpaceId: currentSpace,
   })
 
   // Sign with the document's current epoch (§4.4 / §4.5). The token carries the
@@ -156,7 +161,8 @@ export async function issueCollabToken(
     role,
     permission_epoch: meta.permission_epoch,
     ...(displayName !== '' ? { name: displayName } : {}),
-    ...(spaceMember ? { space_member: true } : {}),
+    space_member: true,
+    home_space_verified: true,
   })
   return { ok: true, result }
 }
@@ -181,16 +187,18 @@ export async function issueCollabTokenByDocId(
 ): Promise<IssueResult> {
   const meta = await docMetaRepo.getByDocId(docId)
   if (!meta || meta.status === 0) return { ok: false, status: 404, error: 'not_found' }
+  const currentSpace = typeof viewerSpaceId === 'string' ? viewerSpaceId.trim() : ''
+  if (currentSpace === '') return { ok: false, status: 403, error: 'space_required' }
+  if (!(await confirmSpaceMembership(uid, currentSpace, octoToken)) || currentSpace !== meta.space_id) {
+    return { ok: false, status: 403, error: 'forbidden' }
+  }
 
   // Authorization: resolveRole (owner + doc_member) merged with #64 space-share.
   // This MUST precede every state/type-specific response: the docId-first route
   // is reachable from the bare `/d/:docId` locator, so returning 422 for an
   // unauthorized html/html_ppt row would disclose its type/existence details.
   const direct = await resolveRole(uid, meta.doc_id)
-  let spaceMember = false
-  if (meta.share_scope === SHARE_SCOPE_ANYONE) {
-    spaceMember = await getOctoIdentity().isSpaceMember(uid, meta.space_id, octoToken)
-  }
+  const spaceMember = true
   const role = effectiveRole(direct, spaceMember, meta.share_scope, meta.share_role)
   if (role === 'none') return { ok: false, status: 403, error: 'forbidden' }
 
@@ -238,6 +246,7 @@ export async function issueCollabTokenByDocId(
     docId: meta.doc_id,
     viewerSpaceId,
     token: octoToken,
+    verifiedViewerSpaceId: currentSpace,
   })
 
   const result = signCollabTokenV2({
@@ -248,7 +257,8 @@ export async function issueCollabTokenByDocId(
     role,
     permissionEpoch: meta.permission_epoch,
     ...(displayName !== '' ? { name: displayName } : {}),
-    ...(spaceMember ? { spaceMember: true } : {}),
+    spaceMember: true,
+    homeSpaceVerified: true,
   })
   return { ok: true, result }
 }

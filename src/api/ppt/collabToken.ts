@@ -113,6 +113,9 @@ export async function collabTokenHandler(req: Request, res: Response): Promise<v
     permission_epoch: meta.permission_epoch,
     snapshotVersion,
     spaceMember,
+    // loadPptDocForRead proved active membership in the request Space and exact
+    // equality with the deck's canonical home Space before this point.
+    homeSpaceVerified: true,
     ...(displayName !== '' ? { name: displayName } : {}),
   })
   sendPptData(res, result)

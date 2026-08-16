@@ -123,42 +123,30 @@ beforeEach(() => {
   setOctoIdentity(outsiderIdentity())
 })
 
-describe('a cross-space doc_member keeps their grant (only-adds contract)', () => {
-  it('GET /api/v1/docs/:docId returns 200 for a doc_member who is not a space member', async () => {
+describe('temporary Human home-Space gate', () => {
+  it('rejects a direct doc_member whose current Space membership cannot be verified', async () => {
     const res = await fetch(`${base}/api/v1/docs/d_1`, {
-      // The space the backend's own share link tells the client to send:
-      // /d/d_1?sp=s_home — the doc's home space, not the caller's.
       headers: { authorization: 'Bearer tok_u_ext', 'X-Space-Id': 's_home' },
     })
-
-    expect(res.status).toBe(200)
-    const body = (await res.json()) as { docId: string; role: string; spaceId: string }
-    expect(body).toMatchObject({ docId: 'd_1', spaceId: 's_home', role: 'reader' })
+    expect(res.status).toBe(404)
+    expect(await res.json()).toEqual({ error: 'not_found' })
   })
 
-  it('ignores a forged Space header: docId and the direct grant remain authoritative', async () => {
-    // remove-sp makes X-Space-Id optional viewer context on single-document
-    // routes, never a selector or authorization input. A forged value therefore
-    // cannot widen or narrow the real doc_member grant resolved from uid + docId.
+  it('rejects a forged current Space before consulting the direct grant', async () => {
     const res = await fetch(`${base}/api/v1/docs/d_1`, {
       headers: { authorization: 'Bearer tok_u_ext', 'X-Space-Id': 's_not_the_docs_space' },
     })
-
-    expect(res.status).toBe(200)
-    expect(await res.json()).toMatchObject({ docId: 'd_1', spaceId: 's_home', role: 'reader' })
+    expect(res.status).toBe(404)
+    expect(await res.json()).toEqual({ error: 'not_found' })
   })
 
-  it('403 (not 404) when the same caller holds no grant at all — doc-level denial survives', async () => {
+  it('rejects a caller with neither verified home-Space membership nor a grant', async () => {
     getRole.mockResolvedValue(null as never)
-
     const res = await fetch(`${base}/api/v1/docs/d_1`, {
       headers: { authorization: 'Bearer tok_u_ext', 'X-Space-Id': 's_home' },
     })
-
-    // The doc exists in the addressed space, so existence-hiding does not apply;
-    // the refusal must come from the role check, not from a space-level gate.
-    expect(res.status).toBe(403)
-    expect(await res.json()).toEqual({ error: 'forbidden' })
+    expect(res.status).toBe(404)
+    expect(await res.json()).toEqual({ error: 'not_found' })
   })
 })
 
@@ -209,58 +197,26 @@ describe('the gate survives only on create, where no doc exists to authorize aga
 
 })
 
-describe('access-request submit stays open to outsiders (#511 screen 4c)', () => {
-  it('POST /api/v1/docs/:docId/access-requests stays OPEN to a non-member — #511 screen 4c', async () => {
-    // The persona this route exists for is an OUTSIDER holding no grant at all,
-    // not the doc_member above: octo-web's forbidden landing
-    // (StandaloneDocPage.tsx, `phase.kind === 'forbidden'`) renders
-    // RequestAccessButton with spaceId = standaloneLinkSpace(), i.e. the `?sp=`
-    // value from the doc's own space. So this asserts the WHOLE two-step flow the
-    // user actually performs, in order — an earlier version of this test used a
-    // doc_member fixture, a persona who never sees the button, and so asserted a
-    // 404 that looked correct while the real flow was dead.
-    getRole.mockResolvedValue(null as never)
-
-    const preflight = await fetch(`${base}/api/v1/docs/d_1`, {
-      headers: { authorization: 'Bearer tok_u_ext', 'X-Space-Id': 's_home' },
-    })
-    // Step 1: 403 is what makes the "Request access" button render at all.
-    expect(preflight.status).toBe(403)
-
-    const submit = await fetch(`${base}/api/v1/docs/d_1/access-requests`, {
-      method: 'POST',
-      headers: {
-        authorization: 'Bearer tok_u_ext',
-        'content-type': 'application/json',
-        'X-Space-Id': 's_home',
-      },
-      body: JSON.stringify({ requestedRole: 'reader' }),
-    })
-
-    // Step 2: clicking it must reach the handler. A membership gate here would
-    // 404 — button shown, button broken.
-    expect(submit.status).toBe(201)
-    expect(await submit.json()).toEqual({ requestId: 'r_1', status: 'pending' })
-  })
-
-  it('ignores a forged Space header and pins the request to the path docId', async () => {
-    getRole.mockResolvedValue(null as never)
-
+describe('access-request submit obeys the temporary home-Space gate', () => {
+  it('rejects a non-member before creating an access request', async () => {
     const res = await fetch(`${base}/api/v1/docs/d_1/access-requests`, {
       method: 'POST',
-      headers: {
-        authorization: 'Bearer tok_u_ext',
-        'content-type': 'application/json',
-        'X-Space-Id': 's_not_the_docs_space',
-      },
-      body: JSON.stringify({ requestedRole: 'reader' }),
+      headers: { authorization: 'Bearer tok_u_ext', 'content-type': 'application/json', 'X-Space-Id': 's_home' },
+      body: '{}',
     })
+    expect(res.status).toBe(404)
+    expect(await res.json()).toEqual({ error: 'not_found' })
+    expect(vi.mocked(docAccessRequestRepo.submit)).not.toHaveBeenCalled()
+  })
 
-    // The client header cannot redirect the write: submit receives only d_1 from
-    // the path, while the backend independently resolves d_1's home Space.
-    expect(res.status).toBe(201)
-    expect(vi.mocked(docAccessRequestRepo.submit)).toHaveBeenCalledWith(
-      expect.objectContaining({ docId: 'd_1', uid: 'u_ext' }),
-    )
+  it('rejects a forged current Space and creates no request', async () => {
+    const res = await fetch(`${base}/api/v1/docs/d_1/access-requests`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer tok_u_ext', 'content-type': 'application/json', 'X-Space-Id': 's_other' },
+      body: '{}',
+    })
+    expect(res.status).toBe(404)
+    expect(await res.json()).toEqual({ error: 'not_found' })
+    expect(vi.mocked(docAccessRequestRepo.submit)).not.toHaveBeenCalled()
   })
 })

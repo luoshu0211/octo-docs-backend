@@ -20,6 +20,7 @@ import { resolveEffectiveRole, resolveEffectiveRoleWithMembership } from '../../
 import type { ResolvedRole } from '../../permission/role.js'
 import { HTML_PPT_DOC_TYPE } from '../../db/docType.js'
 import { PptApiError } from './envelope.js'
+import { confirmSpaceMembership } from '../../permission/spaceMembership.js'
 
 export interface PptDocGuard {
   meta: DocMeta
@@ -78,9 +79,11 @@ export async function loadPptDocForRead(
   if (!meta || meta.status === 0) {
     throw new PptApiError('NOT_FOUND', 'document not found')
   }
-  // Cross-space is indistinguishable from missing (P2 404 gate): never leak that
-  // a doc exists outside the caller's space.
-  if (meta.space_id !== spaceId) {
+  // Temporary pre-qualified-principal gate: a Human must prove active
+  // membership in the current request Space, and that Space must be the deck's
+  // canonical home. Both failures are indistinguishable from a missing deck.
+  const member = await confirmSpaceMembership(uid, spaceId, caller.token ?? '')
+  if (!member || meta.space_id !== spaceId) {
     throw new PptApiError('NOT_FOUND', 'document not found')
   }
   if (meta.status === 2) {
@@ -104,12 +107,13 @@ export async function loadPptDocForRead(
   //     resolver so an identity outage surfaces as a 5xx, never a silent 403/404 for a
   //     legitimate reader; `spaceMember` is not load-bearing there.
   let role: ResolvedRole
-  let spaceMember: boolean
   if (caller.membershipErrorMode === 'fail-closed') {
-    ;({ role, spaceMember } = await resolveEffectiveRoleWithMembership(uid, direct, meta, { token: caller.token }))
+    ;({ role } = await resolveEffectiveRoleWithMembership(uid, direct, meta, {
+      isBot: true,
+    }))
   } else {
-    role = await resolveEffectiveRole(uid, direct, meta, { token: caller.token })
-    spaceMember = false
+    role = await resolveEffectiveRole(uid, direct, meta, { isBot: true })
   }
+  const spaceMember = true
   return { meta, role, spaceMember }
 }

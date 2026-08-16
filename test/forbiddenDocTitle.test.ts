@@ -97,12 +97,12 @@ beforeEach(() => {
     verifyBot: async () => null,
     getUser: async () => null,
     getUsers: async () => [],
-    isSpaceMember: async () => false,
+    isSpaceMember: async (_uid, spaceId) => spaceId === 's_home',
   } as never)
 })
 
 async function openContext(docId = DOC_ID) {
-  const response = await fetch(`${base}/${docId}/open-context`)
+  const response = await fetch(`${base}/${docId}/open-context`, { headers: { 'X-Space-Id': 's_home' } })
   return { status: response.status, body: (await response.json()) as Record<string, unknown> }
 }
 

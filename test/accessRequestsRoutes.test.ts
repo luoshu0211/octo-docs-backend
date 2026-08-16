@@ -122,6 +122,8 @@ describe('POST /:docId/access-requests — submit', () => {
     ({
       uid: 'u_applicant',
       spaceId: 's_1',
+      viewerSpaceId: 's_1',
+      verifiedViewerSpaceId: 's_1',
       docSpaceScope: { mode: 'human' as const },
       params: { docId: 'd_1' },
       body,
@@ -153,18 +155,13 @@ describe('POST /:docId/access-requests — submit', () => {
     expect(vi.mocked(docAccessRequestRepo.submit)).not.toHaveBeenCalled()
   })
 
-  it('HUMAN mount: a doc in ANOTHER space is submittable (locate by docId, no requireSameSpace)', async () => {
-    // The §6.1 point: the 403 "request access" button on a no-`sp` page must work
-    // for a doc in any space the caller can see. The Human submit locates by docId
-    // and never runs requireSameSpace, so a cross-space doc reaches the normal
-    // role-less pending create — this does NOT widen approval/grant.
+  it('HUMAN mount: a doc outside the verified current Space is rejected', async () => {
     vi.mocked(docMetaRepo.getByDocId).mockResolvedValue({ status: 1, space_id: 's_other' } as never)
-    vi.mocked(resolveRole).mockResolvedValue('none')
-    vi.mocked(docAccessRequestRepo.submit).mockResolvedValue({ requestId: 'req_cross', status: 1 })
     const res = mockRes()
     await submitHandler()(req({ requestedRole: 'reader' }), res as never)
-    expect(res.statusCode).toBe(201)
-    expect(res.body).toEqual({ requestId: 'req_cross', status: 'pending' })
+    expect(res.statusCode).toBe(404)
+    expect(res.body).toEqual({ error: 'not_found' })
+    expect(vi.mocked(docAccessRequestRepo.submit)).not.toHaveBeenCalled()
   })
 
   it('archived doc (status=2) -> 409', async () => {
@@ -263,6 +260,8 @@ describe('POST /:docId/access-requests — bot_uids snapshot subset gate', () =>
     ({
       uid: 'u_applicant',
       spaceId: 's_1',
+      viewerSpaceId: 's_1',
+      verifiedViewerSpaceId: 's_1',
       octoToken: 'caller-tok',
       docSpaceScope: { mode: 'human' as const },
       params: { docId: 'd_1' },

@@ -31,6 +31,7 @@ import { resolveEffectiveRole } from '../../permission/resolveEffectiveRole.js'
 import { issueCollabTokenByDocId } from '../../auth/issueCollabToken.js'
 import { recordVerifiedRecentView } from '../services/recordRecentView.js'
 import { requireSpaceMembership, spaceContextMiddleware } from '../middleware/spaceContext.js'
+import { requireVerifiedHumanHomeSpace } from '../middleware/docSpaceScope.js'
 import { searchDocs, VisibleTermsTooLargeError, encodeSearchCursor, decodeSearchCursor } from '../../search/osClient.js'
 
 export const docsRouter: ExpressRouter = Router()
@@ -537,6 +538,7 @@ export async function recordDocViewHandler(req: Request, res: Response) {
     docId,
     viewerSpaceId: req.viewerSpaceId,
     token: req.octoToken,
+    verifiedViewerSpaceId: req.verifiedViewerSpaceId,
   })
   res
     .status(200)
@@ -863,6 +865,7 @@ export async function openContextHandler(req: Request, res: Response): Promise<v
     res.status(404).json({ error: 'not_found' })
     return
   }
+  if (!(await requireVerifiedHumanHomeSpace(req, res, meta))) return
   // Compute role WITHOUT returning any metadata. Human open-context: membership
   // for an anyone_in_space doc is resolved against the doc's HOME Space
   // (meta.space_id) via the caller's own token — never a client header.

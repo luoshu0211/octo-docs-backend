@@ -14,6 +14,7 @@ describe('collab token sign/verify (§4.4)', () => {
       documentName: 'octo:s_001:f_888:d_abc123',
       role: 'writer',
       permission_epoch: 7,
+      home_space_verified: true,
     })
     expect(typeof token).toBe('string')
     expect(role).toBe('writer')
@@ -28,6 +29,7 @@ describe('collab token sign/verify (§4.4)', () => {
       documentName: 'octo:s_001:f_888:d_abc123',
       role: 'writer',
       permission_epoch: 7,
+      home_space_verified: true,
     })
   })
 
@@ -131,6 +133,7 @@ describe('collab token v2 wire contract (remove-sp §7)', () => {
       role: 'writer',
       permissionEpoch: 12,
       spaceMember: true,
+      homeSpaceVerified: true,
     })
     const wire = jwt.decode(result.token) as Record<string, unknown>
     expect(wire).toMatchObject({
@@ -142,6 +145,7 @@ describe('collab token v2 wire contract (remove-sp §7)', () => {
       role: 'writer',
       permissionEpoch: 12,
       spaceMember: true,
+      homeSpaceVerified: true,
     })
     expect(wire).not.toHaveProperty('permission_epoch')
     expect(wire).not.toHaveProperty('home_space_id')
@@ -154,6 +158,7 @@ describe('collab token v2 wire contract (remove-sp §7)', () => {
       role: 'writer',
       permission_epoch: 12,
       space_member: true,
+      home_space_verified: true,
     })
   })
 

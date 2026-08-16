@@ -190,8 +190,9 @@ describe('requireSpaceMembership — the gate on space-selector routes', () => {
     expect(res.statusCode).toBe(404)
   })
 
-  it('fails CLOSED when the membership lookup throws (transient identity outage)', async () => {
-    stubMembership(new Error('octo-server unreachable'))
+  it('fails CLOSED and logs a sanitized event when the membership lookup throws', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    stubMembership(new Error('octo-server unreachable with secret detail'))
     const res = mockRes()
 
     const { reachedHandler } = await runChain(req({ 'X-Space-Id': 's_home' }), res)
@@ -200,6 +201,12 @@ describe('requireSpaceMembership — the gate on space-selector routes', () => {
     expect(reachedHandler).toBe(false)
     expect(res.statusCode).toBe(404)
     expect(res.body).toEqual({ error: 'not_found' })
+    expect(warn).toHaveBeenCalledWith(
+      '[octo-docs] space_membership_verify_error',
+      { reason: 'identity_call_threw', error: 'Error' },
+    )
+    expect(JSON.stringify(warn.mock.calls)).not.toContain('secret detail')
+    warn.mockRestore()
   })
 
   it('fails CLOSED when the identity seam is missing the method entirely', async () => {
