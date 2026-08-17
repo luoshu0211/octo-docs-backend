@@ -25,6 +25,7 @@ import { requireDocRole } from '../src/api/guard.js'
 import type { DocSpaceScope } from '../src/api/middleware/docSpaceScope.js'
 import { docMetaRepo } from '../src/db/repos/docMetaRepo.js'
 import { resolveRole } from '../src/permission/resolveRole.js'
+import { setOctoIdentity } from '../src/auth/octoIdentity.js'
 
 interface MockRes {
   statusCode: number
@@ -49,11 +50,23 @@ function mockRes(): MockRes {
 }
 
 /** Minimal Express-like req carrying the per-mount doc space-scoping policy. */
-function mockReq(opts: { uid?: string; scope?: DocSpaceScope; octoToken?: string } = {}) {
+function mockReq(opts: {
+  uid?: string
+  scope?: DocSpaceScope
+  octoToken?: string
+  viewerSpaceId?: string
+  verifiedViewerSpaceId?: string
+} = {}) {
   return {
     uid: opts.uid ?? 'u_1',
-    octoToken: opts.octoToken,
+    octoToken: opts.octoToken ?? 'session-token',
     docSpaceScope: opts.scope,
+    ...(opts.scope?.mode === 'human'
+      ? {
+          viewerSpaceId: opts.viewerSpaceId ?? 's1',
+          verifiedViewerSpaceId: opts.verifiedViewerSpaceId ?? 's1',
+        }
+      : {}),
   }
 }
 
@@ -82,6 +95,12 @@ function metaRow(over: Record<string, unknown> = {}) {
 beforeEach(() => {
   vi.mocked(docMetaRepo.getByDocId).mockReset()
   vi.mocked(resolveRole).mockReset()
+  setOctoIdentity({
+    verifyToken: async () => null,
+    getUser: async () => null,
+    getUsers: async () => [],
+    isSpaceMember: async () => true,
+  })
 })
 
 describe('requireDocRole — Bot mount cross-space gate (§6)', () => {
@@ -146,19 +165,38 @@ describe('requireDocRole — Bot mount cross-space gate (§6)', () => {
 describe('requireDocRole — Human mount locates by docId (§6)', () => {
   const humanScope: DocSpaceScope = { mode: 'human' }
 
-  it('resolves a doc that lives in ANOTHER space — the human mount never gates on Space', async () => {
-    // The whole point of remove-sp: a cross-Space direct member opens the doc by
-    // docId regardless of any (now absent / wrong) X-Space-Id. No 404 gate here.
-    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(metaRow({ space_id: 's_other' }) as never)
+  it('revalidates when the request-local verified Space does not match the candidate', async () => {
+    const isSpaceMember = vi.fn(async () => true)
+    setOctoIdentity({
+      verifyToken: async () => null,
+      getUser: async () => null,
+      getUsers: async () => [],
+      isSpaceMember,
+    })
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(metaRow() as never)
     vi.mocked(resolveRole).mockResolvedValue('writer' as never)
     const res = mockRes()
 
-    const guard = await requireDocRole(mockReq({ uid: 'u_1', scope: humanScope }) as never, res as never, 'd_1', 'reader')
+    const guard = await requireDocRole(
+      mockReq({ uid: 'u_1', scope: humanScope, viewerSpaceId: 's1', verifiedViewerSpaceId: 'stale-space' }) as never,
+      res as never,
+      'd_1',
+      'reader',
+    )
 
-    expect(res.statusCode).toBe(0)
-    expect(guard).not.toBeNull()
-    expect(guard!.role).toBe('writer')
-    expect(guard!.meta.space_id).toBe('s_other')
+    expect(guard?.role).toBe('writer')
+    expect(isSpaceMember).toHaveBeenCalledWith('u_1', 's1', 'session-token')
+  })
+
+  it('rejects a doc outside the verified current home Space', async () => {
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(metaRow({ space_id: 's_other' }) as never)
+    vi.mocked(resolveRole).mockResolvedValue('writer' as never)
+    const res = mockRes()
+    const guard = await requireDocRole(mockReq({ uid: 'u_1', scope: humanScope }) as never, res as never, 'd_1', 'reader')
+    expect(guard).toBeNull()
+    expect(res.statusCode).toBe(404)
+    expect(res.body).toEqual({ error: 'not_found' })
+    expect(vi.mocked(resolveRole)).not.toHaveBeenCalled()
   })
 
   it('preserves the existing 404 for a missing/deleted doc', async () => {

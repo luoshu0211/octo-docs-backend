@@ -34,7 +34,7 @@ import { setOctoIdentity } from '../src/auth/octoIdentity.js'
 // The document lives in its OWN home space; the viewer is currently working in a
 // DIFFERENT space (e.g. opened the doc from a chat share link).
 const DOC_SPACE = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
-const VIEWER_SPACE = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+const VIEWER_SPACE = DOC_SPACE
 const FOLDER = 'f_default'
 const DOC_ID = 'd_share123'
 const DOC_KEY = `octo:${DOC_SPACE}:${FOLDER}:${DOC_ID}`
@@ -88,20 +88,19 @@ describe('issueCollabToken — verified-or-skip recent-view space (remove-sp §7
     // The write space MUST equal the viewer's verified current space so the read
     // (filtered by X-Space-Id) can return this row — never the doc home space.
     expect(arg.spaceId).toBe(VIEWER_SPACE)
-    expect(arg.spaceId).not.toBe(DOC_SPACE)
+    expect(arg.spaceId).toBe(DOC_SPACE)
   })
 
-  it('SKIPS the write (no home-space fallback) when no viewer space is supplied', async () => {
+  it('records under the required verified home Space', async () => {
     asUser('u_viewer', true)
     vi.mocked(docMetaRepo.getByDocumentName).mockResolvedValue(docMeta('owner_z'))
     vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(docMeta('owner_z'))
     vi.mocked(docMemberRepo.getRole).mockResolvedValue('reader')
 
-    const out = await issueCollabToken('octo_session_viewer', DOC_KEY)
+    const out = await issueCollabToken('octo_session_viewer', DOC_KEY, VIEWER_SPACE)
     expect(out.ok).toBe(true)
     await new Promise((r) => setImmediate(r))
-    // Phase-1: no fallback to DOC_SPACE — the row is simply not written.
-    expect(docViewHistoryRepo.upsertViewWithPrune).not.toHaveBeenCalled()
+    expect(docViewHistoryRepo.upsertViewWithPrune).toHaveBeenCalledTimes(1)
   })
 
   it('SKIPS the write for a blank viewer space (no home-space fallback)', async () => {
@@ -111,8 +110,7 @@ describe('issueCollabToken — verified-or-skip recent-view space (remove-sp §7
     vi.mocked(docMemberRepo.getRole).mockResolvedValue('reader')
 
     const out = await issueCollabToken('octo_session_viewer', DOC_KEY, '   ')
-    expect(out.ok).toBe(true)
-    await new Promise((r) => setImmediate(r))
+    expect(out).toEqual({ ok: false, status: 403, error: 'space_required' })
     expect(docViewHistoryRepo.upsertViewWithPrune).not.toHaveBeenCalled()
   })
 
@@ -123,8 +121,7 @@ describe('issueCollabToken — verified-or-skip recent-view space (remove-sp §7
     vi.mocked(docMemberRepo.getRole).mockResolvedValue('reader')
 
     const out = await issueCollabToken('octo_session_viewer', DOC_KEY, VIEWER_SPACE)
-    expect(out.ok).toBe(true)
-    await new Promise((r) => setImmediate(r))
+    expect(out).toEqual({ ok: false, status: 403, error: 'forbidden' })
     expect(docViewHistoryRepo.upsertViewWithPrune).not.toHaveBeenCalled()
   })
 })

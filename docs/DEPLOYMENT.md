@@ -224,6 +224,7 @@ vars (those without a fallback) **fail fast at boot** — that is intentional.
 | `REDIS_PREFIX` | no (`octo-docs`) | multi-product key isolation prefix |
 | `COLLAB_TOKEN_SECRET` | **yes in prod** | signing secret for the short-lived collab JWT. Use an asymmetric key / KMS-managed secret; the HS256 default `dev-only-change-me` is dev only. |
 | `COLLAB_TOKEN_TTL_SECONDS` | no (`300`) | collab JWT TTL (5 min) |
+| `COLLAB_ALLOW_LEGACY_TOKENS_WITHOUT_HOME_SPACE_PROOF` | no (`false`) | Temporary two-stage rollout compatibility. `true` lets validators accept still-unexpired pre-hotfix collab/PPT credentials that lack `home_space_verified`; all new issuers still stamp the proof. Never leave enabled after the drain window. Accepts only `true`/`false`/`1`/`0`; invalid values fail startup. |
 | `COLLAB_TOKEN_PUBLIC_WS_URL` | **yes in prod** | public, browser-reachable collab WS origin returned to clients as `collabWsUrl` (§4.4). Absolute `ws://`/`wss://` only — the Hocuspocus WS server runs on its own `:1234` origin and is **not** reverse-proxied, so a relative path never reaches it. **Fail-fast prod gate:** if `NODE_ENV=production` and this is unset or malformed the process **refuses to start** (clients no longer carry a build-time WS fallback). Optional in local dev only. |
 | `PPT_RELAY_ENABLED` | no (`false`) | **Master on/off switch for the PPT collab relay. Default OFF.** When false the relay is NOT attached to the REST server and the collab-token issuance route is NOT mounted, so `/api/v1/ppt/collab` is entirely absent. The relay currently ships as **Half A** (durable transport + snapshotting + the server-only room-relative clock bound); the op-metadata trust boundary that ties an op's actor to the authenticated uid and enforces per-actor sequence continuity is **deferred to Half B** (paired with the R4-F1 client). While that boundary is absent, an authenticated writer could submit ops under an arbitrary `a`/`s` (actor impersonation) — so **leave this OFF in production until Half B lands.** Accepts `true`/`false`/`1`/`0` only; any other value fails startup. See "PPT relay op-metadata trust model" below. |
 | `PPT_RELAY_PUBLIC_WS_URL` | **yes in prod _when the relay is enabled_** | public, browser-reachable origin of the Bento PPT collab relay, returned to clients as `pptWsUrl` in the collab-token response (§7.1). Absolute `ws://`/`wss://` only. The relay is hosted **inside the REST server** on the `/api/v1/ppt/collab` upgrade path (unlike the Hocuspocus WS server), so this normally points at the REST origin. **Fail-fast prod gate — gated behind `PPT_RELAY_ENABLED`:** when the relay is enabled and `NODE_ENV=production`, an unset or malformed value makes the process **refuse to start**. When the relay is **off** (the default) its validation is **skipped entirely** — the value is neither required nor consulted, so a disabled relay never fails startup on this knob (XIN-1825). Optional in local dev. Only consulted when `PPT_RELAY_ENABLED=true`. |
@@ -263,6 +264,34 @@ vars (those without a fallback) **fail fast at boot** — that is intentional.
 > complete, correct env, not to retry the request. Treat every secret
 > (`MYSQL_PASSWORD`, `COLLAB_TOKEN_SECRET`, the attachment keys below) as part
 > of one atomic env block, never passed piecemeal.
+
+### 3.1.1 Home-Space collab-token rollout
+
+The `home_space_verified` claim is a hard validator boundary: credentials
+minted before the Home-Space hotfix do not carry it, including historical
+`anyone_in_space` credentials. A mixed fleet that lets an old issuer feed a
+strict new WebSocket validator therefore causes reconnect loops (`4403`). Use
+this two-stage rollout rather than enabling strict validation during a mixed
+deployment:
+
+1. Deploy the new image to **every** token issuer and validator with
+   `COLLAB_ALLOW_LEGACY_TOKENS_WITHOUT_HOME_SPACE_PROOF=true`. New REST issuance
+   already performs the Home-Space check and stamps the proof; the flag affects
+   only validation of still-unexpired old credentials.
+2. Confirm no old issuing instance remains, then wait at least one complete
+   `COLLAB_TOKEN_TTL_SECONDS` interval (default: 300 seconds). This drains every
+   token an old instance could have minted immediately before it stopped.
+3. Set `COLLAB_ALLOW_LEGACY_TOKENS_WITHOUT_HOME_SPACE_PROOF=false` on every
+   instance and roll the fleet again. From this point, a missing proof is
+   rejected (`4403`).
+
+Do not shorten the wait based on rollout start time: it begins only after the
+last old issuer has stopped. Rollback during stage 2 means the drain clock must
+restart after old issuers are removed again. The structured log event
+`space_membership_verify_error` identifies identity-service transport/non-2xx/
+malformed-context failures that still intentionally fail closed at each
+caller's authorization boundary; protected selector/token routes commonly
+return 403/404. The event contains no session token or raw uid/Space id.
 
 ### 3.2 Attachment storage — two modes
 

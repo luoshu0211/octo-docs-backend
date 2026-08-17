@@ -17,11 +17,12 @@ import { docMemberRepo } from '../../db/repos/docMemberRepo.js'
 import { refreshAndPublish } from '../../permission/epoch.js'
 import { roleFromNumber, type ResolvedRole } from '../../permission/role.js'
 import { decideAcceptBranch } from './acceptDecision.js'
+import { confirmSpaceMembership } from '../../permission/spaceMembership.js'
 
 
 export type AcceptResult =
   | { ok: true; status: 200; body: { docId?: string; documentName?: string; role: string } }
-  | { ok: false; status: 401 | 410; error: string }
+  | { ok: false; status: 400 | 401 | 404 | 410; error: string }
 
 interface DocMetaTxRow {
   doc_id: string
@@ -29,6 +30,7 @@ interface DocMetaTxRow {
   owner_id: string
   status: number
   doc_type: string
+  space_id: string
 }
 
 /**
@@ -48,11 +50,17 @@ export async function acceptInvite(
   octoToken: string,
   inviteToken: string,
   nowMs: number = Date.now(),
+  viewerSpaceId?: string,
 ): Promise<AcceptResult> {
   // step 1: verify octo identity -> trusted uid (HARD CONSTRAINT). 401 if not.
   const identity = await getOctoIdentity().verifyToken(octoToken)
   if (!identity) return { ok: false, status: 401, error: 'login_required' }
-  return acceptInviteForUid(identity.uid, inviteToken, nowMs)
+  const currentSpace = typeof viewerSpaceId === 'string' ? viewerSpaceId.trim() : ''
+  if (currentSpace === '') return { ok: false, status: 400, error: 'space_required' }
+  if (!(await confirmSpaceMembership(identity.uid, currentSpace, octoToken))) {
+    return { ok: false, status: 404, error: 'not_found' }
+  }
+  return acceptInviteForUid(identity.uid, inviteToken, nowMs, currentSpace)
 }
 
 /**
@@ -74,6 +82,7 @@ export async function acceptInviteForUid(
   uid: string,
   inviteToken: string,
   nowMs: number = Date.now(),
+  requiredHomeSpaceId?: string,
 ): Promise<AcceptResult> {
   // Branches c/d publish an epoch invalidation. Capture its payload in-tx and
   // fire refreshAndPublish AFTER commit (see the call site below); stays null on
@@ -95,11 +104,14 @@ export async function acceptInviteForUid(
 
     // step 3: read current state (doc meta + role).
     const metaRows = await tx.query<DocMetaTxRow>(
-      'SELECT doc_id, document_name, owner_id, status, doc_type FROM doc_meta WHERE doc_id = ? LIMIT 1',
+      'SELECT doc_id, document_name, owner_id, status, doc_type, space_id FROM doc_meta WHERE doc_id = ? LIMIT 1',
       [invite.doc_id],
     )
     const meta = metaRows[0]
     const docExists = !!meta && meta.status !== 0
+    if (docExists && requiredHomeSpaceId !== undefined && meta!.space_id !== requiredHomeSpaceId) {
+      return { ok: false, status: 404, error: 'not_found' }
+    }
 
     const curRole = docExists ? await resolveRoleTx(tx, meta!, uid) : 'none'
 

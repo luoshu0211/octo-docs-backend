@@ -1,7 +1,7 @@
 // Env seeding MUST be first so config/env.ts reads it at load time.
 import './helpers/pptRelayEnv.js'
 
-import { describe, it, expect } from 'vitest'
+import { beforeEach, describe, it, expect, vi } from 'vitest'
 import {
   issuePptCollabToken,
   verifyPptRelayToken,
@@ -19,6 +19,9 @@ import { config } from '../src/config/env.js'
  * of PPT-WS-001. Pure sign/verify — no network, no DB.
  */
 describe('PPT collab token + one-time ticket (§7.1)', () => {
+  beforeEach(() => {
+    config.collabToken.allowLegacyWithoutHomeSpaceProof = false
+  })
   const base = {
     uid: 'u_1',
     docId: 'd_ppt1',
@@ -26,6 +29,7 @@ describe('PPT collab token + one-time ticket (§7.1)', () => {
     role: 'writer' as const,
     permission_epoch: 3,
     snapshotVersion: 7,
+    homeSpaceVerified: true,
     name: 'Ada',
   }
 
@@ -61,6 +65,39 @@ describe('PPT collab token + one-time ticket (§7.1)', () => {
     // raw payload audiences are exactly as specified.
     expect((jwt.decode(r.token) as { aud?: string }).aud).toBe(PPT_RELAY_AUD)
     expect((jwt.decode(r.ticket) as { aud?: string }).aud).toBe(PPT_RELAY_TICKET_AUD)
+  })
+
+  it('rejects pre-hotfix relay credentials without verified home-Space proof', () => {
+    const legacyClaims = {
+      uid: 'u_legacy',
+      docId: 'd_ppt1',
+      documentName: base.documentName,
+      role: 'writer',
+      permission_epoch: 3,
+    }
+    const legacyToken = jwt.sign(legacyClaims, config.collabToken.secret, {
+      algorithm: 'HS256', audience: PPT_RELAY_AUD, expiresIn: 60,
+    })
+    const legacyTicket = jwt.sign({ ...legacyClaims, jti: 'legacy-jti' }, config.collabToken.secret, {
+      algorithm: 'HS256', audience: PPT_RELAY_TICKET_AUD, expiresIn: 60,
+    })
+    expect(() => verifyPptRelayToken(legacyToken)).toThrow(/home-space proof/)
+    expect(() => verifyPptRelayTicket(legacyTicket)).toThrow(/home-space proof/)
+
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    config.collabToken.allowLegacyWithoutHomeSpaceProof = true
+    expect(verifyPptRelayToken(legacyToken).uid).toBe('u_legacy')
+    expect(verifyPptRelayTicket(legacyTicket).jti).toBe('legacy-jti')
+    expect(warn).toHaveBeenCalledWith(
+      '[octo-docs] legacy_home_space_token_accepted',
+      { credentialKind: 'ppt_relay' },
+    )
+    expect(warn).toHaveBeenCalledWith(
+      '[octo-docs] legacy_home_space_token_accepted',
+      { credentialKind: 'ppt_ticket' },
+    )
+    expect(JSON.stringify(warn.mock.calls)).not.toContain('u_legacy')
+    warn.mockRestore()
   })
 
   it('cross-audience replay is rejected: a relay token is not a valid ticket (and vice versa)', () => {

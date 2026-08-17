@@ -7,6 +7,7 @@ import { resolveRole } from '../permission/resolveRole.js'
 import { roleAtLeast, type ResolvedRole, type Role } from '../permission/role.js'
 import { resolveEffectiveRole } from '../permission/resolveEffectiveRole.js'
 import type { DocSpaceScope } from './middleware/docSpaceScope.js'
+import { requireVerifiedHumanHomeSpace } from './middleware/docSpaceScope.js'
 
 export interface DocGuard {
   meta: DocMeta
@@ -78,10 +79,10 @@ export async function requireDocRole(
     res.status(404).json({ error: 'not_found' })
     return null
   }
-  // Bot keeps the same-space isolation (checked before role/status so a
-  // cross-space doc is indistinguishable from a missing one). Human locates by
-  // docId and skips this gate entirely.
-  if (scope.mode === 'bot' && !requireSameSpace(res, meta, scope.spaceId)) {
+  // Locate by docId first, then enforce the mount-specific trusted Space.
+  if (scope.mode === 'bot') {
+    if (!requireSameSpace(res, meta, scope.spaceId)) return null
+  } else if (!(await requireVerifiedHumanHomeSpace(req, res, meta))) {
     return null
   }
   const direct = await resolveRole(uid, docId)

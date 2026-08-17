@@ -107,3 +107,46 @@ describe('HttpOctoIdentity.verifyToken — owned_bots parsing', () => {
     expect(await identity.verifyToken('tok')).toBeNull()
   })
 })
+
+
+describe('HttpOctoIdentity.isSpaceMember — fail-closed observability', () => {
+  it('returns a confirmed false without emitting a dependency-error event', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    vi.stubGlobal('fetch', vi.fn(async () =>
+      okVerifyResponse({ uid: 'u_h', context_included: true, spaces: ['s_other'] }),
+    ))
+    const identity = new HttpOctoIdentity('http://octo.test')
+    expect(await identity.isSpaceMember('u_h', 's_1', 'tok')).toBe(false)
+    expect(warn).not.toHaveBeenCalled()
+    warn.mockRestore()
+  })
+
+  it('logs a sanitized structured event and returns false on transport failure', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('secret transport detail') }))
+    const identity = new HttpOctoIdentity('http://octo.test')
+    expect(await identity.isSpaceMember('u_h', 's_1', 'sensitive-token')).toBe(false)
+    expect(warn).toHaveBeenCalledWith(
+      '[octo-docs] space_membership_verify_error',
+      { reason: 'transport_error', error: 'Error' },
+    )
+    const rendered = JSON.stringify(warn.mock.calls)
+    expect(rendered).not.toContain('sensitive-token')
+    expect(rendered).not.toContain('u_h')
+    expect(rendered).not.toContain('s_1')
+    expect(rendered).not.toContain('secret transport detail')
+    warn.mockRestore()
+  })
+
+  it('logs status-only diagnostics and returns false on a non-OK response', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, status: 503 }) as Response))
+    const identity = new HttpOctoIdentity('http://octo.test')
+    expect(await identity.isSpaceMember('u_h', 's_1', 'tok')).toBe(false)
+    expect(warn).toHaveBeenCalledWith(
+      '[octo-docs] space_membership_verify_error',
+      { reason: 'non_ok_response', status: 503 },
+    )
+    warn.mockRestore()
+  })
+})

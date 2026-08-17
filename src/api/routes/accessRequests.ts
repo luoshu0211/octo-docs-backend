@@ -26,6 +26,7 @@ import {
   REQUEST_STATUS_DENIED,
 } from '../../db/repos/docAccessRequestRepo.js'
 import { requireDocRole, requireSameSpace } from '../guard.js'
+import { requireVerifiedHumanHomeSpace } from '../middleware/docSpaceScope.js'
 import { resolveRole } from '../../permission/resolveRole.js'
 import { grantRequestWithBots } from '../services/grantRequestWithBots.js'
 import { logBotGrantSummary } from '../services/botGrantAudit.js'
@@ -107,6 +108,7 @@ accessRequestsRouter.post('/:docId/access-requests', async (req: Request, res: R
   if (scope.mode === 'bot' && !requireSameSpace(res, meta, scope.spaceId)) {
     return
   }
+  if (scope.mode === 'human' && !(await requireVerifiedHumanHomeSpace(req, res, meta))) return
   if (meta.status === 2) {
     res.status(409).json({ error: 'conflict' })
     return

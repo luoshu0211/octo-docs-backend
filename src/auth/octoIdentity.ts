@@ -542,24 +542,47 @@ export class HttpOctoIdentity implements OctoIdentity {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ token }),
       })
-    } catch {
+    } catch (err) {
       // Authoritative source unreachable => cannot confirm => fail-closed.
+      this.warnMembershipVerificationFailure('transport_error', {
+        error: err instanceof Error ? err.name : 'unknown',
+      })
       return null
     }
-    if (!res.ok) return null
+    if (!res.ok) {
+      this.warnMembershipVerificationFailure('non_ok_response', { status: res.status })
+      return null
+    }
     const body = (await res.json().catch(() => null)) as
       | { uid?: unknown; context_included?: unknown; spaces?: unknown }
       | null
-    if (!body) return null
+    if (!body) {
+      this.warnMembershipVerificationFailure('malformed_response')
+      return null
+    }
     // Defense-in-depth on the "token holder only" boundary: verify answers for
     // the TOKEN holder, so the uid it resolves must be the uid we are checking.
     // A mismatch (token/uid disagree) can never be a confirmable membership.
-    if (typeof body.uid !== 'string' || body.uid !== uid) return null
+    if (typeof body.uid !== 'string' || body.uid !== uid) {
+      this.warnMembershipVerificationFailure('uid_mismatch')
+      return null
+    }
     // The context fields are opt-in: a pre-context octo-server omits
     // context_included/spaces entirely. Without them we cannot confirm
     // membership => fail-closed (never treat an absent list as "zero spaces").
-    if (body.context_included !== true || !Array.isArray(body.spaces)) return null
+    if (body.context_included !== true || !Array.isArray(body.spaces)) {
+      this.warnMembershipVerificationFailure('context_missing')
+      return null
+    }
     return body.spaces.includes(spaceId)
+  }
+
+  private warnMembershipVerificationFailure(reason: string, details: Record<string, unknown> = {}): void {
+    // Structured event name doubles as a log-derived metric in deployments that
+    // do not yet expose a native metrics registry. Deliberately excludes tokens,
+    // uid, Space id, and the configured identity-service URL.
+    // eslint-disable-next-line no-console
+    console.warn('[octo-docs] space_membership_verify_error', { reason, ...details })
   }
 }
 

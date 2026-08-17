@@ -54,6 +54,8 @@ export interface PptCollabClaims {
    * caller's octo session token on the socket. Fail-closed: absent => false.
    */
   space_member?: boolean
+  /** Temporary hotfix proof: issuance verified the Human current Space equals the deck home Space. */
+  home_space_verified?: boolean
   /** JWT expiry seconds since epoch, present on verified JWTs. */
   exp?: number
 }
@@ -99,6 +101,8 @@ export interface IssuePptCollabInput {
   name?: string
   /** Caller's space-membership at issuance (fold-in for share-derived re-resolve). */
   spaceMember?: boolean
+  /** Required proof produced only after the temporary Human home-Space gate succeeds. */
+  homeSpaceVerified: true
 }
 
 /**
@@ -117,6 +121,7 @@ export function issuePptCollabToken(input: IssuePptCollabInput): PptCollabTokenR
     permission_epoch: input.permission_epoch,
     ...(name !== undefined ? { name } : {}),
     ...(input.spaceMember !== undefined ? { space_member: input.spaceMember } : {}),
+    home_space_verified: input.homeSpaceVerified,
   }
 
   const tokenTtl = config.collabToken.ttlSeconds
@@ -155,7 +160,18 @@ function parseClaims(decoded: unknown): PptCollabClaims & { jti?: string } {
     throw new Error('invalid ppt collab token payload')
   }
   const d = decoded as Record<string, unknown>
-  const { uid, docId, documentName, role, permission_epoch: epoch, name, jti, space_member: spaceMember, exp } = d
+  const {
+    uid,
+    docId,
+    documentName,
+    role,
+    permission_epoch: epoch,
+    name,
+    jti,
+    space_member: spaceMember,
+    home_space_verified: homeSpaceVerified,
+    exp,
+  } = d
   if (
     typeof uid !== 'string' ||
     typeof docId !== 'string' ||
@@ -173,6 +189,7 @@ function parseClaims(decoded: unknown): PptCollabClaims & { jti?: string } {
     permission_epoch: epoch,
     ...(typeof name === 'string' && name !== '' ? { name } : {}),
     ...(typeof spaceMember === 'boolean' ? { space_member: spaceMember } : {}),
+    ...(homeSpaceVerified === true ? { home_space_verified: true } : {}),
     ...(typeof jti === 'string' ? { jti } : {}),
     ...(typeof exp === 'number' ? { exp } : {}),
   }
@@ -184,7 +201,15 @@ export function verifyPptRelayToken(token: string): PptCollabClaims {
     algorithms: ['HS256'],
     audience: PPT_RELAY_AUD,
   })
-  return parseClaims(decoded)
+  const claims = parseClaims(decoded)
+  if (claims.home_space_verified !== true) {
+    if (!config.collabToken.allowLegacyWithoutHomeSpaceProof) {
+      throw new Error('ppt relay token missing verified home-space proof')
+    }
+    // eslint-disable-next-line no-console
+    console.warn('[octo-docs] legacy_home_space_token_accepted', { credentialKind: 'ppt_relay' })
+  }
+  return claims
 }
 
 /**
@@ -200,6 +225,13 @@ export function verifyPptRelayTicket(ticket: string): PptCollabClaims & { jti: s
   const claims = parseClaims(decoded)
   if (typeof claims.jti !== 'string' || claims.jti === '') {
     throw new Error('ppt relay ticket missing jti')
+  }
+  if (claims.home_space_verified !== true) {
+    if (!config.collabToken.allowLegacyWithoutHomeSpaceProof) {
+      throw new Error('ppt relay ticket missing verified home-space proof')
+    }
+    // eslint-disable-next-line no-console
+    console.warn('[octo-docs] legacy_home_space_token_accepted', { credentialKind: 'ppt_ticket' })
   }
   return claims as PptCollabClaims & { jti: string }
 }

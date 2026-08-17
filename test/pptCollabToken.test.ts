@@ -146,7 +146,7 @@ beforeEach(() => {
     stub({
       verifyToken: async (t: string) => (t ? { uid: 'u_writer' } : null),
       getUser: async (uid: string) => ({ uid, name: 'Ada Writer', avatar: '' }),
-      isSpaceMember: async () => false,
+      isSpaceMember: async () => true,
     }),
   )
 })
@@ -213,6 +213,24 @@ describe('POST /api/v1/ppt/docs/collab-token (§7.1)', () => {
   })
 
   describe('PPT-TOKEN-002: rejection statuses', () => {
+    it('a Human direct writer still requires active Space membership before the internal role fast path', async () => {
+      seedDoc()
+      currentMemberRole = 'writer'
+      const isSpaceMember = vi.fn(async () => false)
+      setOctoIdentity(stub({
+        verifyToken: async () => ({ uid: 'u_writer' }),
+        isSpaceMember,
+      }))
+      const { base, close } = await listen(makeApp())
+      try {
+        const res = await post(base, { docId: 'd_ppt1' })
+        expect(res.status).toBe(404)
+        expect(isSpaceMember).toHaveBeenCalledWith('u_writer', 's_1', 'user-tok')
+      } finally {
+        await close()
+      }
+    })
+
     it('no-role user → 403 FORBIDDEN', async () => {
       seedDoc() // caller u_writer is neither owner nor member
       currentMemberRole = undefined

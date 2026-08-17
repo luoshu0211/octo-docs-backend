@@ -83,7 +83,8 @@ async function run(opts: {
   scope?: DocSpaceScope
   octoToken?: string
 }) {
-  vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(meta(opts.metaOver) as never)
+  const loadedMeta = meta(opts.metaOver)
+  vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(loadedMeta as never)
   const dr = opts.directRole ?? 'none'
   vi.mocked(docMemberRepo.getRole).mockResolvedValue((dr === 'none' ? null : dr) as never)
   const res = mockRes()
@@ -91,6 +92,10 @@ async function run(opts: {
     uid: opts.uid,
     octoToken: opts.octoToken,
     docSpaceScope: opts.scope ?? { mode: 'human' as const },
+    ...(opts.scope?.mode === 'bot' ? {} : {
+      viewerSpaceId: loadedMeta.space_id,
+      verifiedViewerSpaceId: loadedMeta.space_id,
+    }),
   }
   const guard = await requireDocRole(req as never, res as never, DOC, opts.minRole)
   return { res, guard }

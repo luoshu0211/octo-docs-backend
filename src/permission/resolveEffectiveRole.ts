@@ -102,19 +102,19 @@ export async function resolveEffectiveRoleWithMembership(
     member = caller.isBot
       ? true
       : await getOctoIdentity().isSpaceMember(uid, meta.space_id, caller.token ?? '')
-  } catch (err) {
+  } catch {
     // Fail-closed, SCOPED to the relay ticket path: a lookup error never widens
     // access, and the SAME false drives both the role and the token claim so they
     // stay consistent (a ticket must carry a concrete, signable boolean; a throw
     // here would break issuance/reauth instead of degrading gracefully). The
     // legacy `resolveEffectiveRole` below does NOT swallow — it lets the error
-    // propagate as at merge-base. Logged so the swallow is never silent
-    // (XIN-1825 P1-3).
+    // propagate as at merge-base. The event intentionally omits identifiers and
+    // raw error details while keeping the swallowed failure operator-visible.
     // eslint-disable-next-line no-console
-    console.warn(
-      `[permission] isSpaceMember lookup failed (uid=${uid} space=${meta.space_id}); relay ticket path failing closed to non-member`,
-      err,
-    )
+    console.warn('[octo-docs] space_membership_verify_error', {
+      reason: 'identity_call_threw',
+      path: 'ppt_relay',
+    })
     member = false
   }
   return { role: effectiveRole(direct, member, meta.share_scope, meta.share_role), spaceMember: member }

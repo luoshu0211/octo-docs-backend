@@ -412,6 +412,15 @@ export const config = {
     // out into a standalone config PR a deploy owner reviews (XIN-1825 P1-1).
     secret: str('COLLAB_TOKEN_SECRET', DEV_SIGNING_SECRET),
     ttlSeconds: num('COLLAB_TOKEN_TTL_SECONDS', 300),
+    // Two-stage rollout switch for the home-Space proof claim. New issuers stamp
+    // the proof regardless of this value. Enable only while draining tokens
+    // minted by pre-hotfix instances, then disable after every old issuer is gone
+    // plus at least one full token TTL. Strict-by-default prevents an accidental
+    // permanent compatibility window.
+    allowLegacyWithoutHomeSpaceProof: strictBool(
+      'COLLAB_ALLOW_LEGACY_TOKENS_WITHOUT_HOME_SPACE_PROOF',
+      false,
+    ),
     // Public, browser-reachable collab WS origin surfaced to clients as
     // `collabWsUrl` in the collab-token response (§4.4). Absolute ws://|wss://
     // only (WS runs on its own :1234 origin, not reverse-proxied). REQUIRED in

@@ -41,13 +41,33 @@ describe('resolveEffectiveRole fail-closed scope (XIN-1825 P1-3)', () => {
     warnSpy.mockRestore()
   })
 
-  it('the relay ticket path fails CLOSED to non-member and LOGS on an isSpaceMember throw', async () => {
-    withThrowingMembership()
-    const out = await resolveEffectiveRoleWithMembership('u_m', 'none', anyoneEdit, { token: 't' })
+  it('the relay ticket path fails CLOSED and logs only a sanitized event on an isSpaceMember throw', async () => {
+    const uid = 'uid-sensitive'
+    const spaceId = 'space-sensitive'
+    const token = 'token-sensitive'
+    const rawError = 'identity service unavailable at https://identity.internal.example'
+    setOctoIdentity({
+      isSpaceMember: async () => {
+        throw new Error(rawError)
+      },
+    } as never)
+
+    const out = await resolveEffectiveRoleWithMembership(
+      uid,
+      'none',
+      { ...anyoneEdit, space_id: spaceId },
+      { token },
+    )
     expect(out).toEqual({ role: 'none', spaceMember: false })
-    // The swallow is no longer silent — the failure is surfaced to operators.
-    expect(warnSpy).toHaveBeenCalled()
-    expect(String(warnSpy.mock.calls[0]?.[0] ?? '')).toContain('isSpaceMember lookup failed')
+    expect(warnSpy).toHaveBeenCalledWith('[octo-docs] space_membership_verify_error', {
+      reason: 'identity_call_threw',
+      path: 'ppt_relay',
+    })
+
+    const serializedLog = JSON.stringify(warnSpy.mock.calls)
+    for (const secret of [uid, spaceId, token, rawError, 'identity.internal.example']) {
+      expect(serializedLog).not.toContain(secret)
+    }
   })
 
   it('the legacy write-path resolver PROPAGATES an isSpaceMember throw (no silent 403 degrade)', async () => {

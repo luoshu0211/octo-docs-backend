@@ -57,15 +57,15 @@ beforeEach(() => {
 })
 
 describe('issueCollabToken — space-scoped share (#64)', () => {
-  it('restricted doc: non-member gets 403 and isSpaceMember is NEVER called (zero new IO)', async () => {
+  it('restricted doc: a verified home-Space member without a direct role gets 403', async () => {
     asUser('u_x', true)
     vi.mocked(docMetaRepo.getByDocumentName).mockResolvedValue(docMeta())
     vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(docMeta())
     vi.mocked(docMemberRepo.getRole).mockResolvedValue(null as never)
-    const out = await issueCollabToken('tok', DOC_KEY)
+    const out = await issueCollabToken('tok', DOC_KEY, SPACE)
     expect(out.ok).toBe(false)
     if (!out.ok) expect(out.status).toBe(403)
-    expect(memberCalls).toBe(0)
+    expect(memberCalls).toBe(1)
   })
 
   it('anyone_in_space/edit: a space member with no doc_member gets a writer token + space_member claim', async () => {
@@ -74,7 +74,7 @@ describe('issueCollabToken — space-scoped share (#64)', () => {
     vi.mocked(docMetaRepo.getByDocumentName).mockResolvedValue(m)
     vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(m)
     vi.mocked(docMemberRepo.getRole).mockResolvedValue(null as never)
-    const out = await issueCollabToken('tok', DOC_KEY)
+    const out = await issueCollabToken('tok', DOC_KEY, SPACE)
     expect(out.ok).toBe(true)
     if (out.ok) {
       expect(out.result.role).toBe('writer')
@@ -91,7 +91,7 @@ describe('issueCollabToken — space-scoped share (#64)', () => {
     vi.mocked(docMetaRepo.getByDocumentName).mockResolvedValue(m)
     vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(m)
     vi.mocked(docMemberRepo.getRole).mockResolvedValue(null as never)
-    const out = await issueCollabToken('tok', DOC_KEY)
+    const out = await issueCollabToken('tok', DOC_KEY, SPACE)
     expect(out.ok && out.result.role).toBe('reader')
   })
 
@@ -104,19 +104,18 @@ describe('issueCollabToken — space-scoped share (#64)', () => {
     vi.mocked(docMetaRepo.getByDocumentName).mockResolvedValue(m)
     vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(m)
     vi.mocked(docMemberRepo.getRole).mockResolvedValue(null as never)
-    const out = await issueCollabToken('tok', DOC_KEY)
+    const out = await issueCollabToken('tok', DOC_KEY, SPACE)
     expect(out.ok).toBe(false)
     if (!out.ok) expect(out.status).toBe(403)
   })
 
-  it('owner on an anyone_in_space doc stays admin and carries no space_member claim if not a member', async () => {
+  it('owner is denied when current home-Space membership cannot be verified', async () => {
     asUser('u_owner', false)
     const m = docMeta({ share_scope: 1, share_role: 2 })
     vi.mocked(docMetaRepo.getByDocumentName).mockResolvedValue(m)
     vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(m)
-    const out = await issueCollabToken('tok', DOC_KEY)
-    expect(out.ok && out.result.role).toBe('admin')
-    if (out.ok) expect(verifyCollabToken(out.result.token).space_member).toBeUndefined()
+    const out = await issueCollabToken('tok', DOC_KEY, SPACE)
+    expect(out).toEqual({ ok: false, status: 403, error: 'forbidden' })
   })
 
   it('O1: a token minted without the space_member claim verifies and reports false', () => {

@@ -30,6 +30,8 @@ export interface RecordRecentViewInput {
   viewerSpaceId?: string
   /** Human session token, used to confirm viewer-Space membership. */
   token?: string
+  /** Request-local proof produced by the mandatory Human home-Space gate. */
+  verifiedViewerSpaceId?: string
 }
 
 async function writeRow(uid: string, docId: string, spaceId: string): Promise<Date> {
@@ -53,9 +55,8 @@ export async function recordVerifiedRecentView(input: RecordRecentViewInput): Pr
     // record history there — otherwise skip (no home-Space fallback, §7.1).
     const viewerSpaceId = typeof input.viewerSpaceId === 'string' ? input.viewerSpaceId.trim() : ''
     if (viewerSpaceId === '') return null
-    const member = await getOctoIdentity()
-      .isSpaceMember(uid, viewerSpaceId, input.token ?? '')
-      .catch(() => false)
+    const member = input.verifiedViewerSpaceId === viewerSpaceId
+      || await getOctoIdentity().isSpaceMember(uid, viewerSpaceId, input.token ?? '').catch(() => false)
     if (!member) return null
     return await writeRow(uid, docId, viewerSpaceId)
   } catch {

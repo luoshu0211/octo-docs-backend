@@ -15,6 +15,7 @@ import { currentEpoch } from '../permission/epoch.js'
 import { recheckCurrentRoleCached } from '../permission/recheck.js'
 import { parseDocumentName } from '../permission/documentName.js'
 import type { Role } from '../permission/role.js'
+import { config } from '../config/env.js'
 
 /**
  * Auth rejection carrying the WS close-code semantics (§8.2). Hocuspocus reads
@@ -76,6 +77,21 @@ export async function authenticate(data: AuthInput): Promise<AuthContext> {
 
   // 2. token.documentName must match the connection documentName (anti-misuse).
   if (claims.documentName !== documentName) throw forbidden() // 4403
+  // Every post-hotfix issuer stamps proof that it verified current Space ==
+  // canonical home Space. During the explicitly configured rollout window only,
+  // accept still-unexpired pre-hotfix tokens so old issuers and new validators
+  // can overlap without a reconnect loop. Old tokens of EVERY role/scope lack
+  // this proof; remove the compatibility flag only after all old issuers are
+  // gone plus at least one full COLLAB_TOKEN_TTL_SECONDS interval.
+  if (claims.home_space_verified !== true) {
+    if (!config.collabToken.allowLegacyWithoutHomeSpaceProof) throw forbidden()
+    // Stable, non-secret event for rollout monitoring. A non-zero count means an
+    // old issuer or still-live old credential remains, so phase 2 is not ready.
+    // eslint-disable-next-line no-console
+    console.warn('[octo-docs] legacy_home_space_token_accepted', {
+      credentialKind: claims.ver === 2 ? 'collab_v2' : 'collab_v1',
+    })
+  }
 
   // 3. permission_epoch check (§4.5). MUST await — number < Promise is always
   //    false and the stale branch would never run (P1-C).

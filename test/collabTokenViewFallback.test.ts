@@ -85,16 +85,16 @@ describe('issueCollabToken — verified-or-skip recent-view ingest (remove-sp §
     expect(typeof arg.retainDays).toBe('number')
   })
 
-  it('SKIPS the write when NO viewer Space is supplied (no home-Space fallback, §7.1)', async () => {
+  it('records under the required verified home Space', async () => {
     asUser('u_doc', true)
     vi.mocked(docMetaRepo.getByDocumentName).mockResolvedValue(docMeta('owner_z'))
     vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(docMeta('owner_z'))
     vi.mocked(docMemberRepo.getRole).mockResolvedValue('reader')
 
-    const out = await issueCollabToken('octo_session_doc', DOC_KEY) // no viewerSpaceId
+    const out = await issueCollabToken('octo_session_doc', DOC_KEY, SPACE) // no viewerSpaceId
     expect(out.ok).toBe(true)
     await new Promise((r) => setImmediate(r))
-    expect(docViewHistoryRepo.upsertViewWithPrune).not.toHaveBeenCalled()
+    expect(docViewHistoryRepo.upsertViewWithPrune).toHaveBeenCalledTimes(1)
   })
 
   it('SKIPS the write when the caller is NOT a member of the supplied viewer Space', async () => {
@@ -104,8 +104,7 @@ describe('issueCollabToken — verified-or-skip recent-view ingest (remove-sp §
     vi.mocked(docMemberRepo.getRole).mockResolvedValue('reader')
 
     const out = await issueCollabToken('octo_session_doc', DOC_KEY, SPACE)
-    expect(out.ok).toBe(true)
-    await new Promise((r) => setImmediate(r))
+    expect(out).toEqual({ ok: false, status: 403, error: 'forbidden' })
     expect(docViewHistoryRepo.upsertViewWithPrune).not.toHaveBeenCalled()
   })
 
