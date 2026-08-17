@@ -14,6 +14,8 @@ describe('commenter collab authentication', () => {
       documentName: 'octo:s1:f1:d1',
       role: 'commenter',
       permission_epoch: 7,
+      space_member: true,
+      home_space_verified: true,
     })
   })
 

@@ -72,6 +72,7 @@ Copy `.env.example` to `.env` and adjust. Summary:
 | `MYSQL_*` | authoritative store connection | §3.4 |
 | `REDIS_*` (incl. `REDIS_PREFIX`) | broadcast bus / cache / registry | §5 |
 | `COLLAB_TOKEN_SECRET` / `COLLAB_TOKEN_TTL_SECONDS` | collab JWT signing + TTL (5 min) | §4.4 |
+| `COLLAB_ALLOW_LEGACY_TOKENS_WITHOUT_HOME_SPACE_PROOF` | temporary rollout compatibility for pre-hotfix collab tokens; strict by default | §4.4 / deployment guide |
 | `OCTO_IDENTITY_MODE` (`http`/`middleware`) / `OCTO_SERVER_BASE_URL` | octo identity integration | §4.7 |
 | `OCTO_SERVER_TOKEN` | service token for octo-server lookups on the human path (optional). The bot path (`/v1/bot/docs`) resolves the anti ghost-member existence check via the bot's own token against the bot user-info route, so this service token is no longer required for bot member-add or forward-grant | §4.7 / v4.3 bot API |
 | `MAX_DOC_BYTES` | single-doc size hard cap (~10MB) | §9.5 |

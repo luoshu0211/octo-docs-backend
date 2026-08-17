@@ -27,6 +27,69 @@ function numMin(name: string, fallback: number, min: number): number {
   return Math.max(min, n)
 }
 
+/**
+ * Strict TCP-port parser for variables where a typo must NOT silently fall back
+ * to "feature off". `num()` accepts `-9090` (and `0x2382` / `9.09e3` / `+9090`,
+ * which all coerce to a plausible-looking number), any of which would leave a
+ * `> 0` gate false — or bind a port the operator never wrote — while they believe
+ * the feature is configured as typed.
+ *
+ * Accepts ONLY a plain decimal integer: the sentinel `0` (explicitly disabled)
+ * or `1..65535`. Digits are matched with `/^\d+$/` before any numeric coercion,
+ * so hex, exponent and sign forms are rejected rather than silently reinterpreted.
+ *
+ * Unset and whitespace-only are treated as "not configured" and return the
+ * fallback, consistent with `str()` / `num()` and with how an env file line like
+ * `INTERNAL_HTTP_PORT=` behaves. That is the one non-strict case, and it is
+ * documented as such everywhere it is described.
+ *
+ * Exported (like parseTrustProxy) so the rule is unit-testable without importing
+ * the whole config module under a mutated environment.
+ */
+export function parseTcpPort(name: string, raw: string | undefined, fallback: number): number {
+  if (raw === undefined || raw.trim() === '') return fallback
+  const trimmed = raw.trim()
+  if (!/^\d+$/.test(trimmed)) {
+    throw new Error(
+      `Env var ${name} must be a plain decimal 0 (disabled) or a TCP port in 1..65535, got: ${JSON.stringify(raw)} (refusing to run)`,
+    )
+  }
+  const n = Number(trimmed)
+  if (n > 65535) {
+    throw new Error(
+      `Env var ${name} must be 0 (disabled) or a TCP port in 1..65535, got: ${JSON.stringify(raw)} (refusing to run)`,
+    )
+  }
+  return n
+}
+
+function numPort(name: string, fallback: number): number {
+  return parseTcpPort(name, process.env[name], fallback)
+}
+
+function pptRelayReplaySlots(): number {
+  const mysqlLimit = numMin('MYSQL_CONNECTION_LIMIT', 10, 1)
+  const fallback = Math.max(1, Math.min(2, Math.floor(mysqlLimit / 4)))
+  const requested = numMin('PPT_RELAY_MAX_IN_FLIGHT_REPLAYS', fallback, 1)
+  // Replay slots MUST stay below the pool size so a saturated replay set cannot
+  // starve the pool of the connection an append/snapshot needs. Previously an
+  // out-of-range value THREW at config load — a boot-trap: the default is
+  // derived from MYSQL_CONNECTION_LIMIT, so a small pool (e.g. the .env.example
+  // MYSQL_CONNECTION_LIMIT=1 or a hardcoded PPT_RELAY_MAX_IN_FLIGHT_REPLAYS) made
+  // the whole process fail to start. Clamp to `mysqlLimit - 1` (min 1) and warn
+  // instead, so a misconfiguration degrades replay concurrency rather than
+  // refusing to boot (XIN-1736 P2-e).
+  const ceiling = Math.max(1, mysqlLimit - 1)
+  if (requested > ceiling) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[config] PPT_RELAY_MAX_IN_FLIGHT_REPLAYS (${requested}) must stay below MYSQL_CONNECTION_LIMIT (${mysqlLimit}); clamping to ${ceiling}`,
+    )
+    return ceiling
+  }
+  return requested
+}
+
 function bool(name: string, fallback: boolean): boolean {
   const v = process.env[name]
   if (v === undefined || v === '') return fallback
@@ -88,7 +151,7 @@ export function parseTrustProxy(raw: string): boolean | number | string {
   return v
 }
 
-/** Dev-only fallback secret; must never reach production (see requireSafeSigningSecret). */
+/** Dev-only fallback secret; must never reach production. */
 const DEV_SIGNING_SECRET = 'dev-only-change-me'
 
 /**
@@ -123,17 +186,17 @@ export function requireSafeSigningSecret(secret: string): string {
  * test suite still boot without the var. Returns '' to mean "omit the field";
  * callers must not emit an empty or malformed URL.
  */
-export function resolveCollabPublicWsUrl(raw: string): string {
+export function resolveCollabPublicWsUrl(raw: string, varName = 'COLLAB_TOKEN_PUBLIC_WS_URL'): string {
   const value = raw.trim()
   if (value === '') {
     if (process.env.NODE_ENV === 'production') {
       throw new Error(
-        'COLLAB_TOKEN_PUBLIC_WS_URL must be set in production (refusing to run: clients cannot reach the collab WS without it)',
+        `${varName} must be set in production (refusing to run: clients cannot reach the collab WS without it)`,
       )
     }
     // eslint-disable-next-line no-console
     console.warn(
-      '[config] COLLAB_TOKEN_PUBLIC_WS_URL is not set; collab-token responses will omit collabWsUrl. ' +
+      `[config] ${varName} is not set; collab-token responses will omit the public WS URL. ` +
         'This is fatal in production — set an absolute ws:// or wss:// URL there.',
     )
     return ''
@@ -141,13 +204,13 @@ export function resolveCollabPublicWsUrl(raw: string): string {
   if (!/^wss?:\/\//i.test(value)) {
     if (process.env.NODE_ENV === 'production') {
       throw new Error(
-        `COLLAB_TOKEN_PUBLIC_WS_URL must be an absolute ws:// or wss:// URL, got: ${value} (refusing to run)`,
+        `${varName} must be an absolute ws:// or wss:// URL, got: ${value} (refusing to run)`,
       )
     }
     // eslint-disable-next-line no-console
     console.warn(
-      `[config] COLLAB_TOKEN_PUBLIC_WS_URL must be an absolute ws:// or wss:// URL, got: ${value}. ` +
-        'Ignoring it; collabWsUrl will be omitted. This is fatal in production.',
+      `[config] ${varName} must be an absolute ws:// or wss:// URL, got: ${value}. ` +
+        'Ignoring it; the public WS URL will be omitted. This is fatal in production.',
     )
     return ''
   }
@@ -178,10 +241,71 @@ export function resolveCardDisplayTimeZone(raw: string): string {
   return value
 }
 
+/**
+ * Master on/off switch for the R4-B1 PPT collab relay (default OFF), read ONCE
+ * here so it can gate both the `relay.enabled` value AND the production
+ * validation of the relay's own env (e.g. PPT_RELAY_PUBLIC_WS_URL) — a disabled
+ * relay must be truly inert at boot, never fail startup for a knob it will not
+ * consult (XIN-1825 P1-2). `strictBool` so an operator typo fails startup loudly.
+ */
+const PPT_RELAY_ENABLED = strictBool('PPT_RELAY_ENABLED', false)
+
 export const config = {
   hostname: str('HOSTNAME', 'octo-docs-local'),
   hocuspocusPort: num('HOCUSPOCUS_PORT', 1234),
   httpPort: num('HTTP_PORT', 3000),
+
+  // Second, INTERNAL-ONLY HTTP listener (service-to-service surface split).
+  //
+  // 0 (the default) = disabled: one listener serves every surface exactly as
+  // before, so an existing deployment that does not set this variable is
+  // bit-for-bit unchanged. Set it (conventionally 9090) and the process binds a
+  // SECOND port that serves ONLY `/internal/html` — the html service registering
+  // published docs with the shared internal token, whose caller is always inside
+  // our own network — while `httpPort` keeps serving every route that has an
+  // out-of-network caller: `/api/v1/docs`, `/api/v1/ppt`, the signed attachment
+  // blob gateway, `/v1/bot/docs` (published through the public gateway today, and
+  // its bot-token clients are not all in-network) and the HMAC card-action
+  // callback (octo-server may live off our network). Each surface 404s the
+  // other's routes.
+  //
+  // The internal port MUST NOT be published to the host (compose: `expose`, never
+  // `ports:`) and MUST NOT appear in any nginx upstream — that network
+  // unreachability is the whole point. It is a reduction of attack surface, NOT a
+  // trust boundary: the internal token check stays exactly as strict on this port,
+  // because anything already inside the network (a compromised sibling container)
+  // can still reach it.
+  //
+  // Parsed with numPort (not num) so an operator typo cannot silently change the
+  // split's state: -9090 / 70000 / nope / 0x2382 / 9.09e3 abort boot instead of
+  // quietly disabling it or binding a port that was never written. Unset and
+  // whitespace-only mean "not configured" and keep the documented default (0 =
+  // disabled), matching how every other optional var in this file behaves.
+  internalHttpPort: numPort('INTERNAL_HTTP_PORT', 0),
+
+  // Bind address for the internal listener. Defaults to all interfaces, which is
+  // correct on a compose/k8s bridge network where the port is never published (the
+  // container IP is only reachable in-network). Set it to 127.0.0.1 when the
+  // process runs with `network_mode: host`, on bare metal, or on macvlan — there
+  // 0.0.0.0 makes the internal port immediately host-reachable and the isolation
+  // is gone.
+  internalHttpHost: str('INTERNAL_HTTP_HOST', '0.0.0.0'),
+
+  // Express `trust proxy` value for the INTERNAL listener only. The internal port
+  // is not fronted by nginx, so it defaults to `false` (see app.ts): honouring
+  // X-Forwarded-For there would let any in-network caller spoof its source IP and
+  // evade the per-IP rate limiter. Set it only when the internal port really is
+  // behind a proxy that rewrites the client address (a service-mesh sidecar) —
+  // otherwise every caller collapses onto one limiter key. Accepts the same forms
+  // as TRUST_PROXY.
+  //
+  // `undefined` (unset) is distinct from any parsed value and is what lets app.ts
+  // apply its own `false` default: parseTrustProxy('') returns 1, which would
+  // silently trust one hop on a port that has none.
+  internalTrustProxy:
+    str('INTERNAL_TRUST_PROXY', '').trim() === ''
+      ? undefined
+      : parseTrustProxy(str('INTERNAL_TRUST_PROXY', '')),
 
   // Express `trust proxy` value. The REST API sits behind nginx, so this must be
   // set for req.ip (and thus the per-IP rate limiter) to see the real client
@@ -281,8 +405,22 @@ export const config = {
   },
 
   collabToken: {
-    secret: str('COLLAB_TOKEN_SECRET', 'dev-only-change-me'),
+    // COLLAB_TOKEN_SECRET is read verbatim (dev default outside prod). A
+    // production strength gate (non-dev-default + a minimum byte length) is a
+    // SERVICE-WIDE config hardening that fails startup for every document type,
+    // so it does not belong on this default-off PPT feature branch; it is split
+    // out into a standalone config PR a deploy owner reviews (XIN-1825 P1-1).
+    secret: str('COLLAB_TOKEN_SECRET', DEV_SIGNING_SECRET),
     ttlSeconds: num('COLLAB_TOKEN_TTL_SECONDS', 300),
+    // Two-stage rollout switch for the home-Space proof claim. New issuers stamp
+    // the proof regardless of this value. Enable only while draining tokens
+    // minted by pre-hotfix instances, then disable after every old issuer is gone
+    // plus at least one full token TTL. Strict-by-default prevents an accidental
+    // permanent compatibility window.
+    allowLegacyWithoutHomeSpaceProof: strictBool(
+      'COLLAB_ALLOW_LEGACY_TOKENS_WITHOUT_HOME_SPACE_PROOF',
+      false,
+    ),
     // Public, browser-reachable collab WS origin surfaced to clients as
     // `collabWsUrl` in the collab-token response (§4.4). Absolute ws://|wss://
     // only (WS runs on its own :1234 origin, not reverse-proxied). REQUIRED in
@@ -307,13 +445,19 @@ export const config = {
   // links (the `shareUrl` field on doc lifecycle responses). A caller — a bot
   // via octo-cli, the OpenClaw octo plugin, or any integration — can pass this
   // URL straight through to chat instead of hand-assembling a link (which
-  // produced broken links). The minted URL mirrors octo-web's authoritative
-  // buildDocLink: `<webOrigin>/d/<docId>?sp=<spaceId>`. Set it to the origin the
-  // end-user browser loads octo-web from, e.g. `http://192.168.214.189:3010`.
-  // Empty (default) safely degrades: shareUrl becomes an origin-relative,
-  // path-only `/d/<docId>?sp=<spaceId>` rather than baking in a wrong host.
+  // produced broken links). Every minted share URL — ordinary docs and PPT decks
+  // alike — mirrors octo-web's authoritative no-Space locator:
+  // `<webOrigin>/d/<docId>`. open-context resolves the canonical home Space when
+  // that bare link opens. Set it to the origin the end-user browser loads
+  // octo-web from, e.g. `http://192.168.214.189:3010`. Empty (default) safely
+  // degrades to origin-relative `/d/<docId>`.
   // See src/util/docShareLink.ts.
   webOrigin: str('OCTO_WEB_ORIGIN', ''),
+
+  htmlRegistration: {
+    // Dedicated service credential; browser session tokens never authorize this entry.
+    token: str('OCTO_DOCS_HTML_REGISTRATION_TOKEN', ''),
+  },
 
   octoIdentity: {
     mode: str('OCTO_IDENTITY_MODE', 'http') as OctoIdentityMode,
@@ -742,5 +886,131 @@ export const config = {
     // frontend refreshes via one bootstrap re-fetch when a URL 403/404s
     // (PPT-ASSET-001), so this is a soft ceiling, not a hard session bound.
     assetUrlTtlSeconds: numMin('PPT_ASSET_URL_TTL_SECONDS', 900, 1),
+
+    // R4-B1 collaboration relay (XIN-1495 §7). The Bento-frame WS relay lives
+    // INSIDE B (attached to the existing REST HTTP server on the
+    // `/api/v1/ppt/collab` upgrade path — owner-locked "no second service"), NOT
+    // the Hocuspocus server and NOT a new deployable. These knobs cover the
+    // collab-token/ticket issuance and the relay's protocol/limit envelope.
+    relay: {
+      // Master on/off switch for the R4-B1 collab relay (default OFF). When false
+      // (the default) the WS relay is NOT attached to the HTTP server and the
+      // collab-token issuance route is NOT mounted, so the `/api/v1/ppt/collab`
+      // endpoint is entirely absent — Half A is inert dead code until Half B lands
+      // the op-metadata trust boundary (server-minted actor binding + per-actor `s`
+      // continuity). This is the single control that keeps the relay's deferred
+      // trust boundary from being reachable in production before it exists (Half A
+      // still enforces the server-only room-relative clock bound; the actor/uid and
+      // per-actor sequence gates are Half B). `strictBool` so an operator typo fails
+      // startup loudly rather than silently turning the endpoint on.
+      enabled: PPT_RELAY_ENABLED,
+      // Bento CRDT sync protocol version the relay speaks (`SYNC_V`). A frame
+      // whose `pv` is missing or != this is refused with `protocol-version`
+      // BEFORE any decode/persist. Mirrors ppt_doc_state.bento_sync_pv. A protocol
+      // version is a positive integer, so it is floored at 1 like the other knobs.
+      protocolVersion: numMin('PPT_RELAY_SYNC_PV', 2, 1),
+      // One-time WS ticket TTL (seconds). The ticket is a single-use handshake
+      // credential carried in `Sec-WebSocket-Protocol` (never a long-lived token
+      // in the URL); short so a leaked/replayed ticket is useless quickly.
+      ticketTtlSeconds: numMin('PPT_RELAY_TICKET_TTL_SECONDS', 30, 1),
+      // Public, browser-reachable relay WS origin surfaced to clients as
+      // `pptWsUrl` in the collab-token response (§7.1). Absolute ws://|wss://
+      // only; REQUIRED in production (unset/malformed is fatal — see
+      // resolveCollabPublicWsUrl) ONLY when the relay is enabled. When the relay
+      // is OFF (the default) its validation is SKIPPED so the disabled default is
+      // truly inert and cannot fail startup for a URL it will never surface
+      // (XIN-1825 P1-2); the raw value is carried through unvalidated but is never
+      // consulted while `enabled` is false.
+      publicWsUrl: PPT_RELAY_ENABLED
+        ? resolveCollabPublicWsUrl(str('PPT_RELAY_PUBLIC_WS_URL', ''), 'PPT_RELAY_PUBLIC_WS_URL')
+        : str('PPT_RELAY_PUBLIC_WS_URL', '').trim(),
+      // Bento default relay limits (§7.3). Starting values ported from Bento's
+      // upstream sync worker; load-test before production. Enforced as hard
+      // refusals: `too-large` (permanent), `rate-limited` (retryable),
+      // `storage-retry` (retryable — transient storage failure), `room-full`
+      // (permanent).
+      maxFrameBytes: numMin('PPT_RELAY_MAX_FRAME_BYTES', 1_900_000, 1),
+      maxOpsPerFrame: numMin('PPT_RELAY_MAX_OPS_PER_FRAME', 512, 1),
+      maxFramesPerWindow: numMin('PPT_RELAY_MAX_FRAMES_PER_WINDOW', 200, 1),
+      rateWindowMs: numMin('PPT_RELAY_RATE_WINDOW_MS', 10_000, 1),
+      maxSingleBlobBytes: numMin('PPT_RELAY_MAX_SINGLE_BLOB_BYTES', 8 * 1024 * 1024, 1),
+      maxRoomFrameBytes: numMin('PPT_RELAY_MAX_ROOM_FRAME_BYTES', 96 * 1024 * 1024, 1),
+      // Byte cap for the EPHEMERAL frames (`hello`/`need`/`p`): they carry only a
+      // small resume cursor or presence payload, so this is far tighter than the
+      // op/blob caps. Previously only `ops`/`snap` were byte-capped, leaving these
+      // frames an unbounded ingress a client could flood (XIN-1660 hardening).
+      maxEphemeralFrameBytes: numMin('PPT_RELAY_MAX_EPHEMERAL_FRAME_BYTES', 64 * 1024, 1),
+      maxLiveBufferFrames: numMin('PPT_RELAY_MAX_LIVE_BUFFER_FRAMES', 4096, 1),
+      maxLiveBufferBytes: numMin('PPT_RELAY_MAX_LIVE_BUFFER_BYTES', 8 * 1024 * 1024, 1),
+      // Page bounds for replay: each `openReplay` cursor reads at most this many
+      // op rows and bytes per page, sends that page, then fetches the next.
+      replayPageSize: numMin('PPT_RELAY_REPLAY_PAGE_SIZE', 1000, 1),
+      replayPageBytes: numMin('PPT_RELAY_REPLAY_PAGE_BYTES', 4 * 1024 * 1024, 1),
+      maxInFlightReplays: pptRelayReplaySlots(),
+      // Max time (ms) a join waits for one of the scarce replay slots before the
+      // relay refuses `storage-retry` (retryable). Bounds a join burst queued
+      // behind a slow replay so it re-tries rather than blocking unboundedly
+      // (XIN-1736 P1-H). Default 10s — above a healthy replay, below a wedged one.
+      replayAcquireTimeoutMs: numMin('PPT_RELAY_REPLAY_ACQUIRE_TIMEOUT_MS', 10_000, 1),
+      // Socket send-buffer high-water (bytes): replay pauses before sending its
+      // next frame while `socket.bufferedAmount` is above this, so one slow/greedy
+      // consumer cannot make the relay accumulate an unbounded send backlog
+      // (XIN-1693 P1-3). Default 4 MiB — a few large ops/a snapshot in flight.
+      sendHighWaterBytes: numMin('PPT_RELAY_SEND_HIGH_WATER_BYTES', 4 * 1024 * 1024, 1),
+      sendDrainTimeoutMs: numMin('PPT_RELAY_SEND_DRAIN_TIMEOUT_MS', 5000, 1),
+      authRefreshMs: numMin('PPT_RELAY_AUTH_REFRESH_MS', 5000, 1),
+      docStatusCacheTtlMs: numMin('PPT_RELAY_DOC_STATUS_CACHE_TTL_MS', 2000, 1),
+      // Grace window (ms) after a share-derived socket's ticket membership claim
+      // expires for the client to present a freshly-minted ticket via an in-place
+      // `reauth` frame before the relay fails closed (XIN-1739 P1-3). Replaces the
+      // old hard disconnect that, with the short ticket TTL, became a permanent
+      // connect/replay/close loop for a genuine `anyone_in_space` share writer.
+      reauthGraceMs: numMin('PPT_RELAY_REAUTH_GRACE_MS', 10_000, 1),
+      // Depth cap for a connection's inbound ordering chain. Beyond it the relay
+      // sheds further frames with `rate-limited` instead of letting `onData`
+      // enqueue an unbounded backlog that keeps persisting after the socket is
+      // gone (XIN-1736 P1-F). Sized well above a legitimate in-flight burst.
+      maxInboundQueue: numMin('PPT_RELAY_MAX_INBOUND_QUEUE', 256, 1),
+      // Byte cap for a connection's inbound ordering chain (XIN-1840 P1-3). The depth
+      // cap above bounds only frame COUNT, so 256 near-`maxFrameBytes` frames can retain
+      // ~2 GiB in-process before the socket drains; this bounds the byte backlog too.
+      // Default 64 MiB — well above a legitimate in-flight burst, far below runaway.
+      maxInboundQueueBytes: numMin('PPT_RELAY_MAX_INBOUND_QUEUE_BYTES', 64 * 1024 * 1024, 1),
+      // Coarse per-connection ceiling for the `ops`-frame PRE-admission window
+      // (XIN-1840 P1-2), checked at the top of handleOps BEFORE identityGate / the
+      // canonical-payload hash / the dedup-ledger SELECT. A reader looping ONE
+      // harvested-valid frameId is O(1)-shed here instead of paying that work per
+      // iteration. Sized FAR above the `maxFramesPerWindow` (200) mutation budget and
+      // the rare idempotent resend so a genuine frame is never shed. Default 5000.
+      maxOpsAdmissionPerWindow: numMin('PPT_RELAY_MAX_OPS_ADMISSION_PER_WINDOW', 5000, 1),
+      // Depth cap for a connection's OUTBOUND ordering chain (XIN-1792 P1-5). A
+      // non-reading peer's send buffer is drained per-frame by `gatedSend`
+      // (bufferedAmount high-water), but frames still QUEUED on the outbound promise
+      // chain are not yet reflected there — a socket that floods (each shed inbound
+      // frame emits a `refused`) or a busy room broadcasting to a stalled peer would
+      // otherwise grow that queue unbounded in the process that also serves REST.
+      // Beyond this cap the peer is closed 4410 (resync) rather than buffered further,
+      // mirroring the inbound bound. Sized well above any legitimate in-flight fan-out.
+      maxOutboundQueue: numMin('PPT_RELAY_MAX_OUTBOUND_QUEUE', 2048, 1),
+      // Retention window (in room seqs) for the dedup ledger `ppt_collab_frame`
+      // (XIN-1821 P1-4). The ledger is written at APPEND time and OUTLIVES the pruned
+      // op row so a resend after a lost ack re-acks its original seq instead of being
+      // re-minted and rebroadcast (XIN-1655 C1) — but with no retention it grew forever
+      // (a writer at the rate cap adds ~1.7M rows/day to a shared table). A prune keeps
+      // every ledger row within this many seqs of the covered watermark and reclaims
+      // only rows FAR below it: an idempotent resend happens within seconds, so the
+      // large default keeps clean re-ack for any realistic resend while bounding the
+      // table to ~this many rows per doc. A resend older than the window is re-minted
+      // and rebroadcast, but the op's `(a,s)` is `<= vv[a]` so every replica's reducer
+      // drops it — inert, never a divergence. Default 262144 (~2^18).
+      ledgerRetentionFrames: numMin('PPT_RELAY_LEDGER_RETENTION_FRAMES', 262_144, 1),
+      // Seq-lag cap after which the server-side snapshotter ages out a permanently
+      // buffered op to unfreeze GC (XIN-1792 P1-3). Operator-tunable (XIN-1821 / yujiawei
+      // addendum #2): a room whose average frame is above `maxRoomFrameBytes / lagCap`
+      // bytes hits the byte budget before this many seqs accumulate, so lowering it lets
+      // an operator force the reclaim on seq lag rather than relying only on the
+      // byte-budget (`room-full`) trigger. Default 4096 (mirrors the snapshotter default).
+      maxBufferedOpLag: numMin('PPT_RELAY_MAX_BUFFERED_OP_LAG', 4096, 1),
+    },
   },
 } as const

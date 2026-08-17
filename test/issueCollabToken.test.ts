@@ -9,7 +9,7 @@ vi.mock('../src/db/repos/docMemberRepo.js', () => ({
   docMemberRepo: { getRole: vi.fn() },
 }))
 
-import { issueCollabToken } from '../src/auth/issueCollabToken.js'
+import { issueCollabToken, issueCollabTokenByDocId } from '../src/auth/issueCollabToken.js'
 import { verifyCollabToken } from '../src/auth/collabToken.js'
 import { docMetaRepo } from '../src/db/repos/docMetaRepo.js'
 import { docMemberRepo } from '../src/db/repos/docMemberRepo.js'
@@ -82,6 +82,7 @@ function asUser(uid: string | null) {
     verifyToken: async (token: string) => (token && uid ? { uid } : null),
     getUser: async () => null,
     getUsers: async () => [],
+    isSpaceMember: async () => true,
   })
 }
 
@@ -98,7 +99,7 @@ describe('issueCollabToken (§4.4) — whiteboard support', () => {
     // resolveRole(uid, doc_id) re-reads the row by doc_id for the owner check.
     vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(boardMeta('wbtest_a'))
 
-    const out = await issueCollabToken('octo_session_a', BOARD_KEY)
+    const out = await issueCollabToken('octo_session_a', BOARD_KEY, SPACE)
 
     expect(out.ok).toBe(true)
     if (!out.ok) return
@@ -114,6 +115,8 @@ describe('issueCollabToken (§4.4) — whiteboard support', () => {
       documentName: BOARD_KEY, // token carries the `:wb:` connection key
       role: 'admin',
       permission_epoch: 4,
+      space_member: true,
+      home_space_verified: true,
     })
   })
 
@@ -123,7 +126,7 @@ describe('issueCollabToken (§4.4) — whiteboard support', () => {
     vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(boardMeta('wbtest_a'))
     vi.mocked(docMemberRepo.getRole).mockResolvedValue('writer')
 
-    const out = await issueCollabToken('octo_session_b', BOARD_KEY)
+    const out = await issueCollabToken('octo_session_b', BOARD_KEY, SPACE)
 
     expect(out.ok).toBe(true)
     if (!out.ok) return
@@ -139,23 +142,23 @@ describe('issueCollabToken (§4.4) — whiteboard support', () => {
     vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(boardMeta('wbtest_a'))
     vi.mocked(docMemberRepo.getRole).mockResolvedValue(undefined)
 
-    const out = await issueCollabToken('octo_session_x', BOARD_KEY)
+    const out = await issueCollabToken('octo_session_x', BOARD_KEY, SPACE)
     expect(out).toEqual({ ok: false, status: 403, error: 'forbidden' })
   })
 
   it('missing / deleted board is 404', async () => {
     asUser('wbtest_a')
     vi.mocked(docMetaRepo.getByDocumentName).mockResolvedValue(null)
-    expect(await issueCollabToken('t', BOARD_KEY)).toEqual({ ok: false, status: 404, error: 'not_found' })
+    expect(await issueCollabToken('t', BOARD_KEY, SPACE)).toEqual({ ok: false, status: 404, error: 'not_found' })
 
     vi.mocked(docMetaRepo.getByDocumentName).mockResolvedValue({ ...boardMeta('wbtest_a'), status: 0 } as never)
-    expect(await issueCollabToken('t', BOARD_KEY)).toEqual({ ok: false, status: 404, error: 'not_found' })
+    expect(await issueCollabToken('t', BOARD_KEY, SPACE)).toEqual({ ok: false, status: 404, error: 'not_found' })
   })
 
   it('a `:wb:` key that resolves to a non-board row is 404 (namespace addresses boards only)', async () => {
     asUser('wbtest_a')
     vi.mocked(docMetaRepo.getByDocumentName).mockResolvedValue({ ...boardMeta('wbtest_a'), doc_type: 'doc' } as never)
-    expect(await issueCollabToken('t', BOARD_KEY)).toEqual({ ok: false, status: 404, error: 'not_found' })
+    expect(await issueCollabToken('t', BOARD_KEY, SPACE)).toEqual({ ok: false, status: 404, error: 'not_found' })
   })
 
   it('a `:wb:` key whose space/folder disagree with the resolved row is not_found (§8.1 consistency)', async () => {
@@ -165,22 +168,22 @@ describe('issueCollabToken (§4.4) — whiteboard support', () => {
     // resolves to no valid row is 404.
     vi.mocked(docMetaRepo.getByDocumentName).mockResolvedValue(boardMeta('wbtest_a'))
     const wrongFolder = `octo:${SPACE}:f_other:wb:${BOARD_ID}`
-    expect(await issueCollabToken('t', wrongFolder)).toEqual({ ok: false, status: 404, error: 'not_found' })
+    expect(await issueCollabToken('t', wrongFolder, SPACE)).toEqual({ ok: false, status: 404, error: 'not_found' })
 
     vi.mocked(docMetaRepo.getByDocumentName).mockResolvedValue(boardMeta('wbtest_a'))
     const wrongSpace = `octo:s_other:${FOLDER}:wb:${BOARD_ID}`
-    expect(await issueCollabToken('t', wrongSpace)).toEqual({ ok: false, status: 404, error: 'not_found' })
+    expect(await issueCollabToken('t', wrongSpace, SPACE)).toEqual({ ok: false, status: 404, error: 'not_found' })
   })
 
   it('missing/invalid octo token is 401 before any repo lookup', async () => {
     asUser(null)
-    expect(await issueCollabToken('', BOARD_KEY)).toEqual({ ok: false, status: 401, error: 'login_required' })
+    expect(await issueCollabToken('', BOARD_KEY, SPACE)).toEqual({ ok: false, status: 401, error: 'login_required' })
     expect(docMetaRepo.getByDocumentName).not.toHaveBeenCalled()
   })
 
   it('malformed documentName is 403', async () => {
     asUser('wbtest_a')
-    expect(await issueCollabToken('t', 'not-a-key')).toEqual({ ok: false, status: 403, error: 'forbidden' })
+    expect(await issueCollabToken('t', 'not-a-key', SPACE)).toEqual({ ok: false, status: 403, error: 'forbidden' })
   })
 
   it('does not break the document path: member gets a 200 token resolved by document_name', async () => {
@@ -190,7 +193,7 @@ describe('issueCollabToken (§4.4) — whiteboard support', () => {
     vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(docMeta('owner_z'))
     vi.mocked(docMemberRepo.getRole).mockResolvedValue('reader')
 
-    const out = await issueCollabToken('octo_session_doc', DOC_KEY)
+    const out = await issueCollabToken('octo_session_doc', DOC_KEY, SPACE)
     expect(out.ok).toBe(true)
     if (!out.ok) return
     expect(out.result.role).toBe('reader')
@@ -198,6 +201,37 @@ describe('issueCollabToken (§4.4) — whiteboard support', () => {
     const claims = verifyCollabToken(out.result.token)
     expect(claims.documentName).toBe(DOC_KEY)
     expect(claims.permission_epoch).toBe(2)
+  })
+})
+
+describe('collab-token archived-state gate', () => {
+  beforeEach(() => {
+    vi.mocked(docMetaRepo.getByDocId).mockReset()
+    vi.mocked(docMetaRepo.getByDocumentName).mockReset()
+    vi.mocked(docMemberRepo.getRole).mockReset()
+  })
+
+  it.each([
+    ['legacy', async () => issueCollabToken('session', DOC_KEY, SPACE)],
+    ['docId-first', async () => issueCollabTokenByDocId('owner', DOC_ID, 'session', SPACE)],
+  ])('%s returns 409 to an authorized caller after role resolution', async (_kind, issue) => {
+    asUser('owner')
+    const archived = { ...docMeta('owner'), status: 2 } as never
+    vi.mocked(docMetaRepo.getByDocumentName).mockResolvedValue(archived)
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(archived)
+    expect(await issue()).toEqual({ ok: false, status: 409, error: 'conflict' })
+  })
+
+  it.each([
+    ['legacy', async () => issueCollabToken('session', DOC_KEY, SPACE)],
+    ['docId-first', async () => issueCollabTokenByDocId('stranger', DOC_ID, 'session', SPACE)],
+  ])('%s does not disclose archived state to a caller with no role', async (_kind, issue) => {
+    asUser('stranger')
+    const archived = { ...docMeta('owner'), status: 2 } as never
+    vi.mocked(docMetaRepo.getByDocumentName).mockResolvedValue(archived)
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(archived)
+    vi.mocked(docMemberRepo.getRole).mockResolvedValue(undefined)
+    expect(await issue()).toEqual({ ok: false, status: 403, error: 'forbidden' })
   })
 })
 
@@ -216,11 +250,12 @@ describe('issueCollabToken (§4.7(b) / XIN-694) — display name threading', () 
       verifyToken: async () => ({ uid: 'wbtest_a', name: '大背头' }),
       getUser,
       getUsers: async () => [],
+      isSpaceMember: async () => true,
     })
     vi.mocked(docMetaRepo.getByDocumentName).mockResolvedValue(boardMeta('wbtest_a'))
     vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(boardMeta('wbtest_a'))
 
-    const out = await issueCollabToken('octo_session_a', BOARD_KEY)
+    const out = await issueCollabToken('octo_session_a', BOARD_KEY, SPACE)
     expect(out.ok).toBe(true)
     if (!out.ok) return
     expect(out.result.name).toBe('大背头')
@@ -235,11 +270,12 @@ describe('issueCollabToken (§4.7(b) / XIN-694) — display name threading', () 
       verifyToken: async () => ({ uid: 'wbtest_a' }), // no name
       getUser,
       getUsers: async () => [],
+      isSpaceMember: async () => true,
     })
     vi.mocked(docMetaRepo.getByDocumentName).mockResolvedValue(boardMeta('wbtest_a'))
     vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(boardMeta('wbtest_a'))
 
-    const out = await issueCollabToken('octo_session_a', BOARD_KEY)
+    const out = await issueCollabToken('octo_session_a', BOARD_KEY, SPACE)
     expect(out.ok).toBe(true)
     if (!out.ok) return
     expect(getUser).toHaveBeenCalledWith('wbtest_a', 'octo_session_a')
@@ -252,11 +288,12 @@ describe('issueCollabToken (§4.7(b) / XIN-694) — display name threading', () 
       verifyToken: async () => ({ uid: 'wbtest_a' }),
       getUser: async () => null, // directory has no profile
       getUsers: async () => [],
+      isSpaceMember: async () => true,
     })
     vi.mocked(docMetaRepo.getByDocumentName).mockResolvedValue(boardMeta('wbtest_a'))
     vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(boardMeta('wbtest_a'))
 
-    const out = await issueCollabToken('octo_session_a', BOARD_KEY)
+    const out = await issueCollabToken('octo_session_a', BOARD_KEY, SPACE)
     expect(out.ok).toBe(true)
     if (!out.ok) return
     expect('name' in out.result).toBe(false)
@@ -285,7 +322,7 @@ describe('issueCollabToken — HTML has no collaboration channel', () => {
     )
     vi.mocked(docMemberRepo.getRole).mockResolvedValue(memberRole)
 
-    const out = await issueCollabToken(`octo_session_${uid}`, HTML_KEY)
+    const out = await issueCollabToken(`octo_session_${uid}`, HTML_KEY, SPACE)
 
     expect(out).toEqual({ ok: false, status: 422, error: 'unsupported_document_type' })
     expect(docMetaRepo.getByDocId).not.toHaveBeenCalled()
@@ -297,7 +334,7 @@ describe('issueCollabToken — HTML has no collaboration channel', () => {
     vi.mocked(docMetaRepo.getByDocumentName).mockResolvedValue(docMeta('doc_owner'))
     vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(docMeta('doc_owner'))
 
-    const out = await issueCollabToken('octo_session_doc_owner', DOC_KEY)
+    const out = await issueCollabToken('octo_session_doc_owner', DOC_KEY, SPACE)
     expect(out.ok).toBe(true)
     if (!out.ok) return
     expect(out.result.role).toBe('admin')
@@ -326,7 +363,7 @@ describe('issueCollabToken — html_ppt uses the Bento relay, not Hocuspocus', (
     )
     vi.mocked(docMemberRepo.getRole).mockResolvedValue(memberRole)
 
-    const out = await issueCollabToken(`octo_session_${uid}`, PPT_KEY)
+    const out = await issueCollabToken(`octo_session_${uid}`, PPT_KEY, SPACE)
 
     expect(out).toEqual({ ok: false, status: 422, error: 'unsupported_document_type' })
     expect(docMetaRepo.getByDocId).not.toHaveBeenCalled()
@@ -341,8 +378,87 @@ describe('issueCollabToken — html_ppt uses the Bento relay, not Hocuspocus', (
     // that could serve it is now closed.
     asUser('ppt_owner')
     vi.mocked(docMetaRepo.getByDocumentName).mockResolvedValue({ ...pptMeta('ppt_owner'), doc_type: 'doc' } as never)
-    const out = await issueCollabToken('octo_session_ppt_owner', PPT_KEY)
+    const out = await issueCollabToken('octo_session_ppt_owner', PPT_KEY, SPACE)
     expect(out).toEqual({ ok: false, status: 404, error: 'not_found' })
     expect(docMemberRepo.getRole).not.toHaveBeenCalled()
+  })
+})
+
+describe('issueCollabTokenByDocId — authorize before unsupported-type disclosure', () => {
+  beforeEach(() => {
+    vi.mocked(docMetaRepo.getByDocId).mockReset()
+    vi.mocked(docMetaRepo.getByDocumentName).mockReset()
+    vi.mocked(docMemberRepo.getRole).mockReset()
+  })
+
+  it.each([
+    ['html', htmlMeta('owner')],
+    ['html_ppt', pptMeta('owner')],
+  ] as const)('returns 403 for an unauthorized %s row instead of leaking 422', async (_kind, meta) => {
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(meta)
+    vi.mocked(docMemberRepo.getRole).mockResolvedValue(undefined)
+
+    const out = await issueCollabTokenByDocId('stranger', meta.doc_id, 'session', meta.space_id)
+
+    expect(out).toEqual({ ok: false, status: 403, error: 'forbidden' })
+    expect(docMemberRepo.getRole).toHaveBeenCalledWith(meta.doc_id, 'stranger')
+  })
+
+  it.each([
+    ['html owner', htmlMeta('owner'), 'owner', undefined],
+    ['html reader', htmlMeta('owner'), 'reader', 'reader'],
+    ['html_ppt owner', pptMeta('owner'), 'owner', undefined],
+    ['html_ppt reader', pptMeta('owner'), 'reader', 'reader'],
+  ] as const)('returns 422 for an authorized %s after role resolution', async (_label, meta, uid, memberRole) => {
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(meta)
+    vi.mocked(docMemberRepo.getRole).mockResolvedValue(memberRole)
+
+    const out = await issueCollabTokenByDocId(uid, meta.doc_id, 'session', meta.space_id)
+
+    expect(out).toEqual({ ok: false, status: 422, error: 'unsupported_document_type' })
+    if (uid === meta.owner_id) {
+      expect(docMemberRepo.getRole).not.toHaveBeenCalled()
+    } else {
+      expect(docMemberRepo.getRole).toHaveBeenCalledWith(meta.doc_id, uid)
+    }
+  })
+
+  it('keeps archived state hidden from an unauthorized caller', async () => {
+    const archived = { ...docMeta('owner'), status: 2 } as never
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(archived)
+    vi.mocked(docMemberRepo.getRole).mockResolvedValue(undefined)
+
+    expect(await issueCollabTokenByDocId('stranger', DOC_ID, 'session', SPACE)).toEqual({
+      ok: false,
+      status: 403,
+      error: 'forbidden',
+    })
+  })
+
+  it.each([
+    ['board row with a document room', { ...docMeta('owner'), doc_type: 'board' }],
+    ['document row with a whiteboard room', {
+      ...docMeta('owner'),
+      document_name: `octo:${SPACE}:f_default:wb:${DOC_ID}`,
+    }],
+    ['row whose room names a different docId', {
+      ...docMeta('owner'),
+      document_name: `octo:${SPACE}:f_default:d_other`,
+    }],
+  ] as const)('fails closed for an authorized corrupt %s', async (_label, corruptMeta) => {
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(corruptMeta as never)
+
+    const out = await issueCollabTokenByDocId('owner', DOC_ID, 'session', SPACE)
+
+    expect(out).toEqual({ ok: false, status: 404, error: 'not_found' })
+  })
+
+  it('does not disclose a corrupt row before authorization', async () => {
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue({ ...docMeta('owner'), doc_type: 'board' } as never)
+    vi.mocked(docMemberRepo.getRole).mockResolvedValue(undefined)
+
+    const out = await issueCollabTokenByDocId('stranger', DOC_ID, 'session', SPACE)
+
+    expect(out).toEqual({ ok: false, status: 403, error: 'forbidden' })
   })
 })
