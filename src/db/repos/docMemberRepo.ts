@@ -157,4 +157,17 @@ export const docMemberRepo = {
       [params.docId, params.uid, params.roleNum, params.grantedBy],
     )
   },
+
+  /** Insert a direct member only when no row for (doc_id, uid) exists. */
+  async insertDirectIfAbsentTx(
+    tx: Tx,
+    params: { docId: string; uid: string; roleNum: number; grantedBy: string },
+  ): Promise<boolean> {
+    const result = await tx.execute(
+      `INSERT IGNORE INTO doc_member (doc_id, uid, role, granted_by, source, invite_token)
+       VALUES (?, ?, ?, ?, ${SOURCE_DIRECT}, '')`,
+      [params.docId, params.uid, params.roleNum, params.grantedBy],
+    )
+    return result.affectedRows === 1
+  },
 }

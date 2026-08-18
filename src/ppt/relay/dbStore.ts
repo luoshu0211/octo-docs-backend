@@ -406,6 +406,10 @@ export class DbPptRelayStore implements PptRelayStore {
         const [rows] = await conn.execute(sql, params as never[])
         return rows as T2[]
       },
+      async execute(sql: string, params: unknown[] = []): Promise<{ affectedRows: number }> {
+        const [result] = await conn.execute(sql, params as never[])
+        return result as { affectedRows: number }
+      },
     }
     try {
       // Transaction-control statements MUST go through the TEXT protocol
