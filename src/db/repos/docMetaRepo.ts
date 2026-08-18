@@ -5,10 +5,12 @@
  * Holds both doc_id (business PK) and document_name (Hocuspocus routing/
  * persistence key, unique). See appendix B for the naming convention.
  */
+import { createHash } from 'node:crypto'
 import { query, transaction, type Tx } from '../pool.js'
 import { docTypeUsesOctoDocSlug } from '../docType.js'
 import { SHARE_SCOPE_ANYONE, SHARE_ROLE_EDIT } from '../../permission/shareScope.js'
-import { STORED_ROLE_VALUES } from '../../permission/role.js'
+import { ROLE_ADMIN, STORED_ROLE_VALUES } from '../../permission/role.js'
+import { docMemberRepo } from './docMemberRepo.js'
 
 /**
  * True when a thrown DB error is a duplicate-key violation. mysql2 surfaces it
@@ -21,9 +23,9 @@ function isDupEntry(err: unknown): boolean {
 }
 
 /**
- * Delegated-owner guard (P0 default-deny). The trusted internal caller supplies
- * the authenticated owner; a slug already bound to another owner cannot be
- * mutated because doing so would overwrite that user's
+ * Broken-object-level-authorization guard (P0 default-deny). Thrown when a
+ * non-owner tries to upsert a slug an existing row already owns: the space-scoped
+ * lookup resolves the OTHER bot's row, so mutating it here would overwrite its
  * title, restamp updated_by, and revive a soft-deleted row with no ownership
  * check. The route maps this to 403 (never fail-open). Ownership is owner-only
  * here (owner is implicit admin, §4.2); an admin-member override would need a
@@ -36,6 +38,28 @@ export class DocOwnershipError extends Error {
   }
 }
 
+/** A canonical create key is permanently consumed by a soft-deleted document. */
+export class CanonicalHtmlDeletedError extends Error {
+  constructor(message = 'canonical_document_deleted') {
+    super(message)
+    this.name = 'CanonicalHtmlDeletedError'
+  }
+}
+
+export class CanonicalHtmlArchivedError extends Error {
+  constructor(message = 'canonical_document_archived') {
+    super(message)
+    this.name = 'CanonicalHtmlArchivedError'
+  }
+}
+
+export class CanonicalHtmlLegacyConflictError extends Error {
+  constructor(message = 'canonical_document_conflict') {
+    super(message)
+    this.name = 'CanonicalHtmlLegacyConflictError'
+  }
+}
+
 export interface DocMeta {
   doc_id: string
   document_name: string
@@ -45,6 +69,7 @@ export interface DocMeta {
   folder_id: string
   doc_type: string
   octo_doc_slug: string | null
+  html_idempotency_key_hash: Buffer | null
   status: number // 1=active 0=deleted 2=archived
   permission_epoch: number
   /**
@@ -74,6 +99,13 @@ export interface CreateDocInput {
   docType: string
   octoDocSlug?: string
   createdBy: string
+}
+
+export interface CanonicalHtmlInput extends CreateDocInput {
+  octoDocSlug: string
+  idempotencyKey: string
+  /** Human creator of the authenticated bot; distinct from ownerId (the bot UID). */
+  humanOwnerUid?: string
 }
 
 const VALID_STORED_ROLES_SQL = STORED_ROLE_VALUES.join(', ')
@@ -135,63 +167,125 @@ export const docMetaRepo = {
     return rows[0] ?? null
   },
 
-  async upsertHtmlByOctoDocSlug(input: CreateDocInput & { octoDocSlug: string }): Promise<{ meta: DocMeta; created: boolean }> {
-    // NOTE (R1 scope): the `doc_type = 'html'` predicates in this method and in
-    // getByOctoDocSlug are INTENTIONALLY html-only. PPT bot register (R2-B2)
-    // adds a `doc_type`-parametrized slug-upsert path; broadening these clauses
-    // to also match html_ppt now would let an html create resolve a PPT row (or
-    // vice-versa) sharing a slug, so they stay kind-scoped until R2 wires PPT.
-    // Tenant isolation (P0): resolve the slug WITHIN the caller's space only. A
-    // slug is unique per (space_id, octo_doc_slug), so a same-slug row in another
-    // space is invisible here and can never be updated/revived across tenants.
-    const existing = await docMetaRepo.getByOctoDocSlug(input.octoDocSlug, input.spaceId)
-    if (existing) {
-      // Re-authorize before mutating the resolved row (P0). The space-scoped
-      // lookup can resolve a different user's row for the same slug; updating it
-      // would overwrite its title/updated_by and revive a soft-deleted row with
-      // no authorization. Only the delegated owner converges idempotently.
+  async upsertHtmlByOctoDocSlug(
+    input: CreateDocInput & { octoDocSlug: string; humanOwnerUid?: string },
+  ): Promise<{ meta: DocMeta; created: boolean; memberReconciled: boolean; permissionEpoch?: number }> {
+    // Legacy slug registration remains kind- and tenant-scoped.
+    const updateExisting = async (existing: DocMeta) => {
       if (existing.owner_id !== input.createdBy) throw new DocOwnershipError()
-      // space_id in the WHERE is defense-in-depth: `existing` is already
-      // space-scoped, so pinning the space here means no cross-tenant row can
-      // ever be the UPDATE target.
-      await query(
-        `UPDATE doc_meta
-         SET title = ?, updated_by = ?, status = 1
-         WHERE doc_id = ? AND doc_type = 'html' AND space_id = ?`,
-        [input.title, input.createdBy, existing.doc_id, input.spaceId],
-      )
-      const updated = await docMetaRepo.getByDocId(existing.doc_id)
-      if (!updated) throw new Error('html doc disappeared after upsert')
-      return { meta: updated, created: false }
+      if (existing.html_idempotency_key_hash != null) {
+        if (existing.status === 0) throw new CanonicalHtmlDeletedError()
+        if (existing.status === 2) throw new CanonicalHtmlArchivedError()
+        throw new CanonicalHtmlLegacyConflictError()
+      }
+      return transaction(async (tx) => {
+        await tx.query(
+          `UPDATE doc_meta
+           SET title = ?, updated_by = ?, status = 1
+           WHERE doc_id = ? AND doc_type = 'html' AND space_id = ?`,
+          [input.title, input.createdBy, existing.doc_id, input.spaceId],
+        )
+        let memberReconciled = false
+        if (input.humanOwnerUid && input.humanOwnerUid !== input.ownerId) {
+          memberReconciled = await docMemberRepo.insertDirectIfAbsentTx(tx, {
+            docId: existing.doc_id,
+            uid: input.humanOwnerUid,
+            roleNum: ROLE_ADMIN,
+            grantedBy: input.ownerId,
+          })
+          if (memberReconciled) await docMetaRepo.bumpEpochTx(tx, existing.doc_id)
+        }
+        const rows = await tx.query<DocMeta>('SELECT * FROM doc_meta WHERE doc_id = ? LIMIT 1', [existing.doc_id])
+        const meta = rows[0]
+        if (!meta) throw new Error('html doc disappeared after upsert')
+        return {
+          meta,
+          created: false as const,
+          memberReconciled,
+          ...(memberReconciled ? { permissionEpoch: Number(meta.permission_epoch) } : {}),
+        }
+      })
     }
 
+    const existing = await docMetaRepo.getByOctoDocSlug(input.octoDocSlug, input.spaceId)
+    if (existing) return updateExisting(existing)
+
     try {
-      await docMetaRepo.create(input)
+      const meta = await transaction(async (tx) => {
+        await docMetaRepo.createTx(tx, input)
+        if (input.humanOwnerUid && input.humanOwnerUid !== input.ownerId) {
+          await docMemberRepo.upsertDirectTx(tx, {
+            docId: input.docId,
+            uid: input.humanOwnerUid,
+            roleNum: ROLE_ADMIN,
+            grantedBy: input.ownerId,
+          })
+        }
+        const created = await docMetaRepo.getByDocIdTx(tx, input.docId)
+        if (!created) throw new Error('html doc missing after create')
+        return created
+      })
+      return { meta, created: true, memberReconciled: false }
     } catch (err) {
-      // TOCTOU: two concurrent registrations of the same (space, slug) both miss
-      // the SELECT, then race on INSERT. The composite unique key makes the loser
-      // fail with ER_DUP_ENTRY — re-fetch the now-committed row and fall through
-      // to the idempotent UPDATE branch instead of surfacing a 500.
       if (!isDupEntry(err)) throw err
       const raced = await docMetaRepo.getByOctoDocSlug(input.octoDocSlug, input.spaceId)
       if (!raced) throw err
-      // Same P0 re-authorization on the TOCTOU recovery branch: the racing
-      // winner may be another user's row, so an owner mismatch must be rejected
-      // rather than silently overwriting/reviving it.
-      if (raced.owner_id !== input.createdBy) throw new DocOwnershipError()
-      await query(
-        `UPDATE doc_meta
-         SET title = ?, updated_by = ?, status = 1
-         WHERE doc_id = ? AND doc_type = 'html' AND space_id = ?`,
-        [input.title, input.createdBy, raced.doc_id, input.spaceId],
-      )
-      const updated = await docMetaRepo.getByDocId(raced.doc_id)
-      if (!updated) throw new Error('html doc disappeared after upsert')
-      return { meta: updated, created: false }
+      return updateExisting(raced)
     }
-    const created = await docMetaRepo.getByDocId(input.docId)
-    if (!created) throw new Error('html doc missing after create')
-    return { meta: created, created: true }
+  },
+
+  async createCanonicalHtml(input: CanonicalHtmlInput): Promise<{ meta: DocMeta; created: boolean }> {
+    const keyHash = createHash('sha256').update(input.idempotencyKey, 'utf8').digest()
+    const find = async () => {
+      const rows = await query<DocMeta>(
+        `SELECT * FROM doc_meta
+         WHERE space_id = ? AND owner_id = ? AND html_idempotency_key_hash = ? AND doc_type = 'html'
+         LIMIT 1`,
+        [input.spaceId, input.ownerId, keyHash],
+      )
+      return rows[0] ?? null
+    }
+    const accept = (meta: DocMeta) => {
+      if (meta.space_id !== input.spaceId || meta.owner_id !== input.ownerId || input.createdBy !== input.ownerId) {
+        throw new DocOwnershipError()
+      }
+      // A canonical key remains consumed after deletion or archival.
+      if (meta.status === 0) throw new CanonicalHtmlDeletedError()
+      if (meta.status === 2) throw new CanonicalHtmlArchivedError()
+      return { meta, created: false as const }
+    }
+
+    const existing = await find()
+    if (existing) return accept(existing)
+    try {
+      const created = await transaction(async (tx) => {
+        await tx.query(
+          `INSERT INTO doc_meta
+             (doc_id, document_name, title, owner_id, space_id, folder_id, doc_type, octo_doc_slug,
+              html_idempotency_key_hash, status, permission_epoch, created_by, updated_by)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, '')`,
+          [input.docId, input.documentName, input.title, input.ownerId, input.spaceId, input.folderId,
+            'html', input.docId, keyHash, input.createdBy],
+        )
+        if (input.humanOwnerUid && input.humanOwnerUid !== input.ownerId) {
+          await docMemberRepo.upsertDirectTx(tx, {
+            docId: input.docId,
+            uid: input.humanOwnerUid,
+            roleNum: ROLE_ADMIN,
+            grantedBy: input.ownerId,
+          })
+        }
+        const meta = await docMetaRepo.getByDocIdTx(tx, input.docId)
+        if (!meta) throw new Error('canonical html doc missing after create')
+        return meta
+      })
+      return { meta: created, created: true }
+    } catch (err) {
+      if (!isDupEntry(err)) throw err
+      const raced = await find()
+      if (!raced) throw err
+      return accept(raced)
+    }
   },
 
   async getByDocId(docId: string): Promise<DocMeta | null> {

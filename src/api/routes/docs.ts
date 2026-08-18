@@ -4,7 +4,12 @@
  */
 import { Router, type Router as ExpressRouter, type Request, type Response } from 'express'
 import { docMetaRepo } from '../../db/repos/docMetaRepo.js'
-import { DocOwnershipError } from '../../db/repos/docMetaRepo.js'
+import {
+  CanonicalHtmlArchivedError,
+  CanonicalHtmlDeletedError,
+  CanonicalHtmlLegacyConflictError,
+  DocOwnershipError,
+} from '../../db/repos/docMetaRepo.js'
 import { docMemberRepo } from '../../db/repos/docMemberRepo.js'
 import { docViewHistoryRepo } from '../../db/repos/docViewHistoryRepo.js'
 import { normalizeTypeFilter, isDocType, HTML_DOC_TYPE, HTML_PPT_DOC_TYPE } from '../../db/docType.js'
@@ -126,8 +131,6 @@ async function grantBotOwnerAdmin(req: Request, docId: string, documentName: str
       roleNum: ROLE_ADMIN,
       grantedBy: uid,
     })
-    // Mirror the PUT /members mutation: a doc_member change bumps the epoch and
-    // broadcasts the invalidation (§4.5) so any listener recomputes access.
     await bumpEpoch(docId, documentName, botOwnerUid)
   }
 }
@@ -135,7 +138,7 @@ async function grantBotOwnerAdmin(req: Request, docId: string, documentName: str
 /** POST /api/v1/docs — create. Creator becomes owner (implicit admin, §4.2). */
 export async function createDocHandler(req: Request, res: Response) {
   const uid = req.uid!
-  const { folderId, title, docType, octoDocSlug, mountType } = req.body ?? {}
+  const { folderId, title, docType, octoDocSlug, idempotencyKey, mountType } = req.body ?? {}
   // Space isolation (P3): the space is sourced solely from the enforced
   // X-Space-Id header (req.spaceId, set by spaceContextMiddleware, guaranteed
   // non-empty). The transitional body.spaceId fallback (P1) is removed — any
@@ -152,6 +155,10 @@ export async function createDocHandler(req: Request, res: Response) {
   }
   const folder = typeof folderId === 'string' && folderId !== '' ? folderId : DEFAULT_FOLDER
   const resolvedDocType = typeof docType === 'string' && docType !== '' ? docType : 'doc'
+  if (resolvedDocType !== HTML_DOC_TYPE && idempotencyKey !== undefined) {
+    res.status(400).json({ error: 'idempotencyKey is only valid for html documents' })
+    return
+  }
   if (resolvedDocType === HTML_PPT_DOC_TYPE) {
     // html_ppt (Bento slide-deck) is created ONLY through /api/v1/ppt/** (§3.1 /
     // §5.2), never the legacy /api/v1/docs create path. Reject as wrong-kind so a
@@ -173,15 +180,29 @@ export async function createDocHandler(req: Request, res: Response) {
       res.status(400).json({ error: 'html registration requires bot mount' })
       return
     }
-    if (mountType !== 'group' && mountType !== 'space' && mountType !== 'thread') {
+    const canonicalUnmounted = idempotencyKey !== undefined
+      && (mountType === undefined || mountType === null || mountType === '')
+    if (!canonicalUnmounted && mountType !== 'group' && mountType !== 'space' && mountType !== 'thread') {
       res.status(400).json({ error: 'mountType must be group, space, or thread' })
       return
     }
-    if (typeof octoDocSlug !== 'string' || octoDocSlug === '') {
+    if (idempotencyKey !== undefined && octoDocSlug !== undefined) {
+      res.status(400).json({ error: 'idempotencyKey and octoDocSlug are mutually exclusive' })
+      return
+    }
+    if (idempotencyKey !== undefined && (typeof idempotencyKey !== 'string' || idempotencyKey.trim() === '')) {
+      res.status(400).json({ error: 'idempotencyKey required' })
+      return
+    }
+    if (typeof idempotencyKey === 'string' && idempotencyKey.trim().length > 128) {
+      res.status(400).json({ error: 'idempotencyKey too long' })
+      return
+    }
+    if (idempotencyKey === undefined && (typeof octoDocSlug !== 'string' || octoDocSlug === '')) {
       res.status(400).json({ error: 'octoDocSlug required' })
       return
     }
-    if (octoDocSlug.length > 128) {
+    if (idempotencyKey === undefined && octoDocSlug.length > 128) {
       res.status(400).json({ error: 'octoDocSlug too long' })
       return
     }
@@ -197,6 +218,7 @@ export async function createDocHandler(req: Request, res: Response) {
     }
     throw err
   }
+  const normalizedIdempotencyKey = typeof idempotencyKey === 'string' ? idempotencyKey.trim() : undefined
   const createInput = {
     docId,
     documentName,
@@ -205,14 +227,42 @@ export async function createDocHandler(req: Request, res: Response) {
     spaceId,
     folderId: folder,
     docType: resolvedDocType,
-    ...(resolvedDocType === HTML_DOC_TYPE ? { octoDocSlug } : {}),
+    ...(resolvedDocType === HTML_DOC_TYPE ? { octoDocSlug: normalizedIdempotencyKey !== undefined ? docId : octoDocSlug } : {}),
     createdBy: uid,
   }
-  let writeResult
+  let writeResult: {
+    meta: Awaited<ReturnType<typeof docMetaRepo.getByDocId>>
+    created: boolean
+    memberReconciled?: boolean
+    permissionEpoch?: number
+  }
   if (resolvedDocType === HTML_DOC_TYPE) {
     try {
-      writeResult = await docMetaRepo.upsertHtmlByOctoDocSlug({ ...createInput, octoDocSlug })
+      writeResult = normalizedIdempotencyKey !== undefined
+        ? await docMetaRepo.createCanonicalHtml({
+          ...createInput,
+          octoDocSlug: docId,
+          idempotencyKey: normalizedIdempotencyKey,
+          humanOwnerUid: req.botOwnerUid,
+        })
+        : await docMetaRepo.upsertHtmlByOctoDocSlug({
+          ...createInput,
+          octoDocSlug,
+          humanOwnerUid: req.botOwnerUid,
+        })
     } catch (err) {
+      if (err instanceof CanonicalHtmlDeletedError) {
+        res.status(410).json({ error: 'canonical_document_deleted' })
+        return
+      }
+      if (err instanceof CanonicalHtmlArchivedError) {
+        res.status(409).json({ error: 'canonical_document_archived' })
+        return
+      }
+      if (err instanceof CanonicalHtmlLegacyConflictError) {
+        res.status(409).json({ error: 'canonical_document_conflict' })
+        return
+      }
       // Default-deny (P0): a non-owner upsert of an existing slug is rejected
       // rather than silently overwriting/reviving another bot's row. Mirrors the
       // 403 the sibling rename/delete (requireDocRole('admin')) paths return.
@@ -224,44 +274,30 @@ export async function createDocHandler(req: Request, res: Response) {
     }
   } else {
     await docMetaRepo.create(createInput)
-    writeResult = { meta: await docMetaRepo.getByDocId(docId), created: true }
+    writeResult = { meta: await docMetaRepo.getByDocId(docId), created: true, memberReconciled: false }
   }
   const meta = writeResult.meta
-  // Bot path only: the doc owner is the bot itself (ownerId = bot uid), so the
-  // bot's human owner would otherwise have no membership and could not see the
-  // doc. Auto-grant that human owner admin. req.botOwnerUid is set solely by
-  // verifyBot (from octo-server's robot.creator_uid reverse lookup) and only when
-  // a real human creator exists — it is never set on the human mount, so this
-  // block is a no-op there. Skip when the owner is the bot itself (no distinct
-  // human owner, e.g. a platform bot) to avoid a redundant self-membership row.
-  // This is purely additive: the doc's owner field and the bot's own access are
-  // unchanged (§4.2 owner is implicit admin); the human owner is added on top.
-  //
-  // Run on BOTH the fresh-create AND the html idempotent-recovery path
-  // (created:false): a prior partial failure could have written doc_meta but
-  // never granted the human owner admin, leaving them unable to see their own
-  // doc. grantBotOwnerAdmin is idempotent (upsertDirect + bumpEpoch) and
-  // self-no-ops when botOwnerUid is absent or equals uid, so calling it
-  // unconditionally heals that recovery case with no double-work regression.
-  if (meta) {
+  // Fresh and historical legacy membership writes happen in the repository
+  // transaction. Publish only a committed historical reconcile.
+  if (meta && resolvedDocType !== HTML_DOC_TYPE) {
     await grantBotOwnerAdmin(req, meta.doc_id ?? docId, meta.document_name ?? documentName)
+  } else if (meta && normalizedIdempotencyKey === undefined && writeResult.memberReconciled) {
+    await refreshAndPublish(
+      meta.document_name ?? documentName,
+      writeResult.permissionEpoch ?? Number(meta.permission_epoch),
+      req.botOwnerUid,
+    )
   }
 
-  // html docs are now indexed too: after registering the meta row (fresh
-  // create OR idempotent-recovery upsert), enqueue an index signal for the
-  // published documentName. Gated OFF by default; html goes through the SAME
-  // isSearchIndexedDoc + enqueueDocIndex path as the rename branch below, so
-  // the octo-doc-indexer picks it up and resolves the body by reading the
-  // latest `v<N>/index.html` from S3 (html has no Yjs body, so the collab
-  // afterStoreDocument feed cannot see it — this handler is the enqueue site).
-  // Best-effort / fire-and-forget: enqueue swallows its own errors so a Kafka
-  // outage does not fail the registration response.
   const responseDocId = resolvedDocType === HTML_DOC_TYPE ? (meta?.doc_id ?? docId) : docId
   const responseDocumentName = resolvedDocType === HTML_DOC_TYPE ? (meta?.document_name ?? documentName) : documentName
   const responseSpaceId = resolvedDocType === HTML_DOC_TYPE ? (meta?.space_id ?? spaceId) : spaceId
   const responseFolderId = resolvedDocType === HTML_DOC_TYPE ? (meta?.folder_id ?? folder) : folder
   const responseOwnerId = resolvedDocType === HTML_DOC_TYPE ? (meta?.owner_id ?? uid) : uid
-  if (resolvedDocType === HTML_DOC_TYPE && config.search.indexEnabled && isSearchIndexedDoc(responseDocumentName)) {
+  // Legacy slug registration historically signals immediately. Canonical HTML
+  // allocation waits for /:docId/published because its body is not durable yet.
+  if (resolvedDocType === HTML_DOC_TYPE && normalizedIdempotencyKey === undefined
+      && config.search.indexEnabled && isSearchIndexedDoc(responseDocumentName)) {
     void enqueueDocIndex(responseDocumentName)
   }
   res.status(201).json({
@@ -272,8 +308,8 @@ export async function createDocHandler(req: Request, res: Response) {
     folderId: responseFolderId,
     ownerId: responseOwnerId,
     docType: resolvedDocType,
-    ...(resolvedDocType === HTML_DOC_TYPE ? { octoDocSlug } : {}),
-    ...(resolvedDocType === HTML_DOC_TYPE ? { created: writeResult.created } : {}),
+    ...(resolvedDocType === HTML_DOC_TYPE ? { octoDocSlug: meta?.octo_doc_slug ?? octoDocSlug } : {}),
+    ...(resolvedDocType === HTML_DOC_TYPE ? { created: writeResult.created, publisherUid: uid } : {}),
     // The caller is always admin on this response: a fresh create makes the
     // caller the owner (implicit admin, §4.2), and the idempotent update branch
     // (created:false) is now reachable ONLY by the owning bot — the repo's
@@ -314,6 +350,44 @@ export async function createDocHandler(req: Request, res: Response) {
 // to meta.space_id).
 // See api/middleware/spaceContext.ts for why this is per-route, not global.
 docsRouter.post('/', requireSpaceMembership, createDocHandler)
+
+/** Notify the backend after HTML content is durably published. */
+export async function publishHtmlHandler(req: Request, res: Response) {
+  if (req.botToken === undefined) {
+    res.status(403).json({ error: 'forbidden' })
+    return
+  }
+  const meta = await docMetaRepo.getByDocId(req.params.docId!)
+  if (!meta || meta.space_id !== req.spaceId) {
+    res.status(404).json({ error: 'not_found' })
+    return
+  }
+  if (meta.owner_id !== req.uid) {
+    res.status(403).json({ error: 'forbidden' })
+    return
+  }
+  if (meta.status === 0) {
+    res.status(410).json({ error: 'canonical_document_deleted' })
+    return
+  }
+  if (meta.status === 2 || meta.doc_type !== HTML_DOC_TYPE) {
+    res.status(409).json({ error: meta.status === 2 ? 'document_archived' : 'wrong_document_type' })
+    return
+  }
+  const { title } = req.body ?? {}
+  if (title !== undefined && (typeof title !== 'string' || title.length > 512)) {
+    res.status(400).json({ error: typeof title === 'string' ? 'title too long' : 'invalid_title' })
+    return
+  }
+  if (typeof title === 'string') await docMetaRepo.rename(meta.doc_id, title, req.uid!)
+  let indexed = false
+  if (config.search.indexEnabled && isSearchIndexedDoc(meta.document_name)) {
+    indexed = await enqueueDocIndex(meta.document_name)
+  }
+  res.status(200).json({ docId: meta.doc_id, title: typeof title === 'string' ? title : meta.title, indexed })
+}
+
+docsRouter.post('/:docId/published', publishHtmlHandler)
 
 /** GET /api/v1/docs/{docId} — fetch one doc's metadata (needs reader). */
 export async function getDocHandler(req: Request, res: Response) {
@@ -660,6 +734,38 @@ async function resolveDocIdBySlug(req: Request, res: Response): Promise<string |
   return meta.doc_id
 }
 
+/**
+ * Resolve a canonical HTML delete target. An already soft-deleted row is visible
+ * only to its owning authenticated principal, which makes the retry idempotent
+ * without allowing unrelated callers to probe deleted document existence.
+ */
+async function resolveCanonicalDeleteBySlug(req: Request, res: Response): Promise<{ docId: string; deleted: boolean } | null> {
+  const meta = await docMetaRepo.getByOctoDocSlug(req.params.octoDocSlug!, req.spaceId!)
+  if (!meta) {
+    res.status(404).json({ error: 'not_found' })
+    return null
+  }
+  if (meta.status === 0) {
+    // Only the canonical identity contract is idempotent here. Historical
+    // slug-registered rows retain their existing 404 behavior.
+    //
+    // slug === doc_id is a convention, not proof of canonical provenance: the
+    // slug charset admits a `d_…` string, so a legacy registration can pick one
+    // equal to its own doc id. Only the canonical insert populates
+    // html_idempotency_key_hash, so that column is the actual discriminator.
+    if (
+      meta.owner_id === req.uid &&
+      meta.html_idempotency_key_hash != null &&
+      meta.octo_doc_slug === meta.doc_id
+    ) {
+      return { docId: meta.doc_id, deleted: true }
+    }
+    res.status(404).json({ error: 'not_found' })
+    return null
+  }
+  return { docId: meta.doc_id, deleted: false }
+}
+
 async function renameDocById(req: Request, res: Response, docId: string): Promise<void> {
   const guard = await requireDocRole(req, res, docId, 'admin')
   if (!guard) return
@@ -710,9 +816,13 @@ export async function octoDocRenameHandler(req: Request, res: Response): Promise
 }
 
 export async function octoDocDeleteHandler(req: Request, res: Response): Promise<void> {
-  const docId = await resolveDocIdBySlug(req, res)
-  if (!docId) return
-  await deleteDocById(req, res, docId)
+  const target = await resolveCanonicalDeleteBySlug(req, res)
+  if (!target) return
+  if (target.deleted) {
+    res.status(204).end()
+    return
+  }
+  await deleteDocById(req, res, target.docId)
 }
 
 /** PATCH /api/v1/docs/{docId} — rename (needs admin). */
