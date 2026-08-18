@@ -83,6 +83,7 @@ import { cardActionDecideHandler, CARD_ACTION_DECIDE_PATH } from './routes/cardA
 import { invitesRouter, acceptInviteRouter, botAcceptInviteRouter } from './routes/invites.js'
 import { attachmentsRouter } from './routes/attachments.js'
 import { linkCardRouter } from './routes/linkCard.js'
+import { htmlCommentsRouter } from './routes/htmlComments.js'
 import { commentsRouter } from './routes/comments.js'
 import { versionsRouter } from './routes/versions.js'
 import { docContentRouter } from './routes/docContent.js'
@@ -281,6 +282,10 @@ export function createApp(
   api.use(invitesRouter) // /:docId/invites ... (admin)
   api.use(attachmentsRouter) // /:docId/attachments/presign , /:docId/attachments/:attachId
   api.use(linkCardRouter) // /:docId/link-card (OG fetch, §3.5 ⑰)
+  // HTML 评论转发。挂载顺序**不承重**:commentsRouter 的 POST 只有 /:docId/comments
+  // (严格两段),而 /html/:slug/comments 是三段,永不匹配 —— 实测把两者顺序反过来,
+  // /html/x/comments 仍命中本路由。此处保持相邻只是可读性。
+  api.use(htmlCommentsRouter) // /html/:slug/comments (转发到 octo-docs-html + Bot 任务上报)
   api.use(commentsRouter) // /:docId/comments , /:docId/comments/:id
   api.use(versionsRouter) // /:docId/versions ... (snapshot + restore, §4 #4)
   api.use(docContentRouter) // /:docId/content (bot incremental body edit + live read)

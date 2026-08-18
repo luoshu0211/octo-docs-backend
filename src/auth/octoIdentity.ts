@@ -11,6 +11,7 @@
  *   - a middleware-style placeholder impl for the same-process mount, where uid
  *     would come from octo's AuthMiddleware via c.GetLoginUID() (§4.7(a)).
  */
+import { createHash } from 'node:crypto'
 import { config } from '../config/env.js'
 import { Singleflight, TtlCache } from '../util/singleflight.js'
 import { parseOwnedBotUidsStrict } from '../util/botUids.js'
@@ -108,6 +109,26 @@ function parseBatchUsers(body: unknown): Map<string, OctoUser> | null {
     })
   }
   return out
+}
+
+/**
+ * One entry of the caller's friend-bot list (GET /v1/robot/my_bots).
+ *
+ * `creatorUid` is the bot's `robot.creator_uid` — octo-server returns '' for a
+ * bot with no recorded creator, so it is surfaced verbatim (possibly empty) and
+ * must never be treated as an ownership proof on its own.
+ */
+export interface OctoCallerBot {
+  uid: string
+  creatorUid: string
+}
+
+/**
+ * Stable, non-reversible cache-key component for a session token. Only ever used
+ * as a Map key inside this process; the token itself is never logged or stored.
+ */
+function tokenFingerprint(token: string): string {
+  return createHash('sha256').update(token).digest('hex').slice(0, 32)
 }
 
 export interface OctoIdentity {
@@ -235,6 +256,40 @@ export interface OctoIdentity {
    * (rejects the bot snapshot), never widens it.
    */
   ownedBotsInSpace(uid: string, spaceId: string, token: string): Promise<string[]>
+
+  /**
+   * (c) Which User Bots has the CALLER added as friends? Reads octo-server's
+   * already-existing GET /v1/robot/my_bots, authenticated with the caller's OWN
+   * session token (the `token` header — octo's AuthMiddleware realm, NOT
+   * `Authorization: Bearer`). No service secret: that route answers only for the
+   * token holder (`c.GetLoginUID()`), so this path can never enumerate a third
+   * party's bots.
+   *
+   * SEMANTICS WORTH KNOWING — octo-server resolves the list as
+   * `friend f INNER JOIN user u ON f.to_uid=u.uid AND u.robot=1
+   *  INNER JOIN robot r ON r.robot_id=f.to_uid AND r.status=1
+   *  WHERE f.uid=<caller> AND f.is_deleted=0 AND f.to_uid!='botfather'`.
+   * Membership of this list therefore PROVES BOTH halves at once: the uid is an
+   * active User Bot, AND the caller is friends with it. No separate friendship
+   * lookup is needed or possible.
+   *
+   * `spaceId`, when non-empty, is forwarded as `?space_id=` and octo-server
+   * additionally requires the bot to be an ACTIVE `space_member` of that space.
+   * That only ever NARROWS the answer, and it narrows it to exactly the bots that
+   * could act in the document's space at all, so it is always the safer scoping.
+   *
+   * FAIL-CLOSED: returns null — "could not confirm" — on a missing principal /
+   * token, any transport failure, any non-200 (octo-server answers 400 for every
+   * error on this route), or a body that is not a JSON array. Callers must treat
+   * null as "no friend bots confirmed" and MUST NOT widen anything on it. A null
+   * is never cached, so a transient outage does not pin an empty list for the TTL.
+   *
+   * The response is a BARE JSON array (`c.Response(results)` => 200 + the array,
+   * no `{data:...}` envelope); individual entries that carry no usable `uid` are
+   * skipped rather than failing the whole list — dropping an entry can only
+   * narrow the caller's candidate set.
+   */
+  listCallerBots(uid: string, spaceId: string, token: string): Promise<OctoCallerBot[] | null>
 }
 
 /**
@@ -259,6 +314,24 @@ export class HttpOctoIdentity implements OctoIdentity {
   private readonly membershipSf = new Singleflight<boolean>()
   private readonly membershipCache = new TtlCache<boolean>(
     config.octoIdentity.membershipCacheTtlSeconds * 1000,
+  )
+
+  /**
+   * Same coalescing + short-TTL pattern for listCallerBots (GET /v1/robot/my_bots).
+   *
+   * KEY = `${uid} ${spaceId} ${tokenFingerprint(token)}`.
+   *
+   * The token fingerprint is what makes this safe to share a process between
+   * users: the endpoint answers for the TOKEN HOLDER, so the cached value is a
+   * property of the token, not of a client-supplied uid. Keying on the token's
+   * hash (plus the uid and the space scope the answer was fetched under) means two
+   * different callers can never read each other's bot list, even if they somehow
+   * presented the same uid. Only a CONFIRMED list is cached — a fail-closed null
+   * is not — so an outage is retried instead of pinned.
+   */
+  private readonly callerBotsSf = new Singleflight<OctoCallerBot[] | null>()
+  private readonly callerBotsCache = new TtlCache<OctoCallerBot[]>(
+    config.octoIdentity.callerBotsCacheTtlSeconds * 1000,
   )
 
   async verifyToken(token: string): Promise<{ uid: string; name?: string; ownedBots?: string[] } | null> {
@@ -584,6 +657,67 @@ export class HttpOctoIdentity implements OctoIdentity {
     // eslint-disable-next-line no-console
     console.warn('[octo-docs] space_membership_verify_error', { reason, ...details })
   }
+
+  async listCallerBots(uid: string, spaceId: string, token: string): Promise<OctoCallerBot[] | null> {
+    // No principal or no token => nothing can be confirmed and no request could be
+    // authorized. Short out BEFORE any IO (and before writing a degenerate key).
+    // Note: an empty spaceId is legitimate — the space filter is optional — so it
+    // is not part of this guard, only of the key and the query string.
+    if (!uid || !token) return null
+    const key = `${uid} ${spaceId} ${tokenFingerprint(token)}`
+    const cached = this.callerBotsCache.get(key)
+    if (cached !== undefined) return cached
+    return this.callerBotsSf.do(key, async () => {
+      const bots = await this.fetchCallerBots(spaceId, token)
+      // Cache confirmed answers only (including a confirmed EMPTY list). A null is
+      // "could not confirm" and is deliberately left uncached so the next call
+      // retries instead of inheriting a fail-closed answer for the whole TTL.
+      if (bots !== null) this.callerBotsCache.set(key, bots)
+      return bots
+    })
+  }
+
+  /**
+   * Fetch the caller's friend-bot list from octo-server's GET /v1/robot/my_bots.
+   *
+   * Auth is the `token` HEADER (octo's AuthMiddleware realm reads `c.GetHeader
+   * ("token")`), never `Authorization: Bearer` — the bearer realm is authBot and
+   * does not serve this route. The token is never logged.
+   *
+   * Returns the parsed list, or null on any transport failure / non-200 / non-array
+   * body so the caller can distinguish "confirmed: no friend bots" ([]) from "could
+   * not confirm" (null => fail-closed, uncached). octo-server answers HTTP 400 for
+   * every error on this route (httperr pins transportStatus to StatusBadRequest),
+   * so `!res.ok` covers all of them.
+   */
+  private async fetchCallerBots(spaceId: string, token: string): Promise<OctoCallerBot[] | null> {
+    const qs = spaceId ? `?space_id=${encodeURIComponent(spaceId)}` : ''
+    let res: Response
+    try {
+      res = await fetch(`${this.baseUrl}/v1/robot/my_bots${qs}`, { headers: { token } })
+    } catch {
+      // Authoritative source unreachable => cannot confirm => fail-closed.
+      return null
+    }
+    if (!res.ok) return null
+    const body = (await res.json().catch(() => null)) as unknown
+    // The wire shape is a BARE array (no {data:...} envelope). Anything else is a
+    // shape we do not understand and must not interpret as "zero friend bots".
+    if (!Array.isArray(body)) return null
+    const bots: OctoCallerBot[] = []
+    for (const item of body) {
+      if (!item || typeof item !== 'object') continue
+      const row = item as { uid?: unknown; creator_uid?: unknown }
+      // A row with no usable uid names no bot; skipping it can only narrow the
+      // caller's candidate set, which is the fail-closed direction.
+      if (typeof row.uid !== 'string' || row.uid === '') continue
+      bots.push({
+        uid: row.uid,
+        creatorUid: typeof row.creator_uid === 'string' ? row.creator_uid : '',
+      })
+    }
+    return bots
+  }
 }
 
 /**
@@ -646,6 +780,10 @@ export class MiddlewareOctoIdentity implements OctoIdentity {
 
   ownedBotsInSpace(uid: string, spaceId: string, token: string): Promise<string[]> {
     return this.delegate.ownedBotsInSpace(uid, spaceId, token)
+  }
+
+  listCallerBots(uid: string, spaceId: string, token: string): Promise<OctoCallerBot[] | null> {
+    return this.delegate.listCallerBots(uid, spaceId, token)
   }
 }
 

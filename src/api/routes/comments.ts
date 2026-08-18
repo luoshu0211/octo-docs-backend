@@ -30,6 +30,7 @@ import {
   AnchorTextNotFoundError,
 } from '../../collab/anchorResolve.js'
 import { notifyDocMentioned } from '../services/docsNotify.js'
+import { reportBotMentions } from '../services/botMention.js'
 import type { BlockPath } from '../../collab/docBodyEdit.js'
 import { isDocType, HTML_PPT_DOC_TYPE } from '../../db/docType.js'
 import { validateExplicitCommentAnchors } from '../services/commentAnchors.js'
@@ -124,6 +125,26 @@ function parseOccurrence(raw: unknown): number | undefined | typeof INVALID_DISA
     typeof raw === 'number' ? raw : typeof raw === 'string' && /^\d+$/.test(raw) ? Number(raw) : NaN
   if (!Number.isSafeInteger(n) || n < 1) return INVALID_DISAMBIGUATION
   return n
+}
+
+/**
+ * Fire the @Bot mention report as a detached, best-effort side channel.
+ *
+ * HARD REQUIREMENT: reporting must never be able to fail comment creation. The
+ * comment row is already committed when this is called, and the report is neither
+ * awaited nor allowed to reject — the promise chain swallows everything, so even a
+ * synchronous throw or a future refactor that drops reportBotMentions' own
+ * internal guard cannot turn a successful 201 into an error or leave an unhandled
+ * rejection behind. Retries (bounded exponential backoff) run inside this detached
+ * task, off the request's critical path.
+ */
+function fireBotMentionReport(params: Parameters<typeof reportBotMentions>[0]): void {
+  void Promise.resolve()
+    .then(() => reportBotMentions(params))
+    .catch(() => {
+      // Swallowed by contract: the comment is committed and the response is sent.
+      // reportBotMentions already logs its own failures with safe metadata.
+    })
 }
 
 /** Serialize a stored comment for the wire (anchors -> base64). */
@@ -262,6 +283,22 @@ export async function createCommentHandler(req: Request, res: Response): Promise
     }
     // Best-effort: notify mentions and invalidate live comment views.
     void notifyDocMentioned({ docId, spaceId: guard.meta.space_id, title: guard.meta.title, authorUid: req.uid!, body })
+    fireBotMentionReport({
+      docId,
+      commentId: id,
+      parentId: pid,
+      // upstream #170 起 space 不再从请求参数取,统一读 guard 解析出的文档归属 —— 
+      // 与上面 notifyDocMentioned 用同一个来源,免得两处 space 漂开。
+      spaceId: guard.meta.space_id,
+      authorUid: req.uid!,
+      authorRole: guard.role,
+      ownedBots: req.ownedBots ?? [],
+      // The author's own session token authenticates the friend-bot lookup
+      // (GET /v1/robot/my_bots answers only for the token holder). Never logged.
+      callerToken: req.octoToken,
+      body,
+      isBotCaller: req.botToken !== undefined,
+    })
     void publishCommentMutation(documentName, docId, id, 'created')
     res.status(201).json({ id })
     return
@@ -355,6 +392,21 @@ export async function createCommentHandler(req: Request, res: Response): Promise
   })
   // Best-effort: notify mentions and invalidate live comment views.
   void notifyDocMentioned({ docId, spaceId: guard.meta.space_id, title: guard.meta.title, authorUid: req.uid!, body })
+  // A root comment sends no parent_id, so octo-server derives the thread from comment_id.
+  fireBotMentionReport({
+    docId,
+    commentId: id,
+    // 同上:upstream #170 后 space 统一取 guard.meta.space_id。
+    spaceId: guard.meta.space_id,
+    authorUid: req.uid!,
+    authorRole: guard.role,
+    ownedBots: req.ownedBots ?? [],
+    // The author's own session token authenticates the friend-bot lookup
+    // (GET /v1/robot/my_bots answers only for the token holder). Never logged.
+    callerToken: req.octoToken,
+    body,
+    isBotCaller: req.botToken !== undefined,
+  })
   void publishCommentMutation(documentName, docId, id, 'created')
   res.status(201).json({ id })
 }
