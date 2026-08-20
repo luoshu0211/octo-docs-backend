@@ -243,3 +243,62 @@ describe('GET /api/v1/docs/:docId/members — synthesized owner row', () => {
     }
   })
 })
+
+// The roster gate was admin-only, which broke the @Bot picker for every non-owner:
+// mentions/botCandidates.ts must read this roster to prove a Bot holds writer+ on the
+// doc, and it fails CLOSED on a read error — so a writer saw zero Bots while the owner
+// (implicit admin) saw them. These cases pin the two halves of the fix: collaborators
+// may READ the roster, and `grantedBy` stays admin-only.
+describe('GET /api/v1/docs/:docId/members — readable by collaborators, grantedBy admin-only', () => {
+  function guardWithRole(role: string, ownerId = 'u_owner') {
+    vi.mocked(requireDocRole).mockResolvedValue({
+      meta: { doc_id: 'd_1', document_name: 'doc-d_1', owner_id: ownerId, doc_type: 'doc' },
+      role,
+    } as never)
+  }
+
+  it('gates on reader, not admin — a writer is no longer refused the roster', async () => {
+    guardWithRole('writer')
+    vi.mocked(docMemberRepo.list).mockResolvedValue([] as never)
+    await getMembersHandler()(getReq(), mockRes() as never)
+    // The guard argument IS the bug: 'admin' here is what locked writers out.
+    expect(vi.mocked(requireDocRole).mock.calls.at(-1)?.[3]).toBe('reader')
+  })
+
+  it('a writer gets the full roster with roles (what the @Bot picker needs)', async () => {
+    guardWithRole('writer')
+    vi.mocked(docMemberRepo.list).mockResolvedValue([
+      { uid: 'bot_1', role: 2, source: 1, granted_by: 'u_owner' }, // the bot, writer
+    ] as never)
+    const res = mockRes()
+    await getMembersHandler()(getReq(), res as never)
+
+    expect(res.statusCode).toBe(200)
+    const items = (res.body as { items: Array<{ uid: string; role: string }> }).items
+    // role must survive — botCandidates filters on canEdit(role), so a blanked role
+    // would fail closed exactly like the 403 did.
+    expect(items).toContainEqual({ uid: 'bot_1', role: 'writer', source: 'direct', grantedBy: null })
+  })
+
+  it('hides grantedBy from non-admins but keeps it for admins', async () => {
+    const rows = [{ uid: 'u_writer', role: 2, source: 1, granted_by: 'u_owner' }]
+
+    guardWithRole('writer')
+    vi.mocked(docMemberRepo.list).mockResolvedValue(rows as never)
+    const asWriter = mockRes()
+    await getMembersHandler()(getReq(), asWriter as never)
+    const writerRow = (asWriter.body as { items: Array<{ uid: string; grantedBy: unknown }> }).items.find(
+      (i) => i.uid === 'u_writer',
+    )
+    expect(writerRow?.grantedBy).toBeNull()
+
+    guardWithRole('admin')
+    vi.mocked(docMemberRepo.list).mockResolvedValue(rows as never)
+    const asAdmin = mockRes()
+    await getMembersHandler()(getReq(), asAdmin as never)
+    const adminRow = (asAdmin.body as { items: Array<{ uid: string; grantedBy: unknown }> }).items.find(
+      (i) => i.uid === 'u_writer',
+    )
+    expect(adminRow?.grantedBy).toBe('u_owner')
+  })
+})
