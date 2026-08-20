@@ -27,10 +27,24 @@ function parseRole(v: unknown): Role | null {
   return isMemberRole(v) ? v : null
 }
 
-/** GET members (needs admin). */
+/**
+ * GET members (needs reader — i.e. any collaborator on the doc).
+ *
+ * WAS admin-only. That gate broke the @Bot picker for every non-owner: the frontend
+ * (mentions/botCandidates.ts) must read this roster to prove a Bot holds writer+ on THIS
+ * doc before it may offer it, and it fails CLOSED when the read throws. A writer therefore
+ * got `permission-unknown` ("暂时读不到文档权限，无法列出可用的 Bot") and zero Bots, while
+ * the owner — implicit admin — saw them. The roster is not a secret from the people already
+ * on the doc: the same @ menu lists every human member by name right below the Bot group.
+ *
+ * `grantedBy` (who granted whom) IS management metadata, so it is disclosed to admins only
+ * and nulled for everyone else. No frontend reads the field, so this costs nothing today and
+ * keeps the admin-only surface from silently widening with the gate.
+ */
 membersRouter.get('/:docId/members', async (req: Request, res: Response) => {
-  const guard = await requireDocRole(req, res, req.params.docId!, 'admin')
+  const guard = await requireDocRole(req, res, req.params.docId!, 'reader')
   if (!guard) return
+  const isAdmin = guard.role === 'admin'
   const ownerId = guard.meta.owner_id
   const members = await docMemberRepo.list(req.params.docId!)
   // The owner is an implicit admin and intentionally has NO doc_member row
@@ -50,7 +64,7 @@ membersRouter.get('/:docId/members', async (req: Request, res: Response) => {
       uid: m.uid,
       role: roleName(Number(m.role)),
       source: m.source === 2 ? 'invite' : 'direct',
-      grantedBy: m.granted_by,
+      grantedBy: isAdmin ? m.granted_by : null,
     }))
   res.status(200).json({
     items: [{ uid: ownerId, role: 'admin', source: 'owner', grantedBy: null }, ...directMembers],
