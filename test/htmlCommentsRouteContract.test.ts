@@ -101,6 +101,7 @@ describe('POST /html/:slug/comments — @Bot 上报拿到的 spaceId(P0 回归)'
       body: JSON.stringify({ slug: 'my-slug', text: '@bot 帮我改一下', version: 1 }),
     })
     expect(res.status).toBe(200)
+    expect(forwardHtmlComment.mock.calls[0]![2]).toBe('sp_real')
     // 上报是 res 之后脱离式触发的,等一个微任务轮次。
     await new Promise((r) => setTimeout(r, 0))
     expect(fireHtmlBotMentionReport).toHaveBeenCalledTimes(1)
@@ -118,6 +119,7 @@ describe('POST /html/:slug/comments — @Bot 上报拿到的 spaceId(P0 回归)'
       body: JSON.stringify({ slug: 'my-slug', text: '@bot', version: 1 }),
     })
     expect(res.status).toBe(200)
+    expect(forwardHtmlComment.mock.calls[0]![2]).toBe('sp_pad')
     await new Promise((r) => setTimeout(r, 0))
     const arg = fireHtmlBotMentionReport.mock.calls[0]![0] as { spaceId: string }
     expect(arg.spaceId).toBe('sp_pad')
