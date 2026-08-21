@@ -679,7 +679,12 @@ function mapInline(inlineTok: Token, ctx: Ctx): PmNode[] {
         out.push({ type: 'hardBreak' })
         break
       case 'code_inline':
-        out.push(withMarks({ type: 'text', text: c.content }, [...markStack, { type: 'code' }]))
+        // ProseMirror's code mark excludes every other mark in the shared schema. Markdown-it
+        // still reports surrounding emphasis/link marks for valid input where strong emphasis
+        // wraps inline code; carrying that stack into the code run makes the later
+        // atomic write fail with schema_incompatible. Inline code is authoritative, so apply
+        // only the code mark while preserving the surrounding marks on adjacent text.
+        out.push(withMarks({ type: 'text', text: c.content }, [{ type: 'code' }]))
         break
       case 'strong_open':
         markStack.push({ type: 'bold' })
