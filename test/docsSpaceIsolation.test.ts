@@ -64,6 +64,7 @@ describe('GET /api/v1/docs — list is scoped to the header space', () => {
     const req = {
       uid: 'u_1',
       spaceId: 's_header',
+      principalSpaceId: 's_header',
       // A stray query.spaceId must NOT override the enforced header space.
       query: { spaceId: 's_query_attacker', page: '1', pageSize: '20' },
     } as never
@@ -83,6 +84,7 @@ describe('POST /api/v1/docs — create persists into the header space', () => {
     const req = {
       uid: 'u_owner',
       spaceId: 's_header',
+      principalSpaceId: 's_header',
       // body.spaceId is ignored (the P1 transitional fallback was removed in
       // P3); the header space is the single source of truth.
       body: { spaceId: 's_body_attacker', folderId: 'f_x', title: 'Hello', docType: 'doc' },

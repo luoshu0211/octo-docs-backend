@@ -60,6 +60,7 @@ function mockReq(opts: {
   return {
     uid: opts.uid ?? 'u_1',
     octoToken: opts.octoToken ?? 'session-token',
+    principalSpaceId: opts.scope?.mode === 'bot' ? opts.scope.spaceId : 's1',
     docSpaceScope: opts.scope,
     ...(opts.scope?.mode === 'human'
       ? {
@@ -106,7 +107,7 @@ beforeEach(() => {
 describe('requireDocRole — Bot mount cross-space gate (§6)', () => {
   const botScope: DocSpaceScope = { mode: 'bot', spaceId: 's2' }
 
-  it('404s a cross-space doc and never consults the role (gate runs before 403)', async () => {
+  it('404s a cross-space doc with no exact principal grant', async () => {
     vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(metaRow({ space_id: 's1' }) as never)
     const res = mockRes()
 
@@ -115,25 +116,33 @@ describe('requireDocRole — Bot mount cross-space gate (§6)', () => {
     expect(guard).toBeNull()
     expect(res.statusCode).toBe(404)
     expect(res.body).toEqual({ error: 'not_found' })
-    // The gate short-circuits before role resolution — no existence/role leak.
-    expect(vi.mocked(resolveRole)).not.toHaveBeenCalled()
+    expect(vi.mocked(resolveRole)).toHaveBeenCalledWith('u_1', 'd_1', 's2')
   })
 
-  it('returns 404 (not 403) even when the caller would otherwise be admin in the doc', async () => {
+  it('allows a cross-space Bot only through its exact principal-qualified direct grant', async () => {
     vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(metaRow({ space_id: 's1' }) as never)
-    vi.mocked(resolveRole).mockResolvedValue('admin' as never)
+    vi.mocked(resolveRole).mockResolvedValue('writer' as never)
     const res = mockRes()
 
-    const guard = await requireDocRole(mockReq({ uid: 'u_admin', scope: botScope }) as never, res as never, 'd_1', 'admin')
+    const guard = await requireDocRole(mockReq({ uid: 'bot_b', scope: botScope }) as never, res as never, 'd_1', 'reader')
 
-    expect(guard).toBeNull()
-    expect(res.statusCode).toBe(404)
-    expect(res.body).toEqual({ error: 'not_found' })
-    expect(vi.mocked(resolveRole)).not.toHaveBeenCalled()
+    expect(guard?.role).toBe('writer')
+    expect(res.statusCode).toBe(0)
+    expect(vi.mocked(resolveRole)).toHaveBeenCalledWith('bot_b', 'd_1', 's2')
   })
 
-  it('404s a cross-space archived doc (gate runs before the 409 archived branch)', async () => {
+  it('keeps non-leaking 404 when a cross-space direct grant is below the required role', async () => {
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(metaRow({ space_id: 's1' }) as never)
+    vi.mocked(resolveRole).mockResolvedValue('reader' as never)
+    const res = mockRes()
+    const guard = await requireDocRole(mockReq({ uid: 'bot_b', scope: botScope }) as never, res as never, 'd_1', 'writer')
+    expect(guard).toBeNull()
+    expect(res.statusCode).toBe(404)
+  })
+
+  it('404s a cross-space archived doc without a grant', async () => {
     vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(metaRow({ space_id: 's1', status: 2 }) as never)
+    vi.mocked(resolveRole).mockResolvedValue('none' as never)
     const res = mockRes()
 
     const guard = await requireDocRole(mockReq({ uid: 'u_1', scope: botScope }) as never, res as never, 'd_1', 'reader')
@@ -158,7 +167,7 @@ describe('requireDocRole — Bot mount cross-space gate (§6)', () => {
     expect(res.statusCode).toBe(0)
     expect(guard).not.toBeNull()
     expect(guard!.role).toBe('writer')
-    expect(vi.mocked(resolveRole)).toHaveBeenCalledWith('u_1', 'd_1')
+    expect(vi.mocked(resolveRole)).toHaveBeenCalledWith('u_1', 'd_1', 's1')
   })
 })
 
@@ -188,15 +197,14 @@ describe('requireDocRole — Human mount locates by docId (§6)', () => {
     expect(isSpaceMember).toHaveBeenCalledWith('u_1', 's1', 'session-token')
   })
 
-  it('rejects a doc outside the verified current home Space', async () => {
+  it('allows a direct collaborator from a different verified current Space', async () => {
     vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(metaRow({ space_id: 's_other' }) as never)
     vi.mocked(resolveRole).mockResolvedValue('writer' as never)
     const res = mockRes()
     const guard = await requireDocRole(mockReq({ uid: 'u_1', scope: humanScope }) as never, res as never, 'd_1', 'reader')
-    expect(guard).toBeNull()
-    expect(res.statusCode).toBe(404)
-    expect(res.body).toEqual({ error: 'not_found' })
-    expect(vi.mocked(resolveRole)).not.toHaveBeenCalled()
+    expect(guard?.role).toBe('writer')
+    expect(res.statusCode).toBe(0)
+    expect(vi.mocked(resolveRole)).toHaveBeenCalled()
   })
 
   it('preserves the existing 404 for a missing/deleted doc', async () => {

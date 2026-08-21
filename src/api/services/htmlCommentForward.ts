@@ -201,11 +201,11 @@ export async function resolveHtmlBotAccess(params: {
     if (!resolved.docId) return { allowed: false, reason: `doc_${resolved.reason}` }
     const docId = resolved.docId
 
-    const authorRole = await resolveRole(authorUid, docId)
+    const authorRole = await resolveRole(authorUid, docId, spaceId)
     if (!roleAtLeast(authorRole, BOT_MENTION_MIN_ROLE)) {
       return { allowed: false, reason: 'author_role_too_low' }
     }
-    const bot = await resolveBotDocAccess(docId, botUid)
+    const bot = await resolveBotDocAccess(docId, botUid, spaceId)
     return bot.allowed ? { allowed: true, reason: 'ok' } : { allowed: false, reason: bot.reason }
   } catch {
     // 判不出来就是不放行:入队之后没有别的关卡了。

@@ -339,7 +339,7 @@ export function createServer() {
       // Stale: recheck this uid's CURRENT role (singleflight + short-TTL cache).
       // #64: pass the token-carried space_member claim so a narrowed
       // anyone_in_space scope is honored on the already-connected socket.
-      const role = await recheckCurrentRoleCached(data.documentName, ctx.user.id, ctx.space_member)
+      const role = await recheckCurrentRoleCached(data.documentName, ctx.user.id, ctx.principal_space_id, ctx.space_member)
       if (role === 'none' || !roleAtLeast(role, 'writer')) {
         // role actually dropped / revoked => reject this write & flip the conn.
         data.connection.readOnly = true

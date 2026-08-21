@@ -19,7 +19,12 @@
  *     is what makes a revoked / deleted / archived doc drop out of the next query.
  */
 import { query, transaction } from '../pool.js'
-import { SHARE_SCOPE_ANYONE, SHARE_ROLE_EDIT } from '../../permission/shareScope.js'
+import {
+  SHARE_SCOPE_AUTHENTICATED,
+  SHARE_SCOPE_ANYONE,
+  SHARE_ROLE_COMMENT,
+  SHARE_ROLE_EDIT,
+} from '../../permission/shareScope.js'
 import { STORED_ROLE_VALUES } from '../../permission/role.js'
 
 const VALID_STORED_ROLES_SQL = STORED_ROLE_VALUES.join(', ')
@@ -92,56 +97,51 @@ function escapeLike(s: string): string {
  * Read-side visibility predicate for the recent-view queries. Mirrors the WRITE
  * side (POST /view -> requireDocRole -> resolveEffectiveRole): a doc is visible
  * when the caller is the owner, holds a doc_member row, OR the doc is
- * space-scoped-shared (share_scope = anyone_in_space) and lives in the SAME space
- * as the view record.
+ * link-shared: authenticated for every authenticated viewer, or anyone_in_space
+ * when the verified current Space equals the document Home Space.
  *
- * The space-share branch is gated on `isSpaceMember` — the SAME membership check
+ * The anyone_in_space branch is gated on `isSpaceMember` — the SAME membership check
  * the write side runs (resolveEffectiveRole -> isSpaceMember(uid, space, token)).
  * `v.space_id = ?` in the surrounding WHERE only pins the query to a space the
  * CALLER named (the unverified X-Space-Id header); it does NOT prove the caller
  * belongs to it. Without the membership gate a non-member could name another
  * space and read its anyone_in_space docs via a stray view row — the cross-space
  * metadata leak this predicate closes. When the caller is NOT a confirmed member
- * of the queried space, the share branch is dropped entirely, so visibility
- * collapses to owner OR doc_member (the pre-#64 behavior) and no share-only doc
- * of that space is ever returned.
+ * of the queried space, only the anyone_in_space branch is dropped;
+ * authenticated remains visible because it is intentionally Space-independent.
  *
- * When the caller IS a member, the branch is added but stays same-space-guarded:
+ * When the caller IS a member, the anyone_in_space branch is added but stays same-space-guarded:
  * `m.space_id = v.space_id` requires the doc's HOME space to equal the view
- * record's space, so a doc shared in a DIFFERENT space never leaks in even for a
- * member. SHARE_SCOPE_ANYONE is a numeric module constant, inlined (not bound),
- * and the branch adds no positional bind, so the bind arrays are identical in
- * both forms and paging stays stable; it carries no injection surface.
+ * record's space. `authenticated` is intentionally not same-space gated.
+ * Discoverability is absent from both branches.
  */
+function shareVisibilityPredicate(isSpaceMember: boolean): string {
+  const authenticated = `m.share_scope = ${SHARE_SCOPE_AUTHENTICATED}`
+  if (!isSpaceMember) return authenticated
+  return `(${authenticated} OR (m.share_scope = ${SHARE_SCOPE_ANYONE} AND m.space_id = v.space_id))`
+}
+
 function visibilityPredicate(isSpaceMember: boolean): string {
-  return isSpaceMember
-    ? `(m.owner_id = ? OR ${validMemberRole} OR (m.share_scope = ${SHARE_SCOPE_ANYONE} AND m.space_id = v.space_id))`
-    : `(m.owner_id = ? OR ${validMemberRole})`
+  return `(m.owner_id = ? AND m.owner_space_id = ? OR ${validMemberRole} OR ${shareVisibilityPredicate(isSpaceMember)})`
 }
 
 /**
- * Role projection for the recent list — the read-side twin of `effectiveRole`
- * (shareScope.ts). Stored commenter=4 is not privilege-ordered, so the merge
- * tests writer/admin explicitly instead of using numeric GREATEST.
- *
- * The share arm carries the SAME same-space guard as the visibility predicate
- * (`m.share_scope = ANYONE AND m.space_id = v.space_id`) and is only emitted when
- * the caller is a confirmed member — a non-member (or a doc shared in a different
- * space) never gets a share label. SHARE_SCOPE_ANYONE / SHARE_ROLE_EDIT are
- * numeric constants inlined (no bind); the single owner-uid `?` is unchanged
- * whether or not the arm is present, so the bind arrays stay stable.
+ * Role projection for recent history. Direct membership and link sharing are
+ * independent permission sources, so each share role only raises the stored
+ * direct role. `authenticated` applies to every authenticated viewer;
+ * `anyone_in_space` additionally requires the already-verified current Space to
+ * equal the document Home Space. Discoverability is intentionally absent: it
+ * controls global search only, never direct-link access or recent history.
  */
 function roleProjection(isSpaceMember: boolean): string {
-  return isSpaceMember
-    ? `CASE WHEN m.owner_id = ? THEN 3
-            WHEN m.share_scope = ${SHARE_SCOPE_ANYONE} AND m.space_id = v.space_id
-                 AND m.share_role = ${SHARE_ROLE_EDIT}
+  const shareVisible = shareVisibilityPredicate(isSpaceMember)
+  return `CASE WHEN m.owner_id = ? AND m.owner_space_id = ? THEN 3
+            WHEN ${shareVisible} AND m.share_role = ${SHARE_ROLE_EDIT}
               THEN CASE WHEN dm.role = 3 THEN 3 WHEN dm.role = 2 THEN 2 ELSE 2 END
-            WHEN m.share_scope = ${SHARE_SCOPE_ANYONE} AND m.space_id = v.space_id
+            WHEN ${shareVisible} AND m.share_role = ${SHARE_ROLE_COMMENT}
+              THEN CASE WHEN dm.role = 3 THEN 3 WHEN dm.role = 2 THEN 2 ELSE 4 END
+            WHEN ${shareVisible}
               THEN CASE WHEN dm.role = 3 THEN 3 WHEN dm.role = 2 THEN 2 WHEN dm.role = 4 THEN 4 WHEN dm.role = 1 THEN 1 ELSE 1 END
-            WHEN dm.role = 3 THEN 3 WHEN dm.role = 2 THEN 2 WHEN dm.role = 4 THEN 4 WHEN dm.role = 1 THEN 1
-            ELSE NULL END`
-    : `CASE WHEN m.owner_id = ? THEN 3
             WHEN dm.role = 3 THEN 3 WHEN dm.role = 2 THEN 2 WHEN dm.role = 4 THEN 4 WHEN dm.role = 1 THEN 1
             ELSE NULL END`
 }
@@ -231,6 +231,7 @@ export const docViewHistoryRepo = {
     uid: string
     spaceId: string
     isSpaceMember?: boolean
+    principalSpaceId: string
     q?: string
     creators?: string[]
     types?: string[]
@@ -271,17 +272,17 @@ export const docViewHistoryRepo = {
     // base binds: role CASE `m.owner_id = ?` is only in the SELECT list (items
     // query), not the count. Build the two arg arrays separately.
     // COUNT: [v.uid, v.space_id, visibility-uid, ...filters]
-    const countArgs: unknown[] = [params.uid, params.spaceId, params.uid, ...filterArgs]
+    const countArgs: unknown[] = [params.uid, params.spaceId, params.uid, params.principalSpaceId, ...filterArgs]
     const base = `
       FROM doc_view_history v
       JOIN doc_meta m         ON m.doc_id = v.doc_id
-      LEFT JOIN doc_member dm ON dm.doc_id = m.doc_id AND dm.uid = ?
+      LEFT JOIN doc_member dm ON dm.doc_id = m.doc_id AND dm.uid = ? AND dm.principal_space_id = ?
       WHERE ${where.join(' AND ')}
     `
     // the doc_member join binds one uid ahead of the WHERE binds.
     const countRows = await query<{ cnt: number }>(
       `SELECT COUNT(*) AS cnt ${base}`,
-      [params.uid, ...countArgs],
+      [params.uid, params.principalSpaceId, ...countArgs],
     )
     const total = Number(countRows[0]?.cnt ?? 0)
 
@@ -296,7 +297,7 @@ export const docViewHistoryRepo = {
        ORDER BY v.viewed_at DESC, v.doc_id DESC
        LIMIT ${pageSize + 1}`,
       // role CASE uid, join uid, then WHERE binds (v.uid, space, visibility uid, ...filters), then cursor.
-      [params.uid, params.uid, ...countArgs, ...cursorArgs],
+      [params.uid, params.principalSpaceId, params.uid, params.principalSpaceId, ...countArgs, ...cursorArgs],
     )
 
     // Fetch pageSize+1 to detect a further page; the (pageSize+1)-th row is the
@@ -317,9 +318,9 @@ export const docViewHistoryRepo = {
    * full distinct owner set BEFORE the creator facet is applied. Name resolution
    * is done by the caller (route), which holds the octo session token.
    */
-  async listCreators(params: { uid: string; spaceId: string; isSpaceMember?: boolean; q?: string }): Promise<string[]> {
+  async listCreators(params: { uid: string; spaceId: string; principalSpaceId: string; isSpaceMember?: boolean; q?: string }): Promise<string[]> {
     const where: string[] = ['v.uid = ?', 'v.space_id = ?', 'm.status = 1', visibilityPredicate(params.isSpaceMember === true)]
-    const args: unknown[] = [params.uid, params.spaceId, params.uid]
+    const args: unknown[] = [params.uid, params.spaceId, params.uid, params.principalSpaceId]
     const q = (params.q ?? '').trim()
     if (q !== '') {
       where.push(`m.title LIKE ? ESCAPE '\\\\'`)
@@ -329,9 +330,9 @@ export const docViewHistoryRepo = {
       `SELECT DISTINCT m.owner_id
        FROM doc_view_history v
        JOIN doc_meta m         ON m.doc_id = v.doc_id
-       LEFT JOIN doc_member dm ON dm.doc_id = m.doc_id AND dm.uid = ?
+       LEFT JOIN doc_member dm ON dm.doc_id = m.doc_id AND dm.uid = ? AND dm.principal_space_id = ?
        WHERE ${where.join(' AND ')}`,
-      [params.uid, ...args],
+      [params.uid, params.principalSpaceId, ...args],
     )
     return rows.map((r) => r.owner_id)
   },

@@ -70,6 +70,7 @@ const DOC_IN_S_HOME = {
   document_name: 'octo:s_home:f_default:doc:d_1',
   title: 'Shared With An Outsider',
   owner_id: 'u_owner',
+  owner_space_id: 's_home',
   space_id: 's_home',
   folder_id: 'f_default',
   doc_type: 'doc',
@@ -97,7 +98,7 @@ function outsiderIdentity(): OctoIdentity {
     getUser: async (): Promise<OctoUser | null> => null,
     getUserAsBot: async (): Promise<OctoUser | null> => null,
     getUsers: async (): Promise<OctoUser[]> => [],
-    isSpaceMember: async () => false,
+    isSpaceMember: async (_uid, spaceId) => spaceId === 's_current',
   }
 }
 
@@ -123,30 +124,29 @@ beforeEach(() => {
   setOctoIdentity(outsiderIdentity())
 })
 
-describe('temporary Human home-Space gate', () => {
-  it('rejects a direct doc_member whose current Space membership cannot be verified', async () => {
+describe('Space-qualified Human authorization', () => {
+  it('accepts a direct grant qualified by the verified current Space', async () => {
     const res = await fetch(`${base}/api/v1/docs/d_1`, {
-      headers: { authorization: 'Bearer tok_u_ext', 'X-Space-Id': 's_home' },
+      headers: { authorization: 'Bearer tok_u_ext', 'X-Space-Id': 's_current' },
     })
-    expect(res.status).toBe(404)
-    expect(await res.json()).toEqual({ error: 'not_found' })
+    expect(res.status).toBe(200)
   })
 
   it('rejects a forged current Space before consulting the direct grant', async () => {
     const res = await fetch(`${base}/api/v1/docs/d_1`, {
-      headers: { authorization: 'Bearer tok_u_ext', 'X-Space-Id': 's_not_the_docs_space' },
+      headers: { authorization: 'Bearer tok_u_ext', 'X-Space-Id': 's_other' },
     })
     expect(res.status).toBe(404)
     expect(await res.json()).toEqual({ error: 'not_found' })
   })
 
-  it('rejects a caller with neither verified home-Space membership nor a grant', async () => {
+  it('returns forbidden when the verified principal has no qualified grant', async () => {
     getRole.mockResolvedValue(null as never)
     const res = await fetch(`${base}/api/v1/docs/d_1`, {
-      headers: { authorization: 'Bearer tok_u_ext', 'X-Space-Id': 's_home' },
+      headers: { authorization: 'Bearer tok_u_ext', 'X-Space-Id': 's_current' },
     })
-    expect(res.status).toBe(404)
-    expect(await res.json()).toEqual({ error: 'not_found' })
+    expect(res.status).toBe(403)
+    expect(await res.json()).toMatchObject({ error: 'forbidden' })
   })
 })
 
@@ -157,7 +157,7 @@ describe('the gate survives only on create, where no doc exists to authorize aga
       headers: {
         authorization: 'Bearer tok_u_ext',
         'content-type': 'application/json',
-        'X-Space-Id': 's_home',
+        'X-Space-Id': 's_unverified',
       },
       body: JSON.stringify({ title: 'Planted' }),
     })
@@ -183,7 +183,7 @@ describe('the gate survives only on create, where no doc exists to authorize aga
     } as never)
 
     const res = await fetch(`${base}/api/v1/docs`, {
-      headers: { authorization: 'Bearer tok_u_ext', 'X-Space-Id': 's_home' },
+      headers: { authorization: 'Bearer tok_u_ext', 'X-Space-Id': 's_current' },
     })
 
     expect(res.status).toBe(200)
@@ -191,29 +191,32 @@ describe('the gate survives only on create, where no doc exists to authorize aga
     // ...and taking the gate off must not widen anything: the caller is still a
     // non-member, so the space-share branch stays OFF in the pushed-down predicate.
     expect(listForUser).toHaveBeenCalledWith(
-      expect.objectContaining({ uid: 'u_ext', spaceId: 's_home', isSpaceMember: false }),
+      expect.objectContaining({ uid: 'u_ext', spaceId: 's_current', isSpaceMember: true }),
     )
   })
 
 })
 
-describe('access-request submit obeys the temporary home-Space gate', () => {
-  it('rejects a non-member before creating an access request', async () => {
+describe('access-request submit requires a verified principal Space', () => {
+  it('accepts an outsider request in their verified current Space', async () => {
+    getRole.mockResolvedValue(null as never)
     const res = await fetch(`${base}/api/v1/docs/d_1/access-requests`, {
       method: 'POST',
-      headers: { authorization: 'Bearer tok_u_ext', 'content-type': 'application/json', 'X-Space-Id': 's_home' },
-      body: '{}',
+      headers: { authorization: 'Bearer tok_u_ext', 'content-type': 'application/json', 'X-Space-Id': 's_current' },
+      body: JSON.stringify({ requestedRole: 'reader' }),
     })
-    expect(res.status).toBe(404)
-    expect(await res.json()).toEqual({ error: 'not_found' })
-    expect(vi.mocked(docAccessRequestRepo.submit)).not.toHaveBeenCalled()
+    expect(res.status).toBe(201)
+    expect(await res.json()).toMatchObject({ status: 'pending' })
+    expect(vi.mocked(docAccessRequestRepo.submit)).toHaveBeenCalledWith(
+      expect.objectContaining({ docId: 'd_1', uid: 'u_ext', principalSpaceId: 's_current' }),
+    )
   })
 
   it('rejects a forged current Space and creates no request', async () => {
     const res = await fetch(`${base}/api/v1/docs/d_1/access-requests`, {
       method: 'POST',
       headers: { authorization: 'Bearer tok_u_ext', 'content-type': 'application/json', 'X-Space-Id': 's_other' },
-      body: '{}',
+      body: JSON.stringify({ requestedRole: 'reader' }),
     })
     expect(res.status).toBe(404)
     expect(await res.json()).toEqual({ error: 'not_found' })

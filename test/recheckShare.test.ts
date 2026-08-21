@@ -25,6 +25,7 @@ const meta = (over: Record<string, unknown> = {}) => ({
   doc_id: DOC_ID,
   document_name: KEY,
   owner_id: 'u_owner',
+  owner_space_id: SPACE,
   space_id: SPACE,
   folder_id: FOLDER,
   doc_type: 'doc',
@@ -48,33 +49,45 @@ beforeEach(() => {
 describe('recheckCurrentRole — share-aware live recheck (#64)', () => {
   it('anyone_in_space/edit + space_member claim => writer (share-derived, no doc_member)', async () => {
     setup({ share_scope: 1, share_role: 2 }, 'none')
-    expect(await recheckCurrentRole(KEY, 'u_m', true)).toBe('writer')
+    expect(await recheckCurrentRole(KEY, 'u_m', SPACE, true)).toBe('writer')
   })
 
   it('N1 narrow edit->read: same connected member now rechecks to reader (< writer => write drops)', async () => {
     setup({ share_scope: 1, share_role: 1 }, 'none')
-    expect(await recheckCurrentRole(KEY, 'u_m', true)).toBe('reader')
+    expect(await recheckCurrentRole(KEY, 'u_m', SPACE, true)).toBe('reader')
   })
 
   it('N2 narrow ->restricted: member with no doc_member drops to none (4403 on refresh)', async () => {
     setup({ share_scope: 0, share_role: 1 }, 'none')
-    expect(await recheckCurrentRole(KEY, 'u_m', true)).toBe('none')
+    expect(await recheckCurrentRole(KEY, 'u_m', SPACE, true)).toBe('none')
+  })
+
+  it('authenticated edit narrows to restricted and loses the derived writer role', async () => {
+    setup({ share_scope: 2, share_role: 2 }, 'none')
+    expect(await recheckCurrentRole(KEY, 'u_authenticated', false)).toBe('writer')
+    setup({ share_scope: 0, share_role: 1 }, 'none')
+    expect(await recheckCurrentRole(KEY, 'u_authenticated', false)).toBe('none')
+  })
+
+  it('authenticated comment rechecks as commenter and cannot satisfy a writer gate', async () => {
+    setup({ share_scope: 2, share_role: 4 }, 'none')
+    expect(await recheckCurrentRole(KEY, 'u_commenter', false)).toBe('commenter')
   })
 
   it('N4: an owner/doc_member writer is unaffected by a narrowing (base role wins)', async () => {
     setup({ share_scope: 0, share_role: 1 }, 'writer')
-    expect(await recheckCurrentRole(KEY, 'u_w', true)).toBe('writer')
+    expect(await recheckCurrentRole(KEY, 'u_w', SPACE, true)).toBe('writer')
     setup({ share_scope: 0, share_role: 1 }, 'none') // owner has no doc_member row
-    expect(await recheckCurrentRole(KEY, 'u_owner', false)).toBe('admin')
+    expect(await recheckCurrentRole(KEY, 'u_owner', SPACE, false)).toBe('admin')
   })
 
   it('O1: old token (space_member absent => false) gets NO share-derived role on anyone_in_space', async () => {
     setup({ share_scope: 1, share_role: 2 }, 'none')
     // default param (no claim) => false => fail-closed, no share-derived writer.
-    expect(await recheckCurrentRole(KEY, 'u_m')).toBe('none')
+    expect(await recheckCurrentRole(KEY, 'u_m', SPACE)).toBe('none')
     // but a direct doc_member role is still preserved for the same old token.
     setup({ share_scope: 1, share_role: 2 }, 'reader')
-    expect(await recheckCurrentRole(KEY, 'u_m')).toBe('reader')
+    expect(await recheckCurrentRole(KEY, 'u_m', SPACE)).toBe('reader')
   })
 
   it('N5 space-membership revocation: scope stays anyone_in_space/edit but the claim is now false => write cut to none', async () => {
@@ -84,19 +97,19 @@ describe('recheckCurrentRole — share-aware live recheck (#64)', () => {
     // their space_member claim resolves false (removed from the space), drops to
     // `none` on the next recheck even though the doc is STILL anyone_in_space/edit.
     setup({ share_scope: 1, share_role: 2 }, 'none')
-    expect(await recheckCurrentRole(KEY, 'u_removed', true)).toBe('writer') // still a member
-    expect(await recheckCurrentRole(KEY, 'u_removed', false)).toBe('none') // removed => cut
+    expect(await recheckCurrentRole(KEY, 'u_removed', SPACE, true)).toBe('writer') // still a member
+    expect(await recheckCurrentRole(KEY, 'u_removed', SPACE, false)).toBe('none') // removed => cut
   })
 
   it('N5 revocation preserves a direct doc_member role (share loss only removes the share-derived grant)', async () => {
     // A removed space member who is ALSO a doc_member keeps their direct role —
     // revocation only strips the share-derived portion, never the base grant.
     setup({ share_scope: 1, share_role: 2 }, 'reader')
-    expect(await recheckCurrentRole(KEY, 'u_both', false)).toBe('reader')
+    expect(await recheckCurrentRole(KEY, 'u_both', SPACE, false)).toBe('reader')
   })
 
   it('deleted / missing doc => none', async () => {
     vi.mocked(docMetaRepo.getByDocumentName).mockResolvedValue(null as never)
-    expect(await recheckCurrentRole(KEY, 'u_m', true)).toBe('none')
+    expect(await recheckCurrentRole(KEY, 'u_m', SPACE, true)).toBe('none')
   })
 })

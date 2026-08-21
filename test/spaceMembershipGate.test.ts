@@ -162,6 +162,7 @@ describe('requireSpaceMembership — the gate on space-selector routes', () => {
     // Same string the handler will scope by — so no whitespace variant can be
     // verified as one space and then applied as another.
     expect((r as unknown as { spaceId?: string }).spaceId).toBe('s_home')
+    expect((r as unknown as { principalSpaceId?: string }).principalSpaceId).toBe('s_home')
     expect(isSpaceMember).toHaveBeenCalledWith('u_outsider', 's_home', 'tok_valid_session')
   })
 
@@ -250,6 +251,7 @@ describe('requireSpaceMembership — the gate on space-selector routes', () => {
     // verify with — asking whether a bot "is a member" of its own space would
     // fail closed and break the whole bot mount.
     expect(next).toHaveBeenCalledTimes(1)
+    expect((r as unknown as { principalSpaceId?: string }).principalSpaceId).toBe('s_bot_space')
     expect(res.statusCode).toBe(0)
     expect(isSpaceMember).not.toHaveBeenCalled()
   })

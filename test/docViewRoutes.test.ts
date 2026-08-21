@@ -48,6 +48,7 @@ function req(extra: Record<string, unknown>) {
   return {
     uid: 'u_1',
     spaceId: 's1',
+    principalSpaceId: 's1',
     octoToken: 'tok',
     docSpaceScope: { mode: 'human' as const },
     viewerSpaceId: 's1',

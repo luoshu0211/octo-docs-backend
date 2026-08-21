@@ -28,6 +28,7 @@ describe('docMetaRepo.listForUser always filters by space (P1 isolation)', () =>
     await docMetaRepo.listForUser({
       uid: 'u_1',
       spaceId: 's_scope',
+      principalSpaceId: 's_scope',
       page: 1,
       pageSize: 10,
       sort: 'updatedAt:desc',
@@ -45,6 +46,7 @@ describe('docMetaRepo.listForUser always filters by space (P1 isolation)', () =>
     await docMetaRepo.listForUser({
       uid: 'u_1',
       spaceId: 's_scope',
+      principalSpaceId: 's_scope',
       page: 1,
       pageSize: 10,
       sort: 'updatedAt:desc',
@@ -57,6 +59,7 @@ describe('docMetaRepo.listForUser always filters by space (P1 isolation)', () =>
     await docMetaRepo.listForUser({
       uid: 'u_1',
       spaceId: 's_scope',
+      principalSpaceId: 's_scope',
       folderId: 'f_1',
       page: 1,
       pageSize: 10,
@@ -64,7 +67,7 @@ describe('docMetaRepo.listForUser always filters by space (P1 isolation)', () =>
     })
     // COUNT placeholder order: JOIN dm.uid, m.space_id, m.folder_id, WHERE m.owner_id.
     const countParams = (mockQuery.mock.calls[0]![1] ?? []) as unknown[]
-    expect(countParams).toEqual(['u_1', 's_scope', 'f_1', 'u_1'])
+    expect(countParams).toEqual(['u_1', 's_scope', 's_scope', 'f_1', 'u_1', 's_scope'])
   })
 
   it('CROSS-SPACE ISOLATION: the #64 space-share branch never escapes the space scope (member)', async () => {
@@ -76,6 +79,7 @@ describe('docMetaRepo.listForUser always filters by space (P1 isolation)', () =>
     // bind, so paging stays stable (verified by the bind-order test above).
     await docMetaRepo.listForUser({
       uid: 'u_1', spaceId: 's_trident', isSpaceMember: true, page: 1, pageSize: 10, sort: 'updatedAt:desc',
+      principalSpaceId: 's_trident',
     })
     for (const call of mockQuery.mock.calls) {
       const sql = call[0] as string
@@ -85,7 +89,7 @@ describe('docMetaRepo.listForUser always filters by space (P1 isolation)', () =>
       expect(params).toContain('s_trident')
       // the share source is present but sits INSIDE the visibility OR, downstream
       // of the AND-ed space filter — it can only ever match docs already in-space.
-      expect(sql).toContain('OR m.share_scope = 1')
+      expect(sql).toContain('OR (m.share_scope = 1 AND m.discoverability_scope = 1)')
     }
   })
 
@@ -97,6 +101,7 @@ describe('docMetaRepo.listForUser always filters by space (P1 isolation)', () =>
     // the bind array is byte-identical to the member case (share adds no bind).
     await docMetaRepo.listForUser({
       uid: 'u_1', spaceId: 's_trident', isSpaceMember: false, page: 1, pageSize: 10, sort: 'updatedAt:desc',
+      principalSpaceId: 's_trident',
     })
     for (const call of mockQuery.mock.calls) {
       const sql = call[0] as string
@@ -105,10 +110,10 @@ describe('docMetaRepo.listForUser always filters by space (P1 isolation)', () =>
       expect(params).toContain('s_trident')
       // NO share branch: the visibility predicate is owner OR doc_member only.
       expect(sql).not.toContain('share_scope')
-      expect(sql).toContain('(m.owner_id = ? OR dm.role IN (1, 2, 3, 4))')
+      expect(sql).toContain('(m.owner_id = ? AND m.owner_space_id = ? OR dm.role IN (1, 2, 3, 4))')
     }
     // paging binds unchanged vs the member case (share branch carries no bind).
-    expect((mockQuery.mock.calls[0]![1] ?? []) as unknown[]).toEqual(['u_1', 's_trident', 'u_1'])
+    expect((mockQuery.mock.calls[0]![1] ?? []) as unknown[]).toEqual(['u_1', 's_trident', 's_trident', 'u_1', 's_trident'])
   })
 })
 

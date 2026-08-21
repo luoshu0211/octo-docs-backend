@@ -43,6 +43,7 @@ export interface EditBoardSceneInput {
   uid: string
   docId: string
   documentName: string
+  principalSpaceId: string
   /** The client-supplied base version (Y state vector) from If-Match / body. */
   clientBaseVersion: Uint8Array
   /** The raw scene edit batch (elements upsert / deletedElementIds / files). */
@@ -78,6 +79,7 @@ export type EditBoardSceneResult =
 
 interface LockedMetaRow {
   owner_id: string
+  owner_space_id: string
   permission_epoch: number
   status: number
   // #64: share seam read FRESH under the lock so the under-lock recheck resolves
@@ -94,14 +96,14 @@ interface LockedMetaRow {
  * space-share-derived role, so an `anyone_in_space`/edit space member is not
  * 403'd here after passing the route guard.
  */
-async function hasWriterTx(tx: Tx, docId: string, uid: string, meta: LockedMetaRow, isBot: boolean, token: string): Promise<boolean> {
+async function hasWriterTx(tx: Tx, docId: string, uid: string, principalSpaceId: string, meta: LockedMetaRow, isBot: boolean, token: string): Promise<boolean> {
   const direct: ResolvedRole =
-    uid === meta.owner_id ? 'admin' : ((await docMemberRepo.getRoleTx(tx, docId, uid)) ?? 'none')
+    uid === meta.owner_id && principalSpaceId === meta.owner_space_id ? 'admin' : ((await docMemberRepo.getRoleTx(tx, docId, uid, principalSpaceId)) ?? 'none')
   const role = await resolveEffectiveRole(uid, direct, {
     space_id: meta.space_id,
     share_scope: Number(meta.share_scope),
     share_role: Number(meta.share_role),
-  }, { isBot, token })
+  }, { isBot, principalSpaceId, token })
   return roleAtLeast(role, 'writer')
 }
 
@@ -148,14 +150,14 @@ export async function editBoardScene(input: EditBoardSceneInput): Promise<EditBo
     await yjsDocumentRepo.selectForUpdateTx(tx, input.documentName)
 
     const metaRows = await tx.query<LockedMetaRow>(
-      'SELECT owner_id, permission_epoch, status, space_id, share_scope, share_role FROM doc_meta WHERE doc_id = ? FOR UPDATE',
+      'SELECT owner_id, owner_space_id, permission_epoch, status, space_id, share_scope, share_role FROM doc_meta WHERE doc_id = ? FOR UPDATE',
       [input.docId],
     )
     const meta = metaRows[0]
     if (!meta || Number(meta.status) === 0) return { ok: false as const, status: 404, error: 'not_found' }
     if (Number(meta.status) === 2) return { ok: false as const, status: 409, error: 'conflict' }
 
-    if (!(await hasWriterTx(tx, input.docId, input.uid, meta, input.isBot ?? false, input.token ?? ''))) {
+    if (!(await hasWriterTx(tx, input.docId, input.uid, input.principalSpaceId, meta, input.isBot ?? false, input.token ?? ''))) {
       return { ok: false as const, status: 403, error: 'forbidden' }
     }
     if (Number(meta.permission_epoch) !== input.authorizedEpoch) {

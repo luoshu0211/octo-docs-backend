@@ -9,8 +9,9 @@ vi.mock('../src/config/env.js', () => ({
 // Mock the identity module so the operator lookup is deterministic and importing
 // this module does not pull in the real config/repos.
 const getUser = vi.fn()
+const getSpaceName = vi.fn()
 vi.mock('../src/auth/octoIdentity.js', () => ({
-  getOctoIdentity: () => ({ getUser }),
+  getOctoIdentity: () => ({ getUser, getSpaceName }),
 }))
 
 const { buildDecisionDisplay, buildDecisionDisplayAt } = await import(
@@ -48,12 +49,20 @@ describe('formatCardTimestamp (explicit zone)', () => {
 })
 
 describe('buildDecisionDisplay (seconds source)', () => {
-  beforeEach(() => getUser.mockReset())
+  beforeEach(() => { getUser.mockReset(); getSpaceName.mockReset().mockResolvedValue('test Space') })
 
   it('includes the resolved operator_name and the formatted decided_at', async () => {
     getUser.mockResolvedValueOnce({ uid: 'op-1', name: '张三' })
     const { display } = await buildDecisionDisplay('季度目标', 'op-1', AT_SECONDS)
     expect(display).toEqual({ title: '季度目标', operator_name: '张三', decided_at: AT_DISPLAY })
+  })
+
+  it('includes the operator Space when provided', async () => {
+    getUser.mockResolvedValueOnce({ uid: 'op-1', name: '张三' })
+    const { display } = await buildDecisionDisplay('季度目标', 'op-1', AT_SECONDS, undefined, 'space-1')
+    expect(display).toEqual({
+      title: '季度目标', operator_name: '张三', operator_space_name: 'test Space', decided_at: AT_DISPLAY,
+    })
   })
 
   it('omits operator_name on a lookup miss (octo-server renders its generic label)', async () => {
@@ -84,7 +93,7 @@ describe('buildDecisionDisplay (seconds source)', () => {
 })
 
 describe('buildDecisionDisplayAt (persisted Date source)', () => {
-  beforeEach(() => getUser.mockReset())
+  beforeEach(() => { getUser.mockReset(); getSpaceName.mockReset().mockResolvedValue('test Space') })
 
   it('formats a persisted decision Date in the configured zone', async () => {
     getUser.mockResolvedValueOnce({ uid: 'admin-A', name: 'Alice' })

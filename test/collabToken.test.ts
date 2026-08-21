@@ -14,7 +14,10 @@ describe('collab token sign/verify (§4.4)', () => {
       documentName: 'octo:s_001:f_888:d_abc123',
       role: 'writer',
       permission_epoch: 7,
+      principal_space_id: 's_001',
       home_space_verified: true,
+      current_space_verified: true,
+      current_space_id: 's_001',
     })
     expect(typeof token).toBe('string')
     expect(role).toBe('writer')
@@ -30,6 +33,9 @@ describe('collab token sign/verify (§4.4)', () => {
       role: 'writer',
       permission_epoch: 7,
       home_space_verified: true,
+      current_space_verified: true,
+      current_space_id: 's_001',
+      principal_space_id: 's_001',
     })
   })
 
@@ -38,7 +44,7 @@ describe('collab token sign/verify (§4.4)', () => {
       uid: 'u_1',
       documentName: 'octo:s:f:d',
       role: 'reader',
-      permission_epoch: 0,
+      permission_epoch: 0, principal_space_id: 's',
     })
     const tampered = token.slice(0, -2) + (token.endsWith('a') ? 'bb' : 'aa')
     expect(() => verifyCollabToken(tampered)).toThrow()
@@ -77,7 +83,7 @@ describe('collab token sign/verify (§4.4)', () => {
 
   it('round-trips a commenter claim', () => {
     const result = signCollabToken({
-      uid: 'u_commenter', documentName: 'octo:s:f:d', role: 'commenter', permission_epoch: 4,
+      uid: 'u_commenter', documentName: 'octo:s:f:d', role: 'commenter', permission_epoch: 4, principal_space_id: 's',
     })
     expect(result.role).toBe('commenter')
     expect(verifyCollabToken(result.token).role).toBe('commenter')
@@ -89,6 +95,7 @@ describe('collab token sign/verify (§4.4)', () => {
       documentName: 'octo:s_001:f_888:wb:d_board1',
       role: 'writer',
       permission_epoch: 2,
+      principal_space_id: 's_001',
       name: '大背头',
     })
     // The display name is also surfaced on the response so the client can seed
@@ -100,6 +107,7 @@ describe('collab token sign/verify (§4.4)', () => {
       documentName: 'octo:s_001:f_888:wb:d_board1',
       role: 'writer',
       permission_epoch: 2,
+      principal_space_id: 's_001',
       name: '大背头',
     })
   })
@@ -109,7 +117,7 @@ describe('collab token sign/verify (§4.4)', () => {
       uid: 'u_1',
       documentName: 'octo:s:f:d',
       role: 'reader',
-      permission_epoch: 0,
+      permission_epoch: 0, principal_space_id: 's',
     })
     expect('name' in result).toBe(false)
     const claims = verifyCollabToken(result.token)
@@ -119,6 +127,7 @@ describe('collab token sign/verify (§4.4)', () => {
       documentName: 'octo:s:f:d',
       role: 'reader',
       permission_epoch: 0,
+      principal_space_id: 's',
     })
   })
 })
@@ -132,8 +141,11 @@ describe('collab token v2 wire contract (remove-sp §7)', () => {
       homeSpaceId: 's_2',
       role: 'writer',
       permissionEpoch: 12,
+      principalSpaceId: 's_current',
       spaceMember: true,
       homeSpaceVerified: true,
+      currentSpaceVerified: true,
+      currentSpaceId: 's_external',
     })
     const wire = jwt.decode(result.token) as Record<string, unknown>
     expect(wire).toMatchObject({
@@ -144,8 +156,11 @@ describe('collab token v2 wire contract (remove-sp §7)', () => {
       homeSpaceId: 's_2',
       role: 'writer',
       permissionEpoch: 12,
+      principalSpaceId: 's_current',
       spaceMember: true,
       homeSpaceVerified: true,
+      currentSpaceVerified: true,
+      currentSpaceId: 's_external',
     })
     expect(wire).not.toHaveProperty('permission_epoch')
     expect(wire).not.toHaveProperty('home_space_id')
@@ -157,8 +172,11 @@ describe('collab token v2 wire contract (remove-sp §7)', () => {
       homeSpaceId: 's_2',
       role: 'writer',
       permission_epoch: 12,
+      principal_space_id: 's_current',
       space_member: true,
       home_space_verified: true,
+      current_space_verified: true,
+      current_space_id: 's_external',
     })
   })
 

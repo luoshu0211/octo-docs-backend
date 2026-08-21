@@ -13,7 +13,7 @@ type CapturedBody = {
   targets: string[]
   payload?: unknown
   card?: unknown
-  docs_card: Record<string, string>
+  docs_card: Record<string, unknown>
 }
 const captured: Array<{ headers: Record<string, string | string[] | undefined>; body: CapturedBody }> = []
 let server: Server
@@ -30,13 +30,20 @@ vi.mock('../src/db/repos/docMemberRepo.js', () => ({
   ROLE_ADMIN: 3,
   docMemberRepo: {
     list: vi.fn(async () => [
-      { doc_id: 'doc-1', uid: 'u-admin', role: 3 },
-      { doc_id: 'doc-1', uid: 'u-owner', role: 3 },
+      { doc_id: 'doc-1', uid: 'u-admin', principal_space_id: 'space-1', role: 3 },
+      { doc_id: 'doc-1', uid: 'u-owner', principal_space_id: 'space-1', role: 3 },
     ]),
   },
 }))
 vi.mock('../src/auth/octoIdentity.js', () => ({
-  getOctoIdentity: () => ({ getUser: vi.fn(async () => ({ uid: 'u-req', name: '小明' })) }),
+  getOctoIdentity: () => ({
+    getUser: vi.fn(async (uid: string) => ({ uid, name: uid === 'u-req' ? '小明' : uid })),
+    getSpaceName: vi.fn(async () => '123 Space'),
+    spaceBots: vi.fn(async () => [
+      { uid: 'bot-a', name: '分析助手' },
+      { uid: 'bot-b', name: '写作助手' },
+    ]),
+  }),
 }))
 
 import { notifyDocAccessRequested } from '../src/api/services/docsNotify.js'
@@ -73,9 +80,12 @@ describe('docsNotify integration (real HTTP round-trip)', () => {
       docId: 'doc-1',
       requestId: 'req-1',
       spaceId: 'space-1',
+      principalSpaceId: 'space-1',
       ownerId: 'u-owner',
+      ownerSpaceId: 'space-1',
       title: 'Q3 计划',
       requesterUid: 'u-req',
+      requesterSpaceId: 'space-1',
       reason: '需要编辑权限',
       botUids: ['bot-a', 'bot-b'],
     })
@@ -96,7 +106,9 @@ describe('docsNotify integration (real HTTP round-trip)', () => {
         title: 'Q3 计划',
         actor_name: '小明',
         actor_uid: 'u-req',
-        excerpt: 'Bots (2): bot-a, bot-b\n需要编辑权限',
+        excerpt: '需要编辑权限',
+        requester_space_name: '123 Space',
+        requested_bot_names: ['分析助手', '写作助手'],
       })
       expect(c.body.docs_card.updated_at).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/)
     }

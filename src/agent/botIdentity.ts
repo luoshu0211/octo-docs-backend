@@ -88,13 +88,17 @@ export type BotDocAccess =
 export async function resolveBotDocAccess(
   docId: string,
   botUid: string,
+  principalSpaceId: string,
   minRole: ResolvedRole = BOT_DOC_ACCESS_MIN_ROLE,
 ): Promise<BotDocAccess> {
-  if (!docId || !botUid) return { allowed: false, reason: 'bot_no_doc_access', role: 'none' }
+  if (!docId || !botUid || !principalSpaceId) {
+    return { allowed: false, reason: 'bot_no_doc_access', role: 'none' }
+  }
   let role: ResolvedRole
   try {
-    // Owner => admin, else the (doc_id, uid) doc_member row, else none.
-    role = await resolveRole(botUid, docId)
+    // Owner => admin, else the Space-qualified (doc_id, uid, principal_space_id)
+    // doc_member row, else none.
+    role = await resolveRole(botUid, docId, principalSpaceId)
   } catch {
     // The error object is not returned or logged here: callers log metadata only,
     // and a DB error string can carry SQL/connection detail.

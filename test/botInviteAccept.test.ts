@@ -31,7 +31,10 @@ vi.mock('../src/db/pool.js', () => ({
     fn({
       query: async (sql: string) => {
         if (/SELECT/i.test(sql) && /document_name/i.test(sql)) {
-          return [{ doc_id: 'd1', document_name: 'Doc', owner_id: 'owner', status: 1, doc_type: txDocType.value, space_id: 's_home' }]
+          return [{
+            doc_id: 'd1', document_name: 'Doc', owner_id: 'owner', owner_space_id: 's_home',
+            status: 1, doc_type: txDocType.value, space_id: 's_home',
+          }]
         }
         if (/SELECT/i.test(sql) && /permission_epoch/i.test(sql)) {
           return [{ permission_epoch: 1 }]
@@ -197,16 +200,28 @@ describe('bot invite accept /v1/bot/docs/invites/:token/accept (docs #61)', () =
 describe('human invite accept /api/v1/docs/invites/:token/accept stays unchanged', () => {
   it('still accepts via the octo session token path and lands the human uid', async () => {
     getForUpdateTx.mockResolvedValue(validInvite())
-    setOctoIdentity(stub({ verifyToken: async () => ({ uid: 'u_1' }), isSpaceMember: async () => true }))
+    setOctoIdentity(stub({
+      verifyToken: async () => ({ uid: 'u_1' }),
+      isSpaceMember: async () => true,
+    }))
 
     const res = await fetch(`${base}/api/v1/docs/invites/tok123/accept`, {
       method: 'POST',
-      headers: { token: 'user-tok', 'X-Space-Id': 's_home' },
+      headers: { token: 'user-tok', 'X-Space-Id': 's_current' },
     })
 
     expect(res.status).toBe(200)
-    expect(await res.json()).toMatchObject({ docId: 'd1', documentName: 'Doc', role: 'writer' })
-    expect(upsertFromInviteTx.mock.calls[0]![1]).toMatchObject({ uid: 'u_1', roleNum: 2 })
+    expect(await res.json()).toMatchObject({
+      docId: 'd1',
+      documentName: 'Doc',
+      role: 'writer',
+      principalSpaceId: 's_current',
+    })
+    expect(upsertFromInviteTx.mock.calls[0]![1]).toMatchObject({
+      uid: 'u_1',
+      principalSpaceId: 's_current',
+      roleNum: 2,
+    })
   })
 
   it('still returns 401 login_required when the session token is invalid', async () => {
@@ -215,7 +230,7 @@ describe('human invite accept /api/v1/docs/invites/:token/accept stays unchanged
 
     const res = await fetch(`${base}/api/v1/docs/invites/tok123/accept`, {
       method: 'POST',
-      headers: { token: 'bad' },
+      headers: { token: 'bad', 'X-Space-Id': 's_current' },
     })
 
     expect(res.status).toBe(401)

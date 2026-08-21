@@ -21,7 +21,7 @@ vi.mock('../src/db/repos/docMetaRepo.js', () => ({
   CanonicalHtmlLegacyConflictError: class CanonicalHtmlLegacyConflictError extends Error {},
   docMetaRepo: {
     create: vi.fn(async () => undefined),
-    getByDocId: vi.fn(async () => ({ title: 'T', created_at: new Date(0) })),
+    getByDocId: vi.fn(async () => ({ doc_id: 'd_html', title: 'T', owner_id: 's_tmos_bot', owner_space_id: 's_1', space_id: 's_1', status: 1, share_scope: 0, created_at: new Date(0) })),
     getByOctoDocSlug: vi.fn(async () => null),
     upsertHtmlByOctoDocSlug: vi.fn(async (input) => ({
       meta: {
@@ -29,6 +29,7 @@ vi.mock('../src/db/repos/docMetaRepo.js', () => ({
         document_name: input.documentName,
         title: input.title,
         owner_id: input.ownerId,
+        owner_space_id: input.spaceId,
         space_id: input.spaceId,
         folder_id: input.folderId,
         doc_type: input.docType,
@@ -50,6 +51,7 @@ vi.mock('../src/db/repos/docMetaRepo.js', () => ({
 }))
 vi.mock('../src/db/repos/docMemberRepo.js', () => ({
   docMemberRepo: {
+    getRole: vi.fn(async () => undefined),
     upsertDirect: vi.fn(async () => undefined),
   },
 }))
@@ -167,6 +169,7 @@ describe('bot doc create auto-grants the bot owner admin (XIN-576)', () => {
     expect(upsertDirect.mock.calls[0]![0]).toMatchObject({
       docId: body.docId,
       uid: 'u_human',
+      principalSpaceId: 's_1',
       roleNum: ROLE_ADMIN,
       grantedBy: 's_tmos_bot',
     })
@@ -225,6 +228,7 @@ describe('bot html doc registration', () => {
     document_name: 'octo:s_1:f_default:html:d_html',
     title: 'HTML Doc',
     owner_id: 's_tmos_bot',
+    owner_space_id: 's_1',
     space_id: 's_1',
     folder_id: 'f_default',
     doc_type: 'html',

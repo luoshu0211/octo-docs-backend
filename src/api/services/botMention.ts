@@ -669,7 +669,7 @@ export async function reportBotMentions(
             return { allowed: false, reason: 'external_error' as const }
           }
         }
-      : (botUid: string) => resolveBotDocAccess(p.docId, botUid)
+      : (botUid: string) => resolveBotDocAccess(p.docId, botUid, p.spaceId)
     const gated = await Promise.all(
       bots.map(async (botUid) => ({ botUid, access: await checkBot(botUid) })),
     )

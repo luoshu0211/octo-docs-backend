@@ -46,14 +46,14 @@ beforeEach(() => {
 describe('resolveEffectiveRoleWithMembership — single space-membership resolution (XIN-1739)', () => {
   it('a confirmed member of an anyone_in_space/edit deck resolves writer AND space_member:true together', async () => {
     withMembership(() => true)
-    const out = await resolveEffectiveRoleWithMembership('u_m', 'none', anyoneEdit, { token: 't' })
+    const out = await resolveEffectiveRoleWithMembership('u_m', 'none', anyoneEdit, { principalSpaceId: SPACE, token: 't' })
     expect(out).toEqual({ role: 'writer', spaceMember: true })
     expect(membershipHits).toBe(1) // resolved exactly once, not twice
   })
 
   it('a non-member of an anyone_in_space/edit deck resolves none AND space_member:false together', async () => {
     withMembership(() => false)
-    const out = await resolveEffectiveRoleWithMembership('u_x', 'none', anyoneEdit, { token: 't' })
+    const out = await resolveEffectiveRoleWithMembership('u_x', 'none', anyoneEdit, { principalSpaceId: SPACE, token: 't' })
     expect(out).toEqual({ role: 'none', spaceMember: false })
     expect(membershipHits).toBe(1)
   })
@@ -65,13 +65,13 @@ describe('resolveEffectiveRoleWithMembership — single space-membership resolut
     withMembership(() => {
       throw new Error('octo-server down')
     })
-    const out = await resolveEffectiveRoleWithMembership('u_m', 'none', anyoneEdit, { token: 't' })
+    const out = await resolveEffectiveRoleWithMembership('u_m', 'none', anyoneEdit, { principalSpaceId: SPACE, token: 't' })
     expect(out).toEqual({ role: 'none', spaceMember: false })
   })
 
   it('a share/read deck grants at most reader; the same membership boolean is returned', async () => {
     withMembership(() => true)
-    const out = await resolveEffectiveRoleWithMembership('u_m', 'none', anyoneRead, { token: 't' })
+    const out = await resolveEffectiveRoleWithMembership('u_m', 'none', anyoneRead, { principalSpaceId: SPACE, token: 't' })
     expect(out).toEqual({ role: 'reader', spaceMember: true })
   })
 
@@ -99,7 +99,7 @@ describe('resolveEffectiveRoleWithMembership — single space-membership resolut
     withMembership(() => {
       throw new Error('isSpaceMember must not be called for a verified bot')
     })
-    const out = await resolveEffectiveRoleWithMembership('bot_1', 'none', anyoneEdit, { isBot: true })
+    const out = await resolveEffectiveRoleWithMembership('bot_1', 'none', anyoneEdit, { isBot: true, principalSpaceId: SPACE })
     expect(out).toEqual({ role: 'writer', spaceMember: true })
     expect(membershipHits).toBe(0)
   })

@@ -52,6 +52,7 @@ function request(body: Record<string, unknown>, token = 'trusted-html-token') {
 const input = {
   octoDocSlug: 'published-page',
   spaceId: 'space-1',
+  principalSpaceId: 'space-1',
   owner: 'user-1',
   title: 'Published page',
 }
@@ -128,6 +129,7 @@ describe('trusted user HTML registration', () => {
       ...input,
       octoDocSlug: '  published-page  ',
       spaceId: '  space-1  ',
+      principalSpaceId: '  space-1  ',
       owner: '  user-1  ',
     }) as never, res as never)
 

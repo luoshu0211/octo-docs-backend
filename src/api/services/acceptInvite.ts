@@ -6,8 +6,9 @@
  * octo user (never a client-self-reported uid).
  *
  * Single transaction; branches a/b/c/d are exactly the contract's precise
- * idempotency semantics. The doc_invite_redemption PK (invite_token, uid) is
- * the "same person never double-consumes used_count" anchor.
+ * idempotency semantics. The doc_invite_redemption PK
+ * (invite_token, uid, principal_space_id) is the "same Space-qualified
+ * principal never double-consumes used_count" anchor.
  */
 import { transaction } from '../../db/pool.js'
 import { getOctoIdentity } from '../../auth/octoIdentity.js'
@@ -21,13 +22,14 @@ import { confirmSpaceMembership } from '../../permission/spaceMembership.js'
 
 
 export type AcceptResult =
-  | { ok: true; status: 200; body: { docId?: string; documentName?: string; role: string } }
+  | { ok: true; status: 200; body: { docId?: string; documentName?: string; role: string; principalSpaceId: string } }
   | { ok: false; status: 400 | 401 | 404 | 410; error: string }
 
 interface DocMetaTxRow {
   doc_id: string
   document_name: string
   owner_id: string
+  owner_space_id: string
   status: number
   doc_type: string
   space_id: string
@@ -40,27 +42,28 @@ async function resolveRoleTx(
   tx: Parameters<Parameters<typeof transaction>[0]>[0],
   meta: DocMetaTxRow,
   uid: string,
+  principalSpaceId: string,
 ): Promise<ResolvedRole> {
-  if (uid === meta.owner_id) return 'admin'
-  const role = await docMemberRepo.getRoleTx(tx, meta.doc_id, uid)
+  if (uid === meta.owner_id && principalSpaceId === meta.owner_space_id) return 'admin'
+  const role = await docMemberRepo.getRoleTx(tx, meta.doc_id, uid, principalSpaceId)
   return role ?? 'none'
 }
 
 export async function acceptInvite(
   octoToken: string,
   inviteToken: string,
+  principalSpaceId: string,
   nowMs: number = Date.now(),
-  viewerSpaceId?: string,
 ): Promise<AcceptResult> {
   // step 1: verify octo identity -> trusted uid (HARD CONSTRAINT). 401 if not.
   const identity = await getOctoIdentity().verifyToken(octoToken)
   if (!identity) return { ok: false, status: 401, error: 'login_required' }
-  const currentSpace = typeof viewerSpaceId === 'string' ? viewerSpaceId.trim() : ''
+  const currentSpace = typeof principalSpaceId === 'string' ? principalSpaceId.trim() : ''
   if (currentSpace === '') return { ok: false, status: 400, error: 'space_required' }
   if (!(await confirmSpaceMembership(identity.uid, currentSpace, octoToken))) {
     return { ok: false, status: 404, error: 'not_found' }
   }
-  return acceptInviteForUid(identity.uid, inviteToken, nowMs, currentSpace)
+  return acceptInviteForUid(identity.uid, currentSpace, inviteToken, nowMs)
 }
 
 /**
@@ -80,6 +83,7 @@ export async function acceptInvite(
  */
 export async function acceptInviteForUid(
   uid: string,
+  principalSpaceId: string,
   inviteToken: string,
   nowMs: number = Date.now(),
   requiredHomeSpaceId?: string,
@@ -97,14 +101,14 @@ export async function acceptInviteForUid(
     const invite = await docInviteRepo.getForUpdateTx(tx, inviteToken)
     if (!invite) return { ok: false, status: 410, error: 'invite_invalid' }
 
-    const redeemed = await docInviteRedemptionRepo.existsTx(tx, inviteToken, uid)
+    const redeemed = await docInviteRedemptionRepo.existsTx(tx, inviteToken, uid, principalSpaceId)
 
     const inviteRole = roleFromNumber(invite.role)
     if (!inviteRole) return { ok: false, status: 410, error: 'invite_invalid' }
 
     // step 3: read current state (doc meta + role).
     const metaRows = await tx.query<DocMetaTxRow>(
-      'SELECT doc_id, document_name, owner_id, status, doc_type, space_id FROM doc_meta WHERE doc_id = ? LIMIT 1',
+      'SELECT doc_id, document_name, owner_id, owner_space_id, status, doc_type, space_id FROM doc_meta WHERE doc_id = ? LIMIT 1',
       [invite.doc_id],
     )
     const meta = metaRows[0]
@@ -113,7 +117,7 @@ export async function acceptInviteForUid(
       return { ok: false, status: 404, error: 'not_found' }
     }
 
-    const curRole = docExists ? await resolveRoleTx(tx, meta!, uid) : 'none'
+    const curRole = docExists ? await resolveRoleTx(tx, meta!, uid, principalSpaceId) : 'none'
 
     // step 2 + step 4 decision (pure).
     const decision = decideAcceptBranch({
@@ -148,20 +152,21 @@ export async function acceptInviteForUid(
 
     if (decision.kind === 'noop') {
       // branch a/b: no write, no used_count, no epoch change.
-      return { ok: true, status: 200, body: { role: decision.role } }
+      return { ok: true, status: 200, body: { role: decision.role, principalSpaceId } }
     }
 
     // branches c (reaccept) and d (first): both write the member + bump epoch.
     await docMemberRepo.upsertFromInviteTx(tx, {
       docId: meta!.doc_id,
       uid,
+      principalSpaceId,
       roleNum: invite.role,
       grantedBy: invite.created_by,
       inviteToken,
     })
     if (decision.kind === 'first') {
       // branch d only: redemption + used_count++ (with exhaustion guard).
-      await docInviteRedemptionRepo.insertTx(tx, inviteToken, uid)
+      await docInviteRedemptionRepo.insertTx(tx, inviteToken, uid, principalSpaceId)
       await docInviteRepo.incrementUsedCountTx(tx, inviteToken)
     }
     await tx.query('UPDATE doc_meta SET permission_epoch = permission_epoch + 1 WHERE doc_id = ?', [meta!.doc_id])
@@ -173,7 +178,12 @@ export async function acceptInviteForUid(
     return {
       ok: true,
       status: 200,
-      body: { docId: meta!.doc_id, documentName: meta!.document_name, role: decision.role },
+      body: {
+        docId: meta!.doc_id,
+        documentName: meta!.document_name,
+        role: decision.role,
+        principalSpaceId,
+      },
     }
   })
 

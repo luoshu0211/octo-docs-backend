@@ -16,6 +16,8 @@ describe('commenter collab authentication', () => {
       permission_epoch: 7,
       space_member: true,
       home_space_verified: true,
+      current_space_verified: true,
+      current_space_id: 's1',
     })
   })
 

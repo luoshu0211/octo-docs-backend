@@ -21,14 +21,16 @@ data:
   REDIS_PORT: "6379"
 
   COLLAB_TOKEN_TTL_SECONDS: "300"
-  # Stage 1 of the Home-Space token rollout: keep true only while all issuers
-  # are upgraded and pre-hotfix credentials drain. After the last old issuer is
-  # gone, wait one full COLLAB_TOKEN_TTL_SECONDS, then change to "false".
-  COLLAB_ALLOW_LEGACY_TOKENS_WITHOUT_HOME_SPACE_PROOF: "true"
+  # Strict by default. A rollout-specific legacy override must be an explicit,
+  # temporary operator decision and cannot bypass current-Space proof.
+  COLLAB_ALLOW_LEGACY_TOKENS_WITHOUT_HOME_SPACE_PROOF: "false"
   COLLAB_TOKEN_PUBLIC_WS_URL: "wss://<collab-ws-host>"
 
   OCTO_IDENTITY_MODE: "http"
   OCTO_SERVER_BASE_URL: "http://octo-server-{{BRANCH}}:8080"
+  # Secret (not ConfigMap data): configure OCTO_SERVER_TOKEN on the Deployment
+  # wherever Bot member-add/delete is enabled. Bot directory validation fails
+  # closed with 503 when absent and never forwards the Bot bearer to those APIs.
 
   ATTACHMENT_BUCKET: "octo-docs-attachments"
   ATTACHMENT_DRIVER: "local-hmac"

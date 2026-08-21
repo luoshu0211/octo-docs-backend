@@ -95,7 +95,7 @@ export async function loadPptDocForRead(
   if (meta.doc_type !== HTML_PPT_DOC_TYPE) {
     throw PptApiError.unsupportedDocumentType('document is not an html_ppt deck')
   }
-  const direct = await resolveRole(uid, docId)
+  const direct = await resolveRole(uid, docId, spaceId)
   // #64 share-scope layering: effectiveRole = max(direct, share-derived). Zero
   // extra IO for the default restricted doc or a caller already at writer/admin.
   // Membership-lookup ERROR handling is caller-scoped (XIN-1835 spec deviation):
@@ -110,9 +110,10 @@ export async function loadPptDocForRead(
   if (caller.membershipErrorMode === 'fail-closed') {
     ;({ role } = await resolveEffectiveRoleWithMembership(uid, direct, meta, {
       isBot: true,
+      principalSpaceId: spaceId,
     }))
   } else {
-    role = await resolveEffectiveRole(uid, direct, meta, { isBot: true })
+    role = await resolveEffectiveRole(uid, direct, meta, { isBot: true, principalSpaceId: spaceId })
   }
   const spaceMember = true
   return { meta, role, spaceMember }

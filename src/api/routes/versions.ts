@@ -375,6 +375,7 @@ export async function restoreVersionHandler(req: Request, res: Response): Promis
     uid: req.uid!,
     docId,
     documentName: guard.meta.document_name,
+    principalSpaceId: req.principalSpaceId!,
     versionId,
     authorizedEpoch: guard.meta.permission_epoch,
     contentKind: kind,

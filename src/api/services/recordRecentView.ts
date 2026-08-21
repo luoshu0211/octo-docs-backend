@@ -30,7 +30,7 @@ export interface RecordRecentViewInput {
   viewerSpaceId?: string
   /** Human session token, used to confirm viewer-Space membership. */
   token?: string
-  /** Request-local proof produced by the mandatory Human home-Space gate. */
+  /** Request-local proof produced by the mandatory Human current-Space verification. */
   verifiedViewerSpaceId?: string
 }
 

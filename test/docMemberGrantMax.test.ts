@@ -20,7 +20,13 @@ beforeEach(() => {
   execute.mockReset()
 })
 
-const params = { docId: 'd_1', uid: 'u_recipient', roleNum: 1, grantedBy: 'u_admin' }
+const params = {
+  docId: 'd_1',
+  uid: 'u_recipient',
+  principalSpaceId: 'sp_recipient',
+  roleNum: 1,
+  grantedBy: 'u_admin',
+}
 
 describe('docMemberRepo.upsertGrantMax — only-up max-merge', () => {
   it('compares by privilege rank (FIELD), not the raw stored value, and passes binds in order', async () => {
@@ -36,7 +42,7 @@ describe('docMemberRepo.upsertGrantMax — only-up max-merge', () => {
     expect(sql).not.toContain('GREATEST')
     // source=direct is inlined (SOURCE_DIRECT), invite_token=''.
     expect(sql).toContain(`${SOURCE_DIRECT}, ''`)
-    expect(binds).toEqual(['d_1', 'u_recipient', 1, 'u_admin'])
+    expect(binds).toEqual(['d_1', 'u_recipient', 'sp_recipient', 1, 'u_admin'])
   })
 
   it('affectedRows=1 (fresh insert) -> changed true', async () => {

@@ -68,14 +68,14 @@ async function main() {
   await docViewHistoryRepo.upsertViewWithPrune({ uid, docId: 'd_0', spaceId: SPACE, retainCount: 0, retainDays: 0 })
   await docViewHistoryRepo.upsertViewWithPrune({ uid, docId: 'd_other', spaceId: SPACE, retainCount: 0, retainDays: 0 })
   const both = await query<{ c: number }>('SELECT COUNT(*) c FROM doc_view_history WHERE uid=?', [uid])
-  const recent1 = await docViewHistoryRepo.listRecent({ uid, spaceId: SPACE, pageSize: 20 })
+  const recent1 = await docViewHistoryRepo.listRecent({ uid, spaceId: SPACE, principalSpaceId: SPACE, pageSize: 20 })
   check('query-time filter: both rows physically present (not pruned)', Number(both[0]!.c) === 2)
   check('query-time filter: d_other (no permission) is NOT returned', !recent1.items.some((r) => r.doc_id === 'd_other'))
   check('query-time filter: d_0 (owned) IS returned', recent1.items.some((r) => r.doc_id === 'd_0'))
 
   // soft-delete d_0 -> next query drops it immediately, though its row lingers
   await query('UPDATE doc_meta SET status=0 WHERE doc_id=?', ['d_0'])
-  const recent2 = await docViewHistoryRepo.listRecent({ uid, spaceId: SPACE, pageSize: 20 })
+  const recent2 = await docViewHistoryRepo.listRecent({ uid, spaceId: SPACE, principalSpaceId: SPACE, pageSize: 20 })
   const lingering = await query<{ c: number }>('SELECT COUNT(*) c FROM doc_view_history WHERE uid=? AND doc_id=?', [uid, 'd_0'])
   check('query-time filter: soft-deleted d_0 vanishes from recent next query', !recent2.items.some((r) => r.doc_id === 'd_0'))
   check('query-time filter: correctness does NOT depend on pruning (row still present)', Number(lingering[0]!.c) === 1)
@@ -90,7 +90,7 @@ async function main() {
   const seen: string[] = []
   let cursor: string | undefined
   for (let page = 0; page < 10; page++) {
-    const res = await docViewHistoryRepo.listRecent({ uid, spaceId: SPACE, cursor, pageSize: 2 })
+    const res = await docViewHistoryRepo.listRecent({ uid, spaceId: SPACE, principalSpaceId: SPACE, cursor, pageSize: 2 })
     seen.push(...res.items.map((r) => r.doc_id))
     if (!res.nextCursor) break
     cursor = res.nextCursor
@@ -99,9 +99,9 @@ async function main() {
   check('keyset paging: viewed_at DESC order (d_4..d_0)', seen.join(',') === 'd_4,d_3,d_2,d_1,d_0')
 
   // --- search normalization + creators facet ---
-  const searched = await docViewHistoryRepo.listRecent({ uid, spaceId: SPACE, q: 'SPEC 1', pageSize: 20 })
+  const searched = await docViewHistoryRepo.listRecent({ uid, spaceId: SPACE, principalSpaceId: SPACE, q: 'SPEC 1', pageSize: 20 })
   check('search: CI substring "SPEC 1" matches "Spec 1"', searched.items.length === 1 && searched.items[0]!.doc_id === 'd_1')
-  const creators = await docViewHistoryRepo.listCreators({ uid, spaceId: SPACE })
+  const creators = await docViewHistoryRepo.listCreators({ uid, spaceId: SPACE, principalSpaceId: SPACE })
   check('creators facet: distinct owner of viewed+visible docs = [u_viewer]', creators.length === 1 && creators[0] === uid)
 
   // cleanup

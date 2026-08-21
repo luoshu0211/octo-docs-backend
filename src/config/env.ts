@@ -465,11 +465,11 @@ export const config = {
     // Service token sent as the `token` header on octo-server lookups (e.g.
     // GET /v1/users/:uid, which requires auth) on the HUMAN path. Empty = not
     // configured; callers then fall back to the authenticated user's own session
-    // token. OPTIONAL for the human path (/api/v1/docs). No longer required for
-    // the bot path (/v1/bot/docs): the bot resolves the target user with its own
-    // bearer token via GET /v1/bot/user/info (see octoIdentity.getUserAsBot), so
-    // the anti ghost-member existence check in members/forwardGrant works with
-    // OCTO_SERVER_TOKEN empty.
+    // token. OPTIONAL for the human path (/api/v1/docs). REQUIRED for bot
+    // member-add roster validation: those human/service directory endpoints do
+    // not accept bot bearer credentials, so that operation fails closed with
+    // 503 when OCTO_SERVER_TOKEN is empty. Bot-realm operations such as
+    // forward-grant may still use GET /v1/bot/user/info with the bot token.
     serviceToken: str('OCTO_SERVER_TOKEN', ''),
     // Space-membership check cache TTL (#64). isSpaceMember(uid, spaceId, token)
     // is resolved server-side by reusing POST /v1/auth/verify?include=context

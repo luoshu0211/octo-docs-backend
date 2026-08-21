@@ -2,12 +2,13 @@
  * doc_access_request repository (§4.4, screen 4c).
  *
  * A no-permission recipient submits an access request; owner/admin pull the
- * pending list and approve/deny (MVP pull-based, no push — §4.2). PK (doc_id, uid)
+ * pending list and approve/deny (MVP pull-based, no push — §4.2). PK
+ * (doc_id, uid, principal_space_id)
  * gives natural idempotency: a repeat request from the same uid refreshes the
  * single row back to pending rather than piling up duplicate rows (mirrors
  * doc_member / doc_invite_redemption dedup范式).
  */
-import { query } from '../pool.js'
+import { query, type Tx } from '../pool.js'
 import { newRequestId } from '../../util/ids.js'
 import { parseStoredBotUids } from '../../util/botUids.js'
 
@@ -19,7 +20,8 @@ export const REQUEST_STATUS_CANCELLED = 4
 export interface DocAccessRequestRow {
   doc_id: string
   uid: string
-  requested_role: number // 1=reader 2=writer 4=commenter
+  principal_space_id: string
+  requested_role: number // 1=reader 2=writer 3=admin 4=commenter
   reason: string
   status: number // 1=pending 2=approved 3=denied 4=cancelled
   request_id: string
@@ -32,7 +34,8 @@ export interface DocAccessRequestRow {
 
 export const docAccessRequestRepo = {
   /**
-   * Submit (or re-submit) a request. Idempotent by (doc_id, uid): a duplicate
+   * Submit (or re-submit) a request. Idempotent by
+   * (doc_id, uid, principal_space_id): a duplicate
    * refreshes the existing row to pending with the new role/reason and clears
    * the previous decision. A re-submit ROTATES request_id to a fresh high-entropy
    * value so every submission is a distinct, addressable snapshot.
@@ -44,7 +47,8 @@ export const docAccessRequestRepo = {
    * approver never saw on their card. Rotating request_id binds each card to the
    * exact submission it represents: a stale card's request_id no longer matches
    * any row, so the callback resolves it as not_found instead of applying to a
-   * newer request. The (doc_id, uid) PK still collapses duplicates to one row.
+   * newer request. The Space-qualified PK still collapses duplicates per
+   * principal while keeping the same uid in different Spaces independent.
    * Returns the row's (now current) request_id and status.
    *
    * `botUids` is the requester's own Space-bot snapshot (already gated by the
@@ -57,6 +61,7 @@ export const docAccessRequestRepo = {
   async submit(params: {
     docId: string
     uid: string
+    principalSpaceId: string
     requestedRoleNum: number
     reason: string
     botUids?: string[]
@@ -66,8 +71,8 @@ export const docAccessRequestRepo = {
     // and store canonical JSON text so the column value is stable/order-independent.
     const botUidsJson = JSON.stringify(parseStoredBotUids(params.botUids ?? []))
     await query(
-      `INSERT INTO doc_access_request (doc_id, uid, requested_role, reason, status, request_id, bot_uids)
-       VALUES (?, ?, ?, ?, ${REQUEST_STATUS_PENDING}, ?, CAST(? AS JSON))
+      `INSERT INTO doc_access_request (doc_id, uid, principal_space_id, requested_role, reason, status, request_id, bot_uids)
+       VALUES (?, ?, ?, ?, ?, ${REQUEST_STATUS_PENDING}, ?, CAST(? AS JSON))
        ON DUPLICATE KEY UPDATE
          requested_role = VALUES(requested_role),
          reason         = VALUES(reason),
@@ -76,14 +81,14 @@ export const docAccessRequestRepo = {
          decision_note  = '',
          request_id     = VALUES(request_id),
          bot_uids       = VALUES(bot_uids)`,
-      [params.docId, params.uid, params.requestedRoleNum, params.reason, candidateId, botUidsJson],
+      [params.docId, params.uid, params.principalSpaceId, params.requestedRoleNum, params.reason, candidateId, botUidsJson],
     )
     // request_id is now rotated to candidateId on both insert and duplicate-update,
     // but read back the authoritative row to return the real stored id + status
     // (defensive against any trigger/collation surprise on the write path).
     const rows = await query<{ request_id: string; status: number }>(
-      'SELECT request_id, status FROM doc_access_request WHERE doc_id = ? AND uid = ? LIMIT 1',
-      [params.docId, params.uid],
+      'SELECT request_id, status FROM doc_access_request WHERE doc_id = ? AND uid = ? AND principal_space_id = ? LIMIT 1',
+      [params.docId, params.uid, params.principalSpaceId],
     )
     const row = rows[0]
     return { requestId: row?.request_id ?? candidateId, status: Number(row?.status ?? REQUEST_STATUS_PENDING) }
@@ -134,5 +139,22 @@ export const docAccessRequestRepo = {
       [params.status, params.decidedBy, params.note ?? '', params.docId, params.requestId],
     )
     return (rows as unknown as { affectedRows?: number }).affectedRows! > 0
+  },
+
+  /** Transaction-scoped pending -> terminal CAS. */
+  async decideTx(tx: Tx, params: {
+    docId: string
+    requestId: string
+    status: number
+    decidedBy: string
+    note?: string
+  }): Promise<boolean> {
+    const result = await tx.execute(
+      `UPDATE doc_access_request
+         SET status = ?, decided_by = ?, decision_note = ?
+       WHERE doc_id = ? AND request_id = ? AND status = ${REQUEST_STATUS_PENDING}`,
+      [params.status, params.decidedBy, params.note ?? '', params.docId, params.requestId],
+    )
+    return result.affectedRows > 0
   },
 }

@@ -100,7 +100,7 @@ async function run() {
 
   // Scenario 1: caller is a space member — the visible set already folds in space-share in MySQL
   console.log('\n=== Scenario 1: isSpaceMember=true (visible set includes share, excludes soft-deleted) ===')
-  const vids1 = await docMetaRepo.listVisibleDocIdSet({ uid: USER, spaceId: SP, isSpaceMember: true })
+  const vids1 = await docMetaRepo.listVisibleDocIdSet({ uid: USER, spaceId: SP, principalSpaceId: SP, isSpaceMember: true })
   allPass = eq('member visible set (own+mem+share; excludes none/arch/other_space/soft-deleted)', vids1.sort(), ['e2e_mem', 'e2e_own', 'e2e_share']) && allPass
   const r1 = await searchDocs({ spaceId: SP, query: KW, visibleDocIds: vids1, size: 50 })
   const ids1 = r1.items.map((i) => i.docId).sort()
@@ -109,7 +109,7 @@ async function run() {
 
   // Scenario 2: caller is NOT a space member — space-share stays out of the visible set (fail-closed)
   console.log('\n=== Scenario 2: isSpaceMember=false (share blocked by MySQL) ===')
-  const vids2 = await docMetaRepo.listVisibleDocIdSet({ uid: USER, spaceId: SP, isSpaceMember: false })
+  const vids2 = await docMetaRepo.listVisibleDocIdSet({ uid: USER, spaceId: SP, principalSpaceId: SP, isSpaceMember: false })
   allPass = eq('non-member visible set (own+mem only, no share)', vids2.sort(), ['e2e_mem', 'e2e_own']) && allPass
   const r2 = await searchDocs({ spaceId: SP, query: KW, visibleDocIds: vids2, size: 50 })
   const ids2 = r2.items.map((i) => i.docId).sort()
@@ -151,7 +151,7 @@ async function run() {
 
   // Scenario 5: space isolation (e2e_os2 in another space does not appear in SP search even when owner=caller)
   console.log('\n=== Scenario 5: space isolation ===')
-  const vidsSp2 = await docMetaRepo.listVisibleDocIdSet({ uid: USER, spaceId: SP, isSpaceMember: true })
+  const vidsSp2 = await docMetaRepo.listVisibleDocIdSet({ uid: USER, spaceId: SP, principalSpaceId: SP, isSpaceMember: true })
   allPass = eq('SP visible set excludes e2e_os2 from another space', vidsSp2.includes('e2e_os2'), false) && allPass
 
   // Scenario 6: ik Chinese tokenizer hits the body (using '增长', a word only in body, not title)

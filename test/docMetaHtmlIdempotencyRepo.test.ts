@@ -4,7 +4,6 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 vi.mock('../src/db/pool.js', () => ({ query: vi.fn(), transaction: vi.fn() }))
 vi.mock('../src/db/repos/docMemberRepo.js', () => ({ docMemberRepo: {
   upsertDirectTx: vi.fn(),
-  insertDirectIfAbsentTx: vi.fn(),
 } }))
 
 import { query, transaction } from '../src/db/pool.js'
@@ -64,7 +63,7 @@ describe('docMetaRepo.createCanonicalHtml', () => {
     ])
     expect(args).not.toContain(input.idempotencyKey)
     expect(docMemberRepo.upsertDirectTx).toHaveBeenCalledWith(tx, {
-      docId: 'd_new', uid: 'u_human', roleNum: 3, grantedBy: 'bot_a',
+      docId: 'd_new', uid: 'u_human', principalSpaceId: 's_a', roleNum: 3, grantedBy: 'bot_a',
     })
   })
 
@@ -146,9 +145,10 @@ describe('docMetaRepo.upsertHtmlByOctoDocSlug canonical isolation', () => {
   beforeEach(() => {
     vi.mocked(query).mockReset()
     tx.query.mockReset()
+    tx.execute.mockReset()
+    tx.execute.mockResolvedValue({ affectedRows: 0 } as never)
     vi.mocked(transaction).mockReset().mockImplementation(async (fn) => fn(tx as never))
     vi.mocked(docMemberRepo.upsertDirectTx).mockReset()
-    vi.mocked(docMemberRepo.insertDirectIfAbsentTx).mockReset()
   })
 
   it('creates legacy metadata and the initial human-owner admin in one transaction', async () => {
@@ -159,9 +159,8 @@ describe('docMetaRepo.upsertHtmlByOctoDocSlug canonical isolation', () => {
     const result = await docMetaRepo.upsertHtmlByOctoDocSlug(legacyWithHuman)
     expect(result.created).toBe(true)
     expect(docMemberRepo.upsertDirectTx).toHaveBeenCalledWith(tx, {
-      docId: 'd_new', uid: 'u_human', roleNum: 3, grantedBy: 'bot_a',
+      docId: 'd_new', uid: 'u_human', principalSpaceId: 's_a', roleNum: 3, grantedBy: 'bot_a',
     })
-    expect(docMemberRepo.insertDirectIfAbsentTx).not.toHaveBeenCalled()
   })
 
   it('propagates a fresh legacy member failure from the create transaction', async () => {
@@ -176,12 +175,12 @@ describe('docMetaRepo.upsertHtmlByOctoDocSlug canonical isolation', () => {
     const row = { ...existing, octo_doc_slug: 'legacy-slug', html_idempotency_key_hash: null }
     vi.mocked(query).mockResolvedValueOnce([row] as never)
     tx.query.mockResolvedValueOnce([] as never).mockResolvedValueOnce([row] as never)
-    vi.mocked(docMemberRepo.insertDirectIfAbsentTx).mockResolvedValueOnce(false)
     const result = await docMetaRepo.upsertHtmlByOctoDocSlug(legacyWithHuman)
     expect(result.memberReconciled).toBe(false)
-    expect(docMemberRepo.insertDirectIfAbsentTx).toHaveBeenCalledWith(tx, {
-      docId: row.doc_id, uid: 'u_human', roleNum: 3, grantedBy: 'bot_a',
-    })
+    expect(tx.execute).toHaveBeenCalledWith(
+      expect.stringContaining('(doc_id, uid, principal_space_id, role, granted_by'),
+      [row.doc_id, 'u_human', 's_a', 3, 'bot_a'],
+    )
     expect(tx.query.mock.calls.some(([sql]) => String(sql).includes('permission_epoch = permission_epoch + 1'))).toBe(false)
     expect(docMemberRepo.upsertDirectTx).not.toHaveBeenCalled()
   })
@@ -193,7 +192,7 @@ describe('docMetaRepo.upsertHtmlByOctoDocSlug canonical isolation', () => {
       .mockResolvedValueOnce([] as never)
       .mockResolvedValueOnce([] as never)
       .mockResolvedValueOnce([{ ...row, permission_epoch: 8 }] as never)
-    vi.mocked(docMemberRepo.insertDirectIfAbsentTx).mockResolvedValueOnce(true)
+    tx.execute.mockResolvedValueOnce({ affectedRows: 1 } as never)
     const result = await docMetaRepo.upsertHtmlByOctoDocSlug(legacyWithHuman)
     expect(result).toMatchObject({ created: false, memberReconciled: true, permissionEpoch: 8 })
     expect(tx.query.mock.calls.filter(([sql]) => String(sql).includes('permission_epoch = permission_epoch + 1'))).toHaveLength(1)
@@ -203,7 +202,6 @@ describe('docMetaRepo.upsertHtmlByOctoDocSlug canonical isolation', () => {
     const row = { ...existing, octo_doc_slug: 'legacy-slug', html_idempotency_key_hash: null }
     vi.mocked(query).mockResolvedValue([row] as never)
     tx.query.mockResolvedValue([row] as never)
-    vi.mocked(docMemberRepo.insertDirectIfAbsentTx).mockResolvedValue(false)
     const first = await docMetaRepo.upsertHtmlByOctoDocSlug(legacyWithHuman)
     const second = await docMetaRepo.upsertHtmlByOctoDocSlug(legacyWithHuman)
     expect(first.memberReconciled).toBe(false)

@@ -33,7 +33,7 @@
  * The fail-closed swallow is thus SCOPED to the relay caller (XIN-1825 P1-3),
  * not shared with the legacy doc/sheet/board paths.
  */
-import { effectiveRole, SHARE_SCOPE_ANYONE } from './shareScope.js'
+import { effectiveRole, SHARE_SCOPE_ANYONE, SHARE_SCOPE_AUTHENTICATED } from './shareScope.js'
 import { roleAtLeast, type ResolvedRole } from './role.js'
 import { getOctoIdentity } from '../auth/octoIdentity.js'
 
@@ -51,6 +51,12 @@ export interface ShareResolvable {
 /** Caller-principal hint: a verified bot derives membership from its space. */
 export interface ShareCaller {
   isBot?: boolean
+  /**
+   * Server-verified current principal Space. `anyone_in_space` is eligible only
+   * when this exact Space equals the document home Space. Membership in the
+   * home Space from another active Space must not grant cross-Space access.
+   */
+  principalSpaceId?: string
   /**
    * The human caller's octo session token. Used to resolve their OWN space
    * membership via verify?include=context (isSpaceMember). Never read for a bot
@@ -94,7 +100,13 @@ export async function resolveEffectiveRoleWithMembership(
   meta: ShareResolvable,
   caller: ShareCaller = {},
 ): Promise<EffectiveRoleWithMembership> {
-  if (meta.share_scope !== SHARE_SCOPE_ANYONE || roleAtLeast(direct, 'writer')) {
+  if (![SHARE_SCOPE_ANYONE, SHARE_SCOPE_AUTHENTICATED].includes(meta.share_scope) || roleAtLeast(direct, 'writer')) {
+    return { role: direct, spaceMember: false }
+  }
+  if (meta.share_scope === SHARE_SCOPE_AUTHENTICATED) {
+    return { role: effectiveRole(direct, false, meta.share_scope, meta.share_role), spaceMember: false }
+  }
+  if (caller.principalSpaceId !== meta.space_id) {
     return { role: direct, spaceMember: false }
   }
   let member: boolean
@@ -132,10 +144,13 @@ export async function resolveEffectiveRole(
   // silently degrading an `anyone_in_space` share writer to 403. `isSpaceMember`
   // still fails closed to `false` on a transport error at its own source, so the
   // normal outage path is unchanged; only a genuinely unexpected throw surfaces.
-  if (meta.share_scope !== SHARE_SCOPE_ANYONE || roleAtLeast(direct, 'writer')) {
+  if (![SHARE_SCOPE_ANYONE, SHARE_SCOPE_AUTHENTICATED].includes(meta.share_scope) || roleAtLeast(direct, 'writer')) {
     return direct
   }
-  const member = caller.isBot
+  if (meta.share_scope === SHARE_SCOPE_ANYONE && caller.principalSpaceId !== meta.space_id) {
+    return direct
+  }
+  const member = meta.share_scope === SHARE_SCOPE_AUTHENTICATED ? false : caller.isBot
     ? true
     : await getOctoIdentity().isSpaceMember(uid, meta.space_id, caller.token ?? '')
   return effectiveRole(direct, member, meta.share_scope, meta.share_role)

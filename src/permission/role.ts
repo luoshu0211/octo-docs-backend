@@ -81,6 +81,7 @@ export function isForwardGrantRole(value: unknown): value is ForwardGrantRole {
   return value === 'reader' || value === 'commenter' || value === 'writer'
 }
 
-export function isAccessRequestRole(value: unknown): value is Exclude<Role, 'admin'> {
-  return value === 'reader' || value === 'commenter' || value === 'writer'
+/** Roles that may be requested or selected while approving an access request. */
+export function isAccessRequestRole(value: unknown): value is Role {
+  return isMemberRole(value)
 }

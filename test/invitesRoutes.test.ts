@@ -56,6 +56,7 @@ function req() {
   return {
     uid: 'u_admin',
     spaceId: 's1',
+    principalSpaceId: 's1',
     params: { docId: 'd_1' },
     body: { role: 'writer' },
     protocol: 'http',
@@ -129,6 +130,7 @@ function reqWith(body: Record<string, unknown>) {
   return {
     uid: 'u_admin',
     spaceId: 's1',
+    principalSpaceId: 's1',
     params: { docId: 'd_1' },
     body,
   } as never
