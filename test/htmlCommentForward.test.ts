@@ -116,6 +116,14 @@ describe('forwardHtmlComment', () => {
     expect(JSON.stringify(headers)).not.toContain('secret')
   })
 
+  it('forwards the verified Viewer Space to octo-docs-html', async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ data: { id: 'c_9' } }), { status: 201 }))
+    vi.stubGlobal('fetch', fetchMock)
+    await forwardHtmlComment({ slug: 's1', body: { text: 'hi' } }, 'caller-tok', 'viewer-space-b')
+    const headers = (fetchMock.mock.calls[0]![1] as RequestInit).headers as Record<string, string>
+    expect(headers['X-Space-Id']).toBe('viewer-space-b')
+  })
+
   it('passes the upstream status and payload through unchanged', async () => {
     // 403/409/422 都是 octo-docs-html 的判断结果,前端按它的错误码做提示。
     // 翻译或吞掉会让两边对不上。

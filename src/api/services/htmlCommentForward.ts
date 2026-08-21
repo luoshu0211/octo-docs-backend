@@ -99,6 +99,7 @@ function joinUrl(base: string, path: string): string {
 export async function forwardHtmlComment(
   input: HtmlCommentCreateInput,
   callerToken: string,
+  principalSpaceId?: string,
 ): Promise<HtmlForwardResult> {
   const url = joinUrl(config.docHtml.baseUrl, '/v1/comments')
   const ac = new AbortController()
@@ -111,6 +112,7 @@ export async function forwardHtmlComment(
         // 用调用方的 token,不是服务间密钥:让 octo-docs-html 用它自己的规则判作者权限。
         Authorization: `Bearer ${callerToken}`,
         token: callerToken,
+        ...(principalSpaceId ? { 'X-Space-Id': principalSpaceId } : {}),
       },
       // ★ 路径 slug 放在展开**之后**,必须由它赢。
       //

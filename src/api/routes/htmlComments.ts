@@ -57,9 +57,18 @@ htmlCommentsRouter.post('/html/:slug/comments', async (req: Request, res: Respon
     return
   }
 
+  const viewerSpaceId = (() => {
+    const raw = req.header('X-Space-Id')
+    return typeof raw === 'string' ? raw.trim() : ''
+  })()
+
   let forwarded
   try {
-    forwarded = await forwardHtmlComment({ slug, body: req.body }, callerToken)
+    forwarded = await forwardHtmlComment(
+      { slug, body: req.body },
+      callerToken,
+      viewerSpaceId || undefined,
+    )
   } catch {
     // 转发本身失败(网络/超时)。502 —— 这不是调用方的错,也不能假装成功。
     res.status(502).json({ error: 'html_upstream_unreachable' })
@@ -113,10 +122,6 @@ htmlCommentsRouter.post('/html/:slug/comments', async (req: Request, res: Respon
   // 就地读头,**不复用** req.viewerSpaceId:那个字段由 humanDocSpaceScopeMiddleware
   // 填(app.ts:194),依赖它就把本路由的承重输入绑在「上游中间件必须挂着」这个前提上
   // —— 而 P0 的成因正是承重输入依赖了本链上没人填的字段。就地读头让这条路自给自足。
-  const viewerSpaceId = (() => {
-    const raw = req.header('X-Space-Id')
-    return typeof raw === 'string' ? raw.trim() : ''
-  })()
   if (viewerSpaceId === '') {
     // 缺头不影响评论(已回 200),但 @Bot 这一半必然做不了。显式记一行:
     // 否则又退回「静默恒拒」那个不可观测的状态。
