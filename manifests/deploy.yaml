@@ -19,17 +19,31 @@ metadata:
     app.kubernetes.io/part-of: octo-docs
     octo.docs/env: "{{BRANCH}}"
 spec:
-  # The colocated process contains REST plus Hocuspocus WS. Running 2 replicas
-  # without documentName-affinity routing or explicit document locks risks
-  # split-brain collab state if the same document lands on different pods.
+  # The colocated process contains REST plus Hocuspocus WS. Cross-node collab
+  # state is carried by the Redis extension mounted unconditionally in
+  # src/collab/server.ts, so a document opened on two pods stays one logical
+  # doc: a two-instance run verified the concurrent baseVersion guard (exactly
+  # one writer wins, the other gets 412) and cold-start catch-up (a peer that
+  # never loaded the doc still receives edits that are only in the other pod's
+  # memory, with the DB row still empty) for all three doc types — doc, sheet
+  # and board. documentName-affinity routing is therefore not a prerequisite;
+  # the Service stays on default round-robin.
   replicas: 2
   revisionHistoryLimit: 10
   selector:
     matchLabels:
       app: octo-docs-backend
       octo.docs/env: "{{BRANCH}}"
+  # Recreate tears every pod down before starting the new ones, which makes
+  # each rollout a full outage — acceptable at one replica, but it throws away
+  # the availability the second replica exists for. maxUnavailable: 0 keeps at
+  # least one pod serving throughout; maxSurge: 1 bounds the extra pod so the
+  # rollout never doubles the DB/Redis connection footprint.
   strategy:
-    type: Recreate
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
   template:
     metadata:
       labels:
