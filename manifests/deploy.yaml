@@ -19,10 +19,10 @@ metadata:
     app.kubernetes.io/part-of: octo-docs
     octo.docs/env: "{{BRANCH}}"
 spec:
-  # The colocated process contains REST plus Hocuspocus WS. Keep one replica and
-  # Recreate until documentName-affinity routing and explicit document locks are
-  # deployed for multi-node operation.
-  replicas: 1
+  # The colocated process contains REST plus Hocuspocus WS. Running 2 replicas
+  # without documentName-affinity routing or explicit document locks risks
+  # split-brain collab state if the same document lands on different pods.
+  replicas: 2
   revisionHistoryLimit: 10
   selector:
     matchLabels:
@@ -115,16 +115,16 @@ spec:
               port: http
             initialDelaySeconds: 10
             periodSeconds: 10
-            timeoutSeconds: 2
-            failureThreshold: 3
+            timeoutSeconds: 5
+            failureThreshold: 5
           livenessProbe:
             httpGet:
               path: /healthz
               port: http
             initialDelaySeconds: 30
             periodSeconds: 20
-            timeoutSeconds: 2
-            failureThreshold: 3
+            timeoutSeconds: 5
+            failureThreshold: 5
           resources:
             requests:
               cpu: 250m
