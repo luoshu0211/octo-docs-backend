@@ -83,8 +83,9 @@ export async function buildDecisionDisplay(
   operatorUid: string,
   actedAtSeconds: number,
   callerToken?: string,
+  operatorSpaceId?: string,
 ): Promise<{ display: Record<string, string>; operatorName: string }> {
-  return assembleDisplay(title, operatorUid, formatCardTimestampFromSeconds(actedAtSeconds), callerToken)
+  return assembleDisplay(title, operatorUid, formatCardTimestampFromSeconds(actedAtSeconds), callerToken, operatorSpaceId)
 }
 
 /**
@@ -97,9 +98,10 @@ export async function buildDecisionDisplayAt(
   operatorUid: string,
   decidedAt: Date | null | undefined,
   callerToken?: string,
+  operatorSpaceId?: string,
 ): Promise<{ display: Record<string, string>; operatorName: string }> {
   const at = decidedAt ? new Date(decidedAt) : null
-  return assembleDisplay(title, operatorUid, at ? formatCardTimestamp(at) : '', callerToken)
+  return assembleDisplay(title, operatorUid, at ? formatCardTimestamp(at) : '', callerToken, operatorSpaceId)
 }
 
 async function assembleDisplay(
@@ -107,10 +109,18 @@ async function assembleDisplay(
   operatorUid: string,
   decidedAtDisplay: string,
   callerToken?: string,
+  operatorSpaceId?: string,
 ): Promise<{ display: Record<string, string>; operatorName: string }> {
   const display: Record<string, string> = { title: truncateDisplay(title || '文档访问申请') }
   const operatorName = await resolveOperatorName(operatorUid, callerToken)
   if (operatorName) display.operator_name = operatorName
+  if (operatorSpaceId) {
+    const identity = getOctoIdentity()
+    const operatorSpaceName = typeof identity.getSpaceName === 'function'
+      ? await identity.getSpaceName(operatorSpaceId, callerToken ?? '').catch(() => '')
+      : ''
+    if (operatorSpaceName) display.operator_space_name = truncateDisplay(operatorSpaceName)
+  }
   if (decidedAtDisplay) display.decided_at = decidedAtDisplay
   return { display, operatorName }
 }

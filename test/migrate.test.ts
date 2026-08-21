@@ -1,4 +1,4 @@
-import { mkdtemp, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -177,6 +177,190 @@ describe('shipped migration files parse cleanly', () => {
     expect(splitSqlStatements("INSERT INTO t VALUES ('a;b'); -- trailing; note")).toEqual([
       "INSERT INTO t VALUES ('a;b')",
     ])
+  })
+
+  it('keeps the applied sharing-v3 migration byte-for-byte immutable', async () => {
+    const files = await loadMigrationFiles(upgradesDir)
+    const migration = files.find((f) => f.filename === '2026-08-17-expand-doc-sharing.sql')
+    expect(migration).toBeTruthy()
+    expect(migration!.checksum).toBe('99b48dbf294177f35fa1918099476e6af6bca1e801220fe15603b46b769d44a1')
+    expect(migration!.sql).toMatch(/ADD COLUMN allow_external_applications TINYINT\(1\) NOT NULL DEFAULT 1/)
+    expect(migration!.sql).toMatch(/ADD COLUMN space_searchable TINYINT\(1\) NOT NULL DEFAULT 0/)
+    expect(migration!.sql).not.toContain('external_application_policy')
+    expect(migration!.sql).not.toContain('discoverability_scope')
+    expect(() => splitSqlStatements(migration!.sql)).not.toThrow()
+  })
+
+  it('captures discovery migration state before draft columns can be recreated', async () => {
+    const files = await loadMigrationFiles(upgradesDir)
+    const marker = files.find((f) => f.filename === '2026-08-16-capture-sharing-discovery-phase.sql')
+    const expandAt = files.findIndex((f) => f.filename === '2026-08-17-expand-doc-sharing.sql')
+    const markerAt = files.findIndex((f) => f.filename === '2026-08-16-capture-sharing-discovery-phase.sql')
+    expect(marker).toBeTruthy()
+    expect(markerAt).toBeGreaterThanOrEqual(0)
+    expect(markerAt).toBeLessThan(expandAt)
+    expect(marker!.sql).toMatch(/CREATE TABLE IF NOT EXISTS schema_migration_markers/)
+    expect(marker!.sql).toMatch(/column_name='discoverability_scope'[\s\S]*'preserve'[\s\S]*'backfill'/)
+    expect(() => splitSqlStatements(marker!.sql)).not.toThrow()
+  })
+
+  it('finalizes historical discovery and removes abandoned draft controls repeatably', async () => {
+    const files = await loadMigrationFiles(upgradesDir)
+    const migration = files.find((f) => f.filename === '2026-08-18-convert-doc-sharing-policies.sql')
+    expect(migration).toBeTruthy()
+    const sql = migration!.sql
+    expect(sql).toMatch(/discoverability_scope[\s\S]*DEFAULT 0[\s\S]*0=hidden, 1=space/)
+    expect(sql).toMatch(/marker_key='sharing_discovery_backfill_v1' AND marker_value='backfill'/)
+    expect(sql).toMatch(/UPDATE doc_meta[\s\S]*discoverability_scope = CASE WHEN share_scope = 1 THEN 1 ELSE 0 END/)
+    expect(sql).toMatch(/UPDATE schema_migration_markers[\s\S]*marker_value='preserve'/)
+    expect(sql).not.toMatch(/column_name='space_searchable'[\s\S]*UPDATE doc_meta/)
+    expect(sql).toMatch(/DROP COLUMN space_searchable/)
+    expect(sql).toMatch(/DROP COLUMN allow_external_applications/)
+    expect(sql).toMatch(/DROP COLUMN external_application_policy/)
+    expect(sql).toMatch(/IF EXISTS[\s\S]*DROP CHECK chk_doc_meta_share_scope/)
+    expect(sql).toMatch(/ADD CONSTRAINT chk_doc_meta_share_role CHECK \(share_role IN \(1,2,4\)\)/)
+    expect(() => splitSqlStatements(sql)).not.toThrow()
+  })
+})
+
+// Contract test for rerunning the shipped migration after any DDL phase failed.
+describe('legacy HTML grants migration contract', () => {
+  const migrationPath = fileURLToPath(
+    new URL('../migrations/upgrades/2026-08-21-migrate-legacy-html-grants.sql', import.meta.url),
+  )
+
+  it('copies only safe missing grants into the document Home Space without overwriting authority', async () => {
+    const sql = await readFile(migrationPath, 'utf8')
+    expect(sql).toMatch(/JSON_TYPE\(JSON_EXTRACT\(hm\.json, '\$\.grants'\)\)='OBJECT'/)
+    expect(sql).toMatch(/dm\.principal_space_id=dm\.space_id|principal_space_id,role,granted_by/)
+    expect(sql).toMatch(/legacy\.role_name IN \('reader','writer','commenter'\)|IN \('reader','writer','commenter'\)/)
+    expect(sql).not.toMatch(/WHEN 'admin' THEN/)
+    expect(sql).toMatch(/grant_keys\.uid[\s\S]*<>dm\.owner_id/)
+    expect(sql).toMatch(/grant_keys\.uid[\s\S]*<>COALESCE\(JSON_UNQUOTE\(JSON_EXTRACT\(hm\.json, '\$\.creator_uid'\)\), ''\)/)
+    expect(sql).toMatch(/NOT EXISTS \([\s\S]*existing\.doc_id[\s\S]*=dm\.doc_id[\s\S]*existing\.uid[\s\S]*=grant_keys\.uid[\s\S]*existing\.principal_space_id[\s\S]*=dm\.space_id/)
+    expect(sql).toMatch(/INSERT IGNORE INTO doc_member/)
+    expect(sql).not.toMatch(/ON DUPLICATE KEY UPDATE role|UPDATE doc_member/)
+    expect(sql).not.toMatch(/JSON_REMOVE|JSON_SET\([^\n]*grants/)
+    expect(() => splitSqlStatements(sql)).not.toThrow()
+  })
+
+  it('is optional-table safe and bumps each changed document epoch once', async () => {
+    const sql = await readFile(migrationPath, 'utf8')
+    expect(sql).toMatch(/information_schema\.columns[\s\S]*table_name='meta'[\s\S]*column_name='json'/)
+    expect(sql).toMatch(/CREATE TEMPORARY TABLE tmp_legacy_html_grants/)
+    expect(sql).toMatch(/marker_key='legacy_html_grants_to_space_members_v1'[\s\S]*marker_value='complete'/)
+    expect(sql).toMatch(/START TRANSACTION[\s\S]*INSERT IGNORE INTO doc_member[\s\S]*SET dm\.permission_epoch=dm\.permission_epoch\+1[\s\S]*INSERT INTO schema_migration_markers[\s\S]*COMMIT/)
+    expect(sql).toMatch(/SELECT DISTINCT doc_id FROM tmp_legacy_html_grants/)
+    expect(sql).toMatch(/DROP TEMPORARY TABLE IF EXISTS tmp_legacy_html_grants/)
+  })
+})
+
+describe('space-qualified permissions migration resumability', () => {
+  const migrationPath = fileURLToPath(
+    new URL('../migrations/upgrades/2026-08-13-space-qualified-permissions.sql', import.meta.url),
+  )
+
+  it('keeps add, backfill, NOT NULL, and primary-key phases independently guarded', async () => {
+    const sql = await readFile(migrationPath, 'utf8')
+    const tables = [
+      {
+        table: 'doc_meta',
+        column: 'owner_space_id',
+        update: /UPDATE doc_meta SET owner_space_id=space_id/,
+        primaryKey: undefined,
+      },
+      {
+        table: 'doc_member',
+        column: 'principal_space_id',
+        update: /UPDATE doc_member dm[\s\S]*?SET dm\.principal_space_id=m\.space_id/,
+        primaryKey: 'doc_id,uid,principal_space_id',
+      },
+      {
+        table: 'doc_access_request',
+        column: 'principal_space_id',
+        update: /UPDATE doc_access_request r[\s\S]*?SET r\.principal_space_id=m\.space_id/,
+        primaryKey: 'doc_id,uid,principal_space_id',
+      },
+      {
+        table: 'doc_invite_redemption',
+        column: 'principal_space_id',
+        update: /UPDATE doc_invite_redemption r[\s\S]*?SET r\.principal_space_id=m\.space_id/,
+        primaryKey: 'invite_token,uid,principal_space_id',
+      },
+    ] as const
+
+    for (const [index, spec] of tables.entries()) {
+      const start = sql.indexOf(`-- ${spec.table}.`)
+      const end = index + 1 < tables.length ? sql.indexOf(`-- ${tables[index + 1]!.table}.`) : sql.indexOf('END //')
+      const section = sql.slice(start, end)
+
+      expect(start, `${spec.table}: section missing`).toBeGreaterThanOrEqual(0)
+      expect(section).toMatch(
+        new RegExp(
+          `IF NOT EXISTS \\([\\s\\S]*?information_schema\\.columns[\\s\\S]*?table_name='${spec.table}'[\\s\\S]*?column_name='${spec.column}'[\\s\\S]*?THEN[\\s\\S]*?ADD COLUMN ${spec.column}[\\s\\S]*?END IF;`,
+        ),
+      )
+
+      // These assertions are the interrupted-rerun contract: UPDATE and MODIFY
+      // occur after the add-column END IF, so an already-present nullable column
+      // cannot cause the remaining phases to be skipped.
+      const addEnd = section.indexOf('END IF;')
+      const updateAt = section.search(spec.update)
+      const notNullAt = section.indexOf(`MODIFY ${spec.column} VARCHAR(64) NOT NULL`)
+      expect(updateAt, `${spec.table}: backfill missing`).toBeGreaterThan(addEnd)
+      expect(notNullAt, `${spec.table}: NOT NULL phase missing`).toBeGreaterThan(updateAt)
+
+      const beforeUpdate = section.slice(addEnd, updateAt)
+      expect(beforeUpdate).toContain('information_schema.columns')
+      expect(beforeUpdate).toContain(`table_name='${spec.table}'`)
+      expect(beforeUpdate).toContain(`column_name='${spec.column}'`)
+      expect(beforeUpdate).toContain(`SELECT 1 FROM ${spec.table}`)
+
+      const beforeNotNull = section.slice(updateAt, notNullAt)
+      expect(beforeNotNull).toContain('information_schema.columns')
+      expect(beforeNotNull).toContain("is_nullable='YES'")
+
+      if (spec.primaryKey) {
+        const primaryKeyAt = section.indexOf(`<> '${spec.primaryKey}'`)
+        expect(primaryKeyAt, `${spec.table}: primary-key state check missing`).toBeGreaterThan(notNullAt)
+        expect(section.slice(notNullAt, primaryKeyAt)).toContain('information_schema.statistics')
+        expect(section).toContain(`ADD PRIMARY KEY(${spec.primaryKey})`)
+      }
+    }
+  })
+
+  it('models reruns from every partial state as advancing only the unfinished phases', () => {
+    const rerun = (state: { column: boolean; backfilled: boolean; notNull: boolean; primaryKey: boolean }) => {
+      const executed: string[] = []
+      if (!state.column) {
+        executed.push('add-column')
+        state.column = true
+      }
+      if (state.column && !state.backfilled) {
+        executed.push('backfill')
+        state.backfilled = true
+      }
+      if (state.column && state.backfilled && !state.notNull) {
+        executed.push('not-null')
+        state.notNull = true
+      }
+      if (state.notNull && !state.primaryKey) executed.push('primary-key')
+      return executed
+    }
+
+    expect(rerun({ column: true, backfilled: false, notNull: false, primaryKey: false })).toEqual([
+      'backfill',
+      'not-null',
+      'primary-key',
+    ])
+    expect(rerun({ column: true, backfilled: true, notNull: false, primaryKey: false })).toEqual([
+      'not-null',
+      'primary-key',
+    ])
+    expect(rerun({ column: true, backfilled: true, notNull: true, primaryKey: false })).toEqual([
+      'primary-key',
+    ])
+    expect(rerun({ column: true, backfilled: true, notNull: true, primaryKey: true })).toEqual([])
   })
 })
 

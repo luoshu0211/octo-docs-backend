@@ -166,7 +166,7 @@ describe('friend bots are ANDed with the document-permission gate', () => {
     expect(r).toEqual({ accepted: 0, skipped: 1, failed: 0 })
     expect(fetch).not.toHaveBeenCalled()
     // Judged against the BOT's own uid on THIS doc.
-    expect(db.getRole).toHaveBeenCalledWith('doc-1', 'bot-friend')
+    expect(db.getRole).toHaveBeenCalledWith('doc-1', 'bot-friend', 'space-1')
   })
 
   it('a friend bot is refused when the permission read itself fails (fail-closed)', async () => {

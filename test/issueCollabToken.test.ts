@@ -33,6 +33,7 @@ const boardMeta = (ownerId: string) =>
     // resolved by this key, same as a document.
     document_name: BOARD_KEY,
     owner_id: ownerId,
+    owner_space_id: SPACE,
     space_id: SPACE,
     folder_id: FOLDER,
     doc_type: 'board',
@@ -45,6 +46,7 @@ const docMeta = (ownerId: string) =>
     doc_id: DOC_ID,
     document_name: DOC_KEY,
     owner_id: ownerId,
+    owner_space_id: SPACE,
     space_id: SPACE,
     folder_id: FOLDER,
     doc_type: 'doc',
@@ -57,6 +59,7 @@ const htmlMeta = (ownerId: string) =>
     doc_id: HTML_DOC_ID,
     document_name: HTML_KEY,
     owner_id: ownerId,
+    owner_space_id: SPACE,
     space_id: SPACE,
     folder_id: FOLDER,
     doc_type: 'html',
@@ -69,6 +72,7 @@ const pptMeta = (ownerId: string) =>
     doc_id: PPT_DOC_ID,
     document_name: PPT_KEY,
     owner_id: ownerId,
+    owner_space_id: SPACE,
     space_id: SPACE,
     folder_id: FOLDER,
     doc_type: 'html_ppt',
@@ -117,6 +121,9 @@ describe('issueCollabToken (§4.4) — whiteboard support', () => {
       permission_epoch: 4,
       space_member: true,
       home_space_verified: true,
+      current_space_verified: true,
+      current_space_id: SPACE,
+      principal_space_id: SPACE,
     })
   })
 
@@ -398,10 +405,10 @@ describe('issueCollabTokenByDocId — authorize before unsupported-type disclosu
     vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(meta)
     vi.mocked(docMemberRepo.getRole).mockResolvedValue(undefined)
 
-    const out = await issueCollabTokenByDocId('stranger', meta.doc_id, 'session', meta.space_id)
+    const out = await issueCollabTokenByDocId('stranger', meta.doc_id, 'session', SPACE)
 
     expect(out).toEqual({ ok: false, status: 403, error: 'forbidden' })
-    expect(docMemberRepo.getRole).toHaveBeenCalledWith(meta.doc_id, 'stranger')
+    expect(docMemberRepo.getRole).toHaveBeenCalledWith(meta.doc_id, 'stranger', SPACE)
   })
 
   it.each([
@@ -413,13 +420,13 @@ describe('issueCollabTokenByDocId — authorize before unsupported-type disclosu
     vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(meta)
     vi.mocked(docMemberRepo.getRole).mockResolvedValue(memberRole)
 
-    const out = await issueCollabTokenByDocId(uid, meta.doc_id, 'session', meta.space_id)
+    const out = await issueCollabTokenByDocId(uid, meta.doc_id, 'session', SPACE)
 
     expect(out).toEqual({ ok: false, status: 422, error: 'unsupported_document_type' })
     if (uid === meta.owner_id) {
       expect(docMemberRepo.getRole).not.toHaveBeenCalled()
     } else {
-      expect(docMemberRepo.getRole).toHaveBeenCalledWith(meta.doc_id, uid)
+      expect(docMemberRepo.getRole).toHaveBeenCalledWith(meta.doc_id, uid, SPACE)
     }
   })
 

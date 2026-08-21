@@ -31,6 +31,10 @@ vi.mock('../src/permission/resolveRole.js', () => ({ resolveRole: vi.fn() }))
 vi.mock('../src/api/services/grantForward.js', () => ({
   grantForwardAccess: vi.fn(async () => ({ finalRole: 'reader', changed: true })),
 }))
+const { mockApproveAccessRequest } = vi.hoisted(() => ({ mockApproveAccessRequest: vi.fn() }))
+vi.mock('../src/api/services/approveAccessRequest.js', () => ({
+  approveAccessRequest: mockApproveAccessRequest,
+}))
 vi.mock('../src/api/services/botGrantAudit.js', () => ({
   logBotGrantFailure: vi.fn(),
   logBotGrantSummary: vi.fn(),
@@ -91,7 +95,7 @@ function handlerFor(path: string, method: 'get' | 'post') {
 }
 
 const okGuard = {
-  meta: { doc_id: 'd_1', document_name: 'doc-d_1', owner_id: 'u_admin', doc_type: 'html' },
+  meta: { doc_id: 'd_1', document_name: 'doc-d_1', owner_id: 'u_admin', space_id: 's_doc_home', doc_type: 'doc' },
   role: 'admin',
 } as never
 
@@ -110,6 +114,25 @@ beforeEach(() => {
   mockOwnedBotsInSpace.mockResolvedValue([])
   // grantForward default success unless a test overrides per-uid.
   vi.mocked(grantForwardAccess).mockResolvedValue({ finalRole: 'reader', changed: true })
+  mockApproveAccessRequest.mockReset().mockImplementation(async (params) => {
+    const transitioned = await docAccessRequestRepo.decide({
+      docId: params.docId,
+      requestId: params.requestId,
+      status: REQUEST_STATUS_APPROVED,
+      decidedBy: params.decidedBy,
+    })
+    if (!transitioned) return { transitioned: false }
+    const grant = await grantForwardAccess({
+      docId: params.docId,
+      documentName: params.documentName,
+      uid: params.uid,
+      principalSpaceId: params.principalSpaceId,
+      roleNum: params.roleNum,
+      ...(params.allowAdmin ? { allowAdmin: true } : {}),
+      grantedBy: params.decidedBy,
+    })
+    return { transitioned: true, requesterRole: grant.finalRole }
+  })
 })
 
 // ── submit ────────────────────────────────────────────────────────────────
@@ -124,6 +147,7 @@ describe('POST /:docId/access-requests — submit', () => {
       spaceId: 's_1',
       viewerSpaceId: 's_1',
       verifiedViewerSpaceId: 's_1',
+      principalSpaceId: 's_1',
       docSpaceScope: { mode: 'human' as const },
       params: { docId: 'd_1' },
       body,
@@ -155,13 +179,19 @@ describe('POST /:docId/access-requests — submit', () => {
     expect(vi.mocked(docAccessRequestRepo.submit)).not.toHaveBeenCalled()
   })
 
-  it('HUMAN mount: a doc outside the verified current Space is rejected', async () => {
-    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue({ status: 1, space_id: 's_other' } as never)
+  it('HUMAN mount: an external non-collaborator can request access by default', async () => {
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue({
+      status: 1,
+      space_id: 's_other',
+      owner_id: 'u_owner',
+      title: 'External',
+    } as never)
+    vi.mocked(resolveRole).mockResolvedValue('none')
+    vi.mocked(docAccessRequestRepo.submit).mockResolvedValue({ requestId: 'r_external', status: 1 } as never)
     const res = mockRes()
     await submitHandler()(req({ requestedRole: 'reader' }), res as never)
-    expect(res.statusCode).toBe(404)
-    expect(res.body).toEqual({ error: 'not_found' })
-    expect(vi.mocked(docAccessRequestRepo.submit)).not.toHaveBeenCalled()
+    expect(res.statusCode).toBe(201)
+    expect(docAccessRequestRepo.submit).toHaveBeenCalledTimes(1)
   })
 
   it('archived doc (status=2) -> 409', async () => {
@@ -192,6 +222,7 @@ describe('POST /:docId/access-requests — submit', () => {
     expect(vi.mocked(docAccessRequestRepo.submit)).toHaveBeenCalledWith({
       docId: 'd_1',
       uid: 'u_applicant',
+      principalSpaceId: 's_1',
       requestedRoleNum: 2,
       reason: 'need edit',
       botUids: [],
@@ -211,6 +242,7 @@ describe('POST /:docId/access-requests — submit', () => {
     expect(vi.mocked(docAccessRequestRepo.submit)).toHaveBeenCalledWith({
       docId: 'd_1',
       uid: 'u_applicant',
+      principalSpaceId: 's_1',
       requestedRoleNum: 1,
       reason: '',
       botUids: [],
@@ -220,14 +252,27 @@ describe('POST /:docId/access-requests — submit', () => {
   it('explicit invalid requestedRole returns 400 without writing a row', async () => {
     vi.mocked(docMetaRepo.getByDocId).mockResolvedValue({ status: 1, space_id: 's_1', doc_type: 'html' } as never)
 
-    for (const requestedRole of ['admin', 'bogus', null]) {
+    for (const requestedRole of ['bogus', null]) {
       const res = mockRes()
       await submitHandler()(req({ requestedRole }), res as never)
       expect(res.statusCode).toBe(400)
-      expect(res.body).toEqual({ error: 'requestedRole must be reader|commenter|writer' })
+      expect(res.body).toEqual({ error: 'requestedRole must be reader|commenter' })
     }
 
     expect(vi.mocked(resolveRole)).not.toHaveBeenCalled()
+    expect(vi.mocked(docAccessRequestRepo.submit)).not.toHaveBeenCalled()
+  })
+
+  it('rejects an admin request without writing a row', async () => {
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue({ status: 1, space_id: 's_1', doc_type: 'doc' } as never)
+    vi.mocked(resolveRole).mockResolvedValue('none')
+    vi.mocked(docAccessRequestRepo.submit).mockResolvedValue({ requestId: 'req_a', status: 1 })
+
+    const res = mockRes()
+    await submitHandler()(req({ requestedRole: 'admin' }), res as never)
+
+    expect(res.statusCode).toBe(400)
+    expect(res.body).toEqual({ error: 'requestedRole must be reader|commenter|writer' })
     expect(vi.mocked(docAccessRequestRepo.submit)).not.toHaveBeenCalled()
   })
 
@@ -262,6 +307,7 @@ describe('POST /:docId/access-requests — bot_uids snapshot subset gate', () =>
       spaceId: 's_1',
       viewerSpaceId: 's_1',
       verifiedViewerSpaceId: 's_1',
+      principalSpaceId: 's_1',
       octoToken: 'caller-tok',
       docSpaceScope: { mode: 'human' as const },
       params: { docId: 'd_1' },
@@ -280,7 +326,7 @@ describe('POST /:docId/access-requests — bot_uids snapshot subset gate', () =>
     const res = mockRes()
     await submitHandler()(req({ requestedRole: 'writer', botUids: ['bot_b', 'bot_a'] }), res as never)
     expect(res.statusCode).toBe(201)
-    // ownedBotsInSpace is resolved with the caller\u2019s own token + the doc\u2019s space.
+    // ownedBotsInSpace is resolved with the caller's own token + verified current Space.
     expect(mockOwnedBotsInSpace).toHaveBeenCalledWith('u_applicant', 's_1', 'caller-tok')
     // Stored snapshot is normalized (sorted, deduped).
     expect(vi.mocked(docAccessRequestRepo.submit)).toHaveBeenCalledWith(
@@ -342,9 +388,12 @@ describe('POST /:docId/access-requests — bot_uids snapshot subset gate', () =>
     expect(vi.mocked(docAccessRequestRepo.submit)).not.toHaveBeenCalled()
   })
 
-  it('zero bots (omitted botUids) never calls the ownership resolver \u2014 legacy path unchanged', async () => {
+  it.each([
+    ['omitted', { requestedRole: 'reader' }],
+    ['explicit empty', { requestedRole: 'reader', botUids: [] }],
+  ] as const)('zero bots (%s botUids) stores an empty snapshot without an ownership lookup', async (_label, body) => {
     const res = mockRes()
-    await submitHandler()(req({ requestedRole: 'reader' }), res as never)
+    await submitHandler()(req(body), res as never)
     expect(res.statusCode).toBe(201)
     expect(mockOwnedBotsInSpace).not.toHaveBeenCalled()
     expect(vi.mocked(docAccessRequestRepo.submit)).toHaveBeenCalledWith(
@@ -387,6 +436,7 @@ describe('POST /:docId/access-requests — bot_uids snapshot subset gate', () =>
     const botReq = ({
       uid: 'bot_self',
       spaceId: 's_1',
+      principalSpaceId: 's_1',
       docSpaceScope: { mode: 'bot', spaceId: 's_1' },
       params: { docId: 'd_1' },
       body: { botUids: ['bot_a'] },
@@ -409,6 +459,7 @@ describe('GET /:docId/access-requests — list pending (admin)', () => {
       {
         doc_id: 'd_1',
         uid: 'u_applicant',
+        principal_space_id: 's_applicant',
         requested_role: 2,
         reason: 'edit pls',
         status: 1,
@@ -424,9 +475,33 @@ describe('GET /:docId/access-requests — list pending (admin)', () => {
     expect(res.statusCode).toBe(200)
     expect(res.body).toEqual({
       items: [
-        { requestId: 'req_x', uid: 'u_applicant', requestedRole: 'writer', reason: 'edit pls', botUids: ['bot_a', 'bot_b'], createdAt: new Date(0) },
+        {
+          requestId: 'req_x',
+          uid: 'u_applicant',
+          principalSpaceId: 's_applicant',
+          requestedRole: 'writer',
+          reason: 'edit pls',
+          botUids: ['bot_a', 'bot_b'],
+          createdAt: new Date(0),
+        },
       ],
     })
+  })
+
+  it('serializes stored admin role code 3 as admin', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(okGuard)
+    vi.mocked(docAccessRequestRepo.listByStatus).mockResolvedValue([
+      {
+        doc_id: 'd_1', uid: 'u_applicant', principal_space_id: 's_applicant', requested_role: 3,
+        reason: '', status: 1, request_id: 'req_admin', decided_by: '', decision_note: '', bot_uids: [],
+        created_at: new Date(0), updated_at: new Date(0),
+      },
+    ])
+
+    const res = mockRes()
+    await listHandler()({ uid: 'u_admin', params: { docId: 'd_1' }, query: {} } as never, res as never)
+
+    expect((res.body as { items: Array<{ requestedRole: string }> }).items[0]?.requestedRole).toBe('admin')
   })
 
   it('blocked guard short-circuits (no list read)', async () => {
@@ -448,6 +523,7 @@ describe('POST /:docId/access-requests/:requestId/approve', () => {
     vi.mocked(docAccessRequestRepo.getByRequestId).mockResolvedValue({
       doc_id: 'd_1',
       uid: 'u_applicant',
+      principal_space_id: 's_applicant',
       requested_role: 1,
       reason: '',
       status: 1,
@@ -466,6 +542,7 @@ describe('POST /:docId/access-requests/:requestId/approve', () => {
       docId: 'd_1',
       documentName: 'doc-d_1',
       uid: 'u_applicant',
+      principalSpaceId: 's_applicant',
       roleNum: 2,
       grantedBy: 'u_admin',
     })
@@ -499,9 +576,49 @@ describe('POST /:docId/access-requests/:requestId/approve', () => {
 
     vi.mocked(docAccessRequestRepo.decide).mockClear()
     const invalid = mockRes()
-    await approveHandler()(req({ role: 'admin' }), invalid as never)
+    await approveHandler()(req({ role: 'bogus' }), invalid as never)
     expect(invalid.statusCode).toBe(400)
     expect(vi.mocked(docAccessRequestRepo.decide)).not.toHaveBeenCalled()
+  })
+
+  it('allows an administrator to choose separate Human/Bot roles and a carried-Bot subset', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(okGuard)
+    vi.mocked(docAccessRequestRepo.getByRequestId).mockResolvedValue({
+      doc_id: 'd_1', uid: 'u_applicant', principal_space_id: 's_applicant', requested_role: 1,
+      reason: '', status: 1, request_id: 'req_x', decided_by: '', bot_uids: ['bot_a', 'bot_b'],
+      created_at: new Date(0), updated_at: new Date(0),
+    })
+    vi.mocked(grantForwardAccess).mockResolvedValue({ finalRole: 'admin', changed: true })
+
+    const res = mockRes()
+    await approveHandler()(req({ humanRole: 'admin', botRole: 'reader', botUids: ['bot_b'] }), res as never)
+
+    expect(res.statusCode).toBe(200)
+    expect(vi.mocked(docAccessRequestRepo.decide)).toHaveBeenCalled()
+    expect(vi.mocked(grantForwardAccess)).toHaveBeenCalledWith(expect.objectContaining({
+      uid: 'u_applicant', roleNum: 3, allowAdmin: true,
+    }))
+    expect(vi.mocked(grantForwardAccess)).toHaveBeenCalledWith(expect.objectContaining({
+      uid: 'bot_b', roleNum: 1,
+    }))
+    expect(vi.mocked(grantForwardAccess)).not.toHaveBeenCalledWith(expect.objectContaining({ uid: 'bot_a' }))
+  })
+
+  it('rejects a Bot selection outside the immutable request snapshot before deciding', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(okGuard)
+    vi.mocked(docAccessRequestRepo.getByRequestId).mockResolvedValue({
+      doc_id: 'd_1', uid: 'u_applicant', principal_space_id: 's_applicant', requested_role: 1,
+      reason: '', status: 1, request_id: 'req_x', decided_by: '', bot_uids: ['bot_a'],
+      created_at: new Date(0), updated_at: new Date(0),
+    })
+
+    const res = mockRes()
+    await approveHandler()(req({ humanRole: 'admin', botRole: 'reader', botUids: ['bot_other'] }), res as never)
+
+    expect(res.statusCode).toBe(400)
+    expect(res.body).toEqual({ error: 'bot_not_in_request' })
+    expect(vi.mocked(docAccessRequestRepo.decide)).not.toHaveBeenCalled()
+    expect(vi.mocked(grantForwardAccess)).not.toHaveBeenCalled()
   })
 
   // Regression (§ review打回 blocker): grant MUST be gated on a genuine
@@ -558,6 +675,21 @@ describe('POST /:docId/access-requests/:requestId/approve', () => {
     })
     expect(vi.mocked(grantForwardAccess)).not.toHaveBeenCalled()
   })
+
+  it('propagates an atomic primary-grant failure without starting Bot fan-out, and permits retry', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(okGuard)
+    vi.mocked(docAccessRequestRepo.getByRequestId).mockResolvedValue(requestRow(1))
+    mockApproveAccessRequest.mockRejectedValueOnce(new Error('primary grant failed'))
+    const failed = mockRes()
+    await expect(approveHandler()(req({ role: 'writer' }), failed as never)).rejects.toThrow('primary grant failed')
+    expect(vi.mocked(grantForwardAccess)).not.toHaveBeenCalled()
+
+    mockApproveAccessRequest.mockResolvedValueOnce({ transitioned: true, requesterRole: 'writer' })
+    const retried = mockRes()
+    await approveHandler()(req({ role: 'writer' }), retried as never)
+    expect(retried.statusCode).toBe(200)
+    expect(mockApproveAccessRequest).toHaveBeenCalledTimes(2)
+  })
 })
 
 // ── deny ────────────────────────────────────────────────────────────────────
@@ -568,6 +700,7 @@ describe('POST /:docId/access-requests/:requestId/approve — carried Space-bot 
   const rowWithBots = (bots: string[], status = 1) => ({
     doc_id: 'd_1',
     uid: 'u_applicant',
+    principal_space_id: 's_requester',
     requested_role: 2,
     reason: '',
     status,
@@ -592,12 +725,15 @@ describe('POST /:docId/access-requests/:requestId/approve — carried Space-bot 
       role: 'writer',
       botGrantResult: { succeeded: ['bot_a', 'bot_b'], failed: [] },
     })
-    // requester + 2 bots, each at roleNum 2 (writer), via the shared grant core.
+    // The human and carried Bots are all granted in the requester's verified current Space.
     expect(vi.mocked(grantForwardAccess)).toHaveBeenCalledTimes(3)
-    for (const uid of ['u_applicant', 'bot_a', 'bot_b']) {
-      expect(vi.mocked(grantForwardAccess)).toHaveBeenCalledWith(
-        expect.objectContaining({ uid, roleNum: 2, docId: 'd_1', grantedBy: 'u_admin' }),
-      )
+    expect(vi.mocked(grantForwardAccess)).toHaveBeenCalledWith(expect.objectContaining({
+      uid: 'u_applicant', principalSpaceId: 's_requester', roleNum: 2,
+    }))
+    for (const uid of ['bot_a', 'bot_b']) {
+      expect(vi.mocked(grantForwardAccess)).toHaveBeenCalledWith(expect.objectContaining({
+        uid, principalSpaceId: 's_requester', roleNum: 2, docId: 'd_1', grantedBy: 'u_admin',
+      }))
     }
   })
 
@@ -763,4 +899,5 @@ describe('POST /:docId/access-requests/:requestId/deny', () => {
     })
     expect(vi.mocked(grantForwardAccess)).not.toHaveBeenCalled()
   })
+
 })

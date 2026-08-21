@@ -90,7 +90,11 @@ interface DocsCardBody {
    *  display name from this uid server-side; actor_name is a client-side fallback. */
   actor_uid: string
   actor_name: string
+  /** Free-text reason only. Requested Bots are carried separately. */
   excerpt: string
+  requester_space_name?: string
+  requested_bot_names?: string[]
+  requested_role?: 'reader' | 'commenter' | 'writer' | 'admin'
   updated_at: string
 }
 
@@ -117,45 +121,101 @@ export interface AccessRequestNotifyParams {
   requestId: string
   spaceId: string
   ownerId: string
+  /** Space-qualified owner principal. Normally the document's Home Space. */
+  ownerSpaceId: string
   title: string
-  /** The uid that submitted the request (excluded from recipients + used as actor). */
+  /** The uid that submitted the request (used as actor). */
   requesterUid: string
+  /** Verified Space of the requester principal. Self-exclusion compares uid + Space. */
+  requesterSpaceId: string
   /** Free-text reason (already trimmed/capped at 512 by the caller). */
   reason: string
+  /** Server-validated requested permission role. */
+  requestedRole: 'reader' | 'commenter' | 'writer' | 'admin'
   /** Server-validated bot principals that approval will grant. */
   botUids: string[]
+  /** Requester's session token, used only for best-effort Space/Bot display lookup. */
+  requesterToken?: string
 }
 
-function accessRequestExcerpt(reason: string, botUids: string[]): string {
-  const takeRunes = (value: string, limit: number): string => [...value].slice(0, Math.max(0, limit)).join('')
-  if (botUids.length === 0) return takeRunes(reason, 300)
+function takeRunes(value: string, limit: number): string {
+  return [...value].slice(0, Math.max(0, limit)).join('')
+}
 
-  const count = `Bots (${botUids.length})`
-  let excerpt = count
-  for (const uid of botUids) {
-    const next = `${excerpt === count ? ': ' : ', '}${uid}`
-    if ([...(excerpt + next)].length > 300) break
-    excerpt += next
+async function resolveAccessRequestDisplayContext(
+  requesterSpaceId: string,
+  botUids: string[],
+  requesterToken: string,
+): Promise<{ requesterSpaceName: string; requestedBotNames: string[] }> {
+  const identity = getOctoIdentity()
+  const [spaceName, spaceBots] = await Promise.all([
+    typeof identity.getSpaceName === 'function'
+      ? identity.getSpaceName(requesterSpaceId, requesterToken).catch(() => '')
+      : Promise.resolve(''),
+    typeof identity.spaceBots === 'function'
+      ? identity.spaceBots(requesterSpaceId, requesterToken).catch(() => null)
+      : Promise.resolve(null),
+  ])
+  const namesByUid = new Map((spaceBots ?? []).map((bot) => [bot.uid, bot.name ?? '']))
+  const requestedBotNames = await Promise.all(botUids.map(async (uid) => {
+    const fromDirectory = namesByUid.get(uid)?.trim()
+    if (fromDirectory) return takeRunes(fromDirectory, 120)
+    try {
+      const user = await identity.getUser(uid, requesterToken)
+      const name = user?.name?.trim()
+      return takeRunes(name || uid, 120)
+    } catch {
+      return takeRunes(uid, 120)
+    }
+  }))
+  return {
+    requesterSpaceName: takeRunes(spaceName.trim() || requesterSpaceId, 200),
+    requestedBotNames,
   }
-  if (reason && [...excerpt].length < 300) {
-    excerpt += `\n${takeRunes(reason, 300 - [...excerpt].length - 1)}`
-  }
-  return excerpt
 }
 
 /**
- * Resolve the doc's approvers = owner + all admins, de-duplicated and with the
- * requester removed. Owner has no doc_member row, so it comes from doc_meta.
+ * Resolve the doc's approvers = owner + all admins.
+ *
+ * Authorization principals are Space-qualified: `(uid, principalSpaceId)`. Only
+ * the exact requester principal is excluded. The same Octo uid in another Space
+ * remains a valid approver (for example, test-Space owner `admin` approving a
+ * request from 123-Space `admin`). Delivery is still uid-addressed, so collapse
+ * qualifying principals to unique recipient uids only after principal filtering.
  */
-async function resolveApprovers(docId: string, ownerId: string, requesterUid: string): Promise<string[]> {
+interface NotifyRecipient {
+  uid: string
+  principalSpaceId: string
+}
+
+async function resolveApprovers(
+  docId: string,
+  owner: NotifyRecipient,
+  requester: NotifyRecipient,
+): Promise<NotifyRecipient[]> {
   const members = await docMemberRepo.list(docId)
-  const set = new Set<string>()
-  if (ownerId) set.add(ownerId)
-  for (const m of members) {
-    if (Number(m.role) === ROLE_ADMIN) set.add(m.uid)
+  const principals = new Map<string, NotifyRecipient>()
+  const add = (principal: NotifyRecipient) => {
+    if (principal.uid && principal.principalSpaceId) {
+      principals.set(`${principal.principalSpaceId}\u0000${principal.uid}`, principal)
+    }
   }
-  set.delete(requesterUid)
-  return [...set]
+  add(owner)
+  for (const member of members) {
+    if (Number(member.role) === ROLE_ADMIN) {
+      add({ uid: member.uid, principalSpaceId: member.principal_space_id })
+    }
+  }
+
+  principals.delete(`${requester.principalSpaceId}\u0000${requester.uid}`)
+
+  // Transport is UID-addressed, but visibility is Space-scoped. Preserve the
+  // first qualifying principal (owner is inserted first) as the delivery Space.
+  const recipients = new Map<string, NotifyRecipient>()
+  for (const principal of principals.values()) {
+    if (!recipients.has(principal.uid)) recipients.set(principal.uid, principal)
+  }
+  return [...recipients.values()]
 }
 
 /**
@@ -297,7 +357,11 @@ export async function notifyDocAccessRequested(p: AccessRequestNotifyParams): Pr
   }
 
   try {
-    const approvers = await resolveApprovers(p.docId, p.ownerId, p.requesterUid)
+    const approvers = await resolveApprovers(
+      p.docId,
+      { uid: p.ownerId, principalSpaceId: p.ownerSpaceId },
+      { uid: p.requesterUid, principalSpaceId: p.requesterSpaceId },
+    )
     if (approvers.length === 0) return 0
 
     // Requester display name for the "X 申请访问" attribution; empty is allowed
@@ -311,6 +375,11 @@ export async function notifyDocAccessRequested(p: AccessRequestNotifyParams): Pr
       actorName = ''
     }
 
+    const displayContext = await resolveAccessRequestDisplayContext(
+      p.requesterSpaceId,
+      p.botUids,
+      p.requesterToken ?? '',
+    )
     const docsCard: DocsCardBody = {
       doc_id: p.docId,
       request_id: p.requestId,
@@ -318,12 +387,17 @@ export async function notifyDocAccessRequested(p: AccessRequestNotifyParams): Pr
       title: p.title,
       actor_uid: p.requesterUid,
       actor_name: actorName,
-      excerpt: accessRequestExcerpt(p.reason, p.botUids),
+      excerpt: takeRunes(p.reason.trim(), 300),
+      requester_space_name: displayContext.requesterSpaceName,
+      requested_bot_names: displayContext.requestedBotNames,
+      requested_role: p.requestedRole,
       updated_at: formatCardTimestamp(new Date()),
     }
 
     const results = await Promise.all(
-      approvers.map((uid) => postNotify(p.spaceId, uid, docsCard, docsToken)),
+      approvers.map((recipient) =>
+        postNotify(recipient.principalSpaceId, recipient.uid, docsCard, docsToken),
+      ),
     )
     // Persist the delivered cards' coordinates so a later approve/deny can locate
     // and terminalize every approver's card. Best-effort: a persistence failure

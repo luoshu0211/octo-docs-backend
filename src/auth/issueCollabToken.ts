@@ -16,15 +16,14 @@
  * Authorization (resolveRole = doc_member + owner) and signing are identical for
  * both — a board owner gets admin, a board member gets their stored role.
  */
+import { confirmSpaceMembership } from '../permission/spaceMembership.js'
 import { signCollabToken, signCollabTokenV2, type CollabTokenResult } from './collabToken.js'
 import { getOctoIdentity } from './octoIdentity.js'
 import { parseDocumentName, isDocTypeConsistentWithName } from '../permission/documentName.js'
 import { resolveRole, resolveDocMetaByName } from '../permission/resolveRole.js'
 import { docMetaRepo } from '../db/repos/docMetaRepo.js'
-import { recordVerifiedRecentView } from '../api/services/recordRecentView.js'
-import { effectiveRole } from '../permission/shareScope.js'
+import { effectiveRole, SHARE_SCOPE_ANYONE } from '../permission/shareScope.js'
 import { HTML_DOC_TYPE, HTML_PPT_DOC_TYPE } from '../db/docType.js'
-import { confirmSpaceMembership } from '../permission/spaceMembership.js'
 
 export type IssueResult =
   | { ok: true; result: CollabTokenResult }
@@ -45,12 +44,15 @@ export type IssueResult =
 export async function issueCollabToken(
   octoToken: string,
   documentName: string,
-  viewerSpaceId?: string,
+  viewerSpaceId: string,
 ): Promise<IssueResult> {
   // Layer-1: octo identity -> trusted uid (never trust a client-supplied uid).
   const identity = await getOctoIdentity().verifyToken(octoToken)
   if (!identity) return { ok: false, status: 401, error: 'login_required' }
   const uid = identity.uid
+  const currentSpace = typeof viewerSpaceId === 'string' ? viewerSpaceId.trim() : ''
+  if (currentSpace === '') return { ok: false, status: 403, error: 'space_required' }
+  if (!(await confirmSpaceMembership(uid, currentSpace, octoToken))) return { ok: false, status: 403, error: 'forbidden' }
 
   // Resolve the trusted DISPLAY NAME for this uid from the octo directory
   // (§4.7(b)), so the collab/presence layer can stamp the awareness frame's
@@ -110,14 +112,8 @@ export async function issueCollabToken(
     return { ok: false, status: 422, error: 'unsupported_document_type' }
   }
 
-  const currentSpace = typeof viewerSpaceId === 'string' ? viewerSpaceId.trim() : ''
-  if (currentSpace === '') return { ok: false, status: 403, error: 'space_required' }
-  if (!(await confirmSpaceMembership(uid, currentSpace, octoToken)) || currentSpace !== meta.space_id) {
-    return { ok: false, status: 403, error: 'forbidden' }
-  }
-
   // Authorization: resolveRole = doc_member + owner (same model for docs/boards).
-  const direct = await resolveRole(uid, meta.doc_id)
+  const direct = await resolveRole(uid, meta.doc_id, viewerSpaceId)
 
   // #64: space-scoped share. Only when the doc is anyone_in_space do we resolve
   // the requester's Space membership — restricted docs (the default/common case)
@@ -126,7 +122,7 @@ export async function issueCollabToken(
   // is both merged into the effective role and baked into the token as the
   // space_member claim, so the live-socket write recheck (§5.3) can re-derive
   // access on a scope narrowing without a fresh membership call.
-  const spaceMember = true
+  const spaceMember = currentSpace === meta.space_id
   const role = effectiveRole(direct, spaceMember, meta.share_scope, meta.share_role)
   if (role === 'none') return { ok: false, status: 403, error: 'forbidden' }
 
@@ -134,22 +130,6 @@ export async function issueCollabToken(
   // This check deliberately follows authorization so archived state is not
   // disclosed to a caller who has no role.
   if (meta.status === 2) return { ok: false, status: 409, error: 'conflict' }
-
-  // FEAT-B recent-view ingest, now VERIFIED-OR-SKIP (remove-sp §7.1). Every
-  // document open — read-only INCLUDED — passes through here, so this remains
-  // the reliable "open == viewed" seam. But phase-1 no longer writes an
-  // unverified viewer Space nor falls back to the document's home Space: the row
-  // lands ONLY when the caller is a confirmed active member of the viewer Space
-  // they supplied (X-Space-Id), otherwise it is skipped. Fire-and-forget so it
-  // can neither slow nor fail token issuance.
-  void recordVerifiedRecentView({
-    scope: { mode: 'human' },
-    uid,
-    docId: meta.doc_id,
-    viewerSpaceId,
-    token: octoToken,
-    verifiedViewerSpaceId: currentSpace,
-  })
 
   // Sign with the document's current epoch (§4.4 / §4.5). The token carries the
   // exact connection documentName (incl. the `:wb:` whiteboard form) so the WS
@@ -160,9 +140,12 @@ export async function issueCollabToken(
     documentName,
     role,
     permission_epoch: meta.permission_epoch,
+    principal_space_id: viewerSpaceId,
     ...(displayName !== '' ? { name: displayName } : {}),
-    space_member: true,
-    home_space_verified: true,
+    space_member: spaceMember,
+    home_space_verified: spaceMember,
+    current_space_verified: true,
+    current_space_id: currentSpace,
   })
   return { ok: true, result }
 }
@@ -183,13 +166,13 @@ export async function issueCollabTokenByDocId(
   uid: string,
   docId: string,
   octoToken: string,
-  viewerSpaceId?: string,
+  viewerSpaceId: string,
 ): Promise<IssueResult> {
   const meta = await docMetaRepo.getByDocId(docId)
   if (!meta || meta.status === 0) return { ok: false, status: 404, error: 'not_found' }
   const currentSpace = typeof viewerSpaceId === 'string' ? viewerSpaceId.trim() : ''
   if (currentSpace === '') return { ok: false, status: 403, error: 'space_required' }
-  if (!(await confirmSpaceMembership(uid, currentSpace, octoToken)) || currentSpace !== meta.space_id) {
+  if (!(await confirmSpaceMembership(uid, currentSpace, octoToken))) {
     return { ok: false, status: 403, error: 'forbidden' }
   }
 
@@ -197,8 +180,11 @@ export async function issueCollabTokenByDocId(
   // This MUST precede every state/type-specific response: the docId-first route
   // is reachable from the bare `/d/:docId` locator, so returning 422 for an
   // unauthorized html/html_ppt row would disclose its type/existence details.
-  const direct = await resolveRole(uid, meta.doc_id)
-  const spaceMember = true
+  const direct = await resolveRole(uid, meta.doc_id, viewerSpaceId)
+  let spaceMember = false
+  if (meta.share_scope === SHARE_SCOPE_ANYONE && currentSpace === meta.space_id) {
+    spaceMember = await getOctoIdentity().isSpaceMember(uid, meta.space_id, octoToken)
+  }
   const role = effectiveRole(direct, spaceMember, meta.share_scope, meta.share_role)
   if (role === 'none') return { ok: false, status: 403, error: 'forbidden' }
 
@@ -239,16 +225,6 @@ export async function issueCollabTokenByDocId(
   const profile = await getOctoIdentity().getUser(uid, octoToken)
   if (profile && typeof profile.name === 'string') displayName = profile.name.trim()
 
-  // Verified-or-skip recent view (§7.1) — human path, fire-and-forget.
-  void recordVerifiedRecentView({
-    scope: { mode: 'human' },
-    uid,
-    docId: meta.doc_id,
-    viewerSpaceId,
-    token: octoToken,
-    verifiedViewerSpaceId: currentSpace,
-  })
-
   const result = signCollabTokenV2({
     uid,
     docId: meta.doc_id,
@@ -256,9 +232,12 @@ export async function issueCollabTokenByDocId(
     homeSpaceId: meta.space_id,
     role,
     permissionEpoch: meta.permission_epoch,
+    principalSpaceId: viewerSpaceId,
     ...(displayName !== '' ? { name: displayName } : {}),
-    spaceMember: true,
-    homeSpaceVerified: true,
+    spaceMember,
+    homeSpaceVerified: spaceMember,
+    currentSpaceVerified: true,
+    currentSpaceId: currentSpace,
   })
   return { ok: true, result }
 }

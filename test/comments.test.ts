@@ -68,6 +68,7 @@ function req(opts: {
   return {
     uid: opts.uid ?? 'u_reader',
     spaceId: 's1',
+    principalSpaceId: 's1',
     params: opts.params ?? {},
     body: opts.body,
     query: opts.query ?? {},

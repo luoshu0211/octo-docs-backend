@@ -62,6 +62,7 @@ forwardGrantRouter.post('/:docId/forward-grant', async (req: Request, res: Respo
     docId: guard.meta.doc_id,
     documentName: guard.meta.document_name,
     uid,
+    principalSpaceId: guard.meta.space_id,
     roleNum: roleToNumber(parsedRole),
     grantedBy: req.uid!,
   })
@@ -177,6 +178,7 @@ forwardGrantRouter.post('/:docId/forward-grant/batch', async (req: Request, res:
         docId: guard.meta.doc_id,
         documentName: guard.meta.document_name,
         uid: g.uid,
+        principalSpaceId: guard.meta.space_id,
         roleNum: roleToNumber(g.role),
         grantedBy: req.uid!,
       })

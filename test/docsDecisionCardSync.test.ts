@@ -21,8 +21,8 @@ vi.mock('../src/config/env.js', () => ({
 // sibling card. Mock the identity module so these tests stay offline and the fetch
 // assertions below count only card mutate / notify calls (the name resolution
 // itself is covered by decisionDisplay.test.ts).
-const { getUser } = vi.hoisted(() => ({ getUser: vi.fn() }))
-vi.mock('../src/auth/octoIdentity.js', () => ({ getOctoIdentity: () => ({ getUser }) }))
+const { getUser, getSpaceName } = vi.hoisted(() => ({ getUser: vi.fn(), getSpaceName: vi.fn() }))
+vi.mock('../src/auth/octoIdentity.js', () => ({ getOctoIdentity: () => ({ getUser, getSpaceName }) }))
 vi.mock('../src/db/repos/docAccessNotifyCardRepo.js', () => ({
   NOTIFY_CARD_STATUS_ACTIVE: 1,
   NOTIFY_CARD_STATUS_TERMINALIZED: 2,
@@ -60,9 +60,11 @@ function baseParams() {
   return {
     requestId: 'req-1',
     spaceId: 'space-1',
+    principalSpaceId: 'space-1',
     docId: 'doc-1',
     title: 'Test Doc',
     deciderUid: 'u-owner',
+    deciderSpaceId: 'space-1',
     denied: false,
   }
 }
@@ -79,6 +81,7 @@ beforeEach(() => {
   repo.listByRequest.mockReset().mockResolvedValue([])
   repo.markTerminalized.mockReset().mockResolvedValue(undefined)
   getUser.mockReset().mockResolvedValue({ uid: 'u-owner', name: '决策人' })
+  getSpaceName.mockReset().mockResolvedValue('test Space')
   fetchMock = vi.fn(async () => ({ ok: true, status: 200 }))
   vi.stubGlobal('fetch', fetchMock)
 })
@@ -143,7 +146,9 @@ describe('syncDecisionCards', () => {
     expect(getUser.mock.calls[0][0]).toBe('u-owner')
     for (let i = 0; i < fetchMock.mock.calls.length; i++) {
       const body = bodyOf(fetchMock, i)
+      expect(body.operator_uid).toBe('u-owner')
       expect(body.operator_name).toBe('决策人')
+      expect(body.operator_space_name).toBe('test Space')
       expect(body.decided_at_display).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/)
     }
   })
@@ -184,41 +189,12 @@ describe('syncDecisionCards', () => {
     expect(bodyOf(fetchMock, 0).operator_name).toBe('张三')
   })
 
-  it('carries the decider identity onto the re-notify fallback too', async () => {
+  it('does not send a second card when an in-place mutate fails', async () => {
     repo.listByRequest.mockResolvedValue([row('u-admin1')])
-    fetchMock.mockImplementation(async (url: string) => {
-      if (url.includes('/v1/internal/cards/mutate')) return { ok: false, status: 500 }
-      return { ok: true, status: 200 }
-    })
-    await syncDecisionCards({
-      ...baseParams(),
-      deciderCardHandledExternally: true,
-      deciderName: '张三',
-      decidedAtSeconds: Math.floor(new Date('2026-07-24T07:35:00.000Z').getTime() / 1000),
-    })
-    const notifyIdx = fetchMock.mock.calls.findIndex((c) =>
-      (c[0] as string).includes('/v1/internal/notify'),
-    )
-    expect(notifyIdx).toBeGreaterThanOrEqual(0)
-    const card = (bodyOf(fetchMock, notifyIdx) as unknown as { docs_card: Record<string, string> })
-      .docs_card
-    // A card that lands on the fallback must not be the odd one out with a
-    // generic label and no time.
-    expect(card.actor_name).toBe('张三')
-    expect(card.updated_at).toBe('2026-07-24 15:35')
-  })
-
-  it('falls back to a fresh terminal card when a mutate fails', async () => {
-    repo.listByRequest.mockResolvedValue([row('u-admin1')])
-    fetchMock.mockImplementation(async (url: string) => {
-      if (url.includes('/v1/internal/cards/mutate')) return { ok: false, status: 500 }
-      return { ok: true, status: 200 }
-    })
+    fetchMock.mockResolvedValue({ ok: false, status: 500 })
     await syncDecisionCards({ ...baseParams(), deciderCardHandledExternally: true })
-    const paths = fetchMock.mock.calls.map((c) => c[0] as string)
-    expect(paths.some((p) => p.includes('/v1/internal/cards/mutate'))).toBe(true)
-    expect(paths.some((p) => p.includes('/v1/internal/notify'))).toBe(true)
-    // A failed mutate must NOT be audited as terminalized.
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(fetchMock.mock.calls[0]![0]).toContain('/v1/internal/cards/mutate')
     expect(repo.markTerminalized).not.toHaveBeenCalled()
   })
 
@@ -243,25 +219,6 @@ describe('syncDecisionCards', () => {
     expect(bodyOf(fetchMock, 0)).not.toHaveProperty('bot_summary')
   })
 
-  it('does not claim bot-grant outcomes in the re-notify fallback', async () => {
-    repo.listByRequest.mockResolvedValue([row('u-admin1')])
-    fetchMock.mockImplementation(async (url: string) => {
-      if (url.includes('/v1/internal/cards/mutate')) return { ok: false, status: 500 }
-      return { ok: true, status: 200 }
-    })
-    await syncDecisionCards({
-      ...baseParams(),
-      denied: false,
-      deciderCardHandledExternally: true,
-    })
-    const notifyIdx = fetchMock.mock.calls.findIndex((c) =>
-      (c[0] as string).includes('/v1/internal/notify'),
-    )
-    expect(notifyIdx).toBeGreaterThanOrEqual(0)
-    const card = (bodyOf(fetchMock, notifyIdx) as unknown as { docs_card: Record<string, string> })
-      .docs_card
-    expect(card.excerpt).toBe('')
-  })
 
   it('never throws even when the ledger lookup fails (best-effort)', async () => {
     repo.listByRequest.mockRejectedValue(new Error('db down'))

@@ -29,9 +29,12 @@ vi.mock('../src/db/repos/docMetaRepo.js', () => ({
     })),
   },
 }))
-vi.mock('../src/auth/octoIdentity.js', () => ({
-  getOctoIdentity: () => ({ getUser: vi.fn(async () => ({ uid: 'u-req', name: '申请人小明' })) }),
+const mockIdentity = vi.hoisted(() => ({
+  getUser: vi.fn(async (uid: string) => ({ uid, name: uid === 'u-req' ? '申请人小明' : uid })),
+  getSpaceName: vi.fn(async () => ''),
+  spaceBots: vi.fn(async () => []),
 }))
+vi.mock('../src/auth/octoIdentity.js', () => ({ getOctoIdentity: () => mockIdentity }))
 
 import { notifyDocAccessRequested, notifyDocMentioned, mentionedUserUids } from '../src/api/services/docsNotify.js'
 import { config } from '../src/config/env.js'
@@ -45,10 +48,14 @@ function baseParams() {
     docId: 'doc-1',
     requestId: 'req-1',
     spaceId: 'space-1',
+    principalSpaceId: 'space-1',
     ownerId: 'u-owner',
+    ownerSpaceId: 'space-1',
     title: 'Test Doc',
     requesterUid: 'u-req',
+    requesterSpaceId: 'space-1',
     reason: 'need edit',
+    requestedRole: 'commenter' as const,
     botUids: [],
   }
 }
@@ -60,10 +67,13 @@ function okResp(delivered: string[]) {
 describe('notifyDocAccessRequested', () => {
   beforeEach(() => {
     cfg.notify.docsToken = 'internal-token'
+    mockIdentity.getUser.mockImplementation(async (uid: string) => ({ uid, name: uid === 'u-req' ? '申请人小明' : uid }))
+    mockIdentity.getSpaceName.mockResolvedValue('')
+    mockIdentity.spaceBots.mockResolvedValue([])
     ;(docMemberRepo.list as ReturnType<typeof vi.fn>).mockResolvedValue([
-      { doc_id: 'doc-1', uid: 'u-admin', role: 3 },
-      { doc_id: 'doc-1', uid: 'u-writer', role: 2 }, // not admin -> excluded
-      { doc_id: 'doc-1', uid: 'u-owner', role: 3 }, // duplicate of owner -> de-duped
+      { doc_id: 'doc-1', uid: 'u-admin', principal_space_id: 'space-1', role: 3 },
+      { doc_id: 'doc-1', uid: 'u-writer', principal_space_id: 'space-1', role: 2 }, // not admin -> excluded
+      { doc_id: 'doc-1', uid: 'u-owner', principal_space_id: 'space-1', role: 3 }, // duplicate of owner -> de-duped
     ])
     // Echo the single target back in delivered[] so each send counts as delivered.
     vi.stubGlobal(
@@ -93,6 +103,76 @@ describe('notifyDocAccessRequested', () => {
     expect(calls).toHaveLength(2)
     const recipients = calls.map((c) => JSON.parse((c[1] as RequestInit).body as string).targets[0]).sort()
     expect(recipients).toEqual(['u-admin', 'u-owner'])
+    const deliverySpaces = Object.fromEntries(calls.map((c) => {
+      const body = JSON.parse((c[1] as RequestInit).body as string)
+      return [body.targets[0], body.space_id]
+    }))
+    expect(deliverySpaces).toEqual({ 'u-owner': 'space-1', 'u-admin': 'space-1' })
+  })
+
+  it('excludes the exact requester principal in the same Space', async () => {
+    ;(docMemberRepo.list as ReturnType<typeof vi.fn>).mockResolvedValue([])
+    const delivered = await notifyDocAccessRequested({
+      ...baseParams(),
+      ownerId: 'u-req',
+      ownerSpaceId: 'space-1',
+      requesterUid: 'u-req',
+      requesterSpaceId: 'space-1',
+    })
+    expect(delivered).toBe(0)
+    expect(fetch).not.toHaveBeenCalled()
+  })
+
+  it('keeps the same uid as an approver when owner and requester are in different Spaces', async () => {
+    ;(docMemberRepo.list as ReturnType<typeof vi.fn>).mockResolvedValue([])
+    const delivered = await notifyDocAccessRequested({
+      ...baseParams(),
+      ownerId: 'admin',
+      ownerSpaceId: 'space-test',
+      requesterUid: 'admin',
+      requesterSpaceId: 'space-123',
+    })
+    expect(delivered).toBe(1)
+    const body = JSON.parse(((fetch as ReturnType<typeof vi.fn>).mock.calls[0]![1] as RequestInit).body as string)
+    expect(body.targets).toEqual(['admin'])
+    expect(body.space_id).toBe('space-test')
+  })
+
+  it('filters principals first, then de-duplicates uid-addressed delivery', async () => {
+    ;(docMemberRepo.list as ReturnType<typeof vi.fn>).mockResolvedValue([
+      { uid: 'admin', principal_space_id: 'space-123', role: 3 }, // exact requester principal: excluded
+      { uid: 'admin', principal_space_id: 'space-other', role: 3 }, // qualifying approver principal
+      { uid: 'admin-2', principal_space_id: 'space-test', role: 3 },
+    ])
+    const delivered = await notifyDocAccessRequested({
+      ...baseParams(),
+      ownerId: 'admin',
+      ownerSpaceId: 'space-test',
+      requesterUid: 'admin',
+      requesterSpaceId: 'space-123',
+    })
+    expect(delivered).toBe(2)
+    const recipients = (fetch as ReturnType<typeof vi.fn>).mock.calls
+      .map((call) => JSON.parse((call[1] as RequestInit).body as string).targets[0])
+      .sort()
+    expect(recipients).toEqual(['admin', 'admin-2'])
+  })
+
+  it('stamps each notification with the approver principal Space', async () => {
+    ;(docMemberRepo.list as ReturnType<typeof vi.fn>).mockResolvedValue([
+      { uid: 'u-admin', principal_space_id: 'space-admin', role: 3 },
+    ])
+    await notifyDocAccessRequested({
+      ...baseParams(),
+      ownerSpaceId: 'space-owner',
+      spaceId: 'space-doc',
+    })
+    const calls = (fetch as ReturnType<typeof vi.fn>).mock.calls
+    const spaces = Object.fromEntries(calls.map((call) => {
+      const body = JSON.parse((call[1] as RequestInit).body as string)
+      return [body.targets[0], body.space_id]
+    }))
+    expect(spaces).toEqual({ 'u-owner': 'space-owner', 'u-admin': 'space-admin' })
   })
 
   it('hits /v1/internal/notify with X-Internal-Token and a single-target docs_card', async () => {
@@ -112,26 +192,36 @@ describe('notifyDocAccessRequested', () => {
     expect(body.docs_card.title).toBe('Test Doc')
     expect(body.docs_card.actor_name).toBe('申请人小明')
     expect(body.docs_card.excerpt).toBe('need edit')
+    expect(body.docs_card.requester_space_name).toBe('space-1')
+    expect(body.docs_card.requested_bot_names).toEqual([])
+    expect(body.docs_card.requested_role).toBe('commenter')
     expect(typeof body.docs_card.updated_at).toBe('string')
   })
 
-  it('shows the bot count and every bot uid before approval', async () => {
+  it('keeps requested Bots separate from the reason and resolves their display names', async () => {
+    mockIdentity.spaceBots.mockResolvedValue([
+      { uid: 'bot_a', name: '分析助手' },
+      { uid: 'bot_b', name: '写作助手' },
+    ])
+    mockIdentity.getSpaceName.mockResolvedValue('产品 Space')
     await notifyDocAccessRequested({ ...baseParams(), botUids: ['bot_a', 'bot_b'] })
     const [, init] = (fetch as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit]
     const body = JSON.parse(init.body as string)
-    expect(body.docs_card.excerpt).toBe('Bots (2): bot_a, bot_b\nneed edit')
+    expect(body.docs_card.excerpt).toBe('need edit')
+    expect(body.docs_card.requester_space_name).toBe('产品 Space')
+    expect(body.docs_card.requested_bot_names).toEqual(['分析助手', '写作助手'])
   })
 
-  it('caps access-request excerpts at 300 runes while always retaining the bot count', async () => {
+  it('caps only the free-text reason at 300 runes', async () => {
     await notifyDocAccessRequested({
       ...baseParams(),
       reason: '理'.repeat(400),
-      botUids: Array.from({ length: 50 }, (_, i) => `bot_${i}_${'😀'.repeat(20)}`),
+      botUids: [],
     })
     const [, init] = (fetch as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit]
     const excerpt = JSON.parse(init.body as string).docs_card.excerpt as string
     expect([...excerpt]).toHaveLength(300)
-    expect(excerpt.startsWith('Bots (50)')).toBe(true)
+    expect(excerpt).toBe('理'.repeat(300))
   })
 
   it('counts only delivered[]; a filtered recipient is not counted', async () => {
@@ -172,6 +262,7 @@ describe('notifyDocMentioned', () => {
     return {
       docId: 'doc-1',
       spaceId: 'space-1',
+      principalSpaceId: 'space-1',
       title: 'Test Doc',
       authorUid: 'u-req', // commenter; excluded + actor
       body: 'see this @[user:u_1:Alice] and @[user:u_2:Bob]',

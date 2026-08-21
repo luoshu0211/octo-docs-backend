@@ -51,7 +51,7 @@ describe('docViewHistoryRepo.upsertViewWithPrune — idempotent UPSERT + prune',
   it('UPSERTs on (uid, doc_id, space_id): a same-space re-open refreshes viewed_at, never inserts a new row', async () => {
     const calls = mockTx()
     await docViewHistoryRepo.upsertViewWithPrune({
-      uid: 'u_1', docId: 'd_1', spaceId: 's1', retainCount: 200, retainDays: 90,
+      uid: 'u_1', docId: 'd_1', spaceId: 's1', principalSpaceId: 's1', retainCount: 200, retainDays: 90,
     })
     const insert = calls.find((c) => c.sql.includes('INSERT INTO doc_view_history'))
     expect(insert).toBeDefined()
@@ -67,7 +67,7 @@ describe('docViewHistoryRepo.upsertViewWithPrune — idempotent UPSERT + prune',
   it('returns the post-write viewed_at read back inside the same transaction', async () => {
     mockTx(new Date('2026-07-15T06:20:48.123Z'))
     const out = await docViewHistoryRepo.upsertViewWithPrune({
-      uid: 'u_1', docId: 'd_1', spaceId: 's1', retainCount: 200, retainDays: 90,
+      uid: 'u_1', docId: 'd_1', spaceId: 's1', principalSpaceId: 's1', retainCount: 200, retainDays: 90,
     })
     expect(out.toISOString()).toBe('2026-07-15T06:20:48.123Z')
   })
@@ -75,7 +75,7 @@ describe('docViewHistoryRepo.upsertViewWithPrune — idempotent UPSERT + prune',
   it('count prune (retainCount=3) keeps the most-recent 3 via an inlined LIMIT, keyed by (uid, space_id)', async () => {
     const calls = mockTx()
     await docViewHistoryRepo.upsertViewWithPrune({
-      uid: 'u_1', docId: 'd_1', spaceId: 's1', retainCount: 3, retainDays: 0,
+      uid: 'u_1', docId: 'd_1', spaceId: 's1', principalSpaceId: 's1', retainCount: 3, retainDays: 0,
     })
     const del = calls.find((c) => c.sql.includes('DELETE') && c.sql.includes('NOT IN'))
     expect(del).toBeDefined()
@@ -94,7 +94,7 @@ describe('docViewHistoryRepo.upsertViewWithPrune — idempotent UPSERT + prune',
   it('age prune (retainDays=1) drops rows older than an inlined INTERVAL, keyed by uid', async () => {
     const calls = mockTx()
     await docViewHistoryRepo.upsertViewWithPrune({
-      uid: 'u_1', docId: 'd_1', spaceId: 's1', retainCount: 0, retainDays: 1,
+      uid: 'u_1', docId: 'd_1', spaceId: 's1', principalSpaceId: 's1', retainCount: 0, retainDays: 1,
     })
     const del = calls.find((c) => c.sql.includes('DELETE') && c.sql.includes('INTERVAL'))
     expect(del).toBeDefined()
@@ -106,7 +106,7 @@ describe('docViewHistoryRepo.upsertViewWithPrune — idempotent UPSERT + prune',
   it('skips the count pass when retainCount=0 and the age pass when retainDays=0 (0 = unbounded)', async () => {
     const calls = mockTx()
     await docViewHistoryRepo.upsertViewWithPrune({
-      uid: 'u_1', docId: 'd_1', spaceId: 's1', retainCount: 0, retainDays: 0,
+      uid: 'u_1', docId: 'd_1', spaceId: 's1', principalSpaceId: 's1', retainCount: 0, retainDays: 0,
     })
     expect(calls.some((c) => c.sql.includes('DELETE'))).toBe(false)
   })
@@ -114,7 +114,7 @@ describe('docViewHistoryRepo.upsertViewWithPrune — idempotent UPSERT + prune',
   it('clamps a fractional / negative retainCount to a safe non-negative integer', async () => {
     const calls = mockTx()
     await docViewHistoryRepo.upsertViewWithPrune({
-      uid: 'u_1', docId: 'd_1', spaceId: 's1', retainCount: 3.9, retainDays: -5,
+      uid: 'u_1', docId: 'd_1', spaceId: 's1', principalSpaceId: 's1', retainCount: 3.9, retainDays: -5,
     })
     const del = calls.find((c) => c.sql.includes('NOT IN'))
     expect(del!.sql).toMatch(/LIMIT 3\b/) // floor(3.9)=3
@@ -166,7 +166,7 @@ describe('docViewHistoryRepo.listRecent — query-time filter + keyset paging', 
   it('filters at query time on status=1 + the owner/member/space-share visibility predicate (member)', async () => {
     mockQuery.mockResolvedValueOnce([{ cnt: 0 }] as never) // count
     mockQuery.mockResolvedValueOnce([] as never) // items
-    await docViewHistoryRepo.listRecent({ uid: 'u_1', spaceId: 's1', isSpaceMember: true, pageSize: 20 })
+    await docViewHistoryRepo.listRecent({ uid: 'u_1', spaceId: 's1', principalSpaceId: 's1', isSpaceMember: true, pageSize: 20 })
     const itemsSql = mockQuery.mock.calls.at(-1)![0] as string
     // this — NOT pruning — is what makes revoked/deleted/archived docs vanish.
     expect(itemsSql).toContain('m.status = 1')
@@ -174,7 +174,7 @@ describe('docViewHistoryRepo.listRecent — query-time filter + keyset paging', 
     // recognizes the space-scoped share source, so an anyone_in_space doc a member
     // opened (written by POST /view's effectiveRole guard) is no longer dropped.
     expect(itemsSql).toContain(
-      '(m.owner_id = ? OR dm.role IN (1, 2, 3, 4) OR (m.share_scope = 1 AND m.space_id = v.space_id))',
+      '(m.owner_id = ? AND m.owner_space_id = ? OR dm.role IN (1, 2, 3, 4) OR (m.share_scope = 2 OR (m.share_scope = 1 AND m.space_id = v.space_id)))',
     )
     expect(itemsSql).toMatch(/ORDER BY v\.viewed_at DESC, v\.doc_id DESC/)
   })
@@ -182,7 +182,7 @@ describe('docViewHistoryRepo.listRecent — query-time filter + keyset paging', 
   it('selects the last-editor uid (m.updated_by) alongside the existing doc_meta columns (XIN-1240)', async () => {
     mockQuery.mockResolvedValueOnce([{ cnt: 0 }] as never) // count
     mockQuery.mockResolvedValueOnce([] as never) // items
-    await docViewHistoryRepo.listRecent({ uid: 'u_1', spaceId: 's1', pageSize: 20 })
+    await docViewHistoryRepo.listRecent({ uid: 'u_1', spaceId: 's1', principalSpaceId: 's1', pageSize: 20 })
     const itemsSql = mockQuery.mock.calls.at(-1)![0] as string
     // additive: updated_by joins the existing SELECT list, next to updated_at.
     expect(itemsSql).toContain('m.updated_by')
@@ -195,7 +195,7 @@ describe('docViewHistoryRepo.listRecent — query-time filter + keyset paging', 
   it('CROSS-SPACE ISOLATION: the share branch is same-space-guarded and never leaks another space (member)', async () => {
     mockQuery.mockResolvedValueOnce([{ cnt: 0 }] as never) // count
     mockQuery.mockResolvedValueOnce([] as never) // items
-    await docViewHistoryRepo.listRecent({ uid: 'u_1', spaceId: 's_trident', isSpaceMember: true, pageSize: 20 })
+    await docViewHistoryRepo.listRecent({ uid: 'u_1', spaceId: 's_trident', principalSpaceId: 's_trident', isSpaceMember: true, pageSize: 20 })
     const itemsSql = mockQuery.mock.calls.at(-1)![0] as string
     const itemsParams = mockQuery.mock.calls.at(-1)![1] as unknown[]
     // The recent query is pinned to ONE space: v.space_id = ? bound to the caller's
@@ -210,22 +210,24 @@ describe('docViewHistoryRepo.listRecent — query-time filter + keyset paging', 
     expect(itemsSql).not.toMatch(/OR\s+m\.share_scope = 1\s*\)/) // never unguarded
   })
 
-  it('CROSS-SPACE GATE: a NON-member never gets the share branch at all — visibility is owner OR doc_member (XIN-1295)', async () => {
+  it('CROSS-SPACE GATE: a NON-member drops anyone_in_space but retains authenticated', async () => {
     mockQuery.mockResolvedValueOnce([{ cnt: 0 }] as never) // count
     mockQuery.mockResolvedValueOnce([] as never) // items
     // v.space_id pins the query to the caller-named space, but naming a space does
     // not make the caller a member of it. Symmetric with the write side
     // (resolveEffectiveRole -> isSpaceMember): an unconfirmed member must NOT read
     // that space's anyone_in_space docs, even via a residual view row.
-    await docViewHistoryRepo.listRecent({ uid: 'u_1', spaceId: 's_trident', isSpaceMember: false, pageSize: 20 })
+    await docViewHistoryRepo.listRecent({ uid: 'u_1', spaceId: 's_trident', principalSpaceId: 's_trident', isSpaceMember: false, pageSize: 20 })
     const itemsSql = mockQuery.mock.calls.at(-1)![0] as string
-    expect(itemsSql).not.toContain('share_scope')
-    expect(itemsSql).toContain('(m.owner_id = ? OR dm.role IN (1, 2, 3, 4))')
+    expect(itemsSql).toContain('m.share_scope = 2')
+    expect(itemsSql).not.toContain('m.share_scope = 1')
+    expect(itemsSql).toContain('(m.owner_id = ? AND m.owner_space_id = ? OR dm.role IN (1, 2, 3, 4) OR m.share_scope = 2)')
     // isSpaceMember omitted (undefined) is fail-closed too: no share branch.
     mockQuery.mockResolvedValueOnce([{ cnt: 0 }] as never)
     mockQuery.mockResolvedValueOnce([] as never)
-    await docViewHistoryRepo.listRecent({ uid: 'u_1', spaceId: 's_trident', pageSize: 20 })
-    expect(mockQuery.mock.calls.at(-1)![0] as string).not.toContain('share_scope')
+    await docViewHistoryRepo.listRecent({ uid: 'u_1', spaceId: 's_trident', principalSpaceId: 's_trident', pageSize: 20 })
+    expect(mockQuery.mock.calls.at(-1)![0] as string).toContain('m.share_scope = 2')
+    expect(mockQuery.mock.calls.at(-1)![0] as string).not.toContain('m.share_scope = 1')
   })
 
   it('fetches pageSize+1 (inlined LIMIT) and derives nextCursor from the last kept row', async () => {
@@ -236,7 +238,7 @@ describe('docViewHistoryRepo.listRecent — query-time filter + keyset paging', 
     }))
     mockQuery.mockResolvedValueOnce([{ cnt: 9 }] as never) // count
     mockQuery.mockResolvedValueOnce(rows as never) // items: pageSize(2)+1 = 3 rows
-    const out = await docViewHistoryRepo.listRecent({ uid: 'u_1', spaceId: 's1', pageSize: 2 })
+    const out = await docViewHistoryRepo.listRecent({ uid: 'u_1', spaceId: 's1', principalSpaceId: 's1', pageSize: 2 })
     const itemsSql = mockQuery.mock.calls.at(-1)![0] as string
     expect(itemsSql).toMatch(/LIMIT 3\b/) // pageSize(2)+1
     expect(itemsSql).not.toMatch(/LIMIT \?/)
@@ -251,7 +253,7 @@ describe('docViewHistoryRepo.listRecent — query-time filter + keyset paging', 
   it('projects m.octo_doc_slug in the items SELECT so html rows can carry a slug', async () => {
     mockQuery.mockResolvedValueOnce([{ cnt: 0 }] as never) // count
     mockQuery.mockResolvedValueOnce([] as never) // items
-    await docViewHistoryRepo.listRecent({ uid: 'u_1', spaceId: 's1', pageSize: 20 })
+    await docViewHistoryRepo.listRecent({ uid: 'u_1', spaceId: 's1', principalSpaceId: 's1', pageSize: 20 })
     const itemsSql = mockQuery.mock.calls.at(-1)![0] as string
     expect(itemsSql).toContain('m.octo_doc_slug')
   })
@@ -262,7 +264,7 @@ describe('docViewHistoryRepo.listRecent — query-time filter + keyset paging', 
       { doc_id: 'd_0', title: 'T', owner_id: 'u_o', doc_type: 'doc', role: 3,
         updated_at: new Date(0), viewed_at: new Date('2026-07-15T06:00:00.000Z') },
     ] as never)
-    const out = await docViewHistoryRepo.listRecent({ uid: 'u_1', spaceId: 's1', pageSize: 20 })
+    const out = await docViewHistoryRepo.listRecent({ uid: 'u_1', spaceId: 's1', principalSpaceId: 's1', pageSize: 20 })
     expect(out.nextCursor).toBeNull()
     expect(out.items).toHaveLength(1)
   })
@@ -271,7 +273,7 @@ describe('docViewHistoryRepo.listRecent — query-time filter + keyset paging', 
     mockQuery.mockResolvedValueOnce([{ cnt: 5 }] as never)
     mockQuery.mockResolvedValueOnce([] as never)
     const cursor = encodeViewCursor('2026-07-15T06:00:01.000Z', 'd_1')
-    await docViewHistoryRepo.listRecent({ uid: 'u_1', spaceId: 's1', cursor, pageSize: 20 })
+    await docViewHistoryRepo.listRecent({ uid: 'u_1', spaceId: 's1', principalSpaceId: 's1', cursor, pageSize: 20 })
     const call = mockQuery.mock.calls.at(-1)!
     const sql = call[0] as string
     const params = call[1] as unknown[]
@@ -285,7 +287,7 @@ describe('docViewHistoryRepo.listRecent — query-time filter + keyset paging', 
   it('escapes LIKE wildcards in q so a literal %/_ matches literally (CI substring)', async () => {
     mockQuery.mockResolvedValueOnce([{ cnt: 0 }] as never)
     mockQuery.mockResolvedValueOnce([] as never)
-    await docViewHistoryRepo.listRecent({ uid: 'u_1', spaceId: 's1', q: '  50%_off  ', pageSize: 20 })
+    await docViewHistoryRepo.listRecent({ uid: 'u_1', spaceId: 's1', principalSpaceId: 's1', q: '  50%_off  ', pageSize: 20 })
     const call = mockQuery.mock.calls.at(-1)!
     const sql = call[0] as string
     const params = call[1] as unknown[]
@@ -298,7 +300,7 @@ describe('docViewHistoryRepo.listRecent — query-time filter + keyset paging', 
     mockQuery.mockResolvedValueOnce([{ cnt: 0 }] as never)
     mockQuery.mockResolvedValueOnce([] as never)
     await docViewHistoryRepo.listRecent({
-      uid: 'u_1', spaceId: 's1', q: 'spec', creators: ['u_a', 'u_b'], pageSize: 20,
+      uid: 'u_1', spaceId: 's1', principalSpaceId: 's1', q: 'spec', creators: ['u_a', 'u_b'], pageSize: 20,
     })
     const call = mockQuery.mock.calls.at(-1)!
     const sql = call[0] as string
@@ -312,7 +314,7 @@ describe('docViewHistoryRepo.listRecent — query-time filter + keyset paging', 
   it('an empty creators array short-circuits to no IN clause (no empty IN ())', async () => {
     mockQuery.mockResolvedValueOnce([{ cnt: 0 }] as never)
     mockQuery.mockResolvedValueOnce([] as never)
-    await docViewHistoryRepo.listRecent({ uid: 'u_1', spaceId: 's1', creators: [], pageSize: 20 })
+    await docViewHistoryRepo.listRecent({ uid: 'u_1', spaceId: 's1', principalSpaceId: 's1', creators: [], pageSize: 20 })
     const sql = mockQuery.mock.calls.at(-1)![0] as string
     expect(sql).not.toContain('IN ()')
     expect(sql).not.toContain('owner_id IN')
@@ -322,7 +324,7 @@ describe('docViewHistoryRepo.listRecent — query-time filter + keyset paging', 
     mockQuery.mockResolvedValueOnce([{ cnt: 0 }] as never)
     mockQuery.mockResolvedValueOnce([] as never)
     await docViewHistoryRepo.listRecent({
-      uid: 'u_1', spaceId: 's1', q: 'spec', creators: ['u_a'], types: ['doc', 'sheet'], pageSize: 20,
+      uid: 'u_1', spaceId: 's1', principalSpaceId: 's1', q: 'spec', creators: ['u_a'], types: ['doc', 'sheet'], pageSize: 20,
     })
     const call = mockQuery.mock.calls.at(-1)!
     const sql = call[0] as string
@@ -337,7 +339,7 @@ describe('docViewHistoryRepo.listRecent — query-time filter + keyset paging', 
   it('the type filter narrows the COUNT too (before pagination — page and total agree)', async () => {
     mockQuery.mockResolvedValueOnce([{ cnt: 0 }] as never)
     mockQuery.mockResolvedValueOnce([] as never)
-    await docViewHistoryRepo.listRecent({ uid: 'u_1', spaceId: 's1', types: ['board'], pageSize: 20 })
+    await docViewHistoryRepo.listRecent({ uid: 'u_1', spaceId: 's1', principalSpaceId: 's1', types: ['board'], pageSize: 20 })
     // first call is the COUNT(*) query; it must carry the same doc_type predicate + bind.
     const countCall = mockQuery.mock.calls[0]!
     expect(countCall[0] as string).toContain('m.doc_type IN (?)')
@@ -347,7 +349,7 @@ describe('docViewHistoryRepo.listRecent — query-time filter + keyset paging', 
   it('an empty types array short-circuits to no doc_type clause (backward compatible)', async () => {
     mockQuery.mockResolvedValueOnce([{ cnt: 0 }] as never)
     mockQuery.mockResolvedValueOnce([] as never)
-    await docViewHistoryRepo.listRecent({ uid: 'u_1', spaceId: 's1', types: [], pageSize: 20 })
+    await docViewHistoryRepo.listRecent({ uid: 'u_1', spaceId: 's1', principalSpaceId: 's1', types: [], pageSize: 20 })
     const sql = mockQuery.mock.calls.at(-1)![0] as string
     expect(sql).not.toContain('doc_type IN')
   })
@@ -356,7 +358,7 @@ describe('docViewHistoryRepo.listRecent — query-time filter + keyset paging', 
 describe('docViewHistoryRepo.listCreators — pre-facet distinct owners', () => {
   it('returns DISTINCT owners under q + query-time permission filter, WITHOUT the creator filter (member)', async () => {
     mockQuery.mockResolvedValueOnce([{ owner_id: 'u_a' }, { owner_id: 'u_b' }] as never)
-    const out = await docViewHistoryRepo.listCreators({ uid: 'u_1', spaceId: 's1', isSpaceMember: true, q: 'spec' })
+    const out = await docViewHistoryRepo.listCreators({ uid: 'u_1', spaceId: 's1', principalSpaceId: 's1', isSpaceMember: true, q: 'spec' })
     const sql = mockQuery.mock.calls.at(-1)![0] as string
     expect(sql).toContain('SELECT DISTINCT m.owner_id')
     expect(sql).toContain('m.status = 1')
@@ -364,21 +366,22 @@ describe('docViewHistoryRepo.listCreators — pre-facet distinct owners', () => 
     // branch for a member, so a shared-doc owner shows up in the filter dropdown too
     // — and it stays same-space-guarded (no cross-space leak into the facet).
     expect(sql).toContain(
-      '(m.owner_id = ? OR dm.role IN (1, 2, 3, 4) OR (m.share_scope = 1 AND m.space_id = v.space_id))',
+      '(m.owner_id = ? AND m.owner_space_id = ? OR dm.role IN (1, 2, 3, 4) OR (m.share_scope = 2 OR (m.share_scope = 1 AND m.space_id = v.space_id)))',
     )
     expect(sql).toContain("LIKE ? ESCAPE '\\\\'") // respects q
     expect(sql).not.toContain('owner_id IN') // NOT the creator filter
     expect(out).toEqual(['u_a', 'u_b'])
   })
 
-  it('CROSS-SPACE GATE: a NON-member creator facet drops the share branch (XIN-1295)', async () => {
+  it('CROSS-SPACE GATE: a NON-member creator facet drops anyone_in_space only', async () => {
     mockQuery.mockResolvedValueOnce([] as never)
-    await docViewHistoryRepo.listCreators({ uid: 'u_1', spaceId: 's1', isSpaceMember: false, q: 'spec' })
+    await docViewHistoryRepo.listCreators({ uid: 'u_1', spaceId: 's1', principalSpaceId: 's1', isSpaceMember: false, q: 'spec' })
     const sql = mockQuery.mock.calls.at(-1)![0] as string
     // Same asymmetry fix as listRecent: no share source in the facet for a
-    // non-member, so a share-only doc's owner never leaks into the dropdown.
-    expect(sql).not.toContain('share_scope')
-    expect(sql).toContain('(m.owner_id = ? OR dm.role IN (1, 2, 3, 4))')
+    // non-member, while authenticated remains visible by design.
+    expect(sql).toContain('m.share_scope = 2')
+    expect(sql).not.toContain('m.share_scope = 1')
+    expect(sql).toContain('(m.owner_id = ? AND m.owner_space_id = ? OR dm.role IN (1, 2, 3, 4) OR m.share_scope = 2)')
   })
 })
 

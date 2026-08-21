@@ -17,9 +17,21 @@ import { Singleflight, TtlCache } from '../util/singleflight.js'
 import { parseOwnedBotUidsStrict } from '../util/botUids.js'
 
 export interface OctoUser {
-  uid: string
-  name: string
-  avatar?: string
+  uid: string;
+  name: string;
+  avatar?: string;
+}
+
+export interface OctoSpaceBot {
+  uid: string;
+  /** Display name from the Space Bot directory; absent only on legacy rows. */
+  name?: string;
+  creatorUid?: string;
+}
+
+export interface OctoSpaceMember {
+  uid: string;
+  isBot: boolean;
 }
 
 /**
@@ -141,7 +153,9 @@ export interface OctoIdentity {
    * include docs a user's bots own. Absent/non-array from octo-server => treated
    * as `[]` (fail-CLOSED: fall back to just the user's own docs, never wider).
    */
-  verifyToken(token: string): Promise<{ uid: string; name?: string; ownedBots?: string[] } | null>
+  verifyToken(
+    token: string,
+  ): Promise<{ uid: string; name?: string; ownedBots?: string[] } | null>;
 
   /**
    * (a-bot) Resolve a bot bearer token to its trusted bot uid, the bot's space,
@@ -154,7 +168,9 @@ export interface OctoIdentity {
    * platform bot). Returns null when the token is missing/invalid (caller => 401 /
    * unauthorized).
    */
-  verifyBot(token: string): Promise<{ uid: string; spaceId: string; ownerUid?: string } | null>
+  verifyBot(
+    token: string,
+  ): Promise<{ uid: string; spaceId: string; ownerUid?: string } | null>;
 
   /**
    * (b) Look up a single user by uid. Returns null if the user does not exist
@@ -164,7 +180,11 @@ export interface OctoIdentity {
    * `token` header: the configured service token when set, else the optional
    * authenticated caller's own octo session token.
    */
-  getUser(uid: string, callerToken?: string, signal?: AbortSignal): Promise<OctoUser | null>
+  getUser(
+    uid: string,
+    callerToken?: string,
+    signal?: AbortSignal,
+  ): Promise<OctoUser | null>;
 
   /**
    * (b-bot) Look up a single user by uid on the BOT path, authenticating with
@@ -174,13 +194,14 @@ export interface OctoIdentity {
    * GET /v1/users/:uid route the human path uses. The 200-vs-404 signal is the
    * same anti ghost-member existence check: 200 -> OctoUser, 404 -> null.
    *
-   * This is why the bot path no longer needs OCTO_SERVER_TOKEN: the bot resolves
-   * the target user with its own token instead of a privileged service token.
+   * Bot-realm callers such as forward-grant therefore do not need
+   * OCTO_SERVER_TOKEN for this specific lookup. Human/service directory APIs
+   * such as member-add roster validation still require the service token.
    */
-  getUserAsBot(uid: string, botToken: string): Promise<OctoUser | null>
+  getUserAsBot(uid: string, botToken: string): Promise<OctoUser | null>;
 
   /** (b) Batch profile lookup for awareness cursors (§4.7(b)). */
-  getUsers(uids: string[], callerToken?: string): Promise<OctoUser[]>
+  getUsers(uids: string[], callerToken?: string): Promise<OctoUser[]>;
 
   /**
    * (b-batch) Resolve MANY uids in a single call against octo-server's
@@ -234,7 +255,7 @@ export interface OctoIdentity {
    * octo-server outage therefore TIGHTENS access (denies share-derived
    * reads/writes), never loosens it.
    */
-  isSpaceMember(uid: string, spaceId: string, token: string): Promise<boolean>
+  isSpaceMember(uid: string, spaceId: string, token: string): Promise<boolean>;
 
   /**
    * (user-bot grants) Resolve the bot uids the caller (`uid`, holding `token`)
@@ -290,6 +311,26 @@ export interface OctoIdentity {
    * narrow the caller's candidate set.
    */
   listCallerBots(uid: string, spaceId: string, token: string): Promise<OctoCallerBot[] | null>
+
+  /**
+   * Resolve the authoritative Bot ownership directory for one Space. Used by
+   * member removal so deleting a human can also remove that human's document
+   * Bot grants without trusting a client-supplied Bot list.
+   *
+   * Returns null on transport/auth/malformed responses. Callers must fail the
+   * whole removal closed rather than delete only the human and leave orphaned
+   * Bot grants behind.
+   */
+  spaceBots(spaceId: string, token: string): Promise<OctoSpaceBot[] | null>;
+
+  /** Best-effort display name for a Space. Callers must fall back to the id. */
+  getSpaceName?(spaceId: string, token: string): Promise<string>;
+
+  /** Resolve an arbitrary target principal from the authoritative active Space roster. */
+  spaceMembers(
+    spaceId: string,
+    token: string,
+  ): Promise<OctoSpaceMember[] | null>;
 }
 
 /**
@@ -302,7 +343,9 @@ export interface OctoIdentity {
  * stopgap until octo ships the thin `POST /v1/users/batch` (wraps GetUsers).
  */
 export class HttpOctoIdentity implements OctoIdentity {
-  constructor(private readonly baseUrl: string = config.octoIdentity.serverBaseUrl) {}
+  constructor(
+    private readonly baseUrl: string = config.octoIdentity.serverBaseUrl,
+  ) {}
 
   /**
    * Per-{uid,spaceId} coalescing + short-TTL cache for isSpaceMember (#64,
@@ -311,10 +354,10 @@ export class HttpOctoIdentity implements OctoIdentity {
    * transport error (so a transient outage does not pin a `false` for the whole
    * TTL — the next call retries).
    */
-  private readonly membershipSf = new Singleflight<boolean>()
+  private readonly membershipSf = new Singleflight<boolean>();
   private readonly membershipCache = new TtlCache<boolean>(
     config.octoIdentity.membershipCacheTtlSeconds * 1000,
-  )
+  );
 
   /**
    * Same coalescing + short-TTL pattern for listCallerBots (GET /v1/robot/my_bots).
@@ -339,19 +382,21 @@ export class HttpOctoIdentity implements OctoIdentity {
     let res: Response
     try {
       res = await fetch(`${this.baseUrl}/v1/auth/verify`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ token }),
-      })
+      });
     } catch {
       // Authoritative identity source unreachable => treat as unverified.
-      return null
+      return null;
     }
-    if (!res.ok) return null
-    const body = (await res.json().catch(() => null)) as
-      | { uid?: string; name?: string; owned_bots?: Array<{ uid?: string } | string> }
-      | null
-    if (!body || typeof body.uid !== 'string' || body.uid === '') return null
+    if (!res.ok) return null;
+    const body = (await res.json().catch(() => null)) as {
+      uid?: string;
+      name?: string;
+      owned_bots?: Array<{ uid?: string } | string>;
+    } | null;
+    if (!body || typeof body.uid !== "string" || body.uid === "") return null;
     // octo-server sends `owned_bots` (snake_case) as an OBJECT array
     // [{uid,name},...] (authVerifyTokenResp.ownedBot); older/other shapes may
     // send a bare uid string. Accept both, extracting the bot uid. FAIL-CLOSED:
@@ -359,30 +404,41 @@ export class HttpOctoIdentity implements OctoIdentity {
     // docs) — it is NEVER allowed to widen visibility.
     const ownedBots = Array.isArray(body.owned_bots)
       ? body.owned_bots
-          .map((b) => (typeof b === 'string' ? b : b && typeof b.uid === 'string' ? b.uid : ''))
-          .filter((uid) => uid !== '')
-      : []
-    return { uid: body.uid, name: body.name, ownedBots }
+          .map((b) =>
+            typeof b === "string"
+              ? b
+              : b && typeof b.uid === "string"
+                ? b.uid
+                : "",
+          )
+          .filter((uid) => uid !== "")
+      : [];
+    return { uid: body.uid, name: body.name, ownedBots };
   }
 
-  async verifyBot(token: string): Promise<{ uid: string; spaceId: string; ownerUid?: string } | null> {
-    if (!token) return null
-    let res: Response
+  async verifyBot(
+    token: string,
+  ): Promise<{ uid: string; spaceId: string; ownerUid?: string } | null> {
+    if (!token) return null;
+    let res: Response;
     try {
       res = await fetch(`${this.baseUrl}/v1/auth/verify-bot`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ bot_token: token }),
-      })
+      });
     } catch {
       // Authoritative identity source unreachable => treat as unverified.
-      return null
+      return null;
     }
-    if (!res.ok) return null
-    const body = (await res.json().catch(() => null)) as
-      | { bot_uid?: string; space_id?: string; owner_uid?: string }
-      | null
-    if (!body || typeof body.bot_uid !== 'string' || body.bot_uid === '') return null
+    if (!res.ok) return null;
+    const body = (await res.json().catch(() => null)) as {
+      bot_uid?: string;
+      space_id?: string;
+      owner_uid?: string;
+    } | null;
+    if (!body || typeof body.bot_uid !== "string" || body.bot_uid === "")
+      return null;
     // The space is whatever octo-server reverse-resolved from the bot's active
     // space_member row; it is never a client-supplied value (anti-spoof).
     //
@@ -394,66 +450,85 @@ export class HttpOctoIdentity implements OctoIdentity {
     // layer means verifyBotMiddleware 401s a spaceless bot via its existing
     // null check, with no per-middleware special case, and keeps the invariant
     // "a verified bot identity always carries a real space" in one place.
-    if (typeof body.space_id !== 'string' || body.space_id === '') return null
+    if (typeof body.space_id !== "string" || body.space_id === "") return null;
     // owner_uid is the bot's robot.creator_uid (the human who owns the bot).
     // octo-server returns '' for a bot with no human creator (e.g. a platform
     // bot); surface it only when it is a real uid so callers can skip the
     // owner-grant step cleanly.
     const ownerUid =
-      typeof body.owner_uid === 'string' && body.owner_uid !== '' ? body.owner_uid : undefined
-    return { uid: body.bot_uid, spaceId: body.space_id, ...(ownerUid ? { ownerUid } : {}) }
+      typeof body.owner_uid === "string" && body.owner_uid !== ""
+        ? body.owner_uid
+        : undefined;
+    return {
+      uid: body.bot_uid,
+      spaceId: body.space_id,
+      ...(ownerUid ? { ownerUid } : {}),
+    };
   }
 
-  async getUser(uid: string, callerToken?: string, signal?: AbortSignal): Promise<OctoUser | null> {
+  async getUser(
+    uid: string,
+    callerToken?: string,
+    signal?: AbortSignal,
+  ): Promise<OctoUser | null> {
     // octo-server requires auth on /v1/users/:uid: prefer a configured service
     // token, else fall back to the caller's own session token. Never logged.
-    const token = config.octoIdentity.serviceToken || callerToken || ''
-    let res: Response
+    const token = config.octoIdentity.serviceToken || callerToken || "";
+    let res: Response;
     try {
       res = await fetch(`${this.baseUrl}/v1/users/${encodeURIComponent(uid)}`, {
         headers: token ? { token } : {},
         // Caller-provided deadline: an abort reclaims the socket instead of
         // leaving an in-flight request against a stalled identity endpoint.
         ...(signal ? { signal } : {}),
-      })
+      });
     } catch {
-      return null
+      return null;
     }
-    if (res.status === 404) return null
-    if (!res.ok) return null
-    const body = (await res.json().catch(() => null)) as
-      | { uid?: string; name?: string; avatar?: string }
-      | null
-    if (!body || typeof body.uid !== 'string') return null
-    return { uid: body.uid, name: body.name ?? '', avatar: body.avatar }
+    if (res.status === 404) return null;
+    if (!res.ok) return null;
+    const body = (await res.json().catch(() => null)) as {
+      uid?: string;
+      name?: string;
+      avatar?: string;
+    } | null;
+    if (!body || typeof body.uid !== "string") return null;
+    return { uid: body.uid, name: body.name ?? "", avatar: body.avatar };
   }
 
   async getUserAsBot(uid: string, botToken: string): Promise<OctoUser | null> {
     // The bot resolves the target user with its own bearer token against the
     // authBot-guarded bot user-info route — no OCTO_SERVER_TOKEN needed. Never
     // logged. An empty token can never authenticate, so short-circuit to null.
-    if (!botToken) return null
-    let res: Response
+    if (!botToken) return null;
+    let res: Response;
     try {
-      res = await fetch(`${this.baseUrl}/v1/bot/user/info?uid=${encodeURIComponent(uid)}`, {
-        headers: { Authorization: `Bearer ${botToken}` },
-      })
+      res = await fetch(
+        `${this.baseUrl}/v1/bot/user/info?uid=${encodeURIComponent(uid)}`,
+        {
+          headers: { Authorization: `Bearer ${botToken}` },
+        },
+      );
     } catch {
-      return null
+      return null;
     }
     // 404 is the anti ghost-member signal (user does not exist) => null.
-    if (res.status === 404) return null
-    if (!res.ok) return null
-    const body = (await res.json().catch(() => null)) as
-      | { uid?: string; name?: string; avatar?: string }
-      | null
-    if (!body || typeof body.uid !== 'string') return null
-    return { uid: body.uid, name: body.name ?? '', avatar: body.avatar }
+    if (res.status === 404) return null;
+    if (!res.ok) return null;
+    const body = (await res.json().catch(() => null)) as {
+      uid?: string;
+      name?: string;
+      avatar?: string;
+    } | null;
+    if (!body || typeof body.uid !== "string") return null;
+    return { uid: body.uid, name: body.name ?? "", avatar: body.avatar };
   }
 
   async getUsers(uids: string[], callerToken?: string): Promise<OctoUser[]> {
-    const results = await Promise.all(uids.map((u) => this.getUser(u, callerToken)))
-    return results.filter((u): u is OctoUser => u !== null)
+    const results = await Promise.all(
+      uids.map((u) => this.getUser(u, callerToken)),
+    );
+    return results.filter((u): u is OctoUser => u !== null);
   }
 
   async getUsersBatch(
@@ -539,61 +614,166 @@ export class HttpOctoIdentity implements OctoIdentity {
     return merged
   }
 
+  async spaceBots(
+    spaceId: string,
+    token: string,
+  ): Promise<OctoSpaceBot[] | null> {
+    const authToken = config.octoIdentity.serviceToken || token;
+    if (!spaceId || !authToken) return null;
+    let res: Response;
+    try {
+      res = await fetch(
+        `${this.baseUrl}/v1/robot/space_bots?space_id=${encodeURIComponent(spaceId)}`,
+        { headers: { token: authToken } },
+      );
+    } catch {
+      return null;
+    }
+    if (!res.ok) return null;
+    const body = (await res.json().catch(() => null)) as unknown;
+    if (!Array.isArray(body)) return null;
+    const bots: OctoSpaceBot[] = [];
+    const seen = new Set<string>();
+    for (const item of body) {
+      if (!item || typeof item !== "object") return null;
+      const row = item as Record<string, unknown>;
+      if (typeof row.uid !== "string" || row.uid.trim() === "") return null;
+      const botUid = row.uid.trim();
+      if (seen.has(botUid)) return null;
+      seen.add(botUid);
+      const creatorUid =
+        typeof row.creator_uid === "string" ? row.creator_uid.trim() : "";
+      const name = typeof row.name === "string" ? row.name.trim() : "";
+      bots.push({
+        uid: botUid,
+        ...(name ? { name } : {}),
+        ...(creatorUid ? { creatorUid } : {}),
+      });
+    }
+    return bots;
+  }
+
+  async getSpaceName(spaceId: string, token: string): Promise<string> {
+    const authToken = config.octoIdentity.serviceToken || token;
+    if (!spaceId || !authToken) return "";
+    try {
+      const res = await fetch(
+        `${this.baseUrl}/v1/space/${encodeURIComponent(spaceId)}`,
+        { headers: { token: authToken } },
+      );
+      if (!res.ok) return "";
+      const body = (await res.json().catch(() => null)) as { name?: unknown } | null;
+      return typeof body?.name === "string" ? body.name.trim() : "";
+    } catch {
+      return "";
+    }
+  }
+
+  async spaceMembers(
+    spaceId: string,
+    token: string,
+  ): Promise<OctoSpaceMember[] | null> {
+    const authToken = config.octoIdentity.serviceToken || token;
+    if (!spaceId || !authToken) return null;
+    const members: OctoSpaceMember[] = [];
+    const seen = new Map<string, boolean>();
+    const pageLimit = 10_000;
+    const maxPages = 20;
+    for (let page = 1; page <= maxPages; page += 1) {
+      let res: Response;
+      try {
+        res = await fetch(
+          `${this.baseUrl}/v1/space/${encodeURIComponent(spaceId)}/members?page=${page}&limit=${pageLimit}`,
+          { headers: { token: authToken } },
+        );
+      } catch {
+        return null;
+      }
+      if (!res.ok) return null;
+      const body = (await res.json().catch(() => null)) as unknown;
+      if (!Array.isArray(body)) return null;
+      for (const item of body) {
+        if (!item || typeof item !== "object") return null;
+        const row = item as Record<string, unknown>;
+        if (typeof row.uid !== "string" || row.uid.trim() === "") return null;
+        if (row.robot !== 0 && row.robot !== 1) return null;
+        const uid = row.uid.trim();
+        const isBot = row.robot === 1;
+        const previous = seen.get(uid);
+        if (previous !== undefined) {
+          if (previous !== isBot) return null;
+          continue;
+        }
+        seen.set(uid, isBot);
+        members.push({ uid, isBot });
+      }
+      if (body.length < pageLimit) return members;
+    }
+    return null;
+  }
+
   async ownedBotsInSpace(uid: string, spaceId: string, token: string): Promise<string[]> {
     // A missing principal/space can own no admissible bots, and an absent token
     // cannot authorize the verify call. Short out before any IO (fail-closed).
-    if (!uid || !spaceId || !token) return []
-    let res: Response
+    if (!uid || !spaceId || !token) return [];
+    let res: Response;
     try {
       res = await fetch(`${this.baseUrl}/v1/auth/verify?include=context`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ token }),
-      })
+      });
     } catch {
       // Authoritative source unreachable => cannot confirm ownership => [].
-      return []
+      return [];
     }
-    if (!res.ok) return []
-    const body = (await res.json().catch(() => null)) as
-      | { uid?: unknown; context_included?: unknown; owned_bots_by_space?: unknown }
-      | null
-    if (!body) return []
+    if (!res.ok) return [];
+    const body = (await res.json().catch(() => null)) as {
+      uid?: unknown;
+      context_included?: unknown;
+      owned_bots_by_space?: unknown;
+    } | null;
+    if (!body) return [];
     // verify answers for the TOKEN holder, so the uid it resolves must be the
     // uid we are gating on; a mismatch can never confirm ownership.
-    if (typeof body.uid !== 'string' || body.uid !== uid) return []
+    if (typeof body.uid !== "string" || body.uid !== uid) return [];
     // context is opt-in: a pre-context octo-server omits these fields. Without
     // context we cannot confirm ownership => fail-closed (never treat an absent
     // map as "owns everything").
-    if (body.context_included !== true) return []
-    const map = body.owned_bots_by_space
-    if (typeof map !== 'object' || map === null || Array.isArray(map)) return []
+    if (body.context_included !== true) return [];
+    const map = body.owned_bots_by_space;
+    if (typeof map !== "object" || map === null || Array.isArray(map))
+      return [];
     // Extract only THIS space's list; parseOwnedBotUidsStrict fails the WHOLE
     // list closed on any illegal/duplicate element (=> []), so a garbled octo-
     // server body can never authorize a partial set. It is NOT count-capped, so
     // an owner of > MAX_BOT_UIDS bots still gets the complete authoritative set.
-    const list = (map as Record<string, unknown>)[spaceId]
-    return parseOwnedBotUidsStrict(list)
+    const list = (map as Record<string, unknown>)[spaceId];
+    return parseOwnedBotUidsStrict(list);
   }
 
-  async isSpaceMember(uid: string, spaceId: string, token: string): Promise<boolean> {
+  async isSpaceMember(
+    uid: string,
+    spaceId: string,
+    token: string,
+  ): Promise<boolean> {
     // A missing principal or space can never be a real active membership, and an
     // absent caller token cannot authorize a verify call; short out before any
     // IO (also avoids caching a degenerate key).
-    if (!uid || !spaceId || !token) return false
-    const key = `${uid} ${spaceId}`
-    const cached = this.membershipCache.get(key)
-    if (cached !== undefined) return cached
+    if (!uid || !spaceId || !token) return false;
+    const key = `${uid} ${spaceId}`;
+    const cached = this.membershipCache.get(key);
+    if (cached !== undefined) return cached;
     return this.membershipSf.do(key, async () => {
-      const member = await this.fetchIsSpaceMember(uid, spaceId, token)
+      const member = await this.fetchIsSpaceMember(uid, spaceId, token);
       // Only cache a confirmed answer. A fail-closed `false` from a transport
       // error / un-confirmable context (fetchIsSpaceMember returns null) is NOT
       // cached — fetchIsSpaceMember distinguishes the two by returning null on
       // error, which we map to an uncached false, so a transient outage does not
       // pin a `false` for the whole TTL (the next call retries).
-      if (member !== null) this.membershipCache.set(key, member)
-      return member ?? false
-    })
+      if (member !== null) this.membershipCache.set(key, member);
+      return member ?? false;
+    });
   }
 
   /**
@@ -607,55 +787,69 @@ export class HttpOctoIdentity implements OctoIdentity {
    * fail-closed, uncached). No service secret is used: the caller's own session
    * token IS the authorization, and verify only answers for that token's holder.
    */
-  private async fetchIsSpaceMember(uid: string, spaceId: string, token: string): Promise<boolean | null> {
-    let res: Response
+  private async fetchIsSpaceMember(
+    uid: string,
+    spaceId: string,
+    token: string,
+  ): Promise<boolean | null> {
+    let res: Response;
     try {
       res = await fetch(`${this.baseUrl}/v1/auth/verify?include=context`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ token }),
-      })
+      });
     } catch (err) {
       // Authoritative source unreachable => cannot confirm => fail-closed.
-      this.warnMembershipVerificationFailure('transport_error', {
-        error: err instanceof Error ? err.name : 'unknown',
-      })
-      return null
+      this.warnMembershipVerificationFailure("transport_error", {
+        error: err instanceof Error ? err.name : "unknown",
+      });
+      return null;
     }
     if (!res.ok) {
-      this.warnMembershipVerificationFailure('non_ok_response', { status: res.status })
-      return null
+      this.warnMembershipVerificationFailure("non_ok_response", {
+        status: res.status,
+      });
+      return null;
     }
-    const body = (await res.json().catch(() => null)) as
-      | { uid?: unknown; context_included?: unknown; spaces?: unknown }
-      | null
+    const body = (await res.json().catch(() => null)) as {
+      uid?: unknown;
+      context_included?: unknown;
+      spaces?: unknown;
+    } | null;
     if (!body) {
-      this.warnMembershipVerificationFailure('malformed_response')
-      return null
+      this.warnMembershipVerificationFailure("malformed_response");
+      return null;
     }
     // Defense-in-depth on the "token holder only" boundary: verify answers for
     // the TOKEN holder, so the uid it resolves must be the uid we are checking.
     // A mismatch (token/uid disagree) can never be a confirmable membership.
-    if (typeof body.uid !== 'string' || body.uid !== uid) {
-      this.warnMembershipVerificationFailure('uid_mismatch')
-      return null
+    if (typeof body.uid !== "string" || body.uid !== uid) {
+      this.warnMembershipVerificationFailure("uid_mismatch");
+      return null;
     }
     // The context fields are opt-in: a pre-context octo-server omits
     // context_included/spaces entirely. Without them we cannot confirm
     // membership => fail-closed (never treat an absent list as "zero spaces").
     if (body.context_included !== true || !Array.isArray(body.spaces)) {
-      this.warnMembershipVerificationFailure('context_missing')
-      return null
+      this.warnMembershipVerificationFailure("context_missing");
+      return null;
     }
-    return body.spaces.includes(spaceId)
+    return body.spaces.includes(spaceId);
   }
 
-  private warnMembershipVerificationFailure(reason: string, details: Record<string, unknown> = {}): void {
+  private warnMembershipVerificationFailure(
+    reason: string,
+    details: Record<string, unknown> = {},
+  ): void {
     // Structured event name doubles as a log-derived metric in deployments that
     // do not yet expose a native metrics registry. Deliberately excludes tokens,
     // uid, Space id, and the configured identity-service URL.
     // eslint-disable-next-line no-console
-    console.warn('[octo-docs] space_membership_verify_error', { reason, ...details })
+    console.warn("[octo-docs] space_membership_verify_error", {
+      reason,
+      ...details,
+    });
   }
 
   async listCallerBots(uid: string, spaceId: string, token: string): Promise<OctoCallerBot[] | null> {
@@ -733,29 +927,39 @@ export class HttpOctoIdentity implements OctoIdentity {
 export class MiddlewareOctoIdentity implements OctoIdentity {
   // Optional: when mounted in-process, a request-scoped uid would be injected
   // by the middleware. Kept as an HTTP delegate so this remains runnable.
-  constructor(private readonly delegate: OctoIdentity = new HttpOctoIdentity()) {}
+  constructor(
+    private readonly delegate: OctoIdentity = new HttpOctoIdentity(),
+  ) {}
 
-  async verifyToken(token: string): Promise<{ uid: string; name?: string; ownedBots?: string[] } | null> {
+  async verifyToken(
+    token: string,
+  ): Promise<{ uid: string; name?: string; ownedBots?: string[] } | null> {
     // In-process: octo AuthMiddleware would already have populated the uid.
     // Until wired, delegate to the HTTP introspection endpoint (which already
     // parses owned_bots -> ownedBots, keeping the contract identical).
-    return this.delegate.verifyToken(token)
+    return this.delegate.verifyToken(token);
   }
 
-  getUser(uid: string, callerToken?: string, signal?: AbortSignal): Promise<OctoUser | null> {
-    return this.delegate.getUser(uid, callerToken, signal)
+  getUser(
+    uid: string,
+    callerToken?: string,
+    signal?: AbortSignal,
+  ): Promise<OctoUser | null> {
+    return this.delegate.getUser(uid, callerToken, signal);
   }
 
   getUserAsBot(uid: string, botToken: string): Promise<OctoUser | null> {
-    return this.delegate.getUserAsBot(uid, botToken)
+    return this.delegate.getUserAsBot(uid, botToken);
   }
 
-  verifyBot(token: string): Promise<{ uid: string; spaceId: string; ownerUid?: string } | null> {
-    return this.delegate.verifyBot(token)
+  verifyBot(
+    token: string,
+  ): Promise<{ uid: string; spaceId: string; ownerUid?: string } | null> {
+    return this.delegate.verifyBot(token);
   }
 
   getUsers(uids: string[], callerToken?: string): Promise<OctoUser[]> {
-    return this.delegate.getUsers(uids, callerToken)
+    return this.delegate.getUsers(uids, callerToken);
   }
 
   getUsersBatch(
@@ -775,11 +979,26 @@ export class MiddlewareOctoIdentity implements OctoIdentity {
   }
 
   isSpaceMember(uid: string, spaceId: string, token: string): Promise<boolean> {
-    return this.delegate.isSpaceMember(uid, spaceId, token)
+    return this.delegate.isSpaceMember(uid, spaceId, token);
   }
 
-  ownedBotsInSpace(uid: string, spaceId: string, token: string): Promise<string[]> {
-    return this.delegate.ownedBotsInSpace(uid, spaceId, token)
+  ownedBotsInSpace(
+    uid: string,
+    spaceId: string,
+    token: string,
+  ): Promise<string[]> {
+    return this.delegate.ownedBotsInSpace(uid, spaceId, token);
+  }
+
+  spaceBots(spaceId: string, token: string): Promise<OctoSpaceBot[] | null> {
+    return this.delegate.spaceBots(spaceId, token);
+  }
+
+  spaceMembers(
+    spaceId: string,
+    token: string,
+  ): Promise<OctoSpaceMember[] | null> {
+    return this.delegate.spaceMembers(spaceId, token);
   }
 
   listCallerBots(uid: string, spaceId: string, token: string): Promise<OctoCallerBot[] | null> {
@@ -787,20 +1006,20 @@ export class MiddlewareOctoIdentity implements OctoIdentity {
   }
 }
 
-let singleton: OctoIdentity | null = null
+let singleton: OctoIdentity | null = null;
 
 /** Resolve the configured OctoIdentity impl (OCTO_IDENTITY_MODE). */
 export function getOctoIdentity(): OctoIdentity {
   if (!singleton) {
     singleton =
-      config.octoIdentity.mode === 'middleware'
+      config.octoIdentity.mode === "middleware"
         ? new MiddlewareOctoIdentity()
-        : new HttpOctoIdentity()
+        : new HttpOctoIdentity();
   }
-  return singleton
+  return singleton;
 }
 
 /** Test seam: inject a stub identity. */
 export function setOctoIdentity(impl: OctoIdentity): void {
-  singleton = impl
+  singleton = impl;
 }

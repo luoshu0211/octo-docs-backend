@@ -20,7 +20,7 @@
  * Parse failures (malformed zip, unreadable OOXML) return 422 import_failed and
  * are logged server-side without leaking any internal path or stack.
  */
-import { Router, type Request, type Response } from 'express'
+import { Router, type Router as ExpressRouter, type Request, type Response } from 'express'
 import express from 'express'
 import { requireDocRole } from '../guard.js'
 import { newAttachId } from '../../util/ids.js'
@@ -60,7 +60,7 @@ import { docMetaRepo } from '../../db/repos/docMetaRepo.js'
 import { resolveRole } from '../../permission/resolveRole.js'
 import { roleAtLeast } from '../../permission/role.js'
 
-export const importRouter = Router()
+export const importRouter: ExpressRouter = Router()
 
 const MAX_EXCALIDRAW_UPLOAD_BYTES = config.docxImport.maxUploadBytes
 const rawExcalidrawBody = express.raw({ type: 'application/json', limit: MAX_EXCALIDRAW_UPLOAD_BYTES })
@@ -149,6 +149,7 @@ export async function importExcalidrawHandler(req: Request, res: Response): Prom
       uid: req.uid,
       docId: guard.meta.doc_id,
       documentName: guard.meta.document_name,
+      principalSpaceId: req.principalSpaceId!,
       clientBaseVersion: live.baseSV,
       ops: { elements: prepared.elements, files: prepared.files, deletedElementIds, deletedFileIds },
       authorizedEpoch: guard.meta.permission_epoch,
@@ -246,6 +247,7 @@ async function applyImportedDoc(
       uid: req.uid!,
       docId: guard.meta.doc_id,
       documentName: guard.meta.document_name,
+      principalSpaceId: req.principalSpaceId!,
       clientBaseVersion: baseSV,
       ops: [op],
       authorizedEpoch: guard.meta.permission_epoch,
@@ -316,7 +318,7 @@ async function migrateImportedAttachments(
           source = null
           const meta = await docMetaRepo.getByDocId(ref.docId)
           if (meta && meta.status !== 0 && meta.space_id === spaceId) {
-            const role = await resolveRole(uid, ref.docId)
+            const role = await resolveRole(uid, ref.docId, spaceId)
             if (roleAtLeast(role, 'reader')) {
               const attachment = await docAttachmentRepo.getById(ref.attachId)
               if (attachment?.docId === ref.docId) source = attachment
@@ -793,6 +795,7 @@ export async function importXlsxHandler(req: Request, res: Response): Promise<vo
       uid: req.uid,
       docId,
       documentName: guard.meta.document_name,
+      principalSpaceId: req.principalSpaceId!,
       clientBaseVersion: baseSV,
       cells,
       dims,

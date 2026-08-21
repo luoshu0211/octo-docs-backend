@@ -26,26 +26,40 @@ import {
   REQUEST_STATUS_DENIED,
 } from '../../db/repos/docAccessRequestRepo.js'
 import { requireDocRole, requireSameSpace } from '../guard.js'
-import { requireVerifiedHumanHomeSpace } from '../middleware/docSpaceScope.js'
+import { requireVerifiedHumanCurrentSpace } from '../middleware/docSpaceScope.js'
 import { resolveRole } from '../../permission/resolveRole.js'
-import { grantRequestWithBots } from '../services/grantRequestWithBots.js'
+import { grantApprovedRequestBots } from '../services/grantRequestWithBots.js'
+import { approveAccessRequest } from '../services/approveAccessRequest.js'
 import { logBotGrantSummary } from '../services/botGrantAudit.js'
 import { getOctoIdentity } from '../../auth/octoIdentity.js'
 import { parseRequestBotUids, BotUidsValidationError } from '../../util/botUids.js'
 import { notifyDocAccessRequested } from '../services/docsNotify.js'
 import { syncDecisionCards } from '../services/docsDecisionCardSync.js'
+import { resolveRequestPrincipalSpace } from '../../permission/principalSpace.js'
 import { isAccessRequestRole, roleAtLeast, roleToNumber, roleFromNumber } from '../../permission/role.js'
 
 
 export const accessRequestsRouter: ExpressRouter = Router()
 
-const roleName = (n: number): 'reader' | 'commenter' | 'writer' => {
+const roleName = (n: number): AccessRequestRole => {
   const role = roleFromNumber(n)
   if (!isAccessRequestRole(role)) throw new Error(`invalid requested_role ${n}`)
   return role
 }
 
-type AccessRequestRole = 'reader' | 'commenter' | 'writer'
+type AccessRequestRole = 'reader' | 'commenter' | 'writer' | 'admin'
+
+const requestableRoles = (docType: string): readonly AccessRequestRole[] =>
+  docType === 'html' ? ['reader', 'commenter'] : ['reader', 'commenter', 'writer']
+
+const approvableRoles = (docType: string): readonly AccessRequestRole[] =>
+  [...requestableRoles(docType), 'admin']
+
+const isRequestableRole = (role: AccessRequestRole, docType: string): boolean =>
+  requestableRoles(docType).includes(role)
+
+const isApprovableRole = (role: AccessRequestRole, docType: string): boolean =>
+  approvableRoles(docType).includes(role)
 
 /**
  * The decider's own session token, when this request carries one. The REST
@@ -108,16 +122,26 @@ accessRequestsRouter.post('/:docId/access-requests', async (req: Request, res: R
   if (scope.mode === 'bot' && !requireSameSpace(res, meta, scope.spaceId)) {
     return
   }
-  if (scope.mode === 'human' && !(await requireVerifiedHumanHomeSpace(req, res, meta))) return
+  if (scope.mode === 'human' && !(await requireVerifiedHumanCurrentSpace(req, res, meta))) return
   if (meta.status === 2) {
     res.status(409).json({ error: 'conflict' })
     return
   }
 
+  const principalSpaceId = await resolveRequestPrincipalSpace(req)
+  if (!principalSpaceId) {
+    res.status(403).json({ error: 'principal_space_unverified' })
+    return
+  }
+
   const suppliedRole = (req.body ?? {}).requestedRole
   const requestedRole = suppliedRole === undefined ? 'reader' : suppliedRole
-  if (!isAccessRequestRole(requestedRole)) {
-    res.status(400).json({ error: 'requestedRole must be reader|commenter|writer' })
+  if (!isAccessRequestRole(requestedRole) || !isRequestableRole(requestedRole, meta.doc_type)) {
+    res.status(400).json({
+      error: meta.doc_type === 'html'
+        ? 'requestedRole must be reader|commenter'
+        : 'requestedRole must be reader|commenter|writer',
+    })
     return
   }
 
@@ -141,21 +165,22 @@ accessRequestsRouter.post('/:docId/access-requests', async (req: Request, res: R
 
   // Preserve the legacy no-op only for human-only requests. A bot-bearing
   // request must remain pending so an admin explicitly approves the bot grants.
-  const current = await resolveRole(req.uid!, docId)
+  const current = await resolveRole(req.uid!, docId, principalSpaceId)
   if (requestedBotUids.length === 0 && roleAtLeast(current, requestedRole)) {
     res.status(200).json({ status: 'already_granted', role: current })
     return
   }
 
-  // Admit ONLY bots the caller actually owns in THIS doc's Space —
-  // octo-server's owned_bots_by_space[doc.space_id], resolved from the caller's
+  // Admit ONLY bots the caller owns in their verified CURRENT Space — the same
+  // principal Space stored on the human request. A cross-Space requester must never
+  // carry a Bot from the document Home Space. Resolved from the caller's
   // own session token (never client-supplied, never a third party's bots).
   // FAIL-CLOSED: a bot mount (no session token) or unresolvable context yields
   // an empty owned set, so any submitted bot is rejected (403).
   let botUids: string[] = []
   if (requestedBotUids.length > 0) {
     const owned = new Set(
-      await getOctoIdentity().ownedBotsInSpace(req.uid!, meta.space_id, req.octoToken ?? ''),
+      await getOctoIdentity().ownedBotsInSpace(req.uid!, principalSpaceId, req.octoToken ?? ''),
     )
     const rejected = requestedBotUids.filter((b) => !owned.has(b))
     if (rejected.length > 0) {
@@ -171,6 +196,7 @@ accessRequestsRouter.post('/:docId/access-requests', async (req: Request, res: R
   const out = await docAccessRequestRepo.submit({
     docId,
     uid: req.uid!,
+    principalSpaceId,
     requestedRoleNum: roleToNumber(requestedRole),
     reason,
     botUids,
@@ -185,10 +211,14 @@ accessRequestsRouter.post('/:docId/access-requests', async (req: Request, res: R
     requestId: out.requestId,
     spaceId: meta.space_id,
     ownerId: meta.owner_id,
+    ownerSpaceId: meta.owner_space_id,
     title: meta.title,
     requesterUid: req.uid!,
+    requesterSpaceId: principalSpaceId,
     reason,
+    requestedRole,
     botUids,
+    requesterToken: req.octoToken ?? '',
   }).catch(() => {})
 
   res.status(201).json({ requestId: out.requestId, status: 'pending' })
@@ -210,6 +240,7 @@ accessRequestsRouter.get('/:docId/access-requests', async (req: Request, res: Re
     items: items.map((r) => ({
       requestId: r.request_id,
       uid: r.uid,
+      principalSpaceId: r.principal_space_id,
       requestedRole: roleName(Number(r.requested_role)),
       reason: r.reason,
       botUids: r.bot_uids,
@@ -219,16 +250,16 @@ accessRequestsRouter.get('/:docId/access-requests', async (req: Request, res: Re
 })
 
 /**
- * POST approve (needs admin). Consumes the pending request FIRST, then grants
- * the chosen role via the shared max-merge path (only-up + epoch bump +
- * owner/admin skip).
+ * POST approve (needs admin). Atomically consumes the pending request and
+ * grants the chosen Human role via the shared only-up path; Bot fan-out follows
+ * after commit and remains partial-failure tolerant.
  *
- * The decide() -> grant order is load-bearing: decide() carries the only
- * `WHERE status = pending` guard and reports whether it actually transitioned a
- * row. Granting only when decide() returns true means a replayed, double-
+ * The transaction-scoped CAS carries the only `WHERE status = pending` guard.
+ * Granting only when that CAS wins means a replayed, double-
  * submitted, or already-decided request (denied OR approved) can never授权 —
  * a denial is never silently overwritten and an approval is never double-
- * granted. A non-pending request is a 409 (already decided) with no grant.
+ * granted. If the primary Human grant fails, the CAS and epoch change roll back,
+ * leaving the request pending and retryable. A non-pending request is a 409.
  */
 accessRequestsRouter.post(
   '/:docId/access-requests/:requestId/approve',
@@ -240,45 +271,72 @@ accessRequestsRouter.post(
       res.status(404).json({ error: 'not_found' })
       return
     }
-    // Omitted role approves the requested tier; an explicit invalid tier fails closed.
-    const suppliedRole = (req.body ?? {}).role
-    let grantRole: AccessRequestRole
-    if (suppliedRole === undefined) {
-      grantRole = roleName(Number(request.requested_role))
-    } else if (isAccessRequestRole(suppliedRole)) {
-      grantRole = suppliedRole
-    } else {
-      res.status(400).json({ error: 'role must be reader|commenter|writer' })
+    // Legacy `{ role }` keeps unified Human/Bot approval compatibility. The new shape permits an
+    // administrator to choose the Human role, Bot role, and an exact subset of carried Bots.
+    const body = (req.body ?? {}) as Record<string, unknown>
+    const suppliedHumanRole = body.humanRole ?? body.role
+    const humanRole = suppliedHumanRole === undefined
+      ? roleName(Number(request.requested_role))
+      : isAccessRequestRole(suppliedHumanRole) ? suppliedHumanRole : null
+    const suppliedBotRole = body.botRole ?? body.role ?? humanRole
+    const botRole = isAccessRequestRole(suppliedBotRole) ? suppliedBotRole : null
+    if (!humanRole || !botRole) {
+      res.status(400).json({ error: 'role_invalid' })
+      return
+    }
+    if (!isApprovableRole(humanRole, guard.meta.doc_type) || !isApprovableRole(botRole, guard.meta.doc_type)) {
+      res.status(400).json({ error: 'role_not_grantable_for_document_type' })
+      return
+    }
+
+    const carriedBots = request.bot_uids ?? []
+    const selectedBotsRaw = body.botUids === undefined ? carriedBots : body.botUids
+    if (!Array.isArray(selectedBotsRaw) || selectedBotsRaw.some((uid) => typeof uid !== 'string')) {
+      res.status(400).json({ error: 'bot_uids_invalid' })
+      return
+    }
+    const selectedBots = [...new Set(selectedBotsRaw as string[])]
+    const carriedBotSet = new Set(carriedBots)
+    if (selectedBots.some((uid) => !carriedBotSet.has(uid))) {
+      res.status(400).json({ error: 'bot_not_in_request' })
       return
     }
 
 
-    // Transition pending -> approved first; grant only on a genuine transition.
-    const decided = await docAccessRequestRepo.decide({
+    const approval = await approveAccessRequest({
       docId: req.params.docId!,
       requestId: req.params.requestId!,
-      status: REQUEST_STATUS_APPROVED,
+      documentName: guard.meta.document_name,
+      ownerUid: guard.meta.owner_id,
+      ownerSpaceId: guard.meta.owner_space_id,
+      uid: request.uid,
+      principalSpaceId: request.principal_space_id,
+      roleNum: roleToNumber(humanRole),
+      allowAdmin: humanRole === 'admin',
       decidedBy: req.uid!,
     })
-    if (!decided) {
+    if (!approval.transitioned) {
       // Already denied / approved / cancelled (or lost a concurrent race):
       // the request is no longer pending, so we grant nothing.
       res.status(409).json({ error: 'not_pending' })
       return
     }
 
-    const result = await grantRequestWithBots({
+    const result = await grantApprovedRequestBots({
       docId: guard.meta.doc_id,
       requestId: req.params.requestId!,
       documentName: guard.meta.document_name,
       uid: request.uid,
-      roleNum: roleToNumber(grantRole),
+      principalSpaceId: request.principal_space_id,
+      roleNum: roleToNumber(humanRole),
+      botRoleNum: roleToNumber(botRole),
+      allowAdmin: humanRole === 'admin',
+      allowBotAdmin: botRole === 'admin',
       grantedBy: req.uid!,
-      // Stored, already-admissible snapshot from submit time; re-normalized
-      // fail-closed by the repo read path so a corrupt DB value grants no bot.
-      botUids: request.bot_uids,
-    })
-    const hadBots = (request.bot_uids?.length ?? 0) > 0
+      // The selected set is constrained to the stored, already-admissible submission snapshot.
+      botUids: selectedBots,
+    }, approval.requesterRole!)
+    const hadBots = selectedBots.length > 0
     if (hadBots) {
       logBotGrantSummary({
         source: 'rest',
@@ -296,6 +354,7 @@ accessRequestsRouter.post(
       docId: guard.meta.doc_id,
       title: guard.meta.title,
       deciderUid: req.uid!,
+      deciderSpaceId: req.principalSpaceId ?? guard.meta.space_id,
       denied: false,
       callerToken: callerSessionToken(req),
       decidedAtSeconds: Math.floor(Date.now() / 1000),
@@ -361,6 +420,7 @@ accessRequestsRouter.post(
       docId: guard.meta.doc_id,
       title: guard.meta.title,
       deciderUid: req.uid!,
+      deciderSpaceId: req.principalSpaceId ?? guard.meta.space_id,
       denied: true,
       callerToken: callerSessionToken(req),
       decidedAtSeconds: Math.floor(Date.now() / 1000),

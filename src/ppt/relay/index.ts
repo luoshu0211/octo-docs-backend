@@ -73,7 +73,7 @@ export function createPptRelay(): PptRelay {
     // share writer. It reads share settings FRESH from the doc row, so a scope
     // narrowing still tightens immediately, and returns 'none' for a
     // missing/soft-deleted doc or a removed member (fail-closed).
-    roleProvider: (ctx) => recheckCurrentRole(ctx.documentName, ctx.uid, ctx.spaceMember),
+    roleProvider: (ctx) => recheckCurrentRole(ctx.documentName, ctx.uid, ctx.principalSpaceId, ctx.spaceMember),
     docStatusProvider: async (docId) => {
       const meta = await docMetaRepo.getByDocId(docId)
       // status 0 = soft-deleted, 2 = archived (both refused by pptDocGuard, the

@@ -30,6 +30,7 @@ describe('docMetaRepo — share columns default restricted (#64)', () => {
       title: 't',
       ownerId: 'u_1',
       spaceId: 's1',
+      principalSpaceId: 's1',
       folderId: 'f_default',
       docType: 'doc',
       createdBy: 'u_1',
@@ -48,19 +49,65 @@ describe('docMetaRepo — share columns default restricted (#64)', () => {
       const tx = {
         query: vi.fn(async (sql: string, params: unknown[] = []) => {
           queries.push({ sql, params })
-          if (sql.includes('SELECT permission_epoch')) return [{ permission_epoch: 8 }]
+          if (sql.includes('UPDATE doc_meta')) return { affectedRows: 1 }
+          if (sql.includes('SELECT share_scope')) return [{
+            share_scope: 1,
+            share_role: 2,
+            discoverability_scope: 0,
+            permission_epoch: 8,
+          }]
           return []
         }),
       }
       return (fn as unknown as (t: typeof tx) => Promise<unknown>)(tx)
     })
 
-    const epoch = await docMetaRepo.setShareSettings('d_1', 1, 2)
-    expect(epoch).toBe(8)
+    const result = await docMetaRepo.setShareSettings('d_1', 1, 2, false, 7)
+    expect(result).toEqual({
+      updated: true,
+      settings: {
+        shareScope: 1,
+        shareRole: 2,
+        spaceSearchable: false,
+        permissionEpoch: 8,
+      },
+    })
     const update = queries.find((q) => q.sql.includes('SET share_scope'))!
-    expect(update.sql).toMatch(/UPDATE doc_meta SET share_scope = \?, share_role = \? WHERE doc_id = \?/)
-    expect(update.params).toEqual([1, 2, 'd_1'])
-    // The same transaction also bumps permission_epoch.
-    expect(queries.some((q) => /permission_epoch = permission_epoch \+ 1/.test(q.sql))).toBe(true)
+    expect(update.sql).toMatch(/discoverability_scope = \?,\s+permission_epoch = permission_epoch \+ 1/)
+    expect(update.sql).toMatch(/WHERE doc_id = \? AND permission_epoch = \?/)
+    expect(update.params).toEqual([1, 2, 0, 'd_1', 7])
+    expect(queries.find((q) => q.sql.includes('SELECT share_scope'))?.sql).toMatch(/LIMIT 1 FOR UPDATE/)
+    expect(queries.filter((q) => /permission_epoch = permission_epoch \+ 1/.test(q.sql))).toHaveLength(1)
+  })
+
+  it('returns the authoritative settings without another update when the expected epoch is stale', async () => {
+    const queries: Array<{ sql: string; params: unknown[] }> = []
+    mockTransaction.mockImplementation(async (fn: never) => {
+      const tx = {
+        query: vi.fn(async (sql: string, params: unknown[] = []) => {
+          queries.push({ sql, params })
+          if (sql.includes('UPDATE doc_meta')) return { affectedRows: 0 }
+          return [{
+            share_scope: 2,
+            share_role: 4,
+            discoverability_scope: 1,
+            permission_epoch: 9,
+          }]
+        }),
+      }
+      return (fn as unknown as (t: typeof tx) => Promise<unknown>)(tx)
+    })
+
+    await expect(docMetaRepo.setShareSettings('d_1', 1, 2, false, 7)).resolves.toEqual({
+      updated: false,
+      current: {
+        shareScope: 2,
+        shareRole: 4,
+        spaceSearchable: true,
+        permissionEpoch: 9,
+      },
+    })
+    expect(queries).toHaveLength(2)
+    expect(queries[1]?.sql).toMatch(/LIMIT 1 FOR UPDATE/)
   })
 })

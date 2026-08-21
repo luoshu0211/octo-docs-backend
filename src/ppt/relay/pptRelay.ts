@@ -217,6 +217,7 @@ export interface RoleResolutionContext {
   uid: string
   docId: string
   documentName: string
+  principalSpaceId: string
   /** Space-membership claim minted at issuance (fail-closed to false). */
   spaceMember: boolean
 }
@@ -267,6 +268,7 @@ interface Conn {
   uid: string
   docId: string
   documentName: string
+  principalSpaceId: string
   role: ResolvedRole
   /**
    * The permission epoch the cached `role` was resolved against. The role is
@@ -782,6 +784,7 @@ export class PptRelay {
           uid: claims.uid,
           docId: claims.docId,
           documentName: claims.documentName,
+          principalSpaceId: claims.principal_space_id,
           spaceMember,
         })
       } catch {
@@ -802,6 +805,7 @@ export class PptRelay {
       uid: claims.uid,
       docId: claims.docId,
       documentName: claims.documentName,
+      principalSpaceId: claims.principal_space_id,
       role,
       // The role above was validated/re-resolved against the live epoch.
       roleEpoch: liveEpoch,
@@ -1457,6 +1461,7 @@ export class PptRelay {
           uid: conn.uid,
           docId: conn.docId,
           documentName: conn.documentName,
+          principalSpaceId: conn.principalSpaceId,
           spaceMember: false,
         })
       } catch {
@@ -1539,8 +1544,14 @@ export class PptRelay {
       return this.failReauth(conn, 'invalid reauth ticket')
     }
     // Identity is immutable across a reauth: it may only refresh the SAME
-    // connection's authority, never migrate the socket to another user or doc.
-    if (claims.uid !== conn.uid || claims.docId !== conn.docId || claims.documentName !== conn.documentName) {
+    // Space-qualified principal and document, never migrate the socket to another
+    // user, Space, or doc.
+    if (
+      claims.uid !== conn.uid
+      || claims.principal_space_id !== conn.principalSpaceId
+      || claims.docId !== conn.docId
+      || claims.documentName !== conn.documentName
+    ) {
       return this.failReauth(conn, 'reauth identity mismatch')
     }
     let fresh: boolean
@@ -1587,7 +1598,7 @@ export class PptRelay {
     if (claims.permission_epoch !== liveEpoch) {
       if (!this.roleProvider) return this.failReauth(conn, 'stale reauth ticket epoch')
       try {
-        role = await this.roleProvider({ uid: conn.uid, docId: conn.docId, documentName: conn.documentName, spaceMember: freshSpaceMember })
+        role = await this.roleProvider({ uid: conn.uid, docId: conn.docId, documentName: conn.documentName, principalSpaceId: conn.principalSpaceId, spaceMember: freshSpaceMember })
       } catch {
         role = 'none'
       }
@@ -2118,6 +2129,7 @@ export class PptRelay {
       uid: conn.uid,
       docId: conn.docId,
       documentName: conn.documentName,
+      principalSpaceId: conn.principalSpaceId,
       spaceMember: conn.spaceMember,
     })
     if (outcome.kind === 'close-membership') {
@@ -2818,6 +2830,7 @@ export class PptRelay {
           uid: conn.uid,
           docId: conn.docId,
           documentName: conn.documentName,
+          principalSpaceId: conn.principalSpaceId,
           spaceMember: conn.spaceMember,
         })
         if (outcome.kind === 'close-membership') {

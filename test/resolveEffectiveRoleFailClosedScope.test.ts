@@ -18,7 +18,7 @@ import {
   resolveEffectiveRole,
   resolveEffectiveRoleWithMembership,
 } from '../src/permission/resolveEffectiveRole.js'
-import { SHARE_SCOPE_ANYONE, SHARE_ROLE_EDIT } from '../src/permission/shareScope.js'
+import { SHARE_SCOPE_ANYONE, SHARE_SCOPE_AUTHENTICATED, SHARE_ROLE_EDIT } from '../src/permission/shareScope.js'
 
 const anyoneEdit = { space_id: 's1', share_scope: SHARE_SCOPE_ANYONE, share_role: SHARE_ROLE_EDIT }
 
@@ -56,7 +56,7 @@ describe('resolveEffectiveRole fail-closed scope (XIN-1825 P1-3)', () => {
       uid,
       'none',
       { ...anyoneEdit, space_id: spaceId },
-      { token },
+      { principalSpaceId: spaceId, token },
     )
     expect(out).toEqual({ role: 'none', spaceMember: false })
     expect(warnSpy).toHaveBeenCalledWith('[octo-docs] space_membership_verify_error', {
@@ -72,7 +72,7 @@ describe('resolveEffectiveRole fail-closed scope (XIN-1825 P1-3)', () => {
 
   it('the legacy write-path resolver PROPAGATES an isSpaceMember throw (no silent 403 degrade)', async () => {
     withThrowingMembership()
-    await expect(resolveEffectiveRole('u_m', 'none', anyoneEdit, { token: 't' })).rejects.toThrow(
+    await expect(resolveEffectiveRole('u_m', 'none', anyoneEdit, { principalSpaceId: 's1', token: 't' })).rejects.toThrow(
       /identity service unavailable/,
     )
   })
@@ -83,5 +83,14 @@ describe('resolveEffectiveRole fail-closed scope (XIN-1825 P1-3)', () => {
     // would throw) is never called — proves the propagation path is lazy, not a
     // regression that adds IO.
     await expect(resolveEffectiveRole('u_w', 'writer', anyoneEdit, { token: 't' })).resolves.toBe('writer')
+  })
+
+  it('authenticated derives writer without any irrelevant home-Space membership lookup', async () => {
+    withThrowingMembership()
+    await expect(resolveEffectiveRoleWithMembership('u_any', 'none', {
+      space_id: 's_home',
+      share_scope: SHARE_SCOPE_AUTHENTICATED,
+      share_role: SHARE_ROLE_EDIT,
+    }, { token: 't' })).resolves.toEqual({ role: 'writer', spaceMember: false })
   })
 })

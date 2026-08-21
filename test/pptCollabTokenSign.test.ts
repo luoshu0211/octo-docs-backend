@@ -28,6 +28,7 @@ describe('PPT collab token + one-time ticket (§7.1)', () => {
     documentName: 'octo:s_1:f_default:ppt:d_ppt1',
     role: 'writer' as const,
     permission_epoch: 3,
+    principalSpaceId: 's_1',
     snapshotVersion: 7,
     homeSpaceVerified: true,
     name: 'Ada',
@@ -56,9 +57,11 @@ describe('PPT collab token + one-time ticket (§7.1)', () => {
     expect(tok.uid).toBe('u_1')
     expect(tok.role).toBe('writer')
     expect(tok.permission_epoch).toBe(3)
+    expect(tok.principal_space_id).toBe('s_1')
 
     const tik = verifyPptRelayTicket(r.ticket)
     expect(tik.docId).toBe('d_ppt1')
+    expect(tik.principal_space_id).toBe('s_1')
     expect(typeof tik.jti).toBe('string')
     expect(tik.jti.length).toBeGreaterThan(0)
 
@@ -98,6 +101,35 @@ describe('PPT collab token + one-time ticket (§7.1)', () => {
     )
     expect(JSON.stringify(warn.mock.calls)).not.toContain('u_legacy')
     warn.mockRestore()
+  })
+
+  it('recovers same-Space principal context for rollout credentials that predate the claim', () => {
+    const legacyClaims = {
+      uid: 'u_legacy',
+      docId: 'd_ppt1',
+      documentName: base.documentName,
+      role: 'writer',
+      permission_epoch: 3,
+      home_space_verified: true,
+    }
+    const token = jwt.sign(legacyClaims, config.collabToken.secret, {
+      algorithm: 'HS256', audience: PPT_RELAY_AUD, expiresIn: 60,
+    })
+    expect(verifyPptRelayToken(token).principal_space_id).toBe('s_1')
+  })
+
+  it('rejects a rollout credential without a principal claim when documentName is not canonical PPT addressing', () => {
+    const malformed = jwt.sign({
+      uid: 'u_legacy',
+      docId: 'd_ppt1',
+      documentName: 'octo:s_1:f_default:d_ppt1',
+      role: 'writer',
+      permission_epoch: 3,
+      home_space_verified: true,
+    }, config.collabToken.secret, {
+      algorithm: 'HS256', audience: PPT_RELAY_AUD, expiresIn: 60,
+    })
+    expect(() => verifyPptRelayToken(malformed)).toThrow(/invalid ppt collab token claims/)
   })
 
   it('cross-audience replay is rejected: a relay token is not a valid ticket (and vice versa)', () => {

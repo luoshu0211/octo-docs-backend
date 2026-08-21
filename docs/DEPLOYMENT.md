@@ -224,7 +224,7 @@ vars (those without a fallback) **fail fast at boot** — that is intentional.
 | `REDIS_PREFIX` | no (`octo-docs`) | multi-product key isolation prefix |
 | `COLLAB_TOKEN_SECRET` | **yes in prod** | signing secret for the short-lived collab JWT. Use an asymmetric key / KMS-managed secret; the HS256 default `dev-only-change-me` is dev only. |
 | `COLLAB_TOKEN_TTL_SECONDS` | no (`300`) | collab JWT TTL (5 min) |
-| `COLLAB_ALLOW_LEGACY_TOKENS_WITHOUT_HOME_SPACE_PROOF` | no (`false`) | Temporary two-stage rollout compatibility. `true` lets validators accept still-unexpired pre-hotfix collab/PPT credentials that lack `home_space_verified`; all new issuers still stamp the proof. Never leave enabled after the drain window. Accepts only `true`/`false`/`1`/`0`; invalid values fail startup. |
+| `COLLAB_ALLOW_LEGACY_TOKENS_WITHOUT_HOME_SPACE_PROOF` | no (`false`) | Temporary compatibility for still-unexpired collab/PPT credentials that lack `home_space_verified`. It does **not** bypass the independent `current_space_verified` + `current_space_id` requirement for Docs Hocuspocus tokens. Never use this flag to bridge the current-Space rollout, and never leave it enabled after its Home-Space/PPT drain window. Accepts only `true`/`false`/`1`/`0`; invalid values fail startup. |
 | `COLLAB_TOKEN_PUBLIC_WS_URL` | **yes in prod** | public, browser-reachable collab WS origin returned to clients as `collabWsUrl` (§4.4). Absolute `ws://`/`wss://` only — the Hocuspocus WS server runs on its own `:1234` origin and is **not** reverse-proxied, so a relative path never reaches it. **Fail-fast prod gate:** if `NODE_ENV=production` and this is unset or malformed the process **refuses to start** (clients no longer carry a build-time WS fallback). Optional in local dev only. |
 | `PPT_RELAY_ENABLED` | no (`false`) | **Master on/off switch for the PPT collab relay. Default OFF.** When false the relay is NOT attached to the REST server and the collab-token issuance route is NOT mounted, so `/api/v1/ppt/collab` is entirely absent. The relay currently ships as **Half A** (durable transport + snapshotting + the server-only room-relative clock bound); the op-metadata trust boundary that ties an op's actor to the authenticated uid and enforces per-actor sequence continuity is **deferred to Half B** (paired with the R4-F1 client). While that boundary is absent, an authenticated writer could submit ops under an arbitrary `a`/`s` (actor impersonation) — so **leave this OFF in production until Half B lands.** Accepts `true`/`false`/`1`/`0` only; any other value fails startup. See "PPT relay op-metadata trust model" below. |
 | `PPT_RELAY_PUBLIC_WS_URL` | **yes in prod _when the relay is enabled_** | public, browser-reachable origin of the Bento PPT collab relay, returned to clients as `pptWsUrl` in the collab-token response (§7.1). Absolute `ws://`/`wss://` only. The relay is hosted **inside the REST server** on the `/api/v1/ppt/collab` upgrade path (unlike the Hocuspocus WS server), so this normally points at the REST origin. **Fail-fast prod gate — gated behind `PPT_RELAY_ENABLED`:** when the relay is enabled and `NODE_ENV=production`, an unset or malformed value makes the process **refuse to start**. When the relay is **off** (the default) its validation is **skipped entirely** — the value is neither required nor consulted, so a disabled relay never fails startup on this knob (XIN-1825). Optional in local dev. Only consulted when `PPT_RELAY_ENABLED=true`. |
@@ -250,7 +250,7 @@ vars (those without a fallback) **fail fast at boot** — that is intentional.
 | `PPT_RELAY_LEDGER_RETENTION_FRAMES` | no (`262144`) | retention window (room seqs) for the `ppt_collab_frame` dedup ledger. The ledger outlives the pruned op log so a resend after a lost ack re-acks its original seq; without retention it grew forever. Ledger rows are reclaimed only once they fall this many seqs behind the covered watermark, bounding the table to ~this many rows per doc. An idempotent resend happens within seconds — far inside the window — so recent frames are always preserved; a resend older than the window is re-minted and rebroadcast but the reducer drops it as a duplicate (inert). |
 | `OCTO_IDENTITY_MODE` | no (`http`) | `http` (cross-service introspection) or `middleware` |
 | `OCTO_SERVER_BASE_URL` | when `http` | octo-server base for token→uid lookups |
-| `OCTO_SERVER_TOKEN` | no (default empty) — **set it if you want approver names on access cards** | Backend service token for octo-server, used by the server-side calls the backend makes on its own behalf (no user session available): (a) the add-member uid existence check (anti ghost-member) in `members.ts`, and (b) resolving the **approver's display name** for the access-decision result card (`decisionDisplay.ts`). For (a), leaving it empty is fine — that check falls back to the caller's own session token. For (b) there is no caller token (the card-action callback is a signed webhook), so with this unset `GET /v1/users/:uid` answers 401, the name is omitted, and the card renders octo-server's generic reviewer label instead of the real approver's name (the lookup miss is logged). Collaborator name/avatar display elsewhere is unaffected (the frontend fetches those directly with the logged-in user's token). |
+| `OCTO_SERVER_TOKEN` | required when Bot member-add/delete is enabled; otherwise optional (default empty) | Backend service token for octo-server human/service directory APIs. Human member-add/delete use the authenticated caller's `req.octoToken`. Bot member-add/delete have no human session and **must** use this service credential; the Bot bearer is never sent to those APIs, and an unset token fails closed with 503 before any directory request or member write. The token is also used to resolve the approver's display name for access-decision cards; without it that optional name is omitted and the generic reviewer label is rendered. Bot-realm operations such as forward-grant may separately use the Bot token against `/v1/bot/user/info`. |
 | `OCTO_DOCS_HTML_REGISTRATION_TOKEN` | yes for docs-html; empty disables access | Dedicated shared token. It must exactly match the token docs-html sends as `X-Internal-Token` to `POST /internal/html/register`. This rate-limited internal boundary authenticates docs-html, not the end user: docs-html authenticates the user and delegates that identity in `owner`; docs-backend enforces owner/space/slug scoping. Never expose this route to browsers or reuse a browser/session token. |
 | `CARD_DISPLAY_TIME_ZONE` | no (`Asia/Shanghai`) | IANA zone used to render timestamps into user-visible card copy (e.g. the access-decision time). Pinned explicitly rather than following the container's `TZ`, which the image does not set (compose defaults it to UTC) — otherwise zh-CN card copy would show a time hours off. **Validated at startup:** an unrecognised zone (`Asia/Shangai`, `UTC+8`, …) fails the process at boot rather than throwing later on the decision path. |
 | `MAX_DOC_BYTES` | no (`10485760`) | single-doc Yjs state hard cap (~10MB) |
@@ -265,33 +265,45 @@ vars (those without a fallback) **fail fast at boot** — that is intentional.
 > (`MYSQL_PASSWORD`, `COLLAB_TOKEN_SECRET`, the attachment keys below) as part
 > of one atomic env block, never passed piecemeal.
 
-### 3.1.1 Home-Space collab-token rollout
+### 3.1.1 Current-Space Docs collab-token rollout
 
-The `home_space_verified` claim is a hard validator boundary: credentials
-minted before the Home-Space hotfix do not carry it, including historical
-`anyone_in_space` credentials. A mixed fleet that lets an old issuer feed a
-strict new WebSocket validator therefore causes reconnect loops (`4403`). Use
-this two-stage rollout rather than enabling strict validation during a mixed
-deployment:
+Docs Hocuspocus authentication now requires both `current_space_verified=true`
+and a non-empty `current_space_id`. This is independent of the older
+`home_space_verified` proof. The
+`COLLAB_ALLOW_LEGACY_TOKENS_WITHOUT_HOME_SPACE_PROOF` flag cannot admit a Docs
+token that lacks current-Space proof. Therefore a strict new WebSocket
+validator must never receive a token from an old issuer, including a token
+minted immediately before that issuer stopped.
 
-1. Deploy the new image to **every** token issuer and validator with
-   `COLLAB_ALLOW_LEGACY_TOKENS_WITHOUT_HOME_SPACE_PROOF=true`. New REST issuance
-   already performs the Home-Space check and stamps the proof; the flag affects
-   only validation of still-unexpired old credentials.
-2. Confirm no old issuing instance remains, then wait at least one complete
-   `COLLAB_TOKEN_TTL_SECONDS` interval (default: 300 seconds). This drains every
-   token an old instance could have minted immediately before it stopped.
-3. Set `COLLAB_ALLOW_LEGACY_TOKENS_WITHOUT_HOME_SPACE_PROOF=false` on every
-   instance and roll the fleet again. From this point, a missing proof is
-   rejected (`4403`).
+Roll out in this order:
 
-Do not shorten the wait based on rollout start time: it begins only after the
-last old issuer has stopped. Rollback during stage 2 means the drain clock must
-restart after old issuers are removed again. The structured log event
-`space_membership_verify_error` identifies identity-service transport/non-2xx/
-malformed-context failures that still intentionally fail closed at each
-caller's authorization boundary; protected selector/token routes commonly
-return 403/404. The event contains no session token or raw uid/Space id.
+1. Deploy the new version to the **REST/token-issuer pool only**. Keep the old
+   WebSocket validator pool serving collaboration. If REST issuance and WS
+   validation normally share one process/image, split traffic or use separate
+   deployments for this rollout; do not perform an ordinary mixed rolling
+   replacement of combined instances.
+2. Confirm every public collab-token route resolves exclusively to new issuers,
+   and confirm no old issuer remains reachable. Record that confirmation time.
+3. Starting from that time, wait at least one complete
+   `COLLAB_TOKEN_TTL_SECONDS` interval (default: 300 seconds). This drains the
+   last token an old issuer could have minted. Any rollback or reappearance of
+   an old issuer resets the drain clock.
+4. Deploy the new strict WebSocket validator pool. Verify missing, false,
+   forged, empty, and unverified current-Space claims close with `4403`, while
+   freshly issued same-Space and authorized cross-Space tokens connect.
+5. Deploy the frontend only after issuer and validator checks pass.
+
+Do not use `COLLAB_ALLOW_LEGACY_TOKENS_WITHOUT_HOME_SPACE_PROOF` to shorten or
+skip this sequence. That flag remains limited to its Home-Space/PPT
+compatibility contract. PPT relay credentials and rollout are a separate
+surface: they must be audited and drained under the PPT contract and cannot be
+used as evidence that the Docs Hocuspocus current-Space rollout is safe.
+
+The structured log event `space_membership_verify_error` identifies
+identity-service transport/non-2xx/malformed-context failures that still
+intentionally fail closed at each caller's authorization boundary; protected
+selector/token routes commonly return 403/404. The event contains no session
+token or raw uid/Space id.
 
 ### 3.2 Attachment storage — two modes
 

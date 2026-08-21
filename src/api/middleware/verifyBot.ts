@@ -14,11 +14,10 @@
  *   2. It MUST NOT read or trust a client-supplied `X-Space-Id` header — the space
  *      is only ever the server-side reverse lookup (anti-spoof).
  *   3. It MUST NOT set req.octoToken. The bot path has no caller session token.
- *      Instead it stashes the bot's own bearer token on req.botToken, which the
- *      downstream anti ghost-member existence check (members/forwardGrant) uses
- *      to call octo-server's bot user-info route (GET /v1/bot/user/info) on the
- *      bot-token realm. OCTO_SERVER_TOKEN is therefore no longer required for the
- *      bot path.
+ *      It stashes the bot bearer on req.botToken for bot-realm operations. Code
+ *      that calls human/service directory APIs (notably member-add roster
+ *      validation) must instead use OCTO_SERVER_TOKEN and fail closed if that
+ *      service credential is absent.
  *
  * Mount order: FIRST on the bot router, before any metadata router. On verify
  * failure return 401 (same envelope as authMiddleware).
@@ -46,17 +45,16 @@ export async function verifyBotMiddleware(
   // Space comes solely from the server-side reverse lookup; any client X-Space-Id
   // is deliberately ignored here (anti-spoof).
   req.spaceId = identity.spaceId
+  req.principalSpaceId = identity.spaceId
   // Explicit bot doc space-scoping policy (remove-sp §6): the guard enforces
-  // requireSameSpace against this server-resolved Space, so a bot NEVER gains the
-  // Human open-context cross-Space locate. Set here (not inferred from
+  // the server-resolved Space as the Bot principal. Cross-Space access requires an
+  // exact direct grant for that principal and never trusts a client header. Set here (not inferred from
   // req.botToken in shared logic) so the boundary is declared at the mount.
   req.docSpaceScope = { mode: 'bot', spaceId: identity.spaceId }
-  // Stash the bot's own bearer token so downstream handlers can authenticate
-  // their octo-server lookups on the bot-token realm — specifically the anti
-  // ghost-member existence check in members/forwardGrant, which calls
-  // GET /v1/bot/user/info with this token (see HttpOctoIdentity.getUserAsBot).
-  // This is NOT req.octoToken: the bot path has no caller session token, and the
-  // bot realm (authBot) is separate from the human session/service-token realm.
+  // Stash the bot's own bearer token for downstream bot-realm operations (for
+  // example forward-grant's GET /v1/bot/user/info lookup). This is NOT
+  // req.octoToken: the bot path has no caller session token, and member-add's
+  // human/service roster APIs deliberately use OCTO_SERVER_TOKEN instead.
   req.botToken = token
   // Surface the bot's human owner (robot.creator_uid) when octo-server resolved
   // one. The doc-create path uses it to auto-grant that owner admin so the bot's

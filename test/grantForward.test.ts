@@ -41,6 +41,30 @@ describe('grantForwardAccess — owner / existing admin skip', () => {
 })
 
 describe('grantForwardAccess — only-up matrix (§7)', () => {
+  it('rejects admin unless the access-request approval path explicitly opts in', async () => {
+    await expect(
+      grantForwardAccess({ ...base, roleNum: roleToNumber('admin') }),
+    ).rejects.toThrow('invalid forward role 3')
+    expect(vi.mocked(resolveRole)).not.toHaveBeenCalled()
+  })
+
+  it('access-request opt-in grants stored admin code 3 and bumps the epoch', async () => {
+    vi.mocked(resolveRole).mockResolvedValue('writer')
+    vi.mocked(docMemberRepo.upsertGrantMax).mockResolvedValue(true)
+
+    const out = await grantForwardAccess({
+      ...base,
+      roleNum: roleToNumber('admin'),
+      allowAdmin: true,
+    })
+
+    expect(out).toEqual({ finalRole: 'admin', changed: true })
+    expect(vi.mocked(docMemberRepo.upsertGrantMax)).toHaveBeenCalledWith(
+      expect.objectContaining({ roleNum: 3 }),
+    )
+    expect(vi.mocked(bumpEpoch)).toHaveBeenCalledTimes(1)
+  })
+
   it('none + reader -> insert, bump, reader', async () => {
     vi.mocked(resolveRole).mockResolvedValue('none')
     vi.mocked(docMemberRepo.upsertGrantMax).mockResolvedValue(true)

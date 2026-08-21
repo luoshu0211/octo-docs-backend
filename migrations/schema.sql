@@ -29,6 +29,7 @@ CREATE TABLE doc_meta (
   document_name VARCHAR(256) NOT NULL,            -- 规范持久化/路由键 octo:{space}:{folder}:{doc}
   title         VARCHAR(512) NOT NULL DEFAULT '',
   owner_id      VARCHAR(64)  NOT NULL,            -- 创建者 / 拥有者（Octo user id），隐含 admin（见 §4.2）
+  owner_space_id VARCHAR(64)  NOT NULL,            -- owner principal 的服务端验证 Space
   space_id      VARCHAR(64)  NOT NULL,            -- 所属 docs 空间（documentName 第 2 段 {space}），多租隔离维度
   folder_id     VARCHAR(64)  NOT NULL DEFAULT 'f_default', -- docs 原生文件夹（documentName 第 3 段 {folder}）；v2.0：不再是 octo group_no，仅做组织/归类，不派生权限（见 §4 / §8.1）。**非空保留默认值 `f_default`**（省略 folderId 的新建文档归此保留文件夹）；**documentName 第 3 段必须等于本列值**（键与 folder_id 恒一致，见 §8.1）
   doc_type      VARCHAR(32)  NOT NULL DEFAULT 'doc', -- doc / template ...
@@ -36,8 +37,9 @@ CREATE TABLE doc_meta (
   html_idempotency_key_hash BINARY(32) NULL DEFAULT NULL,
   status        TINYINT      NOT NULL DEFAULT 1,  -- 1=正常 0=已删除(软删) 2=归档
   permission_epoch BIGINT    NOT NULL DEFAULT 0,   -- 权限版本号（单调递增，权威落 DB；v2.0 按 doc_member 变更 +1，见 §4.5）
-  share_scope   TINYINT      NOT NULL DEFAULT 0,   -- 分享范围：0=restricted(默认) 1=anyone_in_space（#64 空间级分享，见 §4/§5）
-  share_role    TINYINT      NOT NULL DEFAULT 1,   -- anyone_in_space 生效时的角色：1=read 2=edit；restricted 时忽略（#64）
+  share_scope   TINYINT      NOT NULL DEFAULT 0,   -- 0=restricted 1=anyone_in_space 2=authenticated
+  share_role    TINYINT      NOT NULL DEFAULT 1,   -- link role: 1=read 2=edit 4=comment; restricted 时忽略（历史值 3 只兼容读取并降级）
+  discoverability_scope TINYINT NOT NULL DEFAULT 0 COMMENT 'Discovery scope: 0=hidden, 1=space',
   created_at    DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   updated_at    DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
   created_by    VARCHAR(64)  NOT NULL,
@@ -59,8 +61,17 @@ CREATE TABLE doc_meta (
   -- upgraded one (the 2026-07-14-add-doc-share-scope upgrade adds these same two
   -- CHECKs). Authoritative validation lives in the PUT /share handler; these are
   -- the backstop so a raw UPDATE with an out-of-enum value fails on BOTH paths.
-  CONSTRAINT chk_doc_meta_share_scope CHECK (share_scope IN (0, 1)),
-  CONSTRAINT chk_doc_meta_share_role  CHECK (share_role  IN (1, 2))
+  CONSTRAINT chk_doc_meta_share_scope CHECK (share_scope IN (0, 1, 2)),
+  CONSTRAINT chk_doc_meta_share_role  CHECK (share_role  IN (1, 2, 4))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Durable one-time migration phase markers. Unlike temporary feature columns, these survive
+-- empty-ledger adoption and prevent historical data transforms from overwriting live settings.
+CREATE TABLE schema_migration_markers (
+  marker_key   VARCHAR(128) NOT NULL,
+  marker_value VARCHAR(32)  NOT NULL,
+  created_at   DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (marker_key)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- Deployment-level compatibility markers. Role values use append-v1:
@@ -79,13 +90,14 @@ INSERT INTO docs_metadata (meta_key, meta_value) VALUES ('role_encoding', 'appen
 CREATE TABLE doc_member (
   doc_id        VARCHAR(64)  NOT NULL,            -- 关联 doc_meta.doc_id
   uid           VARCHAR(64)  NOT NULL,            -- 被授权的 Octo user id（可信 uid，来源见 §4.4 / §4.6）
+  principal_space_id VARCHAR(64) NOT NULL,          -- 被授权 principal 的服务端验证 Space
   role          TINYINT      NOT NULL,            -- 1=reader 2=writer 3=admin 4=commenter
   granted_by    VARCHAR(64)  NOT NULL,            -- 授权人 uid（直接添加为 owner/admin；链接邀请为 doc_invite.created_by）
   source        TINYINT      NOT NULL DEFAULT 1,  -- 1=direct(直接添加) 2=invite(经 doc_invite 接受)
   invite_token  VARCHAR(64)  NOT NULL DEFAULT '', -- 经邀请加入时记录来源 token（审计/回收），direct 为空
   created_at    DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   updated_at    DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
-  PRIMARY KEY (doc_id, uid),                      -- 一个 uid 对一个 doc 至多一行（role 升降走 UPDATE）
+  PRIMARY KEY (doc_id, uid, principal_space_id),  -- 同 UID 可在不同 Space 独立授权
   KEY idx_uid (uid, role),                        -- 「我能访问哪些 doc」列表页/反查
   KEY idx_doc_role (doc_id, role)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
@@ -110,8 +122,9 @@ CREATE TABLE doc_invite (
 CREATE TABLE doc_invite_redemption (
   invite_token  VARCHAR(64)  NOT NULL,
   uid           VARCHAR(64)  NOT NULL,            -- 接受邀请的可信 uid
+  principal_space_id VARCHAR(64) NOT NULL,          -- 接受者的服务端验证 Space
   redeemed_at   DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-  PRIMARY KEY (invite_token, uid)                 -- 同一 uid 对同一 token 仅计一次（再次点击不重复 +used_count）
+  PRIMARY KEY (invite_token, uid, principal_space_id) -- 同一 Space-qualified principal 仅计一次
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- 访问申请（屏4c「申请访问」MVP，拉取式）：无权限接收方点开文档链接被 403 后，
@@ -121,6 +134,7 @@ CREATE TABLE doc_invite_redemption (
 CREATE TABLE doc_access_request (
   doc_id         VARCHAR(64)  NOT NULL,            -- 关联 doc_meta.doc_id
   uid            VARCHAR(64)  NOT NULL,            -- 申请人可信 uid（authMiddleware 注入，绝非请求体）
+  principal_space_id VARCHAR(64) NOT NULL,          -- 申请人的服务端验证 Space
   requested_role TINYINT      NOT NULL DEFAULT 1,  -- 1=reader 2=writer 4=commenter（无 admin 申请）
   reason         VARCHAR(512) NOT NULL DEFAULT '',
   status         TINYINT      NOT NULL DEFAULT 1,  -- 1=pending 2=approved 3=denied 4=cancelled
@@ -130,7 +144,7 @@ CREATE TABLE doc_access_request (
   bot_uids       JSON         NULL,                -- 申请人携带的本人 Space Bot 快照（JSON 字符串数组）；空/NULL=零 Bot，兼容旧行为。批准时逐个复用 forward-grant 授同一角色
   created_at     DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   updated_at     DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
-  PRIMARY KEY (doc_id, uid),                       -- 一个 uid 对一个 doc 至多一条申请（重复申请 UPDATE 复用）
+  PRIMARY KEY (doc_id, uid, principal_space_id),   -- 每个 Space-qualified principal 一条申请
   UNIQUE KEY uk_request_id (request_id),
   KEY idx_doc_status (doc_id, status)              -- admin 拉「某文档 pending 申请」
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

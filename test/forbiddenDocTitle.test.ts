@@ -48,6 +48,7 @@ function metaRow(over: Record<string, unknown> = {}) {
     document_name: `octo:s_home:f_default:${DOC_ID}`,
     title: TITLE,
     owner_id: 'u_owner',
+    owner_space_id: 's_home',
     space_id: 's_home',
     folder_id: 'f_default',
     doc_type: 'doc',
@@ -72,6 +73,7 @@ beforeAll(async () => {
   app.use((req, _res, next) => {
     req.uid = 'u_outsider'
     req.octoToken = 'session'
+    req.principalSpaceId = 's_home'
     next()
   })
   app.use(humanDocSpaceScopeMiddleware)
@@ -108,30 +110,30 @@ async function openContext(docId = DOC_ID) {
 
 describe('open-context 403 names the refused document', () => {
   it('discloses the title to a role=none caller', async () => {
-    expect(await openContext()).toEqual({ status: 403, body: { error: 'forbidden', title: TITLE } })
+    expect(await openContext()).toEqual({ status: 403, body: { error: 'forbidden', title: TITLE, docType: 'doc' } })
   })
 
   it('discloses nothing else — no Space, documentName, role, epoch or folder', async () => {
     const { body } = await openContext()
-    expect(Object.keys(body).sort()).toEqual(['error', 'title'])
+    expect(Object.keys(body).sort()).toEqual(['docType', 'error', 'title'])
   })
 
   it('omits the field entirely for a blank stored title, rather than sending ""', async () => {
     vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(metaRow({ title: '' }) as never)
     const { status, body } = await openContext()
     expect(status).toBe(403)
-    expect(body).toEqual({ error: 'forbidden' })
+    expect(body).toEqual({ error: 'forbidden', docType: 'doc' })
     expect(body).not.toHaveProperty('title')
   })
 
   it('omits the field for a whitespace-only title — the web side must not render it as a name', async () => {
     vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(metaRow({ title: '   ' }) as never)
-    expect((await openContext()).body).toEqual({ error: 'forbidden' })
+    expect((await openContext()).body).toEqual({ error: 'forbidden', docType: 'doc' })
   })
 
   it('omits the field when the stored title is null', async () => {
     vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(metaRow({ title: null }) as never)
-    expect((await openContext()).body).toEqual({ error: 'forbidden' })
+    expect((await openContext()).body).toEqual({ error: 'forbidden', docType: 'doc' })
   })
 })
 
@@ -161,7 +163,7 @@ describe('the disclosure cannot escape the 403', () => {
     vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(metaRow({ status: 2 }) as never)
     const { status, body } = await openContext()
     expect(status).toBe(403)
-    expect(body).toEqual({ error: 'forbidden', title: TITLE })
+    expect(body).toEqual({ error: 'forbidden', title: TITLE, docType: 'doc' })
   })
 
   it('the authorized 200 context is untouched', async () => {

@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, afterEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { createHash, createHmac } from 'node:crypto'
 
 // Handler-dependency mocks (hoisted). The vector suite below calls
@@ -26,7 +26,7 @@ vi.mock('../src/db/repos/docMetaRepo.js', () => ({
       document_name: 'dn-1',
       title: 'T',
       status: 1,
-      doc_type: 'html',
+      doc_type: 'doc',
     })),
   },
 }))
@@ -43,6 +43,10 @@ vi.mock('../src/db/repos/docAccessRequestRepo.js', () => ({
 vi.mock('../src/permission/resolveRole.js', () => ({ resolveRole: vi.fn(async () => 'admin') }))
 vi.mock('../src/api/services/grantForward.js', () => ({
   grantForwardAccess: vi.fn(async () => ({ finalRole: 'reader', changed: true })),
+}))
+const { mockApproveAccessRequest } = vi.hoisted(() => ({ mockApproveAccessRequest: vi.fn() }))
+vi.mock('../src/api/services/approveAccessRequest.js', () => ({
+  approveAccessRequest: mockApproveAccessRequest,
 }))
 vi.mock('../src/api/services/botGrantAudit.js', () => ({
   logBotGrantFailure: vi.fn(),
@@ -61,6 +65,43 @@ import {
   CARD_ACTION_DECIDE_PATH,
 } from '../src/api/routes/cardActionDecide.js'
 import { logBotGrantFailure, logBotGrantSummary } from '../src/api/services/botGrantAudit.js'
+import { docMetaRepo } from '../src/db/repos/docMetaRepo.js'
+import { docAccessRequestRepo } from '../src/db/repos/docAccessRequestRepo.js'
+import { docCardActionReceiptRepo } from '../src/db/repos/docCardActionReceiptRepo.js'
+import { grantForwardAccess } from '../src/api/services/grantForward.js'
+
+beforeEach(() => {
+  vi.mocked(docMetaRepo.getByDocId).mockReset().mockResolvedValue({
+    doc_id: 'doc-1', space_id: 'space-1', document_name: 'dn-1', title: 'T', status: 1, doc_type: 'doc',
+  } as unknown as Awaited<ReturnType<typeof docMetaRepo.getByDocId>>)
+  vi.mocked(docAccessRequestRepo.getByRequestId).mockReset().mockResolvedValue({
+    uid: 'req-u', principal_space_id: 'space-requester', requested_role: 1, status: 1, bot_uids: [],
+  } as unknown as Awaited<ReturnType<typeof docAccessRequestRepo.getByRequestId>>)
+  vi.mocked(docAccessRequestRepo.decide).mockReset().mockResolvedValue(true)
+  vi.mocked(docCardActionReceiptRepo.claim).mockReset().mockResolvedValue(true)
+  vi.mocked(docCardActionReceiptRepo.getResponse).mockReset().mockResolvedValue(null)
+  vi.mocked(docCardActionReceiptRepo.finalize).mockReset().mockResolvedValue(true)
+  vi.mocked(grantForwardAccess).mockReset().mockResolvedValue({ finalRole: 'reader', changed: true })
+  mockApproveAccessRequest.mockReset().mockImplementation(async (params) => {
+    const transitioned = await docAccessRequestRepo.decide({
+      docId: params.docId,
+      requestId: params.requestId,
+      status: 2,
+      decidedBy: params.decidedBy,
+    })
+    if (!transitioned) return { transitioned: false }
+    const grant = await grantForwardAccess({
+      docId: params.docId,
+      documentName: params.documentName,
+      uid: params.uid,
+      principalSpaceId: params.principalSpaceId,
+      roleNum: params.roleNum,
+      grantedBy: params.decidedBy,
+    })
+    return { transitioned: true, requesterRole: grant.finalRole }
+  })
+  mockGetUser.mockReset()
+})
 
 describe('callback response contract guard', () => {
   it('rejects unknown top-level keys and display values over 500 runes', () => {
@@ -285,6 +326,39 @@ describe('cardActionDecideHandler (commenter on every document type)', () => {
   })
 })
 
+describe('cardActionDecideHandler (historical admin access request)', () => {
+  it('rejects a stored admin request without granting', async () => {
+    const { docMetaRepo } = await import('../src/db/repos/docMetaRepo.js')
+    const { docAccessRequestRepo } = await import('../src/db/repos/docAccessRequestRepo.js')
+    const { grantForwardAccess } = await import('../src/api/services/grantForward.js')
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValueOnce({
+      doc_id: 'doc-1', space_id: 'space-1', document_name: 'dn-1', title: 'T', status: 1,
+    } as unknown as Awaited<ReturnType<typeof docMetaRepo.getByDocId>>)
+    vi.mocked(docAccessRequestRepo.getByRequestId).mockResolvedValueOnce({
+      uid: 'req-u', principal_space_id: 'space-requester', requested_role: 3, status: 1, bot_uids: [],
+    } as unknown as Awaited<ReturnType<typeof docAccessRequestRepo.getByRequestId>>)
+    vi.mocked(docAccessRequestRepo.decide).mockResolvedValueOnce(true)
+    vi.mocked(grantForwardAccess).mockClear()
+    vi.mocked(grantForwardAccess).mockResolvedValue({ finalRole: 'admin', changed: true })
+    const eventId = '4021'
+    const ts = String(Math.floor(Date.now() / 1000))
+    const body = JSON.stringify({
+      event_id: eventId, action_id: 'approval-approve', decision: 'approve', operator_uid: 'op-1',
+      inputs: {}, doc_id: 'doc-1', request_id: 'req-1', message_id: 'm-1', channel_id: 'notification',
+      channel_type: 1, space_id: 'space-1', acted_at: Number(ts),
+    })
+    const { req, res } = makeReqRes({
+      'X-Octo-Timestamp': ts, 'X-Octo-Event-ID': eventId,
+      'X-Octo-Signature': sign(CARD_ACTION_DECIDE_PATH, body, ts, eventId, HANDLER_SECRET),
+    }, body)
+
+    await cardActionDecideHandler(req, res as unknown as Parameters<typeof cardActionDecideHandler>[1])
+
+    expect((res.payload as { disposition: string }).disposition).toBe('conflict')
+    expect(grantForwardAccess).not.toHaveBeenCalled()
+  })
+})
+
 // Review blocker (Jerry-Xin / yujiawei / lml2468 P1): the grant side-effect must
 // be gated on the decide() CAS win (transitioned===true), NOT on claim ownership.
 // The pending→terminal CAS admits exactly one grantor per request across every
@@ -329,7 +403,7 @@ describe('cardActionDecideHandler (grant gated on decide() CAS, not claim)', () 
     vi.mocked(docCardActionReceiptRepo.claim).mockResolvedValueOnce(true)
     vi.mocked(docAccessRequestRepo.getByRequestId).mockResolvedValue({
       uid: 'req-u',
-      requested_role: 2, // stale writer
+      requested_role: 3, // stale admin
       status: REQUEST_STATUS_APPROVED,
     } as unknown as Awaited<ReturnType<typeof docAccessRequestRepo.getByRequestId>>)
     vi.mocked(docAccessRequestRepo.decide).mockResolvedValueOnce(false) // CAS loses
@@ -342,10 +416,9 @@ describe('cardActionDecideHandler (grant gated on decide() CAS, not claim)', () 
     )
     await cardActionDecideHandler(req, res as unknown as Parameters<typeof cardActionDecideHandler>[1])
     expect(res.statusCode).toBe(200)
-    // The row is genuinely at our target (approved) so we report `applied`, but the
-    // decider that flipped it already granted (at its chosen role); a non-transition
-    // MUST NOT re-grant the stale writer role — that is the anti-escalation invariant.
-    expect((res.payload as { disposition: string }).disposition).toBe('applied')
+    // Historical admin requests are no longer grantable; the callback reports a conflict and
+    // never re-grants the stale role.
+    expect((res.payload as { disposition: string }).disposition).toBe('conflict')
     expect(grantForwardAccess).not.toHaveBeenCalled()
     await resetRequestMock()
   })
@@ -400,7 +473,7 @@ describe('cardActionDecideHandler (grant gated on decide() CAS, not claim)', () 
     vi.mocked(docCardActionReceiptRepo.getResponse).mockResolvedValueOnce(null) // sibling not finalized
     vi.mocked(docAccessRequestRepo.getByRequestId).mockResolvedValue({
       uid: 'req-u',
-      requested_role: 2, // stale writer left by the HTTP downgrade approve
+      requested_role: 3, // stale admin left by the HTTP lower-role approve
       status: REQUEST_STATUS_APPROVED,
     } as unknown as Awaited<ReturnType<typeof docAccessRequestRepo.getByRequestId>>)
     vi.mocked(docAccessRequestRepo.decide).mockResolvedValueOnce(false) // CAS loses (already approved)
@@ -602,7 +675,8 @@ describe('cardActionDecideHandler (carried Space-bot snapshot grants)', () => {
     const { docAccessRequestRepo } = await import('../src/db/repos/docAccessRequestRepo.js')
     const { grantForwardAccess } = await import('../src/api/services/grantForward.js')
     vi.mocked(docAccessRequestRepo.getByRequestId).mockResolvedValueOnce({
-      uid: 'req-u', requested_role: 2, status: 1, bot_uids: ['bot_a', 'bot_b'],
+      uid: 'req-u', principal_space_id: 'space-requester', requested_role: 2, status: 1,
+      bot_uids: ['bot_a', 'bot_b'],
     } as unknown as Awaited<ReturnType<typeof docAccessRequestRepo.getByRequestId>>)
     vi.mocked(docAccessRequestRepo.decide).mockResolvedValueOnce(true)
     vi.mocked(grantForwardAccess).mockClear()
@@ -613,10 +687,15 @@ describe('cardActionDecideHandler (carried Space-bot snapshot grants)', () => {
     const payload = res.payload as Record<string, unknown>
     expect(payload.disposition).toBe('applied')
     expect(Object.keys(payload).sort()).toEqual(['display', 'disposition', 'requester_uid', 'state'])
-    // requester (req-u) + 2 bots, all at roleNum 2.
+    // Card approval uses the same split principal contract as REST approval.
     expect(vi.mocked(grantForwardAccess)).toHaveBeenCalledTimes(3)
-    for (const uid of ['req-u', 'bot_a', 'bot_b']) {
-      expect(vi.mocked(grantForwardAccess)).toHaveBeenCalledWith(expect.objectContaining({ uid, roleNum: 2 }))
+    expect(vi.mocked(grantForwardAccess)).toHaveBeenCalledWith(expect.objectContaining({
+      uid: 'req-u', principalSpaceId: 'space-requester', roleNum: 2,
+    }))
+    for (const uid of ['bot_a', 'bot_b']) {
+      expect(vi.mocked(grantForwardAccess)).toHaveBeenCalledWith(expect.objectContaining({
+        uid, principalSpaceId: 'space-requester', roleNum: 2,
+      }))
     }
   })
 
@@ -687,5 +766,22 @@ describe('cardActionDecideHandler (carried Space-bot snapshot grants)', () => {
     expect(payload.disposition).toBe('applied')
     expect(Object.keys(payload).sort()).toEqual(['display', 'disposition', 'requester_uid', 'state'])
     expect(vi.mocked(grantForwardAccess)).toHaveBeenCalledTimes(1) // requester only
+  })
+
+  it('returns retryable failure when atomic primary grant rolls back, then succeeds on redelivery', async () => {
+    const { docAccessRequestRepo } = await import('../src/db/repos/docAccessRequestRepo.js')
+    vi.mocked(docAccessRequestRepo.getByRequestId).mockResolvedValue({
+      uid: 'req-u', principal_space_id: 'space-requester', requested_role: 1, status: 1, bot_uids: [],
+    } as unknown as Awaited<ReturnType<typeof docAccessRequestRepo.getByRequestId>>)
+    mockApproveAccessRequest.mockRejectedValueOnce(new Error('primary grant failed'))
+
+    const failed = await drive('4104')
+    expect(failed.statusCode).toBe(503)
+    expect(failed.payload).toEqual({ error: 'temporarily_unavailable' })
+
+    mockApproveAccessRequest.mockResolvedValueOnce({ transitioned: true, requesterRole: 'reader' })
+    const retried = await drive('4105')
+    expect(retried.statusCode).toBe(200)
+    expect((retried.payload as { state?: string }).state).toBe('approved')
   })
 })

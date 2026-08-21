@@ -33,16 +33,9 @@ describe('pre-hotfix v1 Hocuspocus credential rollout', () => {
       .rejects.toEqual(expect.objectContaining({ code: 4403, reason: 'Forbidden' }))
   })
 
-  it('accepts the same signed no-ver token only during the rollout window', async () => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+  it('still rejects the same signed no-ver token when the old rollout flag is enabled', async () => {
     config.collabToken.allowLegacyWithoutHomeSpaceProof = true
-    const ctx = await authenticate({ token: legacyV1Token(), documentName, connectionConfig: {} })
-    expect(ctx).toMatchObject({ kind: 'document', doc: 'd_1', space: 's_1' })
-    expect(warn).toHaveBeenCalledWith(
-      '[octo-docs] legacy_home_space_token_accepted',
-      { credentialKind: 'collab_v1' },
-    )
-    expect(JSON.stringify(warn.mock.calls)).not.toContain('u_legacy')
-    warn.mockRestore()
+    await expect(authenticate({ token: legacyV1Token(), documentName, connectionConfig: {} }))
+      .rejects.toEqual(expect.objectContaining({ code: 4403, reason: 'Forbidden' }))
   })
 })

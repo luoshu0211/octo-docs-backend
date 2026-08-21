@@ -57,6 +57,7 @@ function req(body: unknown): Request {
   return {
     uid: 'u1',
     spaceId: 's1',
+    principalSpaceId: 's1',
     params: { docId: 'd1' },
     body,
   } as unknown as Request

@@ -123,7 +123,7 @@ beforeEach(() => {
   // asked about is a `writer` member — so a mentioned bot CLEARS the gate. The
   // end-to-end cases below predate the gate and assume it passes; the gate's own
   // cases override these two mocks per test.
-  db.getByDocId.mockResolvedValue({ doc_id: 'doc-1', owner_id: 'u-human' })
+  db.getByDocId.mockResolvedValue({ doc_id: 'doc-1', owner_id: 'u-human', owner_space_id: 'space-1' })
   db.getRole.mockResolvedValue('writer')
   identity.listCallerBots.mockReset()
   identity.listCallerBots.mockResolvedValue([])
@@ -614,7 +614,7 @@ describe('reportBotMentions — bot doc-access gate', () => {
     const r = await reportBotMentions(params(), { sleep: noSleep })
     expect(r).toEqual({ accepted: 1, skipped: 0, failed: 0 })
     // Asked about the BOT's own uid on THIS doc — not the author's.
-    expect(db.getRole).toHaveBeenCalledWith('doc-1', 'bot-1')
+    expect(db.getRole).toHaveBeenCalledWith('doc-1', 'bot-1', 'space-1')
     expect(denyAudit()).toBeUndefined()
   })
 
@@ -662,7 +662,7 @@ describe('reportBotMentions — bot doc-access gate', () => {
   it('reports a bot that OWNS the document (owner is implicit admin, no member row)', async () => {
     // A doc-owning bot has NO doc_member row; a doc_member-only check would
     // wrongly refuse it. Bots do own docs (docMetaRepo owner='me' ownerSet).
-    db.getByDocId.mockResolvedValue({ doc_id: 'doc-1', owner_id: 'bot-1' })
+    db.getByDocId.mockResolvedValue({ doc_id: 'doc-1', owner_id: 'bot-1', owner_space_id: 'space-1' })
     db.getRole.mockResolvedValue(undefined)
     vi.stubGlobal('fetch', fetchMock(resp(200, { accepted: true })))
     expect(await reportBotMentions(params(), { sleep: noSleep })).toEqual({
@@ -740,14 +740,14 @@ describe('reportBotMentions — bot doc-access gate', () => {
 
 describe('resolveBotDocAccess — the judgement in isolation', () => {
   it('allows at or above the floor and refuses below it', async () => {
-    db.getByDocId.mockResolvedValue({ doc_id: 'd1', owner_id: 'u-other' })
+    db.getByDocId.mockResolvedValue({ doc_id: 'd1', owner_id: 'u-other', owner_space_id: 'sp1' })
     for (const role of ['writer', 'admin'] as const) {
       db.getRole.mockResolvedValue(role)
-      expect(await resolveBotDocAccess('d1', 'b1')).toEqual({ allowed: true, role })
+      expect(await resolveBotDocAccess('d1', 'b1', 'sp1')).toEqual({ allowed: true, role })
     }
     for (const role of ['reader', 'commenter'] as const) {
       db.getRole.mockResolvedValue(role)
-      expect(await resolveBotDocAccess('d1', 'b1')).toEqual({
+      expect(await resolveBotDocAccess('d1', 'b1', 'sp1')).toEqual({
         allowed: false,
         reason: 'bot_no_doc_access',
         role,
@@ -756,21 +756,21 @@ describe('resolveBotDocAccess — the judgement in isolation', () => {
   })
 
   it('honours an explicit lower floor (per-capability floors, if ever needed)', async () => {
-    db.getByDocId.mockResolvedValue({ doc_id: 'd1', owner_id: 'u-other' })
+    db.getByDocId.mockResolvedValue({ doc_id: 'd1', owner_id: 'u-other', owner_space_id: 'sp1' })
     db.getRole.mockResolvedValue('commenter')
-    expect(await resolveBotDocAccess('d1', 'b1', 'commenter')).toEqual({
+    expect(await resolveBotDocAccess('d1', 'b1', 'sp1', 'commenter')).toEqual({
       allowed: true,
       role: 'commenter',
     })
     // `commenter` ranks BETWEEN reader and writer even though it is STORED as 4 —
     // the compare must go through roleAtLeast, never the raw stored number.
-    expect(await resolveBotDocAccess('d1', 'b1', 'writer')).toEqual({
+    expect(await resolveBotDocAccess('d1', 'b1', 'sp1', 'writer')).toEqual({
       allowed: false,
       reason: 'bot_no_doc_access',
       role: 'commenter',
     })
     db.getRole.mockResolvedValue('reader')
-    expect(await resolveBotDocAccess('d1', 'b1', 'commenter')).toEqual({
+    expect(await resolveBotDocAccess('d1', 'b1', 'sp1', 'commenter')).toEqual({
       allowed: false,
       reason: 'bot_no_doc_access',
       role: 'reader',
@@ -778,12 +778,12 @@ describe('resolveBotDocAccess — the judgement in isolation', () => {
   })
 
   it('refuses an empty docId/botUid without touching the DB', async () => {
-    expect(await resolveBotDocAccess('', 'b1')).toEqual({
+    expect(await resolveBotDocAccess('', 'b1', 'sp1')).toEqual({
       allowed: false,
       reason: 'bot_no_doc_access',
       role: 'none',
     })
-    expect(await resolveBotDocAccess('d1', '')).toEqual({
+    expect(await resolveBotDocAccess('d1', '', 'sp1')).toEqual({
       allowed: false,
       reason: 'bot_no_doc_access',
       role: 'none',
@@ -793,7 +793,7 @@ describe('resolveBotDocAccess — the judgement in isolation', () => {
 
   it('never throws — a failing read becomes an explicit refusal', async () => {
     db.getByDocId.mockRejectedValue(new Error('boom'))
-    expect(await resolveBotDocAccess('d1', 'b1')).toEqual({
+    expect(await resolveBotDocAccess('d1', 'b1', 'sp1')).toEqual({
       allowed: false,
       reason: 'bot_doc_access_unavailable',
       role: 'none',

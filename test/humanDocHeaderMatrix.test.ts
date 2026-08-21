@@ -54,6 +54,7 @@ const meta = {
   permission_epoch: 3,
   share_scope: 0,
   share_role: 0,
+  discoverability_scope: 0,
 }
 
 const routes = [
@@ -185,13 +186,24 @@ describe('Human single-document X-Space-Id tri-state router matrix (remove-sp St
     ])
   })
 
-  it('allows authorized metadata only from the verified home Space', async () => {
+  it.each([
+    { discoverability_scope: 0, spaceSearchable: false },
+    { discoverability_scope: 1, spaceSearchable: true },
+  ])('allows authorized metadata only from the verified home Space and maps discovery scope $discoverability_scope', async (flags) => {
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue({ ...meta, ...flags } as never)
     vi.mocked(resolveRole).mockResolvedValue('reader')
     expect(await request('GET', `/${DOC_ID}`, 'missing')).toEqual({ status: 400, body: { error: 'space_required' } })
     expect(await request('GET', `/${DOC_ID}`, 'wrong')).toEqual({ status: 404, body: { error: 'not_found' } })
     expect(await request('GET', `/${DOC_ID}`, 'correct')).toEqual({
       status: 200,
-      body: expect.objectContaining({ docId: DOC_ID, spaceId: 's_home', role: 'reader' }),
+      body: expect.objectContaining({
+        docId: DOC_ID,
+        spaceId: 's_home',
+        role: 'reader',
+        shareScope: 'restricted',
+        shareRole: 'read',
+        spaceSearchable: flags.spaceSearchable,
+      }),
     })
   })
 
@@ -207,7 +219,7 @@ describe('Human single-document X-Space-Id tri-state router matrix (remove-sp St
     expect(await request('GET', `/${DOC_ID}/open-context`, 'wrong'))
       .toEqual({ status: 404, body: { error: 'not_found' } })
     expect(await request('GET', `/${DOC_ID}/open-context`, 'correct'))
-      .toEqual({ status: 403, body: { error: 'forbidden', title: 'Secret title' } })
+      .toEqual({ status: 403, body: { error: 'forbidden', title: 'Secret title', docType: 'doc' } })
   })
 
   it('docId collab-token enforces the same home-Space gate', async () => {
