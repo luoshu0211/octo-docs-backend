@@ -21,6 +21,7 @@ import { getCollabServer } from './server.js'
 import { advanceEditVersion } from './liveDocWrite.js'
 import { stateVectorsEqual, BaseVersionStaleError } from './docBodyEdit.js'
 import { applyBoardOpsToDoc, type ValidatedBoardOps } from '../whiteboard/boardEdit.js'
+import { persistedByteLength } from './persistedEncoding.js'
 
 /**
  * Read the live board document for a scene read (mirrors readLiveSheet).
@@ -82,7 +83,9 @@ export async function commitLiveBoardEdit(
       //     moves the state vector forward; the token is read AFTER this bump.
       advanceEditVersion(doc)
       newSV = Y.encodeStateVector(doc)
-      bytes = Y.encodeStateAsUpdate(doc).length
+      // Same dimension the store caps/writes (persistedEncoding), so the size we
+      // report back to the caller can be compared against maxDocBytes at all.
+      bytes = persistedByteLength(doc)
     })
   } finally {
     // Flushes the final store (awaited) and releases the direct connection.

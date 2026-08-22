@@ -15,6 +15,7 @@
  * in lockstep or bot edits land in a Y.Map the clients never read.
  */
 import * as Y from 'yjs'
+import { persistedByteLength } from '../collab/persistedEncoding.js'
 
 /** Y.Map field that holds the spreadsheet payload on the shared Y.Doc. */
 export const SHEET_YMAP_FIELD = 'sheet'
@@ -1238,7 +1239,13 @@ export function validateSheetList(sheets: Record<string, unknown>): Record<strin
  *
  *   - docBytes: the encoded Y.Doc update length, hydrated from the LIVE
  *     `preEditState` (so it carries the live clientId clocks + tombstones) exactly
- *     as persistence.store caps it at config.maxDocBytes. A from-scratch encode
+ *     as persistence.store caps it at config.maxDocBytes — measured through
+ *     persistedByteLength so it is the SAME encoding the store writes. Hardcoding
+ *     an encoder here would silently re-open the dimension mismatch: with v2
+ *     writes on, a sheet in the band "v1 over cap, v2 under cap" (the 2026-08-21
+ *     incident sheet: 18.3 MB v1 vs 6.07 MB v2) would 413 every bot edit while
+ *     collab persisted it fine, and its delete-only shrink edits would 413 too
+ *     because tombstones keep the v1 encoding over the cap. A from-scratch encode
  *     would be strictly smaller (fresh clientId, no accumulated history) and could
  *     pass this pre-check only to have the live commit broadcast-then-fail on
  *     store — the silent-fork hole this closes.
@@ -1277,7 +1284,7 @@ export function measureSheetAfterEdit(
     applySheetMergesToYMap(mergeMap, merges)
     applySheetListToYMap(listMap, sheets)
   })
-  const docBytes = Y.encodeStateAsUpdate(scratch).length
+  const docBytes = persistedByteLength(scratch)
   // Decode + validate the READ maps exactly as GET does (decodeSheetSnapshot /
   // decodeSheetDimsSnapshot / hyperlinks) so payloadBytes is byte-identical to the
   // read body. NOTE: drawings are NOT part of the GET payload (their inline base64

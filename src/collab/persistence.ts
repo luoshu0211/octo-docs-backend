@@ -10,8 +10,10 @@
  */
 import * as Y from 'yjs'
 import { transaction } from '../db/pool.js'
-import { yjsDocumentRepo } from '../db/repos/yjsDocumentRepo.js'
+import { yjsDocumentRepo, type StoredYjsState, type YjsEncoding } from '../db/repos/yjsDocumentRepo.js'
 import { config } from '../config/env.js'
+import { clearOversized, markOversized } from './oversizeGuard.js'
+import { encodeForPersistence } from './persistedEncoding.js'
 
 /**
  * An empty Yjs v1 update encodes as two zero bytes (no structs, empty delete
@@ -19,6 +21,20 @@ import { config } from '../config/env.js'
  */
 export function isEmptyUpdate(update: Uint8Array): boolean {
   return update.length === 2 && update[0] === 0 && update[1] === 0
+}
+
+/**
+ * The v2 encoding of an empty update. v2 frames a header before the (empty)
+ * struct/delete-set payload, so the v1 two-zero-bytes check does not apply; we
+ * derive the constant from Yjs itself rather than hardcoding a byte pattern that
+ * a lib0 upgrade could change underneath us.
+ */
+const EMPTY_UPDATE_V2 = Y.encodeStateAsUpdateV2(new Y.Doc())
+
+/** Whether a v2 update carries no structs and an empty delete set. */
+export function isEmptyUpdateV2(update: Uint8Array): boolean {
+  if (update.length !== EMPTY_UPDATE_V2.length) return false
+  return update.every((b, i) => b === EMPTY_UPDATE_V2[i])
 }
 
 export interface StoreContext {
@@ -39,53 +55,102 @@ export interface StoreContext {
 export const SYSTEM_STORE_UID = 'system'
 
 /**
- * Pure merge-on-write computation (§3.2). Returns the bytes to persist and
- * whether the union fallback path ran (for diagnostics/tests).
+ * Pure merge-on-write computation (§3.2). Returns the bytes to persist, in the
+ * SAME encoding as `liveEncoded` (whatever this build writes — see
+ * persistedEncoding.ts), and whether the union fallback path ran (for
+ * diagnostics/tests).
  *
- * Direction is critical (P1-D): surplus = diffUpdate(existing, sv(incoming)).
- * Empty surplus => existing ⊆ incoming (incoming is the superset) => write
- * incoming directly. The reverse would misjudge a stale incoming and drop
+ * Direction is critical (P1-D): surplus = diffUpdate(existing, sv(live)).
+ * Empty surplus => existing ⊆ live (live is the superset) => persist the live
+ * encoding directly. The reverse would misjudge a stale live doc and drop
  * existing's edits.
+ *
+ * BOTH sides carry their own encoding, and neither may be assumed:
+ *   - `existing` because rows convert lazily — a document not written since the
+ *     v2 rollout is still v1 on disk, and the two decoders are not
+ *     interchangeable (v2 bytes through the v1 decoder yield an EMPTY doc, not
+ *     an error), and
+ *   - `liveEncoding` because v2 writes are behind a flag during the two-phase
+ *     rollout, so the union re-encode must not silently emit v2 while the row is
+ *     about to be labelled v1.
+ *
+ * Unlike the pre-v2 version this takes the LIVE document rather than its encoded
+ * bytes: the state vector comes straight off the object, so the normal
+ * single-writer path no longer decodes a full copy of the incoming update just
+ * to read its state vector (that decode cost ~2.4 s on the 17 MB sheet from the
+ * 2026-08-21 incident, on every store attempt).
  */
 export function computeFinalState(
-  existingState: Uint8Array | null,
-  incoming: Uint8Array,
+  existing: StoredYjsState | null,
+  liveDoc: Y.Doc,
+  liveEncoded: Uint8Array,
+  liveEncoding: YjsEncoding,
 ): { finalState: Buffer; usedUnion: boolean } {
-  if (!existingState) {
-    return { finalState: Buffer.from(incoming), usedUnion: false }
+  if (!existing) {
+    return { finalState: Buffer.from(liveEncoded), usedUnion: false }
   }
-  const incomingDoc = new Y.Doc()
-  Y.applyUpdate(incomingDoc, incoming)
-  const surplus = Y.diffUpdate(existingState, Y.encodeStateVector(incomingDoc))
-  if (isEmptyUpdate(surplus)) {
-    // incoming ⊇ existing => union === incoming; skip the re-encode.
-    return { finalState: Buffer.from(incoming), usedUnion: false }
+
+  const liveStateVector = Y.encodeStateVector(liveDoc)
+  const surplus =
+    existing.encoding === 2
+      ? Y.diffUpdateV2(existing.state, liveStateVector)
+      : Y.diffUpdate(existing.state, liveStateVector)
+
+  if (existing.encoding === 2 ? isEmptyUpdateV2(surplus) : isEmptyUpdate(surplus)) {
+    // existing ⊆ live => union === live; skip the re-encode.
+    return { finalState: Buffer.from(liveEncoded), usedUnion: false }
   }
-  // Concurrency detected: union-merge fallback to never lose edits.
-  const doc = new Y.Doc()
-  Y.applyUpdate(doc, existingState)
-  Y.applyUpdate(doc, incoming)
-  return { finalState: Buffer.from(Y.encodeStateAsUpdate(doc)), usedUnion: true }
+
+  // Concurrency detected: union-merge fallback so no edit is lost. Each side is
+  // applied with ITS OWN decoder, and the result is re-encoded in the encoding
+  // this build persists — not unconditionally v2.
+  const merged = new Y.Doc()
+  if (liveEncoding === 2) Y.applyUpdateV2(merged, liveEncoded)
+  else Y.applyUpdate(merged, liveEncoded)
+  if (existing.encoding === 2) Y.applyUpdateV2(merged, existing.state)
+  else Y.applyUpdate(merged, existing.state)
+  const union = liveEncoding === 2 ? Y.encodeStateAsUpdateV2(merged) : Y.encodeStateAsUpdate(merged)
+  return { finalState: Buffer.from(union), usedUnion: true }
 }
 
 export const persistence = {
   /**
-   * fetch(documentName): full binary state (Uint8Array) or null (§3.2).
-   * documentName is the canonical persistence key, not doc_id.
+   * fetch(documentName): the persisted state plus the encoder that produced it,
+   * or null (§3.2). documentName is the canonical persistence key, not doc_id.
+   * The caller MUST decode with the matching decoder — see collabDatabase.ts.
    */
-  async fetch(documentName: string): Promise<Uint8Array | null> {
+  async fetch(documentName: string): Promise<StoredYjsState | null> {
     return yjsDocumentRepo.fetchState(documentName)
   },
 
   /**
-   * store(documentName, incoming, context): persist the full merged state.
-   * merge-on-write (union) is the correctness fallback; the diffUpdate bypass
-   * skips the redundant union re-encode on the normal single-writer path.
+   * store(documentName, liveDoc, context): persist the full merged state in the
+   * encoding this build writes (v1, or v2 once YJS_WRITE_V2 is flipped — see
+   * persistedEncoding.ts for the mandatory two-phase rollout). merge-on-write
+   * (union) is the correctness fallback; the diffUpdate bypass skips the
+   * redundant union re-encode on the normal single-writer path.
+   *
+   * Takes the LIVE document rather than pre-encoded bytes so the state is
+   * encoded exactly once, in the format we actually persist. The size cap is
+   * therefore measured against what goes to disk, and the three REST pre-flight
+   * gates measure the SAME dimension via persistedByteLength — that shared
+   * measure is what keeps the "byte-accurate gate" contract true rather than
+   * aspirational. Under v2 the sheet from the 2026-08-21 incident encodes to
+   * 6,073,851 bytes instead of 18,320,896 as v1, so the same document that could
+   * not be saved at all saves normally.
    */
-  async store(documentName: string, incoming: Uint8Array, context?: StoreContext): Promise<void> {
+  async store(documentName: string, liveDoc: Y.Doc, context?: StoreContext): Promise<void> {
+    const { state: incoming, encoding } = encodeForPersistence(liveDoc)
+
     // §9.5 single-document hard size cap: reject oversized writes (a runaway
     // doc would block the event loop in decode/encode under the row lock).
     if (incoming.length > config.maxDocBytes) {
+      // Remember the rejection so beforeHandleMessage can refuse further writes
+      // instead of letting the document keep growing past a size it can never
+      // persist (incident 2026-08-21: 9.06 MB -> 17.47 MB in ~20 min, 23 pod
+      // restarts). Without this the throw below is swallowed by the database
+      // extension and the client simply retries.
+      markOversized(documentName, incoming.length, config.maxDocBytes)
       throw new Error(
         `document ${documentName} exceeds max size ${config.maxDocBytes} bytes (got ${incoming.length})`,
       )
@@ -93,13 +158,16 @@ export const persistence = {
 
     await transaction(async (tx) => {
       // 1. lock + take the latest row (read-modify-write 2nd-layer defense).
-      const existingState = await yjsDocumentRepo.selectForUpdateTx(tx, documentName)
+      const existing = await yjsDocumentRepo.selectForUpdateTx(tx, documentName)
 
-      // 2. merge-on-write + diffUpdate bypass.
-      const { finalState } = computeFinalState(existingState, incoming)
+      // 2. merge-on-write + diffUpdate bypass, in the encoding we are writing.
+      const { finalState } = computeFinalState(existing, liveDoc, incoming, encoding)
 
-      // 3. UPSERT single authoritative row.
-      await yjsDocumentRepo.upsertStateTx(tx, documentName, finalState)
+      // 3. UPSERT single authoritative row, recording the encoding that produced
+      //    `finalState` — never a hardcoded 2. A mislabelled row is unreadable
+      //    (or worse, silently decodes empty), so the label must come from the
+      //    same decision that produced the bytes.
+      await yjsDocumentRepo.upsertStateTx(tx, documentName, finalState, encoding)
 
       // doc_meta.updated_at + updated_by (updated_by from context.user.id, §4.1).
       // A read-only direct connection (SYSTEM_STORE_UID) flushes a store on
@@ -113,5 +181,10 @@ export const persistence = {
         ])
       }
     })
+
+    // The document fits again (it may have been marked on an earlier attempt and
+    // then shrunk — e.g. the owner deleted rows). Lift the write guard so the
+    // recovery needs no operator action.
+    clearOversized(documentName)
   },
 }
