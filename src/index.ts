@@ -18,6 +18,7 @@
  * supported. The two listeners are colocated here for a runnable scaffold.
  */
 import { Redis } from 'ioredis'
+import { startNodeHeartbeat, withdrawNode } from './collab/compactionCluster.js'
 import type { Server } from 'node:http'
 // B3: load .env before config/env.js is evaluated (must be the first import).
 import './config/loadEnv.js'
@@ -127,6 +128,12 @@ async function main(): Promise<void> {
   // eslint-disable-next-line no-console
   console.log(`[octo-docs] Hocuspocus listening on :${config.hocuspocusPort}`)
 
+  // Announce this replica as alive so the other replicas honour the documents it
+  // holds when they consider compacting them. Started AFTER listen(): before
+  // this point the node holds nothing, and a liveness key without a server
+  // behind it would only delay other replicas' compactions.
+  const stopHeartbeat = startNodeHeartbeat()
+
   const app = createApp({ surface: config.internalHttpPort > 0 ? 'public' : 'all' })
   const httpServer = app.listen(config.httpPort, () => {
     // eslint-disable-next-line no-console
@@ -199,6 +206,12 @@ async function main(): Promise<void> {
     // eslint-disable-next-line no-console
     console.log(`[octo-docs] ${signal} received, shutting down...`)
     try {
+      // Stand down from the fleet first: once this key is gone the other
+      // replicas stop honouring documents this node used to hold. Doing it
+      // before destroy() means the handover costs no compaction window, and the
+      // 90 s TTL is the backstop for the kill -9 case where none of this runs.
+      stopHeartbeat()
+      await withdrawNode()
       await hocuspocus.destroy() // flushes in-memory docs (triggers onStoreDocument)
       // TODO(§5.3 / §9.4): releaseAllDocumentLocks() so a takeover node can
       // become primary writer immediately without waiting for the lock TTL.

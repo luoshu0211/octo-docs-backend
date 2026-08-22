@@ -31,8 +31,10 @@
  */
 /* eslint-disable no-console -- this is a stdout-driven ops CLI, not a request path */
 import { pathToFileURL } from 'node:url'
+import * as Y from 'yjs'
 import { query, transaction, closePool } from '../src/db/pool.js'
 import { yjsDocumentRepo } from '../src/db/repos/yjsDocumentRepo.js'
+import { applyStoredState, storedStateAsV1 } from '../src/collab/collabDatabase.js'
 import { parseDocumentName } from '../src/permission/documentName.js'
 import {
   findLegacyIllegalIndices,
@@ -42,6 +44,7 @@ import {
 interface DocRow {
   document_name: string
   state: Buffer
+  encoding: number
 }
 
 interface Victim {
@@ -62,12 +65,20 @@ async function scanVictims(): Promise<Victim[]> {
   // `%:wb:%` prefilters to whiteboard keys (octo:{space}:{folder}:wb:{board});
   // parseDocumentName then confirms the exact shape.
   const rows = await query<DocRow>(
-    "SELECT document_name, state FROM yjs_document WHERE document_name LIKE '%:wb:%'",
+    "SELECT document_name, state, encoding FROM yjs_document WHERE document_name LIKE '%:wb:%'",
   )
   const victims: Victim[] = []
   for (const row of rows) {
     if (!isWhiteboardKey(row.document_name)) continue
-    const elementIds = findLegacyIllegalIndices(new Uint8Array(row.state))
+    // Decode with the encoder that produced the row. Assuming v1 on a v2 row
+    // does not throw — it yields an empty document, which here would silently
+    // report "no illegal indices" and skip a board that does need repairing.
+    const doc = new Y.Doc()
+    applyStoredState(doc, {
+      state: new Uint8Array(row.state),
+      encoding: row.encoding === 2 ? 2 : 1,
+    })
+    const elementIds = findLegacyIllegalIndices(Y.encodeStateAsUpdate(doc))
     if (elementIds.length > 0) {
       victims.push({ documentName: row.document_name, elementIds })
     }
@@ -97,13 +108,20 @@ export interface MigrationResult {
 async function migrateVictim(v: Victim): Promise<{ changed: boolean }> {
   return transaction(async (tx) => {
     const current = await yjsDocumentRepo.selectForUpdateTx(tx, v.documentName)
-    const { state, changed } = migrateState(current)
+    // `migrateState` works on v1 bytes; convert in and back out so a v2 row is
+    // rewritten as v2. This repair must not double as a format migration —
+    // changing encoding here would rewrite rows the collab path never asked to
+    // touch, on a code path that only runs for whiteboards.
+    const asV1 = storedStateAsV1(current)
+    const { state, changed } = migrateState(asV1)
     if (!changed) {
       console.log(`  = ${v.documentName}  (already legal on re-read, skipped)`)
       return { changed: false }
     }
-    await yjsDocumentRepo.upsertStateTx(tx, v.documentName, Buffer.from(state))
-    console.log(`  ✓ ${v.documentName}  (repaired -> legal keys, ${state.length} bytes)`)
+    const encoding = current?.encoding ?? 1
+    const out = encoding === 2 ? Y.convertUpdateFormatV1ToV2(state) : state
+    await yjsDocumentRepo.upsertStateTx(tx, v.documentName, Buffer.from(out), encoding)
+    console.log(`  ✓ ${v.documentName}  (repaired -> legal keys, ${out.length} bytes, v${encoding})`)
     return { changed: true }
   })
 }

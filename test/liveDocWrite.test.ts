@@ -74,8 +74,11 @@ describe('commitLiveEdit — guarded write', () => {
 
     // §7.7: the write is a minimal, forward, union-safe delta — computeFinalState
     // takes the diffUpdate bypass (reconciled ⊇ pre-edit), never the union reback.
-    const newState = Y.encodeStateAsUpdate(h.liveDoc)
-    const { usedUnion } = computeFinalState(preEditState, newState)
+    const { usedUnion } = computeFinalState(
+      { state: preEditState, encoding: 1 },
+      h.liveDoc,
+      Y.encodeStateAsUpdateV2(h.liveDoc),
+    )
     expect(usedUnion).toBe(false)
   })
 

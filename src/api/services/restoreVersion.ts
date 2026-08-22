@@ -24,6 +24,7 @@
  */
 import { transaction, type Tx } from '../../db/pool.js'
 import { yjsDocumentRepo } from '../../db/repos/yjsDocumentRepo.js'
+import { storedStateAsV1 } from '../../collab/collabDatabase.js'
 import { docVersionRepo, KIND_RESTORE_MARKER } from '../../db/repos/docVersionRepo.js'
 import { docMemberRepo } from '../../db/repos/docMemberRepo.js'
 import {
@@ -117,6 +118,10 @@ export async function restoreVersion(input: RestoreInput): Promise<RestoreResult
     // 1. Lock the authoritative state row FIRST (same order as
     //    persistence.store: yjs_document -> doc_meta) and read current state.
     const currentState = await yjsDocumentRepo.selectForUpdateTx(tx, input.documentName)
+    // Reconcile against doc_version blobs, which are v1; the live row may now be
+    // v2, so normalise before handing it to the v1 reconcilers. Restore is rare
+    // and explicitly triggered, so the conversion is not on any hot path.
+    const currentStateV1 = storedStateAsV1(currentState)
 
     // 2. Lock the doc_meta row; re-read role inputs + epoch under the lock.
     const metaRows = await tx.query<LockedMetaRow>(
@@ -152,10 +157,10 @@ export async function restoreVersion(input: RestoreInput): Promise<RestoreResult
       // ProseMirror reconcile.
       switch (kind) {
         case 'board':
-          validated = restoreReconcileBoard(currentState, target.state)
+          validated = restoreReconcileBoard(currentStateV1, target.state)
           break
         case 'document':
-          validated = restoreReconcile(currentState, target.state)
+          validated = restoreReconcile(currentStateV1, target.state)
           break
         default:
           assertNeverKind(kind)

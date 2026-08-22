@@ -724,6 +724,20 @@ export const config = {
   // §9.5 single-document Yjs state hard cap.
   maxDocBytes: num('MAX_DOC_BYTES', 10 * 1024 * 1024),
 
+  // Write persisted Yjs state as the v2 update format (see
+  // collab/persistedEncoding.ts and the 2026-08-21-yjs-document-encoding-v2
+  // migration). DEFAULT OFF, and it must STAY off until every instance in the
+  // fleet runs a build that can READ v2 rows: during a rolling deploy an old
+  // instance handed a v2 row decodes it with the v1 decoder, which yields an
+  // EMPTY document rather than an error, and the next edit persists that empty
+  // state over the row. Two-phase rollout is mandatory:
+  //   phase 1: deploy fleet-wide with this unset (reads v2, writes v1)
+  //   phase 2: set YJS_WRITE_V2=true (new writes convert rows lazily)
+  // strictBool, not bool: a typo (=treu) must not silently mean "still v1"
+  // AFTER phase 2 is believed done — that would leave the fleet half-converted
+  // with no signal.
+  yjsWriteV2: strictBool('YJS_WRITE_V2', false),
+
   // Bot incremental doc-body edit request-shape bounds (PATCH /:docId/content).
   // These fail fast at the route shape gate, BEFORE the no-lock op resolution +
   // PMNode.fromJSON + Y.Doc hydration in editDocBody, so an oversized batch is

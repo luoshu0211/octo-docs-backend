@@ -61,10 +61,11 @@ import { readLiveBoard } from '../src/collab/liveBoardWrite.js'
 import { readLiveSheet } from '../src/collab/liveSheetWrite.js'
 import { readLiveDocState } from '../src/collab/liveDocRead.js'
 
-function smallUpdate(): Uint8Array {
+/** persistence.store now takes the LIVE document, not an encoding of it. */
+function smallDoc(): Y.Doc {
   const doc = new Y.Doc()
   doc.transact(() => doc.getText('t').insert(0, 'hi'))
-  return Y.encodeStateAsUpdate(doc)
+  return doc
 }
 
 const DOC = 'octo:s1:f_default:doc:d_1'
@@ -77,7 +78,7 @@ beforeEach(() => {
 
 describe('persistence.store — read-only sentinel does not touch doc_meta (defect 1 root cause)', () => {
   it('skips the doc_meta updated_by/updated_at write for the system sentinel', async () => {
-    await persistence.store(DOC, smallUpdate(), { user: { id: SYSTEM_STORE_UID } })
+    await persistence.store(DOC, smallDoc(), { user: { id: SYSTEM_STORE_UID } })
     // The authoritative row is still upserted (idempotent for a read)...
     const { yjsDocumentRepo } = await import('../src/db/repos/yjsDocumentRepo.js')
     expect(yjsDocumentRepo.upsertStateTx).toHaveBeenCalledTimes(1)
@@ -86,14 +87,14 @@ describe('persistence.store — read-only sentinel does not touch doc_meta (defe
   })
 
   it('still stamps updated_by/updated_at for a real editor uid', async () => {
-    await persistence.store(DOC, smallUpdate(), { user: { id: 'u_real' } })
+    await persistence.store(DOC, smallDoc(), { user: { id: 'u_real' } })
     const meta = cap.queries.find((q) => /UPDATE doc_meta/i.test(q.sql))
     expect(meta).toBeDefined()
     expect(meta!.params).toEqual(['u_real', DOC])
   })
 
   it('records updated_by = null (not the sentinel) when no user context is present', async () => {
-    await persistence.store(DOC, smallUpdate(), undefined)
+    await persistence.store(DOC, smallDoc(), undefined)
     const meta = cap.queries.find((q) => /UPDATE doc_meta/i.test(q.sql))
     expect(meta).toBeDefined()
     expect(meta!.params).toEqual([null, DOC])

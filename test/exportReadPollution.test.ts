@@ -59,8 +59,8 @@ vi.mock('../src/collab/server.js', () => ({
             srv.liveDoc.transact(() => cb(srv.liveDoc))
           },
           disconnect: async () => {
-            const state = Y.encodeStateAsUpdate(srv.liveDoc)
-            await persistence.store(srv.name, state, { user: { id: opts.user?.id } })
+            // store() now takes the live document and encodes it itself (v2).
+            await persistence.store(srv.name, srv.liveDoc, { user: { id: opts.user?.id } })
           },
         }
       },
