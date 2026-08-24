@@ -746,7 +746,14 @@ function withMarks(
   node: PmNode,
   stack: Array<{ type: string; attrs?: Record<string, unknown> }>,
 ): PmNode {
-  const marks = stack.filter((m) => m.type !== '__dropped_link')
+  let marks = stack.filter((m) => m.type !== '__dropped_link')
+  // Schema: the `code` mark declares `excludes: '_'` — it cannot coexist with
+  // ANY other mark. Markdown like **`x`** / [`x`](u) yields bold+code / link+code,
+  // which PMNode.fromJSON rejects as schema_incompatible. Mirror the schema rule
+  // here (code wins, drop the rest) so no code+other-mark combination can fail import.
+  if (marks.some((m) => m.type === 'code')) {
+    marks = marks.filter((m) => m.type === 'code').slice(0, 1)
+  }
   if (node.type === 'text' && marks.length) return { ...node, marks: marks.map((m) => ({ ...m })) }
   return node
 }
