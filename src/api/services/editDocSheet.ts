@@ -52,6 +52,7 @@ export interface EditDocSheetInput {
   uid: string
   docId: string
   documentName: string
+  principalSpaceId: string
   /** The client-supplied base version (Y state vector) from If-Match / body. */
   clientBaseVersion: Uint8Array
   /** Keyed cells to set; a null value deletes that cell. */
@@ -102,6 +103,7 @@ export type EditDocSheetResult =
 
 interface LockedMetaRow {
   owner_id: string
+  owner_space_id: string
   permission_epoch: number
   status: number
   // #64: share seam read FRESH under the lock so the under-lock recheck resolves
@@ -118,14 +120,14 @@ interface LockedMetaRow {
  * space-share-derived role, so an `anyone_in_space`/edit space member is not
  * 403'd here after passing the route guard.
  */
-async function resolveWriterTx(tx: Tx, docId: string, uid: string, meta: LockedMetaRow, isBot: boolean, token: string): Promise<{ canWrite: boolean; isAdmin: boolean }> {
+async function resolveWriterTx(tx: Tx, docId: string, uid: string, principalSpaceId: string, meta: LockedMetaRow, isBot: boolean, token: string): Promise<{ canWrite: boolean; isAdmin: boolean }> {
   const direct: ResolvedRole =
-    uid === meta.owner_id ? 'admin' : ((await docMemberRepo.getRoleTx(tx, docId, uid)) ?? 'none')
+    uid === meta.owner_id && principalSpaceId === meta.owner_space_id ? 'admin' : ((await docMemberRepo.getRoleTx(tx, docId, uid, principalSpaceId)) ?? 'none')
   const role = await resolveEffectiveRole(uid, direct, {
     space_id: meta.space_id,
     share_scope: Number(meta.share_scope),
     share_role: Number(meta.share_role),
-  }, { isBot, token })
+  }, { isBot, principalSpaceId, token })
   // Return the ADMIN verdict too: range-protection enforcement (commitLiveSheetEdit) must use the
   // very same effective role this guard computed under the lock. Re-resolving it later could give a
   // different answer (membership/share change in between) and let a write slip past protection.
@@ -202,14 +204,14 @@ export async function editDocSheet(input: EditDocSheetInput): Promise<EditDocShe
     await yjsDocumentRepo.selectForUpdateTx(tx, input.documentName)
 
     const metaRows = await tx.query<LockedMetaRow>(
-      'SELECT owner_id, permission_epoch, status, space_id, share_scope, share_role FROM doc_meta WHERE doc_id = ? FOR UPDATE',
+      'SELECT owner_id, owner_space_id, permission_epoch, status, space_id, share_scope, share_role FROM doc_meta WHERE doc_id = ? FOR UPDATE',
       [input.docId],
     )
     const meta = metaRows[0]
     if (!meta || Number(meta.status) === 0) return { ok: false as const, status: 404, error: 'not_found' }
     if (Number(meta.status) === 2) return { ok: false as const, status: 409, error: 'conflict' }
 
-    const writer = await resolveWriterTx(tx, input.docId, input.uid, meta, input.isBot ?? false, input.token ?? '')
+    const writer = await resolveWriterTx(tx, input.docId, input.uid, input.principalSpaceId, meta, input.isBot ?? false, input.token ?? '')
     if (!writer.canWrite) {
       return { ok: false as const, status: 403, error: 'forbidden' }
     }

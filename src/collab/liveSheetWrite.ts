@@ -18,6 +18,7 @@ import { getCollabServer } from './server.js'
 import { validateSheetCellBatch, validateSheetDimBatch, validateSheetDrawingBatch, validateSheetHyperLinkBatch, validateSheetMergeBatch, validateSheetListBatch, assertSheetWriteAllowed, SHEET_YMAP_FIELD, SHEET_DIMS_FIELD, SHEET_DRAWINGS_FIELD, SHEET_HYPERLINKS_FIELD, SHEET_MERGES_FIELD, SHEET_LIST_FIELD, type SheetCell, type StoredDrawing, type StoredHyperLink, type StoredSheetMeta } from '../agent/sheetConversion.js'
 import { advanceEditVersion } from './liveDocWrite.js'
 import { stateVectorsEqual, BaseVersionStaleError } from './docBodyEdit.js'
+import { persistedByteLength } from './persistedEncoding.js'
 
 /**
  * Read the live sheet document for a content read (mirrors readLiveForEdit).
@@ -152,7 +153,9 @@ export async function commitLiveSheetEdit(
       //     the state vector forward; the token is read AFTER this bump.
       advanceEditVersion(doc)
       newSV = Y.encodeStateVector(doc)
-      bytes = Y.encodeStateAsUpdate(doc).length
+      // Same dimension the store caps/writes (persistedEncoding), so the size we
+      // report back to the caller can be compared against maxDocBytes at all.
+      bytes = persistedByteLength(doc)
     })
   } finally {
     // Flushes the final store (awaited) and releases the direct connection.

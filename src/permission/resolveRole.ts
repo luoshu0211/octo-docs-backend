@@ -16,11 +16,11 @@ import { parseDocumentName } from './documentName.js'
 import { effectiveRole } from './shareScope.js'
 import type { ResolvedRole } from './role.js'
 
-export async function resolveRole(uid: string, docId: string): Promise<ResolvedRole> {
+export async function resolveRole(uid: string, docId: string, principalSpaceId: string): Promise<ResolvedRole> {
   const meta = await docMetaRepo.getByDocId(docId)
   if (!meta) return 'none'
-  if (uid === meta.owner_id) return 'admin' // owner implies admin (§4.2)
-  const memberRole = await docMemberRepo.getRole(docId, uid)
+  if (uid === meta.owner_id && principalSpaceId === meta.owner_space_id) return 'admin' // owner implies admin (§4.2)
+  const memberRole = await docMemberRepo.getRole(docId, uid, principalSpaceId)
   return memberRole ?? 'none'
 }
 
@@ -70,6 +70,7 @@ export async function resolveDocMetaByName(documentName: string): Promise<DocMet
 export async function recheckCurrentRole(
   documentName: string,
   uid: string,
+  principalSpaceId: string,
   spaceMember = false,
 ): Promise<ResolvedRole> {
   // M2: both document (4-seg) and whiteboard (5-seg `:wb:`) keys are served, via
@@ -78,7 +79,7 @@ export async function recheckCurrentRole(
   // fail closed with 'none'.
   const meta = await resolveDocMetaByName(documentName)
   if (!meta) return 'none'
-  const direct = uid === meta.owner_id ? 'admin' : ((await docMemberRepo.getRole(meta.doc_id, uid)) ?? 'none')
+  const direct = uid === meta.owner_id && principalSpaceId === meta.owner_space_id ? 'admin' : ((await docMemberRepo.getRole(meta.doc_id, uid, principalSpaceId)) ?? 'none')
   // #64: max(directRole, share-derived). restricted docs (default) yield
   // shareDerived='none', so this is byte-identical to the pre-feature result.
   return effectiveRole(direct, spaceMember, meta.share_scope, meta.share_role)

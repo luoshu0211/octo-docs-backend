@@ -1,0 +1,36 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": "."
+  },
+  // WHY THESE FILES ARE LISTED (review round 2). This used to include exactly
+  // `test/botMentionAuthorGate.test.ts`, which made
+  // `tsc -p tsconfig.test.json --noEmit` a green light that proved almost
+  // nothing about the suite: when `computeFinalState` grew a required 4th
+  // argument (the persisted encoding), seven call sites in
+  // test/persistence*.test.ts were left passing 3 — a plain TS2554 this config
+  // could not see, so it surfaced only as runtime failures under vitest.
+  //
+  // The correct fix is `"test"` (the whole tree). Measured: that currently
+  // reports 824 pre-existing errors in files this MR does not touch
+  // (test/accessRequestsRoutes.test.ts and friends drifting from
+  // DocAccessRequestRow), so flipping it here would mean either fixing unrelated
+  // files in this MR or shipping a config that is red on arrival. Both are worse
+  // than an explicit list. The tests this MR owns are enumerated instead, and
+  // widening to "test" is left as its own change.
+  "include": [
+    "src",
+    "test/botMentionAuthorGate.test.ts",
+    "test/persistence.test.ts",
+    "test/persistenceV2.test.ts",
+    "test/persistenceOversizeGuard.test.ts",
+    "test/compactionWorker.test.ts",
+    "test/compactDocumentWiring.test.ts",
+    "test/compactionCluster.test.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist"
+  ]
+}

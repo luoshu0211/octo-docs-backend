@@ -1,9 +1,10 @@
 /**
  * Forward-grant core (§2 max-merge, §6 epoch, §9.1/§9.3).
  *
- * Shared by two callers so the "only-up, never-down" semantics live in ONE place:
+ * Shared by callers so the "only-up, never-down" semantics live in ONE place:
  *   - POST /:docId/forward-grant           (forward-to-chat authorization)
- *   - POST /:docId/access-requests/:id/approve (screen 4c approval)
+ *   - POST /:docId/access-requests/:id/approve (screen 4c approval; may opt in
+ *     to admin grants without widening the public forward-grant route)
  *
  * Semantics:
  *   1. Resolve the target's CURRENT role first.
@@ -27,7 +28,10 @@ export interface GrantForwardParams {
   docId: string
   documentName: string
   uid: string
-  roleNum: number // 1=reader 2=writer 4=commenter (admin is not grantable via forward)
+  principalSpaceId: string
+  roleNum: number // stored mapping: 1=reader 2=writer 3=admin 4=commenter
+  /** Narrow opt-in for access-request approval paths. Defaults false. */
+  allowAdmin?: boolean
   grantedBy: string
 }
 
@@ -40,8 +44,10 @@ export interface GrantForwardResult {
 
 export async function grantForwardAccess(params: GrantForwardParams): Promise<GrantForwardResult> {
   const granted = roleFromNumber(params.roleNum)
-  if (!granted || granted === 'admin') throw new Error(`invalid forward role ${params.roleNum}`)
-  const current = await resolveRole(params.uid, params.docId)
+  if (!granted || (granted === 'admin' && params.allowAdmin !== true)) {
+    throw new Error(`invalid forward role ${params.roleNum}`)
+  }
+  const current = await resolveRole(params.uid, params.docId, params.principalSpaceId)
   // owner (=> admin) or existing admin: keep as-is, no write, no misleading audit row.
   if (current === 'admin') {
     return { finalRole: 'admin', changed: false }
@@ -50,6 +56,7 @@ export async function grantForwardAccess(params: GrantForwardParams): Promise<Gr
   const changed = await docMemberRepo.upsertGrantMax({
     docId: params.docId,
     uid: params.uid,
+    principalSpaceId: params.principalSpaceId,
     roleNum: params.roleNum,
     grantedBy: params.grantedBy,
   })

@@ -114,9 +114,9 @@ export const acceptInviteRouter: ExpressRouter = Router()
 
 acceptInviteRouter.post('/invites/:inviteToken/accept', async (req: Request, res: Response) => {
   const octoToken = extractOctoToken(req)
-  const rawSpace = req.header('X-Space-Id')
-  const viewerSpaceId = typeof rawSpace === 'string' ? rawSpace.trim() : ''
-  const out = await acceptInvite(octoToken, req.params.inviteToken!, Date.now(), viewerSpaceId)
+  const principalSpaceId = (req.header('X-Space-Id') ?? '').trim()
+  if (!principalSpaceId) { res.status(400).json({ error: 'space_required' }); return }
+  const out = await acceptInvite(octoToken, req.params.inviteToken!, principalSpaceId)
   if (!out.ok) {
     res.status(out.status).json({ error: out.error })
     return
@@ -135,10 +135,10 @@ acceptInviteRouter.post('/invites/:inviteToken/accept', async (req: Request, res
  * expired/exhausted -> 410) applies to the bot exactly as to a human; an invalid
  * bot token is already rejected upstream by verifyBot (401).
  */
-export const botAcceptInviteRouter = Router()
+export const botAcceptInviteRouter: ExpressRouter = Router()
 
 botAcceptInviteRouter.post('/invites/:inviteToken/accept', async (req: Request, res: Response) => {
-  const out = await acceptInviteForUid(req.uid!, req.params.inviteToken!)
+  const out = await acceptInviteForUid(req.uid!, req.principalSpaceId!, req.params.inviteToken!)
   if (!out.ok) {
     res.status(out.status).json({ error: out.error })
     return

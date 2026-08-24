@@ -203,7 +203,7 @@ export async function createPptDocHandler(req: Request, res: Response): Promise<
         docType: HTML_PPT_DOC_TYPE,
         createdBy: uid,
       })
-      await docMemberRepo.upsertDirectTx(tx, { docId, uid, roleNum: ROLE_ADMIN, grantedBy: uid })
+      await docMemberRepo.upsertDirectTx(tx, { docId, uid, principalSpaceId: spaceId, roleNum: ROLE_ADMIN, grantedBy: uid })
       await pptDocStateRepo.createTx(tx, { docId, templateId, draftDoc: deck })
 
       const meta = await docMetaRepo.getByDocIdTx(tx, docId)

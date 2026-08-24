@@ -13,6 +13,9 @@ vi.mock('../src/config/env.js', () => ({ config: mockConfig }))
 vi.mock('../src/util/ids.js', () => ({ newDocId }))
 vi.mock('../src/db/repos/docMetaRepo.js', () => ({
   DocOwnershipError: class DocOwnershipError extends Error {},
+  CanonicalHtmlDeletedError: class CanonicalHtmlDeletedError extends Error {},
+  CanonicalHtmlArchivedError: class CanonicalHtmlArchivedError extends Error {},
+  CanonicalHtmlLegacyConflictError: class CanonicalHtmlLegacyConflictError extends Error {},
   docMetaRepo: { upsertHtmlByOctoDocSlug: vi.fn() },
 }))
 vi.mock('../src/search/docIndexQueue.js', () => ({
@@ -49,6 +52,7 @@ function request(body: Record<string, unknown>, token = 'trusted-html-token') {
 const input = {
   octoDocSlug: 'published-page',
   spaceId: 'space-1',
+  principalSpaceId: 'space-1',
   owner: 'user-1',
   title: 'Published page',
 }
@@ -125,6 +129,7 @@ describe('trusted user HTML registration', () => {
       ...input,
       octoDocSlug: '  published-page  ',
       spaceId: '  space-1  ',
+      principalSpaceId: '  space-1  ',
       owner: '  user-1  ',
     }) as never, res as never)
 

@@ -27,7 +27,8 @@ import {
 } from '../../db/repos/docAccessRequestRepo.js'
 import { docCardActionReceiptRepo } from '../../db/repos/docCardActionReceiptRepo.js'
 import { resolveRole } from '../../permission/resolveRole.js'
-import { grantRequestWithBots } from '../services/grantRequestWithBots.js'
+import { grantApprovedRequestBots } from '../services/grantRequestWithBots.js'
+import { approveAccessRequest } from '../services/approveAccessRequest.js'
 import { logBotGrantSummary } from '../services/botGrantAudit.js'
 import { syncDecisionCards } from '../services/docsDecisionCardSync.js'
 import { buildDecisionDisplay, buildDecisionDisplayAt } from '../services/decisionDisplay.js'
@@ -222,28 +223,46 @@ async function computeDecision(req: DecisionRequest): Promise<DecisionResult> {
   const request = await docAccessRequestRepo.getByRequestId(docId, requestId)
   if (!request) return { disposition: 'not_found', state: 'cancelled' }
   const requestedRole = roleFromNumber(Number(request.requested_role))
-  if (!isAccessRequestRole(requestedRole)) {
+  const grantableRoles = meta.doc_type === 'html'
+    ? ['reader', 'commenter']
+    : ['reader', 'commenter', 'writer']
+  if (!isAccessRequestRole(requestedRole) || !grantableRoles.includes(requestedRole)) {
     return { disposition: 'conflict', state: statusToState(request.status), requester_uid: request.uid }
   }
 
 
   // operator_uid is an authenticated identity assertion, NOT authorization —
   // re-check the operator is currently an admin/owner of this doc.
-  const opRole = await resolveRole(req.operator_uid, docId)
+  if (!req.space_id) return { disposition: 'forbidden', state: statusToState(request.status), requester_uid: request.uid }
+  const opRole = await resolveRole(req.operator_uid, docId, req.space_id)
   if (opRole !== 'admin') {
     return { disposition: 'forbidden', state: statusToState(request.status), requester_uid: request.uid }
   }
 
   const targetStatus = req.decision === 'approve' ? REQUEST_STATUS_APPROVED : REQUEST_STATUS_DENIED
-  const transitioned = await docAccessRequestRepo.decide({
-    docId,
-    requestId,
-    status: targetStatus,
-    decidedBy: req.operator_uid,
-    // The reviewer's reason (deny dialog). Persisted atomically with the status
-    // flip; on approve the card submits "" so this is a no-op there.
-    note: decisionNote(req),
-  })
+  const approval = req.decision === 'approve'
+    ? await approveAccessRequest({
+        docId,
+        requestId,
+        documentName: meta.document_name,
+        ownerUid: meta.owner_id,
+        ownerSpaceId: meta.owner_space_id,
+        uid: request.uid,
+        principalSpaceId: request.principal_space_id,
+        roleNum: Number(request.requested_role),
+        allowAdmin: false,
+        decidedBy: req.operator_uid,
+      })
+    : null
+  const transitioned = approval
+    ? approval.transitioned
+    : await docAccessRequestRepo.decide({
+        docId,
+        requestId,
+        status: targetStatus,
+        decidedBy: req.operator_uid,
+        note: decisionNote(req),
+      })
   if (!transitioned) {
     // The pending→terminal CAS did not fire — THIS execution is NOT the decider,
     // so it must apply NO grant side-effect (that belongs solely to the one
@@ -274,7 +293,7 @@ async function computeDecision(req: DecisionRequest): Promise<DecisionResult> {
       state: req.decision === 'approve' ? 'approved' : 'denied',
       requester_uid: request.uid,
       display: (
-        await buildDecisionDisplayAt(meta.title, current?.decided_by ?? '', current?.updated_at)
+        await buildDecisionDisplayAt(meta.title, current?.decided_by ?? '', current?.updated_at, undefined, req.space_id)
       ).display,
     }
   }
@@ -292,19 +311,21 @@ async function computeDecision(req: DecisionRequest): Promise<DecisionResult> {
     // Grant the requested role to the requester AND their carried Space-bot
     // snapshot via the shared only-up max-merge path. Idempotent (resolveRole
     // skip / GREATEST upsert). Per-bot failures are isolated and never fail the
-    // callback — the request is already approved (the CAS won above), and the
-    // grant is gated on transitioned===true so bots are granted exactly once
+    // callback — the atomic Human approval committed above, and Bot fan-out is
+    // gated on transitioned===true so bots are granted exactly once
     // (a redelivery/replay of the same event falls into the report-only branch
     // above and grants nothing, so no bot is ever double-granted).
-    const result = await grantRequestWithBots({
+    const result = await grantApprovedRequestBots({
       docId,
       requestId,
       documentName: meta.document_name,
       uid: request.uid,
+      principalSpaceId: request.principal_space_id,
       roleNum: Number(request.requested_role),
+      allowAdmin: false,
       grantedBy: req.operator_uid,
       botUids,
-    })
+    }, approval!.requesterRole!)
     if (botUids.length > 0) {
       logBotGrantSummary({ source: 'card_callback', docId, requestId, result })
     }
@@ -326,6 +347,8 @@ async function computeDecision(req: DecisionRequest): Promise<DecisionResult> {
     meta.title,
     req.operator_uid,
     req.acted_at,
+    undefined,
+    req.space_id,
   )
   void syncDecisionCards({
     requestId,
@@ -333,6 +356,7 @@ async function computeDecision(req: DecisionRequest): Promise<DecisionResult> {
     docId,
     title: meta.title,
     deciderUid: req.operator_uid,
+    deciderSpaceId: req.space_id,
     deciderCardHandledExternally: true,
     denied: req.decision === 'deny',
     denyReason: decisionNote(req),

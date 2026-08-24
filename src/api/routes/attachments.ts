@@ -504,7 +504,7 @@ export async function copyHandler(req: Request, res: Response): Promise<void> {
       fail('source_not_found')
       continue
     }
-    const srcRole = await resolveRole(req.uid!, ref.docId)
+    const srcRole = await resolveRole(req.uid!, ref.docId, req.principalSpaceId!)
     if (srcRole === 'none' || !roleAtLeast(srcRole, 'reader')) {
       fail('source_forbidden')
       continue

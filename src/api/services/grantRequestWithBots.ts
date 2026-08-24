@@ -5,7 +5,7 @@
  * Boundary: the requester grant is the primary op and its failure propagates
  * (the caller's 503 path owns it). Each carried bot is granted INDEPENDENTLY in
  * a per-item try/catch — a single bot failure is isolated and never fails the
- * (already-committed) approval; we return { succeeded, failed } so the caller
+ * approval; we return { succeeded, failed } so the caller
  * can report the partial outcome. No cross-bot transaction/rollback (grants are
  * additive + idempotent, so a replay re-grants nothing). Zero bots => the loop
  * is empty and only the human is granted (legacy single-grant behavior).
@@ -19,8 +19,16 @@ export interface GrantWithBotsParams {
   documentName: string
   /** The human requester's uid. */
   uid: string
-  /** Role number to grant (1=reader 2=writer 4=commenter). */
+  /** Verified current Space shared by the requester and every carried Bot. */
+  principalSpaceId: string
+  /** Human role number (1=reader, 2=writer, 3=admin, 4=commenter). */
   roleNum: number
+  /** Optional Bot role; omitted preserves the legacy unified-role behavior. */
+  botRoleNum?: number
+  /** Access-request approvals explicitly permit human admin; unrelated forward grants do not. */
+  allowAdmin?: boolean
+  /** Access-request approvals explicitly permit Bot admin independently. */
+  allowBotAdmin?: boolean
   grantedBy: string
   /** Already-normalized, already-admissible bot uids (the stored snapshot). */
   botUids: string[] | undefined
@@ -43,7 +51,9 @@ export async function grantRequestWithBots(
     docId: params.docId,
     documentName: params.documentName,
     uid: params.uid,
+    principalSpaceId: params.principalSpaceId,
     roleNum: params.roleNum,
+    ...(params.allowAdmin === true ? { allowAdmin: true } : {}),
     grantedBy: params.grantedBy,
   })
 
@@ -58,7 +68,11 @@ export async function grantRequestWithBots(
         docId: params.docId,
         documentName: params.documentName,
         uid: botUid,
-        roleNum: params.roleNum,
+        principalSpaceId: params.principalSpaceId,
+        roleNum: params.botRoleNum ?? params.roleNum,
+        ...(params.allowBotAdmin === true || (params.botRoleNum === undefined && params.allowAdmin === true)
+          ? { allowAdmin: true }
+          : {}),
         grantedBy: params.grantedBy,
       })
       botsSucceeded.push(botUid)
@@ -74,4 +88,34 @@ export async function grantRequestWithBots(
   }
 
   return { requesterRole: requester.finalRole, botsSucceeded, botsFailed }
+}
+
+/** Fan out only the non-primary Bot grants after an atomic Human approval. */
+export async function grantApprovedRequestBots(
+  params: GrantWithBotsParams,
+  requesterRole: string,
+): Promise<GrantWithBotsResult> {
+  const botsSucceeded: string[] = []
+  const botsFailed: string[] = []
+  for (const botUid of params.botUids ?? []) {
+    if (botUid === params.uid) continue
+    try {
+      await grantForwardAccess({
+        docId: params.docId,
+        documentName: params.documentName,
+        uid: botUid,
+        principalSpaceId: params.principalSpaceId,
+        roleNum: params.botRoleNum ?? params.roleNum,
+        ...(params.allowBotAdmin === true || (params.botRoleNum === undefined && params.allowAdmin === true)
+          ? { allowAdmin: true }
+          : {}),
+        grantedBy: params.grantedBy,
+      })
+      botsSucceeded.push(botUid)
+    } catch (error) {
+      botsFailed.push(botUid)
+      logBotGrantFailure({ docId: params.docId, requestId: params.requestId, botUid, error })
+    }
+  }
+  return { requesterRole, botsSucceeded, botsFailed }
 }

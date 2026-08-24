@@ -636,13 +636,25 @@ describe('restoreReconcile — union-safe forward restore (the core, §4)', () =
 
     // 2) The write is on the union-safe direction: reconciled ⊇ liveState, so
     //    computeFinalState takes the diffUpdate bypass — NO union reback.
-    const { finalState, usedUnion } = computeFinalState(liveState, reconciled)
+    const reconciledDoc = new Y.Doc()
+    Y.applyUpdate(reconciledDoc, reconciled)
+    const { finalState, usedUnion } = computeFinalState(
+      { state: liveState, encoding: 1 },
+      reconciledDoc,
+      Y.encodeStateAsUpdateV2(reconciledDoc),
+    )
     expect(usedUnion).toBe(false)
-    expect(Uint8Array.from(finalState)).toEqual(reconciled)
+    // The fast path writes the live v2 encoding verbatim, so the persisted bytes
+    // are exactly that. (Decoding them standalone is NOT a valid check here: the
+    // reconcile output carries tombstones for structs the empty target doc never
+    // received, and Yjs cannot re-encode that unapplied delete set — a shape the
+    // collab server never produces, since it always holds the full live doc.)
+    expect(Uint8Array.from(finalState)).toEqual(Y.encodeStateAsUpdateV2(reconciledDoc))
 
     // 3) And the persisted result still has 'C' gone (proves no reback resurrects it).
+    //    Persisted bytes are v2, so they need the v2 decoder.
     const persisted = new Y.Doc()
-    Y.applyUpdate(persisted, new Uint8Array(finalState))
+    Y.applyUpdateV2(persisted, new Uint8Array(finalState))
     expect(paragraphTexts(yDocToProsemirrorJSON(persisted, COLLAB_FIELD))).not.toContain('C')
   })
 
@@ -695,7 +707,13 @@ describe('restoreReconcile — union-safe forward restore (the core, §4)', () =
     expect(paragraphTexts(yDocToProsemirrorJSON(out, COLLAB_FIELD))).toEqual([''])
 
     // Still union-safe: reconciled ⊇ live, so no union reback (Steve's invariant).
-    const { usedUnion } = computeFinalState(liveState, reconciled)
+    const reconciledDoc2 = new Y.Doc()
+    Y.applyUpdate(reconciledDoc2, reconciled)
+    const { usedUnion } = computeFinalState(
+      { state: liveState, encoding: 1 },
+      reconciledDoc2,
+      Y.encodeStateAsUpdateV2(reconciledDoc2),
+    )
     expect(usedUnion).toBe(false)
   })
 

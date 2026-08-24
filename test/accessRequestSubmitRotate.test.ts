@@ -27,9 +27,26 @@ beforeEach(() => {
   query.mockReset()
 })
 
-const params = { docId: 'd_1', uid: 'u_req', requestedRoleNum: 2, reason: 'need writer' }
+const params = {
+  docId: 'd_1',
+  uid: 'u_req',
+  principalSpaceId: 'sp_req',
+  requestedRoleNum: 2,
+  reason: 'need writer',
+}
 
 describe('docAccessRequestRepo.submit — request_id rotation on re-submit', () => {
+  it('stores admin using canonical numeric role 3 without altering the Space-qualified key', async () => {
+    query
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([{ request_id: 'req-admin', status: 1 }])
+
+    await docAccessRequestRepo.submit({ ...params, requestedRoleNum: 3 })
+
+    const [, binds] = query.mock.calls[0]!
+    expect(binds).toEqual(['d_1', 'u_req', 'sp_req', 3, 'need writer', expect.any(String), '[]'])
+  })
+
   it('writes request_id = VALUES(request_id) in the ON DUPLICATE KEY UPDATE', async () => {
     query
       .mockResolvedValueOnce(undefined) // the INSERT ... ON DUPLICATE KEY UPDATE
@@ -44,7 +61,7 @@ describe('docAccessRequestRepo.submit — request_id rotation on re-submit', () 
     // The fresh id is bound as the INSERT candidate, so a duplicate
     // update sets request_id to this new value via VALUES(request_id). The
     // trailing bind is the normalized bot_uids JSON snapshot (empty here).
-    expect(insertBinds).toEqual(['d_1', 'u_req', 2, 'need writer', 'rotated-id-2', '[]'])
+    expect(insertBinds).toEqual(['d_1', 'u_req', 'sp_req', 2, 'need writer', 'rotated-id-2', '[]'])
   })
 
   it('clears decision_note in the ON DUPLICATE KEY UPDATE so a re-submit drops the prior denial reason', async () => {

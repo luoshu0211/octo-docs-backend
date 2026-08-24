@@ -24,6 +24,7 @@
  */
 import { transaction, type Tx } from '../../db/pool.js'
 import { yjsDocumentRepo } from '../../db/repos/yjsDocumentRepo.js'
+import { storedStateAsV1 } from '../../collab/collabDatabase.js'
 import { docVersionRepo, KIND_RESTORE_MARKER } from '../../db/repos/docVersionRepo.js'
 import { docMemberRepo } from '../../db/repos/docMemberRepo.js'
 import {
@@ -50,6 +51,7 @@ export interface RestoreInput {
   uid: string
   docId: string
   documentName: string
+  principalSpaceId: string
   versionId: number
   /** permission_epoch observed when the request was authorized (TOCTOU baseline). */
   authorizedEpoch: number
@@ -65,14 +67,15 @@ export interface RestoreInput {
 
 interface LockedMetaRow {
   owner_id: string
+  owner_space_id: string
   permission_epoch: number
   status: number
 }
 
 /** Re-check the caller's role under the doc_meta lock (owner => admin). */
-async function isAdminTx(tx: Tx, docId: string, uid: string, ownerId: string): Promise<boolean> {
-  if (uid === ownerId) return true
-  const role = await docMemberRepo.getRoleTx(tx, docId, uid)
+async function isAdminTx(tx: Tx, docId: string, uid: string, principalSpaceId: string, ownerId: string, ownerSpaceId: string): Promise<boolean> {
+  if (uid === ownerId && principalSpaceId === ownerSpaceId) return true
+  const role = await docMemberRepo.getRoleTx(tx, docId, uid, principalSpaceId)
   return role !== undefined && roleAtLeast(role, 'admin')
 }
 
@@ -115,10 +118,14 @@ export async function restoreVersion(input: RestoreInput): Promise<RestoreResult
     // 1. Lock the authoritative state row FIRST (same order as
     //    persistence.store: yjs_document -> doc_meta) and read current state.
     const currentState = await yjsDocumentRepo.selectForUpdateTx(tx, input.documentName)
+    // Reconcile against doc_version blobs, which are v1; the live row may now be
+    // v2, so normalise before handing it to the v1 reconcilers. Restore is rare
+    // and explicitly triggered, so the conversion is not on any hot path.
+    const currentStateV1 = storedStateAsV1(currentState)
 
     // 2. Lock the doc_meta row; re-read role inputs + epoch under the lock.
     const metaRows = await tx.query<LockedMetaRow>(
-      'SELECT owner_id, permission_epoch, status FROM doc_meta WHERE doc_id = ? FOR UPDATE',
+      'SELECT owner_id, owner_space_id, permission_epoch, status FROM doc_meta WHERE doc_id = ? FOR UPDATE',
       [input.docId],
     )
     const meta = metaRows[0]
@@ -126,7 +133,7 @@ export async function restoreVersion(input: RestoreInput): Promise<RestoreResult
     if (Number(meta.status) === 2) return { ok: false as const, status: 409, error: 'conflict' }
 
     // 3. Re-check role INSIDE the lock — server authority, not just frontend UX.
-    if (!(await isAdminTx(tx, input.docId, input.uid, meta.owner_id))) {
+    if (!(await isAdminTx(tx, input.docId, input.uid, input.principalSpaceId, meta.owner_id, meta.owner_space_id))) {
       return { ok: false as const, status: 403, error: 'forbidden' }
     }
 
@@ -150,10 +157,10 @@ export async function restoreVersion(input: RestoreInput): Promise<RestoreResult
       // ProseMirror reconcile.
       switch (kind) {
         case 'board':
-          validated = restoreReconcileBoard(currentState, target.state)
+          validated = restoreReconcileBoard(currentStateV1, target.state)
           break
         case 'document':
-          validated = restoreReconcile(currentState, target.state)
+          validated = restoreReconcile(currentStateV1, target.state)
           break
         default:
           assertNeverKind(kind)

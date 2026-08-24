@@ -4,7 +4,12 @@
  */
 import { Router, type Router as ExpressRouter, type Request, type Response } from 'express'
 import { docMetaRepo } from '../../db/repos/docMetaRepo.js'
-import { DocOwnershipError } from '../../db/repos/docMetaRepo.js'
+import {
+  CanonicalHtmlArchivedError,
+  CanonicalHtmlDeletedError,
+  CanonicalHtmlLegacyConflictError,
+  DocOwnershipError,
+} from '../../db/repos/docMetaRepo.js'
 import { docMemberRepo } from '../../db/repos/docMemberRepo.js'
 import { docViewHistoryRepo } from '../../db/repos/docViewHistoryRepo.js'
 import { normalizeTypeFilter, isDocType, HTML_DOC_TYPE, HTML_PPT_DOC_TYPE } from '../../db/docType.js'
@@ -17,8 +22,12 @@ import {
   parseShareRole,
   shareScopeName,
   shareRoleName,
-  SHARE_SCOPE_ANYONE,
+  SHARE_SCOPE_RESTRICTED,
+  SHARE_SCOPE_AUTHENTICATED,
   SHARE_ROLE_READ,
+  SHARE_ROLE_COMMENT,
+  SHARE_ROLE_EDIT,
+  DISCOVERABILITY_SPACE,
 } from '../../permission/shareScope.js'
 import { buildWhiteboardName, WhiteboardNameError } from '../../whiteboard/schema/index.js'
 import { newDocId } from '../../util/ids.js'
@@ -27,14 +36,30 @@ import { config } from '../../config/env.js'
 import { getOctoIdentity } from '../../auth/octoIdentity.js'
 import { requireDocRole } from '../guard.js'
 import { resolveRole } from '../../permission/resolveRole.js'
+import { resolveRequestPrincipalSpace } from '../../permission/principalSpace.js'
 import { resolveEffectiveRole } from '../../permission/resolveEffectiveRole.js'
 import { issueCollabTokenByDocId } from '../../auth/issueCollabToken.js'
 import { recordVerifiedRecentView } from '../services/recordRecentView.js'
 import { requireSpaceMembership, spaceContextMiddleware } from '../middleware/spaceContext.js'
-import { requireVerifiedHumanHomeSpace } from '../middleware/docSpaceScope.js'
+import { requireVerifiedHumanCurrentSpace } from '../middleware/docSpaceScope.js'
 import { searchDocs, VisibleTermsTooLargeError, encodeSearchCursor, decodeSearchCursor } from '../../search/osClient.js'
 
 export const docsRouter: ExpressRouter = Router()
+
+/** Project only the share controls that the Bot API is allowed to know about. */
+function botShareProjection(
+  shareScope: number,
+  shareRole: number,
+  permissionEpoch: number,
+): { shareScope?: string; shareRole?: string; permissionEpoch: number } {
+  return {
+    ...(shareScope === SHARE_SCOPE_AUTHENTICATED ? {} : {
+      shareScope: shareScopeName(shareScope),
+      shareRole: shareRoleName(shareRole),
+    }),
+    permissionEpoch,
+  }
+}
 
 const DEFAULT_FOLDER = 'f_default'
 
@@ -124,11 +149,10 @@ async function grantBotOwnerAdmin(req: Request, docId: string, documentName: str
     await docMemberRepo.upsertDirect({
       docId,
       uid: botOwnerUid,
+      principalSpaceId: req.principalSpaceId!,
       roleNum: ROLE_ADMIN,
       grantedBy: uid,
     })
-    // Mirror the PUT /members mutation: a doc_member change bumps the epoch and
-    // broadcasts the invalidation (§4.5) so any listener recomputes access.
     await bumpEpoch(docId, documentName, botOwnerUid)
   }
 }
@@ -136,7 +160,7 @@ async function grantBotOwnerAdmin(req: Request, docId: string, documentName: str
 /** POST /api/v1/docs — create. Creator becomes owner (implicit admin, §4.2). */
 export async function createDocHandler(req: Request, res: Response) {
   const uid = req.uid!
-  const { folderId, title, docType, octoDocSlug, mountType } = req.body ?? {}
+  const { folderId, title, docType, octoDocSlug, idempotencyKey, mountType } = req.body ?? {}
   // Space isolation (P3): the space is sourced solely from the enforced
   // X-Space-Id header (req.spaceId, set by spaceContextMiddleware, guaranteed
   // non-empty). The transitional body.spaceId fallback (P1) is removed — any
@@ -153,6 +177,10 @@ export async function createDocHandler(req: Request, res: Response) {
   }
   const folder = typeof folderId === 'string' && folderId !== '' ? folderId : DEFAULT_FOLDER
   const resolvedDocType = typeof docType === 'string' && docType !== '' ? docType : 'doc'
+  if (resolvedDocType !== HTML_DOC_TYPE && idempotencyKey !== undefined) {
+    res.status(400).json({ error: 'idempotencyKey is only valid for html documents' })
+    return
+  }
   if (resolvedDocType === HTML_PPT_DOC_TYPE) {
     // html_ppt (Bento slide-deck) is created ONLY through /api/v1/ppt/** (§3.1 /
     // §5.2), never the legacy /api/v1/docs create path. Reject as wrong-kind so a
@@ -174,15 +202,29 @@ export async function createDocHandler(req: Request, res: Response) {
       res.status(400).json({ error: 'html registration requires bot mount' })
       return
     }
-    if (mountType !== 'group' && mountType !== 'space' && mountType !== 'thread') {
+    const canonicalUnmounted = idempotencyKey !== undefined
+      && (mountType === undefined || mountType === null || mountType === '')
+    if (!canonicalUnmounted && mountType !== 'group' && mountType !== 'space' && mountType !== 'thread') {
       res.status(400).json({ error: 'mountType must be group, space, or thread' })
       return
     }
-    if (typeof octoDocSlug !== 'string' || octoDocSlug === '') {
+    if (idempotencyKey !== undefined && octoDocSlug !== undefined) {
+      res.status(400).json({ error: 'idempotencyKey and octoDocSlug are mutually exclusive' })
+      return
+    }
+    if (idempotencyKey !== undefined && (typeof idempotencyKey !== 'string' || idempotencyKey.trim() === '')) {
+      res.status(400).json({ error: 'idempotencyKey required' })
+      return
+    }
+    if (typeof idempotencyKey === 'string' && idempotencyKey.trim().length > 128) {
+      res.status(400).json({ error: 'idempotencyKey too long' })
+      return
+    }
+    if (idempotencyKey === undefined && (typeof octoDocSlug !== 'string' || octoDocSlug === '')) {
       res.status(400).json({ error: 'octoDocSlug required' })
       return
     }
-    if (octoDocSlug.length > 128) {
+    if (idempotencyKey === undefined && octoDocSlug.length > 128) {
       res.status(400).json({ error: 'octoDocSlug too long' })
       return
     }
@@ -198,6 +240,7 @@ export async function createDocHandler(req: Request, res: Response) {
     }
     throw err
   }
+  const normalizedIdempotencyKey = typeof idempotencyKey === 'string' ? idempotencyKey.trim() : undefined
   const createInput = {
     docId,
     documentName,
@@ -206,14 +249,42 @@ export async function createDocHandler(req: Request, res: Response) {
     spaceId,
     folderId: folder,
     docType: resolvedDocType,
-    ...(resolvedDocType === HTML_DOC_TYPE ? { octoDocSlug } : {}),
+    ...(resolvedDocType === HTML_DOC_TYPE ? { octoDocSlug: normalizedIdempotencyKey !== undefined ? docId : octoDocSlug } : {}),
     createdBy: uid,
   }
-  let writeResult
+  let writeResult: {
+    meta: Awaited<ReturnType<typeof docMetaRepo.getByDocId>>
+    created: boolean
+    memberReconciled?: boolean
+    permissionEpoch?: number
+  }
   if (resolvedDocType === HTML_DOC_TYPE) {
     try {
-      writeResult = await docMetaRepo.upsertHtmlByOctoDocSlug({ ...createInput, octoDocSlug })
+      writeResult = normalizedIdempotencyKey !== undefined
+        ? await docMetaRepo.createCanonicalHtml({
+          ...createInput,
+          octoDocSlug: docId,
+          idempotencyKey: normalizedIdempotencyKey,
+          humanOwnerUid: req.botOwnerUid,
+        })
+        : await docMetaRepo.upsertHtmlByOctoDocSlug({
+          ...createInput,
+          octoDocSlug,
+          humanOwnerUid: req.botOwnerUid,
+        })
     } catch (err) {
+      if (err instanceof CanonicalHtmlDeletedError) {
+        res.status(410).json({ error: 'canonical_document_deleted' })
+        return
+      }
+      if (err instanceof CanonicalHtmlArchivedError) {
+        res.status(409).json({ error: 'canonical_document_archived' })
+        return
+      }
+      if (err instanceof CanonicalHtmlLegacyConflictError) {
+        res.status(409).json({ error: 'canonical_document_conflict' })
+        return
+      }
       // Default-deny (P0): a non-owner upsert of an existing slug is rejected
       // rather than silently overwriting/reviving another bot's row. Mirrors the
       // 403 the sibling rename/delete (requireDocRole('admin')) paths return.
@@ -225,44 +296,30 @@ export async function createDocHandler(req: Request, res: Response) {
     }
   } else {
     await docMetaRepo.create(createInput)
-    writeResult = { meta: await docMetaRepo.getByDocId(docId), created: true }
+    writeResult = { meta: await docMetaRepo.getByDocId(docId), created: true, memberReconciled: false }
   }
   const meta = writeResult.meta
-  // Bot path only: the doc owner is the bot itself (ownerId = bot uid), so the
-  // bot's human owner would otherwise have no membership and could not see the
-  // doc. Auto-grant that human owner admin. req.botOwnerUid is set solely by
-  // verifyBot (from octo-server's robot.creator_uid reverse lookup) and only when
-  // a real human creator exists — it is never set on the human mount, so this
-  // block is a no-op there. Skip when the owner is the bot itself (no distinct
-  // human owner, e.g. a platform bot) to avoid a redundant self-membership row.
-  // This is purely additive: the doc's owner field and the bot's own access are
-  // unchanged (§4.2 owner is implicit admin); the human owner is added on top.
-  //
-  // Run on BOTH the fresh-create AND the html idempotent-recovery path
-  // (created:false): a prior partial failure could have written doc_meta but
-  // never granted the human owner admin, leaving them unable to see their own
-  // doc. grantBotOwnerAdmin is idempotent (upsertDirect + bumpEpoch) and
-  // self-no-ops when botOwnerUid is absent or equals uid, so calling it
-  // unconditionally heals that recovery case with no double-work regression.
-  if (meta) {
+  // Fresh and historical legacy membership writes happen in the repository
+  // transaction. Publish only a committed historical reconcile.
+  if (meta && resolvedDocType !== HTML_DOC_TYPE) {
     await grantBotOwnerAdmin(req, meta.doc_id ?? docId, meta.document_name ?? documentName)
+  } else if (meta && normalizedIdempotencyKey === undefined && writeResult.memberReconciled) {
+    await refreshAndPublish(
+      meta.document_name ?? documentName,
+      writeResult.permissionEpoch ?? Number(meta.permission_epoch),
+      req.botOwnerUid,
+    )
   }
 
-  // html docs are now indexed too: after registering the meta row (fresh
-  // create OR idempotent-recovery upsert), enqueue an index signal for the
-  // published documentName. Gated OFF by default; html goes through the SAME
-  // isSearchIndexedDoc + enqueueDocIndex path as the rename branch below, so
-  // the octo-doc-indexer picks it up and resolves the body by reading the
-  // latest `v<N>/index.html` from S3 (html has no Yjs body, so the collab
-  // afterStoreDocument feed cannot see it — this handler is the enqueue site).
-  // Best-effort / fire-and-forget: enqueue swallows its own errors so a Kafka
-  // outage does not fail the registration response.
   const responseDocId = resolvedDocType === HTML_DOC_TYPE ? (meta?.doc_id ?? docId) : docId
   const responseDocumentName = resolvedDocType === HTML_DOC_TYPE ? (meta?.document_name ?? documentName) : documentName
   const responseSpaceId = resolvedDocType === HTML_DOC_TYPE ? (meta?.space_id ?? spaceId) : spaceId
   const responseFolderId = resolvedDocType === HTML_DOC_TYPE ? (meta?.folder_id ?? folder) : folder
   const responseOwnerId = resolvedDocType === HTML_DOC_TYPE ? (meta?.owner_id ?? uid) : uid
-  if (resolvedDocType === HTML_DOC_TYPE && config.search.indexEnabled && isSearchIndexedDoc(responseDocumentName)) {
+  // Legacy slug registration historically signals immediately. Canonical HTML
+  // allocation waits for /:docId/published because its body is not durable yet.
+  if (resolvedDocType === HTML_DOC_TYPE && normalizedIdempotencyKey === undefined
+      && config.search.indexEnabled && isSearchIndexedDoc(responseDocumentName)) {
     void enqueueDocIndex(responseDocumentName)
   }
   res.status(201).json({
@@ -273,8 +330,8 @@ export async function createDocHandler(req: Request, res: Response) {
     folderId: responseFolderId,
     ownerId: responseOwnerId,
     docType: resolvedDocType,
-    ...(resolvedDocType === HTML_DOC_TYPE ? { octoDocSlug } : {}),
-    ...(resolvedDocType === HTML_DOC_TYPE ? { created: writeResult.created } : {}),
+    ...(resolvedDocType === HTML_DOC_TYPE ? { octoDocSlug: meta?.octo_doc_slug ?? octoDocSlug } : {}),
+    ...(resolvedDocType === HTML_DOC_TYPE ? { created: writeResult.created, publisherUid: uid } : {}),
     // The caller is always admin on this response: a fresh create makes the
     // caller the owner (implicit admin, §4.2), and the idempotent update branch
     // (created:false) is now reachable ONLY by the owning bot — the repo's
@@ -294,27 +351,54 @@ export async function createDocHandler(req: Request, res: Response) {
 // authorization. Confirming it here is what stops a session holder from planting
 // a doc into a space they do not belong to.
 //
-// The COLLECTION READS below (`GET /`, `POST /search`, `GET /recent`,
-// `GET /recent/creators`) deliberately do NOT carry it, even though the space is
-// their selector too. They are not authorized by space membership in the first
-// place: each pushes a row-level predicate down to the repo that admits only
-// `owner OR doc_member`, and ADDS the `share_scope = anyone_in_space` branch only
-// when `isSpaceMember` is confirmed (docMetaRepo.listForUser's `includeSpaceShare`,
-// listVisibleDocIdSet's `spaceShare`, docViewHistoryRepo.visibilityPredicate). A
-// non-member naming someone else's space therefore already sees nothing of that
-// space — the predicate collapses to their own direct grants. Gating the route
-// instead would SUBTRACT: a legitimate cross-space owner / doc_member, whose grant
-// is independent of space membership by design (members.ts / forwardGrant.ts
-// verify only that the grantee is a real octo user), would be 404'd out of listing
-// or searching documents they own. That violates the contract's supplemental-only
-// rule (docs/contract/backend-design.md:1514, only-adds) — the same subtraction
-// that split this middleware off the global mount in the first place.
+// Collection reads (`GET /`, `POST /search`, `GET /recent`,
+// `GET /recent/creators`) also carry requireSpaceMembership. Their repositories
+// query Space-qualified principals, so the client-supplied X-Space-Id must first
+// be upgraded into the trusted req.principalSpaceId by an active-membership check.
+// A forged Space therefore fails with 404 before any principal-qualified query.
 //
 // The `/:docId` routes below also do NOT carry it: requireDocRole is strictly
-// stronger there (real-uid role resolution + requireSameSpace pinning req.spaceId
-// to meta.space_id).
+// stronger there (real-uid role resolution + principal-qualified direct-role resolution for Bot/Human requests).
 // See api/middleware/spaceContext.ts for why this is per-route, not global.
 docsRouter.post('/', requireSpaceMembership, createDocHandler)
+
+/** Notify the backend after HTML content is durably published. */
+export async function publishHtmlHandler(req: Request, res: Response) {
+  if (req.botToken === undefined) {
+    res.status(403).json({ error: 'forbidden' })
+    return
+  }
+  const meta = await docMetaRepo.getByDocId(req.params.docId!)
+  if (!meta || meta.space_id !== req.spaceId) {
+    res.status(404).json({ error: 'not_found' })
+    return
+  }
+  if (meta.owner_id !== req.uid) {
+    res.status(403).json({ error: 'forbidden' })
+    return
+  }
+  if (meta.status === 0) {
+    res.status(410).json({ error: 'canonical_document_deleted' })
+    return
+  }
+  if (meta.status === 2 || meta.doc_type !== HTML_DOC_TYPE) {
+    res.status(409).json({ error: meta.status === 2 ? 'document_archived' : 'wrong_document_type' })
+    return
+  }
+  const { title } = req.body ?? {}
+  if (title !== undefined && (typeof title !== 'string' || title.length > 512)) {
+    res.status(400).json({ error: typeof title === 'string' ? 'title too long' : 'invalid_title' })
+    return
+  }
+  if (typeof title === 'string') await docMetaRepo.rename(meta.doc_id, title, req.uid!)
+  let indexed = false
+  if (config.search.indexEnabled && isSearchIndexedDoc(meta.document_name)) {
+    indexed = await enqueueDocIndex(meta.document_name)
+  }
+  res.status(200).json({ docId: meta.doc_id, title: typeof title === 'string' ? title : meta.title, indexed })
+}
+
+docsRouter.post('/:docId/published', publishHtmlHandler)
 
 /** GET /api/v1/docs/{docId} — fetch one doc's metadata (needs reader). */
 export async function getDocHandler(req: Request, res: Response) {
@@ -337,13 +421,17 @@ export async function getDocHandler(req: Request, res: Response) {
     // Canonical browser-facing link a caller can pass straight to chat. See
     // buildDocShareUrl / config.webOrigin.
     shareUrl: buildDocShareUrl(config.webOrigin, meta.doc_id, meta.space_id),
-    // #64: additive share-scope fields so the client dialog can render current
-    // state without a second round-trip to GET /:docId/share. Coerced through the
-    // fail-safe name mappers, so an unexpected stored value reads as the most
-    // restrictive (restricted / read).
-    shareScope: shareScopeName(meta.share_scope),
-    shareRole: shareRoleName(meta.share_role),
-    ...(meta.permission_epoch != null ? { permissionEpoch: meta.permission_epoch } : {}),
+    // Human metadata carries the complete dialog state. Bot metadata uses the
+    // same restricted projection as the dedicated share endpoints so Human-only
+    // controls cannot leak through an alternate response surface.
+    ...(req.botToken !== undefined
+      ? botShareProjection(meta.share_scope, meta.share_role, meta.permission_epoch)
+      : {
+          shareScope: shareScopeName(meta.share_scope),
+          shareRole: shareRoleName(meta.share_role),
+          spaceSearchable: meta.discoverability_scope === DISCOVERABILITY_SPACE,
+          ...(meta.permission_epoch != null ? { permissionEpoch: meta.permission_epoch } : {}),
+        }),
   })
 }
 
@@ -376,7 +464,7 @@ export async function listDocsHandler(req: Request, res: Response) {
   // branch outright, so skip the membership lookup entirely in that case.
   const isSpaceMember = owner === 'me' ? false : await resolveViewerSpaceMembership(req)
 
-  const { total, items } = await docMetaRepo.listForUser({ uid, spaceId, isSpaceMember, folderId, owner, ownedBots, q, types, page, pageSize, sort })
+  const { total, items } = await docMetaRepo.listForUser({ uid, spaceId, principalSpaceId: req.principalSpaceId!, isSpaceMember, folderId, owner, ownedBots, q, types, page, pageSize, sort })
   const visibleItems = items.flatMap((d) => {
     const role = roleName(Number(d.role))
     if (!role) return []
@@ -469,6 +557,7 @@ export async function searchDocsHandler(req: Request, res: Response) {
   const visibleDocIds = await docMetaRepo.listVisibleDocIdSet({
     uid,
     spaceId,
+    principalSpaceId: req.principalSpaceId!,
     docType,
     isSpaceMember,
     limit: config.search.maxVisibleTerms,
@@ -565,7 +654,7 @@ export async function listRecentHandler(req: Request, res: Response) {
   const isSpaceMember = await resolveViewerSpaceMembership(req)
   let result
   try {
-    result = await docViewHistoryRepo.listRecent({ uid, spaceId, isSpaceMember, q, creators, types, cursor, pageSize })
+    result = await docViewHistoryRepo.listRecent({ uid, spaceId, principalSpaceId: req.principalSpaceId!, isSpaceMember, q, creators, types, cursor, pageSize })
   } catch (err) {
     if (err instanceof Error && err.message === 'invalid_cursor') {
       res.status(400).json({ error: 'invalid_cursor' })
@@ -625,7 +714,7 @@ export async function listRecentCreatorsHandler(req: Request, res: Response) {
   const spaceId = req.spaceId!
   const q = typeof req.query.q === 'string' ? req.query.q : undefined
   const isSpaceMember = await resolveViewerSpaceMembership(req)
-  const ownerIds = await docViewHistoryRepo.listCreators({ uid, spaceId, isSpaceMember, q })
+  const ownerIds = await docViewHistoryRepo.listCreators({ uid, spaceId, principalSpaceId: req.principalSpaceId!, isSpaceMember, q })
   const nameByUid = new Map<string, string>()
   if (ownerIds.length > 0) {
     const users = await getOctoIdentity().getUsers(ownerIds, req.octoToken)
@@ -660,6 +749,38 @@ async function resolveDocIdBySlug(req: Request, res: Response): Promise<string |
     return null
   }
   return meta.doc_id
+}
+
+/**
+ * Resolve a canonical HTML delete target. An already soft-deleted row is visible
+ * only to its owning authenticated principal, which makes the retry idempotent
+ * without allowing unrelated callers to probe deleted document existence.
+ */
+async function resolveCanonicalDeleteBySlug(req: Request, res: Response): Promise<{ docId: string; deleted: boolean } | null> {
+  const meta = await docMetaRepo.getByOctoDocSlug(req.params.octoDocSlug!, req.spaceId!)
+  if (!meta) {
+    res.status(404).json({ error: 'not_found' })
+    return null
+  }
+  if (meta.status === 0) {
+    // Only the canonical identity contract is idempotent here. Historical
+    // slug-registered rows retain their existing 404 behavior.
+    //
+    // slug === doc_id is a convention, not proof of canonical provenance: the
+    // slug charset admits a `d_…` string, so a legacy registration can pick one
+    // equal to its own doc id. Only the canonical insert populates
+    // html_idempotency_key_hash, so that column is the actual discriminator.
+    if (
+      meta.owner_id === req.uid &&
+      meta.html_idempotency_key_hash != null &&
+      meta.octo_doc_slug === meta.doc_id
+    ) {
+      return { docId: meta.doc_id, deleted: true }
+    }
+    res.status(404).json({ error: 'not_found' })
+    return null
+  }
+  return { docId: meta.doc_id, deleted: false }
 }
 
 async function renameDocById(req: Request, res: Response, docId: string): Promise<void> {
@@ -712,9 +833,13 @@ export async function octoDocRenameHandler(req: Request, res: Response): Promise
 }
 
 export async function octoDocDeleteHandler(req: Request, res: Response): Promise<void> {
-  const docId = await resolveDocIdBySlug(req, res)
-  if (!docId) return
-  await deleteDocById(req, res, docId)
+  const target = await resolveCanonicalDeleteBySlug(req, res)
+  if (!target) return
+  if (target.deleted) {
+    res.status(204).end()
+    return
+  }
+  await deleteDocById(req, res, target.docId)
 }
 
 /** PATCH /api/v1/docs/{docId} — rename (needs admin). */
@@ -742,10 +867,27 @@ docsRouter.delete('/:docId', deleteDocHandler)
 export async function getShareHandler(req: Request, res: Response) {
   const guard = await requireDocRole(req, res, req.params.docId!, 'reader')
   if (!guard) return
+  // The Bot contract intentionally exposes only Bot-manageable settings. The
+  // authenticated-link scope and Space-search discoverability are Human-only:
+  // omit them here as well as rejecting writes below, so Bot clients cannot
+  // discover or mirror those controls from the read response.
+  if (req.botToken !== undefined) {
+    res.status(200).json({
+      docId: guard.meta.doc_id,
+      ...botShareProjection(
+        guard.meta.share_scope,
+        guard.meta.share_role,
+        guard.meta.permission_epoch,
+      ),
+    })
+    return
+  }
   res.status(200).json({
     docId: guard.meta.doc_id,
     shareScope: shareScopeName(guard.meta.share_scope),
     shareRole: shareRoleName(guard.meta.share_role),
+    spaceSearchable: guard.meta.discoverability_scope === DISCOVERABILITY_SPACE,
+    permissionEpoch: guard.meta.permission_epoch,
   })
 }
 
@@ -754,12 +896,14 @@ export async function getShareHandler(req: Request, res: Response) {
  * admin; owner is implicit admin). Mirrors the members mutation shape: guard,
  * validate, write, bump epoch.
  *
- *   body: { shareScope: "restricted"|"anyone_in_space", shareRole?: "read"|"edit" }
+ *   body: { shareScope: "restricted"|"anyone_in_space"|"authenticated",
+ *           shareRole?: "read"|"comment"|"edit" }
  *   400 invalid_scope   shareScope not in enum
  *   400 invalid_role    shareScope=anyone_in_space but shareRole missing/invalid
+ *   400 invalid_permission_epoch  missing/malformed optimistic-concurrency token
  *   403 forbidden       caller is not admin/owner (requireDocRole admin gate)
  *   404 not_found       doc missing/deleted OR cross-space
- *   409 conflict        archived (status=2)
+ *   409 share_settings_conflict  permissionEpoch no longer current
  *
  * Normalization (design §3.2): when shareScope=restricted the handler persists
  * share_role=read regardless of any shareRole sent (the field is ignored, not
@@ -770,17 +914,41 @@ export async function getShareHandler(req: Request, res: Response) {
 export async function putShareHandler(req: Request, res: Response) {
   const guard = await requireDocRole(req, res, req.params.docId!, 'admin')
   if (!guard) return
-  const { shareScope, shareRole } = req.body ?? {}
+  const { shareScope, shareRole, spaceSearchable, permissionEpoch } = req.body ?? {}
+  if (!Number.isInteger(permissionEpoch) || permissionEpoch < 0) {
+    res.status(400).json({ error: 'invalid_permission_epoch' })
+    return
+  }
   const scopeNum = parseShareScope(shareScope)
   if (scopeNum === null) {
     res.status(400).json({ error: 'invalid_scope' })
     return
   }
+  const isBotRequest = req.botToken !== undefined
+  if (isBotRequest) {
+    // These controls are absent from the Bot API contract. Keep a server-side
+    // boundary too: custom Bot clients must not opt all logged-in users into
+    // access, toggle Space search, or replace a Human-selected authenticated scope.
+    if (
+      scopeNum === SHARE_SCOPE_AUTHENTICATED ||
+      Object.prototype.hasOwnProperty.call(req.body ?? {}, 'spaceSearchable')
+    ) {
+      res.status(400).json({ error: 'unsupported_share_settings' })
+      return
+    }
+    if (guard.meta.share_scope === SHARE_SCOPE_AUTHENTICATED) {
+      res.status(403).json({ error: 'forbidden' })
+      return
+    }
+  }
   let roleNum: number
-  if (scopeNum === SHARE_SCOPE_ANYONE) {
+  if (scopeNum !== SHARE_SCOPE_RESTRICTED) {
     // anyone_in_space requires an explicit, valid share role.
     const parsed = parseShareRole(shareRole)
-    if (parsed === null) {
+    const allowed = guard.meta.doc_type === 'html'
+      ? [SHARE_ROLE_READ, SHARE_ROLE_COMMENT]
+      : [SHARE_ROLE_READ, SHARE_ROLE_COMMENT, SHARE_ROLE_EDIT]
+    if (parsed === null || !allowed.includes(parsed)) {
       res.status(400).json({ error: 'invalid_role' })
       return
     }
@@ -789,17 +957,61 @@ export async function putShareHandler(req: Request, res: Response) {
     // restricted: normalize+persist read, ignoring any body shareRole.
     roleNum = SHARE_ROLE_READ
   }
+  // Bot writes preserve the Human-owned discoverability bit exactly. Human
+  // writes retain the existing partial-update behavior.
+  const searchable = isBotRequest
+    ? guard.meta.discoverability_scope === DISCOVERABILITY_SPACE
+    : spaceSearchable ?? guard.meta.discoverability_scope === DISCOVERABILITY_SPACE
+  if (typeof searchable !== 'boolean') {
+    res.status(400).json({ error: 'invalid_share_settings' })
+    return
+  }
   // Flip the share settings AND bump the epoch atomically (one transaction), so
   // a narrowing is never observable at the new scope with a stale epoch. Then
   // refresh caches + publish the doc-wide invalidation (no uid) so every
   // non-member's live session re-derives access (§3.2 / §5.3), mirroring the
   // softDelete -> refreshAndPublish path.
-  const newEpoch = await docMetaRepo.setShareSettings(guard.meta.doc_id, scopeNum, roleNum)
-  await refreshAndPublish(guard.meta.document_name, newEpoch)
+  const result = await docMetaRepo.setShareSettings(
+    guard.meta.doc_id,
+    scopeNum,
+    roleNum,
+    searchable,
+    permissionEpoch,
+  )
+  if (!result.updated) {
+    res.status(409).json({
+      error: 'share_settings_conflict',
+      ...(result.current ? {
+        current: {
+          docId: guard.meta.doc_id,
+          ...(isBotRequest
+            ? botShareProjection(
+                result.current.shareScope,
+                result.current.shareRole,
+                result.current.permissionEpoch,
+              )
+            : {
+                shareScope: shareScopeName(result.current.shareScope),
+                shareRole: shareRoleName(result.current.shareRole),
+                spaceSearchable: result.current.spaceSearchable,
+                permissionEpoch: result.current.permissionEpoch,
+              }),
+        },
+      } : {}),
+    })
+    return
+  }
+  await refreshAndPublish(guard.meta.document_name, result.settings.permissionEpoch)
   res.status(200).json({
     docId: guard.meta.doc_id,
-    shareScope: shareScopeName(scopeNum),
-    shareRole: shareRoleName(roleNum),
+    ...(isBotRequest
+      ? botShareProjection(scopeNum, roleNum, result.settings.permissionEpoch)
+      : {
+          shareScope: shareScopeName(scopeNum),
+          shareRole: shareRoleName(roleNum),
+          spaceSearchable: searchable,
+          permissionEpoch: result.settings.permissionEpoch,
+        }),
   })
 }
 
@@ -865,18 +1077,30 @@ export async function openContextHandler(req: Request, res: Response): Promise<v
     res.status(404).json({ error: 'not_found' })
     return
   }
-  if (!(await requireVerifiedHumanHomeSpace(req, res, meta))) return
-  // Compute role WITHOUT returning any metadata. Human open-context: membership
-  // for an anyone_in_space doc is resolved against the doc's HOME Space
-  // (meta.space_id) via the caller's own token — never a client header.
-  const direct = await resolveRole(uid, docId)
-  const role = await resolveEffectiveRole(uid, direct, meta, { isBot: false, token: req.octoToken })
+  if (!(await requireVerifiedHumanCurrentSpace(req, res, meta))) return
+  // Resolve the direct ACL against the caller's server-verified CURRENT Space;
+  // share-derived access is independently evaluated against the document home Space.
+  const principalSpaceId = await resolveRequestPrincipalSpace(req)
+  if (!principalSpaceId) {
+    res.status(403).json({ error: 'principal_space_unverified' })
+    return
+  }
+  const direct = await resolveRole(uid, docId, principalSpaceId)
+  const role = await resolveEffectiveRole(uid, direct, meta, {
+    isBot: false,
+    principalSpaceId,
+    token: req.octoToken,
+  })
   if (role === 'none') {
     // See the titleOn403 rationale in this handler's doc comment. Omitted rather than sent empty
     // when the stored title is blank, so the client can distinguish "no title disclosed" from
     // "the title is an empty string" and never renders a placeholder as the document's name.
     const title = typeof meta.title === 'string' && meta.title.trim() !== '' ? meta.title : undefined
-    res.status(403).json({ error: 'forbidden', ...(title ? { title } : {}) })
+    res.status(403).json({
+      error: 'forbidden',
+      ...(title ? { title } : {}),
+      docType: meta.doc_type,
+    })
     return
   }
   // Only now — the caller is at least a reader — may archived/locked state be
@@ -904,7 +1128,11 @@ export async function openContextHandler(req: Request, res: Response): Promise<v
  * issues a v2 token bound to them; never derives the doc from `sp`/`X-Space-Id`.
  */
 export async function docIdCollabTokenHandler(req: Request, res: Response): Promise<void> {
-  const out = await issueCollabTokenByDocId(req.uid!, req.params.docId!, req.octoToken ?? '', req.viewerSpaceId)
+  const candidate = (req.viewerSpaceId ?? '').trim()
+  if (!candidate) { res.status(403).json({ error: 'space_required' }); return }
+  const principalSpaceId = await resolveRequestPrincipalSpace(req)
+  if (!principalSpaceId) { res.status(403).json({ error: 'forbidden' }); return }
+  const out = await issueCollabTokenByDocId(req.uid!, req.params.docId!, req.octoToken ?? '', principalSpaceId)
   if (!out.ok) {
     res.status(out.status).json({ error: out.error })
     return
@@ -926,10 +1154,10 @@ export const spaceCollectionRouter: ExpressRouter = Router()
 // confirmed members; gating those reads would subtract legitimate cross-Space
 // direct grants.
 spaceCollectionRouter.post('/', spaceContextMiddleware, requireSpaceMembership, createDocHandler)
-spaceCollectionRouter.get('/', spaceContextMiddleware, listDocsHandler)
-spaceCollectionRouter.post('/search', spaceContextMiddleware, searchDocsHandler)
-spaceCollectionRouter.get('/recent', spaceContextMiddleware, listRecentHandler)
-spaceCollectionRouter.get('/recent/creators', spaceContextMiddleware, listRecentCreatorsHandler)
+spaceCollectionRouter.get('/', spaceContextMiddleware, requireSpaceMembership, listDocsHandler)
+spaceCollectionRouter.post('/search', spaceContextMiddleware, requireSpaceMembership, searchDocsHandler)
+spaceCollectionRouter.get('/recent', spaceContextMiddleware, requireSpaceMembership, listRecentHandler)
+spaceCollectionRouter.get('/recent/creators', spaceContextMiddleware, requireSpaceMembership, listRecentCreatorsHandler)
 
 /**
  * Human DocumentResourceRouter (remove-sp §6): every single-document operation,

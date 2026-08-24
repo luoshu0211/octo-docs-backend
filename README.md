@@ -46,6 +46,10 @@ Key design invariants (from the contract):
   singleflight DB fallback; revocation/downgrade is real-time (§4.5).
 - **documentName** = `octo:{space}:{folder}:{doc}` (4 segments); whiteboard keys
   are 5 segments with `parts[3]==='wb'` and are rejected here (§4.1/§8.1).
+- **Limited invite accounting** is per Space-qualified principal
+  `(uid, principalSpaceId)`: repeated acceptance by the same principal consumes
+  one use, while the same uid accepting in distinct verified Spaces consumes
+  one use in each Space.
 
 ---
 
@@ -72,9 +76,9 @@ Copy `.env.example` to `.env` and adjust. Summary:
 | `MYSQL_*` | authoritative store connection | §3.4 |
 | `REDIS_*` (incl. `REDIS_PREFIX`) | broadcast bus / cache / registry | §5 |
 | `COLLAB_TOKEN_SECRET` / `COLLAB_TOKEN_TTL_SECONDS` | collab JWT signing + TTL (5 min) | §4.4 |
-| `COLLAB_ALLOW_LEGACY_TOKENS_WITHOUT_HOME_SPACE_PROOF` | temporary rollout compatibility for pre-hotfix collab tokens; strict by default | §4.4 / deployment guide |
+| `COLLAB_ALLOW_LEGACY_TOKENS_WITHOUT_HOME_SPACE_PROOF` | temporary Home-Space/PPT compatibility only; it never bypasses Docs current-Space proof | §4.4 / deployment guide |
 | `OCTO_IDENTITY_MODE` (`http`/`middleware`) / `OCTO_SERVER_BASE_URL` | octo identity integration | §4.7 |
-| `OCTO_SERVER_TOKEN` | service token for octo-server lookups on the human path (optional). The bot path (`/v1/bot/docs`) resolves the anti ghost-member existence check via the bot's own token against the bot user-info route, so this service token is no longer required for bot member-add or forward-grant | §4.7 / v4.3 bot API |
+| `OCTO_SERVER_TOKEN` | service token for octo-server directory lookups. Human member-add/delete use `req.octoToken`; Bot member-add/delete must use this service token (never the Bot bearer) and fail closed with 503 when it is unset. Bot-realm operations such as forward-grant may use the Bot token against the Bot user-info route | §4.7 / v4.3 bot API |
 | `MAX_DOC_BYTES` | single-doc size hard cap (~10MB) | §9.5 |
 | `SEARCH_ENABLED` / `SEARCH_PAGE_SIZE_MAX` / `SEARCH_MAX_VISIBLE_TERMS` | full-text doc search: feature switch, per-page hit cap, and the OpenSearch `doc_id IN` down-push bound (over bound ⇒ 503 `terms_limit_exceeded`) | search |
 | `OPENSEARCH_NODE` / `OPENSEARCH_USERNAME` / `OPENSEARCH_PASSWORD` | read-only OpenSearch client for the `octo-doc` index | search |
@@ -340,4 +344,3 @@ Honest accounting of what is **stubbed / deferred** for the next round:
   default-off alternative; not implemented.
 - **Integration tests** — only offline unit tests this round. No live
   MySQL/Redis integration suite yet.
-

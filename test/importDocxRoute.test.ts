@@ -83,6 +83,7 @@ function req(body: unknown, headers: Record<string, string> = {}): Request {
   return {
     uid: 'u1',
     spaceId: 's1',
+    principalSpaceId: 's1',
     params: { docId: 'd1' },
     body,
     header: (name: string) => headers[name.toLowerCase()],

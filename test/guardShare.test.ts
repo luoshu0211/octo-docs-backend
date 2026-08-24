@@ -48,6 +48,7 @@ const meta = (over: Record<string, unknown> = {}) => ({
   doc_id: DOC,
   document_name: 'octo:s1:f_default:d_1',
   owner_id: 'u_owner',
+  owner_space_id: SPACE,
   space_id: SPACE,
   folder_id: 'f_default',
   doc_type: 'doc',
@@ -88,13 +89,16 @@ async function run(opts: {
   const dr = opts.directRole ?? 'none'
   vi.mocked(docMemberRepo.getRole).mockResolvedValue((dr === 'none' ? null : dr) as never)
   const res = mockRes()
+  const scope = opts.scope ?? { mode: 'human' as const }
+  const principalSpaceId = scope.mode === 'bot' ? scope.spaceId : SPACE
   const req = {
     uid: opts.uid,
-    octoToken: opts.octoToken,
-    docSpaceScope: opts.scope ?? { mode: 'human' as const },
-    ...(opts.scope?.mode === 'bot' ? {} : {
-      viewerSpaceId: loadedMeta.space_id,
-      verifiedViewerSpaceId: loadedMeta.space_id,
+    octoToken: opts.octoToken ?? 'session',
+    principalSpaceId,
+    docSpaceScope: scope,
+    ...(scope.mode === 'bot' ? {} : {
+      viewerSpaceId: principalSpaceId,
+      verifiedViewerSpaceId: principalSpaceId,
     }),
   }
   const guard = await requireDocRole(req as never, res as never, DOC, opts.minRole)
@@ -182,6 +186,19 @@ describe('requireDocRole — anyone_in_space (§5.2.c)', () => {
     expect(res.statusCode).toBe(403)
   })
 
+  it('does not inherit Home-Space sharing while the verified current Space is different', async () => {
+    memberReturns(true)
+    const { res, guard } = await run({
+      uid: 'u_member_of_both',
+      minRole: 'reader',
+      metaOver: { ...A, space_id: 's_home' },
+      directRole: 'none',
+    })
+    expect(res.statusCode).toBe(403)
+    expect(guard).toBeNull()
+    expect(calls).toBe(0)
+  })
+
   it('A3: membership lookup THROWS => fail-closed 403 (isSpaceMember swallows to false in prod; guard must not open)', async () => {
     // The Http impl fails closed to false; here we assert the guard denies when
     // the identity reports non-member (the lookup-failure surface).
@@ -196,6 +213,26 @@ describe('requireDocRole — anyone_in_space (§5.2.c)', () => {
     const { guard } = await run({ uid: 'u_owner', minRole: 'reader', metaOver: A })
     expect(guard?.role).toBe('admin')
     expect(calls).toBe(0) // lazy: direct role already >= minRole
+  })
+})
+
+describe('requireDocRole — authenticated scope', () => {
+  it('grants an external authenticated Human reader without document-home membership', async () => {
+    memberReturns(false)
+    const { guard } = await run({ uid: 'u_external', minRole: 'reader', metaOver: { share_scope: 2, share_role: 1 } })
+    expect(guard?.role).toBe('reader')
+    expect(calls).toBe(0)
+  })
+
+  it('grants edit when configured and spaceSearchable=false does not affect direct authorization', async () => {
+    memberReturns(false)
+    const { guard } = await run({
+      uid: 'u_external',
+      minRole: 'writer',
+      metaOver: { share_scope: 2, share_role: 2, discoverability_scope: 0 },
+    })
+    expect(guard?.role).toBe('writer')
+    expect(calls).toBe(0)
   })
 })
 

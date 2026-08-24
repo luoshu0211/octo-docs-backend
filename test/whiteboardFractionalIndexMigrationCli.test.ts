@@ -16,18 +16,23 @@ import { ELEMENTS_FIELD, isValidIndex } from '../src/whiteboard/schema/index.js'
 import { readElements } from '../src/whiteboard/ydoc.js'
 
 // In-memory yjs_document store shared between the pool/repo mocks and the tests.
+// The mock mirrors the real repo contract: rows carry an `encoding`, and the
+// tx-level read hands back `{ state, encoding }` rather than bare bytes. The
+// fixtures here are all v1, which is what the migration must keep them as.
 const h = vi.hoisted(() => {
   const store = new Map<string, Buffer>()
-  const upsertStateTx = vi.fn(async (_tx: unknown, name: string, state: Buffer) => {
-    store.set(name, Buffer.from(state))
-  })
+  const upsertStateTx = vi.fn(
+    async (_tx: unknown, name: string, state: Buffer, _encoding?: number) => {
+      store.set(name, Buffer.from(state))
+    },
+  )
   const selectForUpdateTx = vi.fn(async (_tx: unknown, name: string) => {
     const buf = store.get(name)
-    return buf ? new Uint8Array(buf) : null
+    return buf ? { state: new Uint8Array(buf), encoding: 1 as const } : null
   })
   // scanVictims issues one SELECT; return every row in the store.
   const query = vi.fn(async () =>
-    [...store.entries()].map(([document_name, state]) => ({ document_name, state })),
+    [...store.entries()].map(([document_name, state]) => ({ document_name, state, encoding: 1 })),
   )
   const transaction = vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn({})) as unknown
   return { store, upsertStateTx, selectForUpdateTx, query, transaction }

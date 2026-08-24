@@ -193,6 +193,7 @@ export async function patchDocContentHandler(req: Request, res: Response): Promi
       uid: req.uid!,
       docId: guard.meta.doc_id,
       documentName: guard.meta.document_name,
+      principalSpaceId: req.principalSpaceId!,
       clientBaseVersion: parseBaseVersion(baseVersionRaw),
       ops,
       authorizedEpoch: guard.meta.permission_epoch,

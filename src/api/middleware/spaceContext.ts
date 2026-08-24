@@ -121,6 +121,7 @@ export async function requireSpaceMembership(
   // Bot mount: req.spaceId came from verifyBot's server-side reverse lookup, so
   // it is already authoritative and there is no session token to verify with.
   if (req.botToken !== undefined) {
+    req.principalSpaceId = req.spaceId
     next()
     return
   }
@@ -132,5 +133,9 @@ export async function requireSpaceMembership(
     res.status(404).json({ error: 'not_found' })
     return
   }
+  // The membership check upgrades the caller-supplied candidate into the trusted
+  // principal used by every Space-qualified repository query. Without this handoff,
+  // collection handlers pass `undefined` into `(uid, principal_space_id)` SQL binds.
+  req.principalSpaceId = req.spaceId
   next()
 }

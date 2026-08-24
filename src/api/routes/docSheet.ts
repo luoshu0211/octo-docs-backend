@@ -535,6 +535,7 @@ export async function patchDocSheetHandler(req: Request, res: Response): Promise
       uid: req.uid!,
       docId: guard.meta.doc_id,
       documentName: guard.meta.document_name,
+      principalSpaceId: req.principalSpaceId!,
       clientBaseVersion: parseBaseVersion(baseVersionRaw),
       cells,
       dims,

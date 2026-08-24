@@ -170,6 +170,7 @@ function seedDoc(over: Partial<FakeMeta> = {}): void {
     doc_id: 'd_ppt1',
     document_name: 'octo:s_1:f_default:ppt:d_ppt1',
     owner_id: 'u_owner',
+    owner_space_id: 's_1',
     space_id: 's_1',
     doc_type: 'html_ppt',
     status: 1,

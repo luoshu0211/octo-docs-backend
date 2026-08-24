@@ -20,6 +20,7 @@ import { Node as PMNode, type Schema } from 'prosemirror-model'
 import { Transform } from 'prosemirror-transform'
 import { buildSchema, COLLAB_FIELD, sanitizeBlockAttrValues } from '../schema/index.js'
 import { reconcileFragment, SchemaIncompatibleError } from './versionRestore.js'
+import { persistedByteLength } from './persistedEncoding.js'
 
 /**
  * The single shared schema instance for the whole doc-body-edit feature. A
@@ -388,13 +389,22 @@ export function applyIncrementalOps(currentDoc: PMNode, ops: DocEditOp[], schema
  * update. A from-scratch encode would be strictly smaller (fresh clientId, no
  * accumulated history) and could pass the pre-check only to have the live commit
  * broadcast-then-fail on store — this closes that fail-closed hole.
+ *
+ * The measure MUST come from persistedByteLength, not from a local
+ * `Y.encodeStateAsUpdate`: the store cap is applied to the bytes actually
+ * written, so a hardcoded encoder here would make this gate measure a different
+ * dimension than the cap it claims to mirror. Concretely, with v2 writes on, a
+ * document in the band "v1 over cap, v2 under cap" (the 2026-08-21 incident sheet
+ * sat there: 18.3 MB v1 vs 6.07 MB v2) would 413 every REST edit while collab
+ * saved it fine — including the delete-only edits needed to shrink it, since
+ * tombstones keep the v1 encoding over the cap.
  */
 export function sizeAfterEdit(preEditState: Uint8Array, newDoc: PMNode): number {
   const scratch = new Y.Doc()
   Y.applyUpdate(scratch, preEditState)
   const fragment = scratch.get(COLLAB_FIELD, Y.XmlFragment)
   scratch.transact(() => reconcileFragment(newDoc, fragment))
-  return Y.encodeStateAsUpdate(scratch).length
+  return persistedByteLength(scratch)
 }
 
 // ── attachment reference validation (locked contract item 8) ────────────────────

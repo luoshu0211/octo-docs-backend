@@ -30,6 +30,7 @@ import {
   schema as sharedSchema,
   type DocEditOp,
 } from './docBodyEdit.js'
+import { persistedByteLength } from './persistedEncoding.js'
 
 /**
  * Doc-private field holding the monotonic edit-version counter (defect ②). It is
@@ -137,7 +138,9 @@ export async function commitLiveEdit(
       //     state vector forward (defect ②); the token is read AFTER this bump.
       advanceEditVersion(doc)
       newSV = Y.encodeStateVector(doc)
-      bytes = Y.encodeStateAsUpdate(doc).length
+      // Same dimension the store caps/writes (persistedEncoding), so the size we
+      // report back to the caller can be compared against maxDocBytes at all.
+      bytes = persistedByteLength(doc)
     })
   } finally {
     // Awaited flush -> persistence.store (re-caps + re-stamps updated_by).

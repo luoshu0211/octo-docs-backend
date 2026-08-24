@@ -26,6 +26,7 @@ import jwt from 'jsonwebtoken'
 import { randomUUID } from 'node:crypto'
 import { config } from '../config/env.js'
 import { getRedis, rkey } from '../db/redis.js'
+import { parseDocumentName } from '../permission/documentName.js'
 import type { Role } from '../permission/role.js'
 
 /** JWT audience for the primary relay token. */
@@ -45,6 +46,7 @@ export interface PptCollabClaims {
   documentName: string
   role: Role
   permission_epoch: number
+  principal_space_id: string
   /** Server-trusted display name resolved at issuance; absent when unknown. */
   name?: string
   /**
@@ -97,6 +99,7 @@ export interface IssuePptCollabInput {
   documentName: string
   role: Role
   permission_epoch: number
+  principalSpaceId: string
   snapshotVersion: number
   name?: string
   /** Caller's space-membership at issuance (fold-in for share-derived re-resolve). */
@@ -119,6 +122,7 @@ export function issuePptCollabToken(input: IssuePptCollabInput): PptCollabTokenR
     documentName: input.documentName,
     role: input.role,
     permission_epoch: input.permission_epoch,
+    principal_space_id: input.principalSpaceId,
     ...(name !== undefined ? { name } : {}),
     ...(input.spaceMember !== undefined ? { space_member: input.spaceMember } : {}),
     home_space_verified: input.homeSpaceVerified,
@@ -166,6 +170,7 @@ function parseClaims(decoded: unknown): PptCollabClaims & { jti?: string } {
     documentName,
     role,
     permission_epoch: epoch,
+    principal_space_id: principalSpaceId,
     name,
     jti,
     space_member: spaceMember,
@@ -177,9 +182,22 @@ function parseClaims(decoded: unknown): PptCollabClaims & { jti?: string } {
     typeof docId !== 'string' ||
     typeof documentName !== 'string' ||
     (role !== 'reader' && role !== 'commenter' && role !== 'writer' && role !== 'admin') ||
-    typeof epoch !== 'number'
+    typeof epoch !== 'number' || (principalSpaceId !== undefined && (typeof principalSpaceId !== 'string' || principalSpaceId === ''))
   ) {
     throw new Error('invalid ppt collab token claims')
+  }
+  let effectivePrincipalSpaceId = principalSpaceId
+  if (effectivePrincipalSpaceId === undefined) {
+    // Rollout compatibility for an already-issued same-Space PPT credential. PPT access is still
+    // home-Space-only, so the canonical signed documentName is the only safe value to recover.
+    // Never emit an empty principal Space: every live role recheck is Space-qualified.
+    try {
+      const parsed = parseDocumentName(documentName)
+      if (parsed.kind !== 'ppt') throw new Error('not a ppt document name')
+      effectivePrincipalSpaceId = parsed.space
+    } catch {
+      throw new Error('invalid ppt collab token claims')
+    }
   }
   return {
     uid,
@@ -187,6 +205,7 @@ function parseClaims(decoded: unknown): PptCollabClaims & { jti?: string } {
     documentName,
     role,
     permission_epoch: epoch,
+    principal_space_id: effectivePrincipalSpaceId,
     ...(typeof name === 'string' && name !== '' ? { name } : {}),
     ...(typeof spaceMember === 'boolean' ? { space_member: spaceMember } : {}),
     ...(homeSpaceVerified === true ? { home_space_verified: true } : {}),

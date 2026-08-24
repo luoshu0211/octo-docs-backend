@@ -4,12 +4,13 @@
  * Document-autonomous membership. resolveRole queries this table + owner only
  * (§4.2); no group inheritance. PK (doc_id, uid) => at most one row per pair.
  */
-import { query, getPool, type Tx } from '../pool.js'
+import { query, getPool, transaction, type Tx } from '../pool.js'
 import { roleFromNumber, type Role } from '../../permission/role.js'
 
 export interface DocMemberRow {
   doc_id: string
   uid: string
+  principal_space_id: string
   role: number
   granted_by: string
   source: number // 1=direct 2=invite
@@ -35,10 +36,10 @@ const roleRankSql = (col: string): string => `FIELD(${col}, 1, 4, 2, 3)`
 
 export const docMemberRepo = {
   /** Read a single member row's role (§4.2 resolveRole). Returns undefined if no row. */
-  async getRole(docId: string, uid: string): Promise<Role | undefined> {
+  async getRole(docId: string, uid: string, principalSpaceId: string): Promise<Role | undefined> {
     const rows = await query<{ role: number }>(
-      'SELECT role FROM doc_member WHERE doc_id = ? AND uid = ? LIMIT 1',
-      [docId, uid],
+      'SELECT role FROM doc_member WHERE doc_id = ? AND uid = ? AND principal_space_id = ? LIMIT 1',
+      [docId, uid, principalSpaceId],
     )
     if (rows.length === 0) return undefined
     return roleFromNumber(Number(rows[0]!.role))
@@ -55,19 +56,97 @@ export const docMemberRepo = {
   async upsertDirect(params: {
     docId: string
     uid: string
+    principalSpaceId: string
     roleNum: number
     grantedBy: string
   }): Promise<void> {
     await query(
-      `INSERT INTO doc_member (doc_id, uid, role, granted_by, source, invite_token)
-       VALUES (?, ?, ?, ?, ${SOURCE_DIRECT}, '')
+      `INSERT INTO doc_member (doc_id, uid, principal_space_id, role, granted_by, source, invite_token)
+       VALUES (?, ?, ?, ?, ?, ${SOURCE_DIRECT}, '')
        ON DUPLICATE KEY UPDATE role = VALUES(role), granted_by = VALUES(granted_by)`,
-      [params.docId, params.uid, params.roleNum, params.grantedBy],
+      [params.docId, params.uid, params.principalSpaceId, params.roleNum, params.grantedBy],
     )
   },
 
-  async remove(docId: string, uid: string): Promise<void> {
-    await query('DELETE FROM doc_member WHERE doc_id = ? AND uid = ?', [docId, uid])
+  /**
+   * Precisely change an existing Space-qualified grant without creating one.
+   * Used for non-home-Space rows: cross-Space principals may be managed after
+   * they already exist, but this endpoint must never become an arbitrary grant
+   * creation path. Returns false when the exact compound principal is absent.
+   */
+  async updateExistingDirect(params: {
+    docId: string
+    uid: string
+    principalSpaceId: string
+    roleNum: number
+    grantedBy: string
+  }): Promise<boolean> {
+    const result = await query<{ affectedRows?: number }>(
+      `UPDATE doc_member
+         SET role = ?, granted_by = ?
+       WHERE doc_id = ? AND uid = ? AND principal_space_id = ?`,
+      [params.roleNum, params.grantedBy, params.docId, params.uid, params.principalSpaceId],
+    )
+    if ((result as unknown as { affectedRows?: number }).affectedRows! > 0) return true
+
+    // MySQL reports affectedRows=0 when the exact row already has these values.
+    // Distinguish that idempotent success from absence without ever INSERTing.
+    const rows = await query<{ present: number }>(
+      `SELECT 1 AS present FROM doc_member
+       WHERE doc_id = ? AND uid = ? AND principal_space_id = ? LIMIT 1`,
+      [params.docId, params.uid, params.principalSpaceId],
+    )
+    return rows.length > 0
+  },
+
+  async remove(docId: string, uid: string, principalSpaceId: string): Promise<void> {
+    await query('DELETE FROM doc_member WHERE doc_id = ? AND uid = ? AND principal_space_id = ?', [docId, uid, principalSpaceId])
+  },
+
+  /**
+   * Atomically remove one principal plus an optional set of Bots from the same
+   * Space and bump the document epoch exactly once. The caller derives botUids
+   * from Octo's authoritative Space Bot directory; this repository only applies
+   * the already Space-qualified set.
+   */
+  async removePrincipalWithBots(params: {
+    docId: string
+    principalSpaceId: string
+    uid: string
+    botUids: string[]
+  }): Promise<{ changed: boolean; removedUids: string[]; newEpoch?: number }> {
+    const uids = [...new Set([params.uid, ...params.botUids].filter((uid) => uid !== ''))]
+    return transaction(async (tx) => {
+      const placeholders = uids.map(() => '?').join(', ')
+      const present = await tx.query<{ uid: string }>(
+        `SELECT uid FROM doc_member
+         WHERE doc_id = ? AND principal_space_id = ? AND uid IN (${placeholders})
+         FOR UPDATE`,
+        [params.docId, params.principalSpaceId, ...uids],
+      )
+      const removedUids = [...new Set(present.map((row) => row.uid))]
+      if (removedUids.length === 0) return { changed: false, removedUids: [] }
+
+      const removedPlaceholders = removedUids.map(() => '?').join(', ')
+      await tx.query(
+        `DELETE FROM doc_member
+         WHERE doc_id = ? AND principal_space_id = ? AND uid IN (${removedPlaceholders})`,
+        [params.docId, params.principalSpaceId, ...removedUids],
+      )
+      await tx.query(
+        'UPDATE doc_meta SET permission_epoch = permission_epoch + 1 WHERE doc_id = ?',
+        [params.docId],
+      )
+      const epochRows = await tx.query<{ permission_epoch: number }>(
+        'SELECT permission_epoch FROM doc_meta WHERE doc_id = ? LIMIT 1',
+        [params.docId],
+      )
+      return {
+        changed: true,
+        removedUids,
+        newEpoch: Number(epochRows[0]?.permission_epoch ?? 0),
+      }
+    })
   },
 
   /**
@@ -99,28 +178,48 @@ export const docMemberRepo = {
   async upsertGrantMax(params: {
     docId: string
     uid: string
+    principalSpaceId: string
     roleNum: number
     grantedBy: string
   }): Promise<boolean> {
     const [result] = await getPool().execute(
-      `INSERT INTO doc_member (doc_id, uid, role, granted_by, source, invite_token)
-       VALUES (?, ?, ?, ?, ${SOURCE_DIRECT}, '')
+      `INSERT INTO doc_member (doc_id, uid, principal_space_id, role, granted_by, source, invite_token)
+       VALUES (?, ?, ?, ?, ?, ${SOURCE_DIRECT}, '')
        ON DUPLICATE KEY UPDATE
          granted_by = IF(${roleRankSql('VALUES(role)')} > ${roleRankSql('role')}, VALUES(granted_by), granted_by),
          role       = IF(${roleRankSql('VALUES(role)')} > ${roleRankSql('role')}, VALUES(role), role)`,
-      [params.docId, params.uid, params.roleNum, params.grantedBy] as never[],
+      [params.docId, params.uid, params.principalSpaceId, params.roleNum, params.grantedBy] as never[],
     )
     // mysql2 ResultSetHeader.affectedRows: insert => 1, real update => 2,
     // "no change" (already >= target) => 0. Non-zero means a genuine grant/upgrade.
     return (result as unknown as { affectedRows?: number }).affectedRows! > 0
   },
 
+  /** Transaction-scoped only-up grant used by atomic access-request approval. */
+  async upsertGrantMaxTx(tx: Tx, params: {
+    docId: string
+    uid: string
+    principalSpaceId: string
+    roleNum: number
+    grantedBy: string
+  }): Promise<boolean> {
+    const result = await tx.execute(
+      `INSERT INTO doc_member (doc_id, uid, principal_space_id, role, granted_by, source, invite_token)
+       VALUES (?, ?, ?, ?, ?, ${SOURCE_DIRECT}, '')
+       ON DUPLICATE KEY UPDATE
+         granted_by = IF(${roleRankSql('VALUES(role)')} > ${roleRankSql('role')}, VALUES(granted_by), granted_by),
+         role       = IF(${roleRankSql('VALUES(role)')} > ${roleRankSql('role')}, VALUES(role), role)`,
+      [params.docId, params.uid, params.principalSpaceId, params.roleNum, params.grantedBy],
+    )
+    return result.affectedRows > 0
+  },
+
   // ── transaction-scoped variants for the invite accept flow (§4.6) ──────────
 
-  async getRoleTx(tx: Tx, docId: string, uid: string): Promise<Role | undefined> {
+  async getRoleTx(tx: Tx, docId: string, uid: string, principalSpaceId: string): Promise<Role | undefined> {
     const rows = await tx.query<{ role: number }>(
-      'SELECT role FROM doc_member WHERE doc_id = ? AND uid = ? LIMIT 1',
-      [docId, uid],
+      'SELECT role FROM doc_member WHERE doc_id = ? AND uid = ? AND principal_space_id = ? LIMIT 1',
+      [docId, uid, principalSpaceId],
     )
     if (rows.length === 0) return undefined
     return roleFromNumber(Number(rows[0]!.role))
@@ -129,14 +228,14 @@ export const docMemberRepo = {
   /** Insert/rebuild a member row from an accepted invite (§4.6 branch c/d). */
   async upsertFromInviteTx(
     tx: Tx,
-    params: { docId: string; uid: string; roleNum: number; grantedBy: string; inviteToken: string },
+    params: { docId: string; uid: string; principalSpaceId: string; roleNum: number; grantedBy: string; inviteToken: string },
   ): Promise<void> {
     await tx.query(
-      `INSERT INTO doc_member (doc_id, uid, role, granted_by, source, invite_token)
-       VALUES (?, ?, ?, ?, ${SOURCE_INVITE}, ?)
+      `INSERT INTO doc_member (doc_id, uid, principal_space_id, role, granted_by, source, invite_token)
+       VALUES (?, ?, ?, ?, ?, ${SOURCE_INVITE}, ?)
        ON DUPLICATE KEY UPDATE role = VALUES(role), granted_by = VALUES(granted_by),
                                source = VALUES(source), invite_token = VALUES(invite_token)`,
-      [params.docId, params.uid, params.roleNum, params.grantedBy, params.inviteToken],
+      [params.docId, params.uid, params.principalSpaceId, params.roleNum, params.grantedBy, params.inviteToken],
     )
   },
 
@@ -148,13 +247,14 @@ export const docMemberRepo = {
    */
   async upsertDirectTx(
     tx: Tx,
-    params: { docId: string; uid: string; roleNum: number; grantedBy: string },
+    params: { docId: string; uid: string; principalSpaceId: string; roleNum: number; grantedBy: string },
   ): Promise<void> {
     await tx.query(
-      `INSERT INTO doc_member (doc_id, uid, role, granted_by, source, invite_token)
-       VALUES (?, ?, ?, ?, ${SOURCE_DIRECT}, '')
+      `INSERT INTO doc_member (doc_id, uid, principal_space_id, role, granted_by, source, invite_token)
+       VALUES (?, ?, ?, ?, ?, ${SOURCE_DIRECT}, '')
        ON DUPLICATE KEY UPDATE role = VALUES(role), granted_by = VALUES(granted_by)`,
-      [params.docId, params.uid, params.roleNum, params.grantedBy],
+      [params.docId, params.uid, params.principalSpaceId, params.roleNum, params.grantedBy],
     )
   },
+
 }

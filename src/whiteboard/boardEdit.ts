@@ -23,6 +23,7 @@ import {
   type FileRef,
 } from './schema/index.js'
 import { getElementsMap, getFilesMap, readEntry, writeEntryFields } from './ydoc.js'
+import { persistedByteLength } from '../collab/persistedEncoding.js'
 
 /**
  * Raised when an upsert element fails the frozen schema whitelist / normalize
@@ -223,6 +224,13 @@ export function applyBoardOpsToDoc(doc: Y.Doc, ops: ValidatedBoardOps): void {
  * measureSheetAfterEdit / sizeAfterEdit. Lets the write path reject an oversized
  * result in its no-lock pre-flight, before commitLiveBoardEdit applies the batch
  * to the shared live Y.Doc, broadcasts it, and only then fails at store. Pure.
+ *
+ * The measure goes through persistedByteLength so it is the SAME encoding the
+ * store writes. A hardcoded encoder here would make this gate cap a different
+ * dimension than the store does: with v2 writes on, a board in the band "v1 over
+ * cap, v2 under cap" would 413 every REST edit while collab saved it fine, and
+ * even its delete-only shrink edits would 413 (tombstones keep the v1 encoding
+ * over the cap), so a guard-marked board could never be brought back under.
  */
 export function measureBoardAfterEdit(
   preEditState: Uint8Array,
@@ -231,5 +239,5 @@ export function measureBoardAfterEdit(
   const scratch = new Y.Doc()
   Y.applyUpdate(scratch, preEditState)
   scratch.transact(() => applyBoardOpsToDoc(scratch, ops))
-  return { docBytes: Y.encodeStateAsUpdate(scratch).length }
+  return { docBytes: persistedByteLength(scratch) }
 }

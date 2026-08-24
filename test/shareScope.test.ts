@@ -7,8 +7,11 @@ import {
   parseShareRole,
   SHARE_SCOPE_RESTRICTED,
   SHARE_SCOPE_ANYONE,
+  SHARE_SCOPE_AUTHENTICATED,
   SHARE_ROLE_READ,
+  SHARE_ROLE_COMMENT,
   SHARE_ROLE_EDIT,
+  SHARE_ROLE_ADMIN,
 } from '../src/permission/shareScope.js'
 import type { ResolvedRole } from '../src/permission/role.js'
 
@@ -21,7 +24,9 @@ describe('effectiveRole — decision matrix (§5.2)', () => {
   const R = SHARE_SCOPE_RESTRICTED
   const A = SHARE_SCOPE_ANYONE
   const READ = SHARE_ROLE_READ
+  const COMMENT = SHARE_ROLE_COMMENT
   const EDIT = SHARE_ROLE_EDIT
+  const ADMIN = SHARE_ROLE_ADMIN
 
   describe('§5.2.b restricted docs — behavior identical to today (shareDerived=none)', () => {
     // A restricted doc IGNORES membership entirely: only the direct role counts,
@@ -59,6 +64,12 @@ describe('effectiveRole — decision matrix (§5.2)', () => {
     it('A5/A6: space member, no doc_member, share=edit => writer', () => {
       expect(effectiveRole('none', true, A, EDIT)).toBe('writer')
     })
+    it('space member, no doc_member, share=comment => commenter', () => {
+      expect(effectiveRole('none', true, A, COMMENT)).toBe('commenter')
+    })
+    it('historical share=admin degrades safely to reader', () => {
+      expect(effectiveRole('none', true, A, ADMIN)).toBe('reader')
+    })
     it('A7: doc_member writer on a read-share doc keeps writer (max, base wins)', () => {
       expect(effectiveRole('writer', true, A, READ)).toBe('writer')
     })
@@ -69,6 +80,15 @@ describe('effectiveRole — decision matrix (§5.2)', () => {
     })
     it('reader doc_member on an edit-share doc is RAISED to writer (max, share wins)', () => {
       expect(effectiveRole('reader', true, A, EDIT)).toBe('writer')
+    })
+  })
+
+  describe('authenticated docs', () => {
+    it('grants the configured role to any authenticated caller without Space membership', () => {
+      expect(effectiveRole('none', false, SHARE_SCOPE_AUTHENTICATED, READ)).toBe('reader')
+      expect(effectiveRole('none', false, SHARE_SCOPE_AUTHENTICATED, COMMENT)).toBe('commenter')
+      expect(effectiveRole('none', false, SHARE_SCOPE_AUTHENTICATED, EDIT)).toBe('writer')
+      expect(effectiveRole('none', false, SHARE_SCOPE_AUTHENTICATED, ADMIN)).toBe('reader')
     })
   })
 
@@ -84,12 +104,12 @@ describe('effectiveRole — decision matrix (§5.2)', () => {
 
   describe('§5.1/§2 fail-safe coercion of unexpected stored values', () => {
     it('any share_scope !== 1 is treated as restricted (shareDerived=none)', () => {
-      for (const scope of [2, 9, -1, 99]) {
+      for (const scope of [9, -1, 99]) {
         expect(effectiveRole('none', true, scope, EDIT)).toBe('none')
       }
     })
     it('any share_role !== 2 collapses to reader when anyone_in_space', () => {
-      for (const role of [0, 3, 9, -1]) {
+      for (const role of [0, 9, -1]) {
         expect(effectiveRole('none', true, A, role)).toBe('reader')
       }
     })
@@ -107,8 +127,10 @@ describe('share enum mappers — fail-safe names + strict wire parsing', () => {
     expect(shareScopeName(SHARE_SCOPE_RESTRICTED)).toBe('restricted')
     expect(shareScopeName(9)).toBe('restricted')
   })
-  it('shareRoleName: only 2 is edit; everything else read', () => {
+  it('shareRoleName maps comment/edit explicitly and unknown values to read', () => {
     expect(shareRoleName(SHARE_ROLE_EDIT)).toBe('edit')
+    expect(shareRoleName(SHARE_ROLE_COMMENT)).toBe('comment')
+    expect(shareRoleName(SHARE_ROLE_ADMIN)).toBe('read')
     expect(shareRoleName(SHARE_ROLE_READ)).toBe('read')
     expect(shareRoleName(0)).toBe('read')
     expect(shareRoleName(9)).toBe('read')
@@ -116,12 +138,14 @@ describe('share enum mappers — fail-safe names + strict wire parsing', () => {
   it('parseShareScope accepts only the two enum strings', () => {
     expect(parseShareScope('restricted')).toBe(SHARE_SCOPE_RESTRICTED)
     expect(parseShareScope('anyone_in_space')).toBe(SHARE_SCOPE_ANYONE)
+    expect(parseShareScope('authenticated')).toBe(SHARE_SCOPE_AUTHENTICATED)
     expect(parseShareScope('public')).toBeNull()
     expect(parseShareScope(1)).toBeNull()
     expect(parseShareScope(undefined)).toBeNull()
   })
-  it('parseShareRole accepts only read|edit', () => {
+  it('parseShareRole accepts forward share roles and rejects admin', () => {
     expect(parseShareRole('read')).toBe(SHARE_ROLE_READ)
+    expect(parseShareRole('comment')).toBe(SHARE_ROLE_COMMENT)
     expect(parseShareRole('edit')).toBe(SHARE_ROLE_EDIT)
     expect(parseShareRole('admin')).toBeNull()
     expect(parseShareRole(2)).toBeNull()

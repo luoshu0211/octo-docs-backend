@@ -239,6 +239,7 @@ describe('PPT-HUMAN-001 — human creates a PPT from a template', () => {
     expect(upsertDirectTx).toHaveBeenCalledWith(expect.anything(), {
       docId: 'd_ppt1',
       uid: 'u_1',
+      principalSpaceId: 's_1',
       roleNum: ROLE_ADMIN,
       grantedBy: 'u_1',
     })

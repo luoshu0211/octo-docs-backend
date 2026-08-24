@@ -9,11 +9,21 @@
  * - beforeHandleAwareness validates presence identity + fields (§8.3.1).
  */
 import { Server } from '@hocuspocus/server'
-import { Database } from '@hocuspocus/extension-database'
+import { CollabDatabase } from './collabDatabase.js'
 import { Redis } from '@hocuspocus/extension-redis'
 import { Logger } from '@hocuspocus/extension-logger'
 import { config } from '../config/env.js'
 import { persistence } from './persistence.js'
+import { maybeCompactOnUnload } from './autoCompact.js'
+import { markLoaded, markUnloaded } from './compactionCluster.js'
+import { compactDocument } from './compaction.js'
+import {
+  clearOversized,
+  DocumentTooLargeError,
+  getOversized,
+  noticeOversizeOnJoin,
+  setOversizeAnnouncer,
+} from './oversizeGuard.js'
 import { authenticate, type AuthContext } from './authenticate.js'
 import { connectionRegistry } from '../permission/connectionRegistry.js'
 import { recheckCurrentRoleCached } from '../permission/recheck.js'
@@ -283,11 +293,13 @@ export function createServer() {
 
     extensions: [
       new Logger(),
-      new Database({
-        fetch: ({ documentName }) => persistence.fetch(documentName),
-        // v4: pass lastContext through so store can write doc_meta.updated_by (P2-A).
-        store: ({ documentName, state, lastContext }) =>
-          persistence.store(documentName, state, lastContext as { user?: { id?: string } }),
+      // Our own persistence extension instead of @hocuspocus/extension-database:
+      // that one hardcodes the v1 update format on both sides, and we persist v2
+      // (see collabDatabase.ts / the 2026-08-21-yjs-document-encoding-v2 migration).
+      new CollabDatabase({
+        fetch: (documentName) => persistence.fetch(documentName),
+        // lastContext flows through so store can write doc_meta.updated_by (P2-A).
+        store: (documentName, doc, context) => persistence.store(documentName, doc, context),
       }),
       new Redis({
         host: config.redis.host,
@@ -310,6 +322,14 @@ export function createServer() {
     async connected(data) {
       const ctx = data.context as AuthContext
       setEpochWatermark(data.documentName, ctx.permission_epoch)
+
+      // A document already over the cap has to tell THIS connection so, on its
+      // way in — see noticeOversizeOnJoin for why the broadcast alone is not
+      // enough for someone who arrives after the rejection.
+      noticeOversizeOnJoin(data.documentName, (payload) =>
+        data.connection.sendStateless(payload),
+      )
+
       await connectionRegistry.register({
         documentName: data.documentName,
         uid: ctx.user.id,
@@ -333,13 +353,32 @@ export function createServer() {
       const ctx = data.context as AuthContext | undefined
       if (!ctx) return // server-internal writes (DirectConnection) carry no client ctx
 
+      // Oversize guard (incident 2026-08-21). A document whose last store was
+      // rejected for size can never persist another byte, so accepting writes
+      // only inflates the in-memory state — which is re-encoded on every store
+      // attempt and blocks the single JS thread until the liveness probe fails.
+      //
+      // This hook's job is ONLY to stop the inflation. Telling the user happens
+      // elsewhere and earlier: markOversized pushes a stateless frame the moment
+      // the first store is rejected, and `connected` sends one to anyone who
+      // arrives later. Do not be tempted to carry a 1009 close code on the error
+      // below — Hocuspocus's close does not close the socket and the code never
+      // reaches the browser (see oversizeGuard.ts). readOnly is still flipped so
+      // the connection cannot be used to write again. O(1) lookup: the size came
+      // from a store that already ran.
+      const oversize = getOversized(data.documentName)
+      if (oversize) {
+        data.connection.readOnly = true
+        throw new DocumentTooLargeError(data.documentName, oversize.bytes, oversize.limit)
+      }
+
       const watermark = epochWatermark.get(data.documentName) ?? ctx.permission_epoch
       if (ctx.permission_epoch >= watermark) return // not stale => allow (no IO)
 
       // Stale: recheck this uid's CURRENT role (singleflight + short-TTL cache).
       // #64: pass the token-carried space_member claim so a narrowed
       // anyone_in_space scope is honored on the already-connected socket.
-      const role = await recheckCurrentRoleCached(data.documentName, ctx.user.id, ctx.space_member)
+      const role = await recheckCurrentRoleCached(data.documentName, ctx.user.id, ctx.principal_space_id, ctx.space_member)
       if (role === 'none' || !roleAtLeast(role, 'writer')) {
         // role actually dropped / revoked => reject this write & flip the conn.
         data.connection.readOnly = true
@@ -365,6 +404,16 @@ export function createServer() {
     // converge any persisted illegal state. The observer scopes work to changed
     // ids and skips its own REPAIR_ORIGIN writes (anti-self-excitation gates).
     async afterLoadDocument(data) {
+      // Announce to the fleet that this replica now holds the document in
+      // memory, so no other replica compacts it out from under us. Done first
+      // and unconditionally: the early returns below are about whiteboard
+      // repair, and every document kind needs this. Best-effort — a failure
+      // here makes compaction elsewhere possible, which the compaction path's
+      // own transaction-time checks still catch.
+      void markLoaded(data.documentName).catch(() => {
+        /* see above */
+      })
+
       let kind: string
       try {
         kind = parseDocumentName(data.documentName).kind
@@ -413,9 +462,76 @@ export function createServer() {
       }
       await handleBeforeUnload(data.documentName, data.document)
     },
+
+    /**
+     * History compaction, at the one moment it is safe to rebuild a document:
+     * it has just unloaded, so nobody is connected and the next client loads the
+     * compacted state fresh. See autoCompact.ts for why the stale-reconnect case
+     * costs part of the saving but never correctness.
+     *
+     * Deliberately NOT awaited: this is an optimisation, and a slow or failing
+     * compaction must not hold up teardown. That is safe here ONLY because the
+     * expensive half runs on a worker thread (compactionRunner.ts) — not
+     * awaiting a promise never moves synchronous work off this thread, so on the
+     * main thread this hook would stall teardown and the liveness probe alike.
+     */
+    async afterUnloadDocument(data) {
+      // Drop the oversize mark with the document itself — and do it HERE, not in
+      // beforeUnloadDocument.
+      //
+      // Byte-verified in the pinned @hocuspocus/server 4.4.0 dist:
+      // `unloadDocument` awaits the beforeUnloadDocument hook and only THEN
+      // re-checks whether the document should still unload; a connection arriving
+      // during the hook (our hook awaits an async flush, and with snapshots on it
+      // also takes a Redis lock and writes a snapshot, so the window is real)
+      // ABORTS the unload and leaves the document in the `documents` map — live
+      // and oversized, but with the mark already cleared. The reconnecting
+      // client's sync delta then passes beforeHandleMessage unchallenged and is
+      // applied immediately, re-opening the write amplification this MR exists to
+      // stop.
+      //
+      // afterUnloadDocument fires only after the document is really removed and
+      // destroyed, so clearing here cannot disarm a document that stayed live. A
+      // later load re-derives the mark from its own first store attempt, and
+      // clearing at all is what keeps this from leaking one slot per document
+      // that ever tripped the cap.
+      clearOversized(data.documentName)
+
+      // Withdraw this replica from the document's holder set BEFORE attempting
+      // compaction, and await it: while this entry stands, every other replica
+      // correctly refuses to compact the document, so leaving it behind would
+      // block the fleet rather than just this node.
+      try {
+        await markUnloaded(data.documentName)
+      } catch {
+        // The entry stays until this node's liveness key expires, which costs a
+        // delayed compaction and nothing else. Never worth failing an unload.
+      }
+
+      void maybeCompactOnUnload(data.documentName, {
+        storedBytes: async (name) => (await persistence.fetch(name))?.state.length ?? null,
+        compact: compactDocument,
+        log: (message) => {
+          // eslint-disable-next-line no-console
+          console.info(`[octo-docs] compaction: ${message}`)
+        },
+      })
+    },
   })
 
   collabServer = server
+
+  // Wire the oversize notifier now that `server` exists. oversizeGuard cannot
+  // import this module (server.ts already imports it, and persistence.ts sits
+  // between them), so the direction is inverted: the guard is handed a closure.
+  //
+  // `documents.get` returning nothing is normal, not an error — a store can be
+  // rejected during an unload flush, by which point the document is already off
+  // the map and there is nobody left to notify anyway.
+  setOversizeAnnouncer((documentName, payload) => {
+    server.hocuspocus.documents.get(documentName)?.broadcastStateless(payload)
+  })
+
   return server
 }
 

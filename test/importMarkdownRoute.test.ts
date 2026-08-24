@@ -27,6 +27,7 @@ function req(body: unknown): Request {
   return {
     uid: 'human_u1',
     spaceId: 's1',
+    principalSpaceId: 's1',
     params: { docId: 'd1' },
     body,
     header: () => undefined,

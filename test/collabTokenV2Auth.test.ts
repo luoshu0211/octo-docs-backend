@@ -18,6 +18,8 @@ const claims = {
   permission_epoch: 7,
   space_member: true,
   home_space_verified: true,
+  current_space_verified: true,
+  current_space_id: 's_1',
 }
 
 beforeEach(() => {
@@ -26,25 +28,22 @@ beforeEach(() => {
 })
 
 describe('v2 WebSocket identity binding (remove-sp §7.3)', () => {
-  it('rejects a pre-hotfix token without home-Space proof in strict mode', async () => {
-    vi.mocked(verifyCollabToken).mockReturnValue({ ...claims, home_space_verified: undefined })
+  it.each([
+    ['missing proof', { current_space_verified: undefined }],
+    ['false proof', { current_space_verified: false }],
+    ['missing current Space', { current_space_id: undefined }],
+    ['empty current Space', { current_space_id: '' }],
+  ])('rejects %s with 4403', async (_name, patch) => {
+    vi.mocked(verifyCollabToken).mockReturnValue({ ...claims, ...patch })
     await expect(authenticate({ token: 'legacy', documentName: claims.documentName, connectionConfig: {} }))
       .rejects.toEqual(expect.objectContaining({ code: 4403, reason: 'Forbidden' }))
   })
 
-  it('accepts a still-unexpired pre-hotfix token only during the explicit rollout window', async () => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+  it('does not let the legacy compatibility flag bypass missing current-Space proof', async () => {
     config.collabToken.allowLegacyWithoutHomeSpaceProof = true
-    vi.mocked(verifyCollabToken).mockReturnValue({ ...claims, home_space_verified: undefined })
-    const ctx = await authenticate({ token: 'sensitive-legacy-jwt', documentName: claims.documentName, connectionConfig: {} })
-    expect(ctx).toMatchObject({ kind: 'document', doc: 'd_1', space: 's_1' })
-    expect(warn).toHaveBeenCalledWith(
-      '[octo-docs] legacy_home_space_token_accepted',
-      { credentialKind: 'collab_v2' },
-    )
-    expect(JSON.stringify(warn.mock.calls)).not.toContain('sensitive-legacy-jwt')
-    expect(JSON.stringify(warn.mock.calls)).not.toContain('u_1')
-    warn.mockRestore()
+    vi.mocked(verifyCollabToken).mockReturnValue({ ...claims, current_space_verified: undefined })
+    await expect(authenticate({ token: 'legacy', documentName: claims.documentName, connectionConfig: {} }))
+      .rejects.toEqual(expect.objectContaining({ code: 4403, reason: 'Forbidden' }))
   })
 
   it('accepts a token whose docId, homeSpaceId, room and epoch agree', async () => {

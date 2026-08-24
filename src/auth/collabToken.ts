@@ -40,6 +40,7 @@ export interface CollabClaims {
   documentName: string
   role: Role
   permission_epoch: number
+  principal_space_id: string
   /**
    * Trusted display name for `uid`, resolved from the octo user directory at
    * issuance (§4.7(b)). Optional: absent when the directory could not supply a
@@ -59,6 +60,10 @@ export interface CollabClaims {
   space_member?: boolean
   /** Emergency proof that issuance verified current Space == document home Space. */
   home_space_verified?: boolean
+  /** The signed current Space was verified as an active Space of this uid. */
+  current_space_verified?: boolean
+  /** Current Space whose membership was verified at issuance. */
+  current_space_id?: string
   /**
    * (remove-sp §7) Wire version. Absent on legacy v1 tokens; `2` on v2. The WS
    * verifier keys the docId/homeSpaceId/canonical-documentName binding on this
@@ -84,10 +89,15 @@ export interface CollabClaimsV2 {
   homeSpaceId: string
   role: Role
   permissionEpoch: number
+  principalSpaceId: string
   name?: string
   spaceMember?: boolean
   /** Emergency proof that issuance verified current Space == document home Space. */
   homeSpaceVerified?: boolean
+  /** The signed currentSpaceId was verified as an active Space of this uid. */
+  currentSpaceVerified?: boolean
+  /** Current Space whose membership was verified at issuance. */
+  currentSpaceId?: string
 }
 
 export interface CollabTokenResult {
@@ -144,12 +154,17 @@ export function signCollabToken(claims: CollabClaims): CollabTokenResult {
       documentName: claims.documentName,
       role: claims.role,
       permission_epoch: claims.permission_epoch,
+      principal_space_id: claims.principal_space_id,
       ...(name !== undefined ? { name } : {}),
       // Only stamp the claim when the requester IS a space member; absence is the
       // canonical "false" so an old token (no claim) and a non-member both
       // fail-closed on the share path (design §5.2f / O1).
       ...(claims.space_member === true ? { space_member: true } : {}),
       ...(claims.home_space_verified === true ? { home_space_verified: true } : {}),
+      ...(claims.current_space_verified === true ? { current_space_verified: true } : {}),
+      ...(typeof claims.current_space_id === 'string' && claims.current_space_id !== ''
+        ? { current_space_id: claims.current_space_id }
+        : {}),
     },
     config.collabToken.secret,
     { algorithm: 'HS256', audience: LEGACY_COLLAB_AUD, expiresIn: ttl },
@@ -175,9 +190,14 @@ export function signCollabTokenV2(claims: CollabClaimsV2): CollabTokenResult {
       homeSpaceId: claims.homeSpaceId,
       role: claims.role,
       permissionEpoch: claims.permissionEpoch,
+      principalSpaceId: claims.principalSpaceId,
       ...(name !== undefined ? { name } : {}),
       ...(claims.spaceMember === true ? { spaceMember: true } : {}),
       ...(claims.homeSpaceVerified === true ? { homeSpaceVerified: true } : {}),
+      ...(claims.currentSpaceVerified === true ? { currentSpaceVerified: true } : {}),
+      ...(typeof claims.currentSpaceId === 'string' && claims.currentSpaceId !== ''
+        ? { currentSpaceId: claims.currentSpaceId }
+        : {}),
     },
     config.collabToken.secret,
     { algorithm: 'HS256', expiresIn: ttl },
@@ -238,6 +258,10 @@ function verifyLegacyV1(d: Record<string, unknown>): CollabClaims {
   const documentName = d.documentName
   const role = d.role
   const permission_epoch = d.permission_epoch
+  // Pre-Space-qualified v1 tokens had no principal claim. Keep them structurally
+  // parseable so the current-Space proof gate rejects them as 4403 (rather than
+  // misclassifying a valid signature as 4401). They can never reach a DB recheck.
+  const principal_space_id = typeof d.principal_space_id === 'string' ? d.principal_space_id : ''
   if (typeof uid !== 'string' || typeof documentName !== 'string' || !isRole(role) || typeof permission_epoch !== 'number') {
     throw new Error('invalid collab token claims')
   }
@@ -250,14 +274,21 @@ function verifyLegacyV1(d: Record<string, unknown>): CollabClaims {
   // but keeps its direct `role` (design §5.2f / O1).
   const spaceMember = d.space_member === true
   const homeSpaceVerified = d.home_space_verified === true
+  const currentSpaceVerified = d.current_space_verified === true
+  const currentSpaceId = typeof d.current_space_id === 'string' && d.current_space_id !== ''
+    ? d.current_space_id
+    : undefined
   return {
     uid,
     documentName,
     role,
     permission_epoch,
+    principal_space_id,
     ...(typeof name === 'string' && name !== '' ? { name } : {}),
     ...(spaceMember ? { space_member: true } : {}),
     ...(homeSpaceVerified ? { home_space_verified: true } : {}),
+    ...(currentSpaceVerified ? { current_space_verified: true } : {}),
+    ...(currentSpaceId ? { current_space_id: currentSpaceId } : {}),
   }
 }
 
@@ -274,11 +305,13 @@ function verifyV2(d: Record<string, unknown>): CollabClaims {
   const homeSpaceId = d.homeSpaceId
   const role = d.role
   const permissionEpoch = d.permissionEpoch
+  const principalSpaceId = d.principalSpaceId
   if (
     typeof uid !== 'string' ||
     typeof docId !== 'string' ||
     typeof documentName !== 'string' ||
     typeof homeSpaceId !== 'string' ||
+    typeof principalSpaceId !== 'string' || principalSpaceId === '' ||
     !isRole(role) ||
     typeof permissionEpoch !== 'number'
   ) {
@@ -287,16 +320,23 @@ function verifyV2(d: Record<string, unknown>): CollabClaims {
   const name = d.name
   const spaceMember = d.spaceMember === true
   const homeSpaceVerified = d.homeSpaceVerified === true
+  const currentSpaceVerified = d.currentSpaceVerified === true
+  const currentSpaceId = typeof d.currentSpaceId === 'string' && d.currentSpaceId !== ''
+    ? d.currentSpaceId
+    : undefined
   return {
     uid,
     documentName,
     role,
     permission_epoch: permissionEpoch,
+    principal_space_id: principalSpaceId,
     ver: 2,
     docId,
     homeSpaceId,
     ...(typeof name === 'string' && name !== '' ? { name } : {}),
     ...(spaceMember ? { space_member: true } : {}),
     ...(homeSpaceVerified ? { home_space_verified: true } : {}),
+    ...(currentSpaceVerified ? { current_space_verified: true } : {}),
+    ...(currentSpaceId ? { current_space_id: currentSpaceId } : {}),
   }
 }

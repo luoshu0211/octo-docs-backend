@@ -465,11 +465,11 @@ export const config = {
     // Service token sent as the `token` header on octo-server lookups (e.g.
     // GET /v1/users/:uid, which requires auth) on the HUMAN path. Empty = not
     // configured; callers then fall back to the authenticated user's own session
-    // token. OPTIONAL for the human path (/api/v1/docs). No longer required for
-    // the bot path (/v1/bot/docs): the bot resolves the target user with its own
-    // bearer token via GET /v1/bot/user/info (see octoIdentity.getUserAsBot), so
-    // the anti ghost-member existence check in members/forwardGrant works with
-    // OCTO_SERVER_TOKEN empty.
+    // token. OPTIONAL for the human path (/api/v1/docs). REQUIRED for bot
+    // member-add roster validation: those human/service directory endpoints do
+    // not accept bot bearer credentials, so that operation fails closed with
+    // 503 when OCTO_SERVER_TOKEN is empty. Bot-realm operations such as
+    // forward-grant may still use GET /v1/bot/user/info with the bot token.
     serviceToken: str('OCTO_SERVER_TOKEN', ''),
     // Space-membership check cache TTL (#64). isSpaceMember(uid, spaceId, token)
     // is resolved server-side by reusing POST /v1/auth/verify?include=context
@@ -480,6 +480,21 @@ export const config = {
     // is not epoch-bounded on the live socket (design §5.3 case 3); this cache
     // only affects fresh REST/issuance checks. Default 30 s.
     membershipCacheTtlSeconds: num('SPACE_MEMBERSHIP_CACHE_TTL_SECONDS', 30),
+    // Friend-bot list cache TTL. listCallerBots(uid, spaceId, token) reads
+    // octo-server's GET /v1/robot/my_bots with the CALLER's OWN session token to
+    // learn which User Bots the caller has added as friends (the second half of
+    // the "which bots may this caller @" rule — see api/services/botMention.ts).
+    // Answers are coalesced + cached per {uid, spaceId, token-fingerprint} for
+    // this many seconds to bound the extra octo-server QPS on the comment path.
+    //
+    // WHAT THIS TTL MEANS: it is the maximum STALENESS WINDOW after a friendship
+    // is removed — for up to this long, a just-unfriended bot can still be
+    // @-mentioned successfully by that caller. Only a POSITIVE/negative confirmed
+    // list is cached (never a fail-closed "could not confirm"), so an octo-server
+    // outage is retried on the next call rather than pinned for the TTL. The
+    // bot's own document permission is a SEPARATE, uncached gate, so this window
+    // can never admit a bot that lacks access to the document. Default 30 s.
+    callerBotsCacheTtlSeconds: num('CALLER_BOTS_CACHE_TTL_SECONDS', 30),
   },
 
   // Outbound IM notification via octo-server's internal notify API (docs-notify
@@ -501,6 +516,56 @@ export const config = {
     // with; must equal the route's `secret_env` value in OCTO_CARD_ACTION_ROUTES.
     // Empty = the decide endpoint rejects all callbacks (fail-closed). Never logged.
     cardActionSecret: str('OCTO_DOCS_CARD_ACTION_SECRET', ''),
+  },
+
+  // Outbound @Bot-in-comment report to octo-server's internal bot-mention ingress
+  // (POST /v1/internal/bot-mentions). When a comment @-mentions one of the
+  // author's User Bots, docs-backend reports it ONCE PER BOT so octo-server can
+  // validate the active User Bot, apply its gray-release gate, dedupe on the
+  // idempotency key and enqueue the bot's turn. Mirrors the `notify` block above:
+  // a docs-specific X-Internal-Token, best-effort, and a silent no-op when the
+  // token is unset. See api/services/botMention.ts.
+  /**
+   * octo-docs-html(HTML 文档后端)。HTML 的评论**存在它那儿**,docs-backend 只做转发 ——
+   * 这样发布时的锚点迁移(publish_merge + AnchorMigrations)照旧生效,那套东西 docs-backend
+   * 做不了(它不认识 aid、也不参与发布)。
+   */
+  docHtml: {
+    // 基址。空 = HTML 评论转发**整体关闭**(路由回 503),不是静默放行 —— 漏配时前端会立刻
+    // 看到失败,而不是评论看着发出去了其实没落库。
+    baseUrl: str('OCTO_DOC_HTML_BASE_URL', ''),
+    // 每次请求的超时。转发挂住不能把评论创建拖死。
+    timeoutMs: numMin('OCTO_DOC_HTML_TIMEOUT_MS', 5000, 1),
+  },
+  botMention: {
+    // Docs-specific ingress token for POST /v1/internal/bot-mentions, sent as
+    // `X-Internal-Token`; must equal octo-server's OCTO_DOCS_BOT_MENTION_TOKEN.
+    // Empty (default) = the whole report path is a silent no-op, so the feature
+    // ships dark and can never block comment creation. NEVER logged.
+    token: str('OCTO_DOCS_BOT_MENTION_TOKEN', ''),
+    // octo-server base address. Defaults to the same OCTO_SERVER_BASE_URL every
+    // other octo-server call uses (docsNotify reuses it directly); the dedicated
+    // override exists so the internal ingress can be pointed at a separate
+    // internal-only listener without moving the identity/notify traffic with it.
+    baseUrl: str('OCTO_DOCS_BOT_MENTION_BASE_URL', str('OCTO_SERVER_BASE_URL', 'http://127.0.0.1:8080')),
+    // Per-attempt HTTP deadline; a hung octo-server can't pin the detached
+    // best-effort task open. Same budget docsNotify uses.
+    timeoutMs: numMin('OCTO_DOCS_BOT_MENTION_TIMEOUT_MS', 5000, 1),
+    // Bounded exponential backoff for the RETRYABLE outcomes only (500, network
+    // timeout, and 409 in_progress when it carries no Retry-After). Total
+    // attempts including the first; delay = base * 2^(n-1), capped at maxDelayMs,
+    // and the whole ladder is additionally bounded by budgetMs wall clock.
+    maxAttempts: numMin('OCTO_DOCS_BOT_MENTION_MAX_ATTEMPTS', 5, 1),
+    baseDelayMs: numMin('OCTO_DOCS_BOT_MENTION_BASE_DELAY_MS', 500, 1),
+    maxDelayMs: numMin('OCTO_DOCS_BOT_MENTION_MAX_DELAY_MS', 8000, 1),
+    budgetMs: numMin('OCTO_DOCS_BOT_MENTION_BUDGET_MS', 60_000, 1),
+    // Upper bound on a server-supplied `Retry-After` we are willing to honour, so
+    // a bogus/hostile header can't park a detached task for hours.
+    maxRetryAfterMs: numMin('OCTO_DOCS_BOT_MENTION_MAX_RETRY_AFTER_MS', 30_000, 1),
+    // Hard cap on distinct bots reported per comment. A ≤1MB comment body could
+    // otherwise carry a large `@[user:...]` run; each bot is an independent retry
+    // chain, so this bounds the fan-out. Extras are dropped + logged.
+    maxBotsPerComment: numMin('OCTO_DOCS_BOT_MENTION_MAX_BOTS', 8, 1),
   },
 
   // IANA zone used to render user-visible card timestamps. Card copy is zh-CN
@@ -658,6 +723,20 @@ export const config = {
 
   // §9.5 single-document Yjs state hard cap.
   maxDocBytes: num('MAX_DOC_BYTES', 10 * 1024 * 1024),
+
+  // Write persisted Yjs state as the v2 update format (see
+  // collab/persistedEncoding.ts and the 2026-08-21-yjs-document-encoding-v2
+  // migration). DEFAULT OFF, and it must STAY off until every instance in the
+  // fleet runs a build that can READ v2 rows: during a rolling deploy an old
+  // instance handed a v2 row decodes it with the v1 decoder, which yields an
+  // EMPTY document rather than an error, and the next edit persists that empty
+  // state over the row. Two-phase rollout is mandatory:
+  //   phase 1: deploy fleet-wide with this unset (reads v2, writes v1)
+  //   phase 2: set YJS_WRITE_V2=true (new writes convert rows lazily)
+  // strictBool, not bool: a typo (=treu) must not silently mean "still v1"
+  // AFTER phase 2 is believed done — that would leave the fleet half-converted
+  // with no signal.
+  yjsWriteV2: strictBool('YJS_WRITE_V2', false),
 
   // Bot incremental doc-body edit request-shape bounds (PATCH /:docId/content).
   // These fail fast at the route shape gate, BEFORE the no-lock op resolution +

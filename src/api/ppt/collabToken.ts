@@ -111,6 +111,7 @@ export async function collabTokenHandler(req: Request, res: Response): Promise<v
     documentName: meta.document_name,
     role: role as Role,
     permission_epoch: meta.permission_epoch,
+    principalSpaceId: spaceId,
     snapshotVersion,
     spaceMember,
     // loadPptDocForRead proved active membership in the request Space and exact

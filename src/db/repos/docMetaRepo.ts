@@ -5,10 +5,18 @@
  * Holds both doc_id (business PK) and document_name (Hocuspocus routing/
  * persistence key, unique). See appendix B for the naming convention.
  */
+import { createHash } from 'node:crypto'
 import { query, transaction, type Tx } from '../pool.js'
 import { docTypeUsesOctoDocSlug } from '../docType.js'
-import { SHARE_SCOPE_ANYONE, SHARE_ROLE_EDIT } from '../../permission/shareScope.js'
-import { STORED_ROLE_VALUES } from '../../permission/role.js'
+import {
+  DISCOVERABILITY_HIDDEN,
+  DISCOVERABILITY_SPACE,
+  SHARE_SCOPE_ANYONE,
+  SHARE_ROLE_COMMENT,
+  SHARE_ROLE_EDIT,
+} from '../../permission/shareScope.js'
+import { ROLE_ADMIN, STORED_ROLE_VALUES } from '../../permission/role.js'
+import { docMemberRepo } from './docMemberRepo.js'
 
 /**
  * True when a thrown DB error is a duplicate-key violation. mysql2 surfaces it
@@ -21,9 +29,9 @@ function isDupEntry(err: unknown): boolean {
 }
 
 /**
- * Delegated-owner guard (P0 default-deny). The trusted internal caller supplies
- * the authenticated owner; a slug already bound to another owner cannot be
- * mutated because doing so would overwrite that user's
+ * Broken-object-level-authorization guard (P0 default-deny). Thrown when a
+ * non-owner tries to upsert a slug an existing row already owns: the space-scoped
+ * lookup resolves the OTHER bot's row, so mutating it here would overwrite its
  * title, restamp updated_by, and revive a soft-deleted row with no ownership
  * check. The route maps this to 403 (never fail-open). Ownership is owner-only
  * here (owner is implicit admin, §4.2); an admin-member override would need a
@@ -36,15 +44,39 @@ export class DocOwnershipError extends Error {
   }
 }
 
+/** A canonical create key is permanently consumed by a soft-deleted document. */
+export class CanonicalHtmlDeletedError extends Error {
+  constructor(message = 'canonical_document_deleted') {
+    super(message)
+    this.name = 'CanonicalHtmlDeletedError'
+  }
+}
+
+export class CanonicalHtmlArchivedError extends Error {
+  constructor(message = 'canonical_document_archived') {
+    super(message)
+    this.name = 'CanonicalHtmlArchivedError'
+  }
+}
+
+export class CanonicalHtmlLegacyConflictError extends Error {
+  constructor(message = 'canonical_document_conflict') {
+    super(message)
+    this.name = 'CanonicalHtmlLegacyConflictError'
+  }
+}
+
 export interface DocMeta {
   doc_id: string
   document_name: string
   title: string
   owner_id: string
+  owner_space_id: string
   space_id: string
   folder_id: string
   doc_type: string
   octo_doc_slug: string | null
+  html_idempotency_key_hash: Buffer | null
   status: number // 1=active 0=deleted 2=archived
   permission_epoch: number
   /**
@@ -58,11 +90,24 @@ export interface DocMeta {
    * Ignored when restricted (the update API normalizes it to 1 in that case).
    */
   share_role: number
+  /** Discovery scope enum; only DISCOVERABILITY_SPACE exposes Space search. */
+  discoverability_scope: number
   created_at: Date
   updated_at: Date
   created_by: string
   updated_by: string
 }
+
+export interface ShareSettingsSnapshot {
+  shareScope: number
+  shareRole: number
+  spaceSearchable: boolean
+  permissionEpoch: number
+}
+
+export type SetShareSettingsResult =
+  | { updated: true; settings: ShareSettingsSnapshot }
+  | { updated: false; current: ShareSettingsSnapshot | null }
 
 export interface CreateDocInput {
   docId: string
@@ -76,6 +121,13 @@ export interface CreateDocInput {
   createdBy: string
 }
 
+export interface CanonicalHtmlInput extends CreateDocInput {
+  octoDocSlug: string
+  idempotencyKey: string
+  /** Human creator of the authenticated bot; distinct from ownerId (the bot UID). */
+  humanOwnerUid?: string
+}
+
 const VALID_STORED_ROLES_SQL = STORED_ROLE_VALUES.join(', ')
 const validMemberRole = `dm.role IN (${VALID_STORED_ROLES_SQL})`
 
@@ -83,13 +135,14 @@ export const docMetaRepo = {
   async create(input: CreateDocInput): Promise<void> {
     await query(
       `INSERT INTO doc_meta
-         (doc_id, document_name, title, owner_id, space_id, folder_id, doc_type, octo_doc_slug, status, permission_epoch, created_by, updated_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, '')`,
+         (doc_id, document_name, title, owner_id, owner_space_id, space_id, folder_id, doc_type, octo_doc_slug, status, permission_epoch, created_by, updated_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, '')`,
       [
         input.docId,
         input.documentName,
         input.title,
         input.ownerId,
+        input.spaceId,
         input.spaceId,
         input.folderId,
         input.docType,
@@ -113,13 +166,14 @@ export const docMetaRepo = {
   async createTx(tx: Tx, input: CreateDocInput): Promise<void> {
     await tx.query(
       `INSERT INTO doc_meta
-         (doc_id, document_name, title, owner_id, space_id, folder_id, doc_type, octo_doc_slug, status, permission_epoch, created_by, updated_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, '')`,
+         (doc_id, document_name, title, owner_id, owner_space_id, space_id, folder_id, doc_type, octo_doc_slug, status, permission_epoch, created_by, updated_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, '')`,
       [
         input.docId,
         input.documentName,
         input.title,
         input.ownerId,
+        input.spaceId,
         input.spaceId,
         input.folderId,
         input.docType,
@@ -135,63 +189,128 @@ export const docMetaRepo = {
     return rows[0] ?? null
   },
 
-  async upsertHtmlByOctoDocSlug(input: CreateDocInput & { octoDocSlug: string }): Promise<{ meta: DocMeta; created: boolean }> {
-    // NOTE (R1 scope): the `doc_type = 'html'` predicates in this method and in
-    // getByOctoDocSlug are INTENTIONALLY html-only. PPT bot register (R2-B2)
-    // adds a `doc_type`-parametrized slug-upsert path; broadening these clauses
-    // to also match html_ppt now would let an html create resolve a PPT row (or
-    // vice-versa) sharing a slug, so they stay kind-scoped until R2 wires PPT.
-    // Tenant isolation (P0): resolve the slug WITHIN the caller's space only. A
-    // slug is unique per (space_id, octo_doc_slug), so a same-slug row in another
-    // space is invisible here and can never be updated/revived across tenants.
-    const existing = await docMetaRepo.getByOctoDocSlug(input.octoDocSlug, input.spaceId)
-    if (existing) {
-      // Re-authorize before mutating the resolved row (P0). The space-scoped
-      // lookup can resolve a different user's row for the same slug; updating it
-      // would overwrite its title/updated_by and revive a soft-deleted row with
-      // no authorization. Only the delegated owner converges idempotently.
+  async upsertHtmlByOctoDocSlug(
+    input: CreateDocInput & { octoDocSlug: string; humanOwnerUid?: string },
+  ): Promise<{ meta: DocMeta; created: boolean; memberReconciled: boolean; permissionEpoch?: number }> {
+    // Legacy slug registration remains kind- and tenant-scoped.
+    const updateExisting = async (existing: DocMeta) => {
       if (existing.owner_id !== input.createdBy) throw new DocOwnershipError()
-      // space_id in the WHERE is defense-in-depth: `existing` is already
-      // space-scoped, so pinning the space here means no cross-tenant row can
-      // ever be the UPDATE target.
-      await query(
-        `UPDATE doc_meta
-         SET title = ?, updated_by = ?, status = 1
-         WHERE doc_id = ? AND doc_type = 'html' AND space_id = ?`,
-        [input.title, input.createdBy, existing.doc_id, input.spaceId],
-      )
-      const updated = await docMetaRepo.getByDocId(existing.doc_id)
-      if (!updated) throw new Error('html doc disappeared after upsert')
-      return { meta: updated, created: false }
+      if (existing.html_idempotency_key_hash != null) {
+        if (existing.status === 0) throw new CanonicalHtmlDeletedError()
+        if (existing.status === 2) throw new CanonicalHtmlArchivedError()
+        throw new CanonicalHtmlLegacyConflictError()
+      }
+      return transaction(async (tx) => {
+        await tx.query(
+          `UPDATE doc_meta
+           SET title = ?, updated_by = ?, status = 1
+           WHERE doc_id = ? AND doc_type = 'html' AND space_id = ?`,
+          [input.title, input.createdBy, existing.doc_id, input.spaceId],
+        )
+        let memberReconciled = false
+        if (input.humanOwnerUid && input.humanOwnerUid !== input.ownerId) {
+          const inserted = await tx.execute(
+            `INSERT IGNORE INTO doc_member
+               (doc_id, uid, principal_space_id, role, granted_by, source, invite_token)
+             VALUES (?, ?, ?, ?, ?, 1, '')`,
+            [existing.doc_id, input.humanOwnerUid, input.spaceId, ROLE_ADMIN, input.ownerId],
+          )
+          memberReconciled = inserted.affectedRows === 1
+          if (memberReconciled) await docMetaRepo.bumpEpochTx(tx, existing.doc_id)
+        }
+        const rows = await tx.query<DocMeta>('SELECT * FROM doc_meta WHERE doc_id = ? LIMIT 1', [existing.doc_id])
+        const meta = rows[0]
+        if (!meta) throw new Error('html doc disappeared after upsert')
+        return {
+          meta,
+          created: false as const,
+          memberReconciled,
+          ...(memberReconciled ? { permissionEpoch: Number(meta.permission_epoch) } : {}),
+        }
+      })
     }
 
+    const existing = await docMetaRepo.getByOctoDocSlug(input.octoDocSlug, input.spaceId)
+    if (existing) return updateExisting(existing)
+
     try {
-      await docMetaRepo.create(input)
+      const meta = await transaction(async (tx) => {
+        await docMetaRepo.createTx(tx, input)
+        if (input.humanOwnerUid && input.humanOwnerUid !== input.ownerId) {
+          await docMemberRepo.upsertDirectTx(tx, {
+            docId: input.docId,
+            uid: input.humanOwnerUid,
+            principalSpaceId: input.spaceId,
+            roleNum: ROLE_ADMIN,
+            grantedBy: input.ownerId,
+          })
+        }
+        const created = await docMetaRepo.getByDocIdTx(tx, input.docId)
+        if (!created) throw new Error('html doc missing after create')
+        return created
+      })
+      return { meta, created: true, memberReconciled: false }
     } catch (err) {
-      // TOCTOU: two concurrent registrations of the same (space, slug) both miss
-      // the SELECT, then race on INSERT. The composite unique key makes the loser
-      // fail with ER_DUP_ENTRY — re-fetch the now-committed row and fall through
-      // to the idempotent UPDATE branch instead of surfacing a 500.
       if (!isDupEntry(err)) throw err
       const raced = await docMetaRepo.getByOctoDocSlug(input.octoDocSlug, input.spaceId)
       if (!raced) throw err
-      // Same P0 re-authorization on the TOCTOU recovery branch: the racing
-      // winner may be another user's row, so an owner mismatch must be rejected
-      // rather than silently overwriting/reviving it.
-      if (raced.owner_id !== input.createdBy) throw new DocOwnershipError()
-      await query(
-        `UPDATE doc_meta
-         SET title = ?, updated_by = ?, status = 1
-         WHERE doc_id = ? AND doc_type = 'html' AND space_id = ?`,
-        [input.title, input.createdBy, raced.doc_id, input.spaceId],
-      )
-      const updated = await docMetaRepo.getByDocId(raced.doc_id)
-      if (!updated) throw new Error('html doc disappeared after upsert')
-      return { meta: updated, created: false }
+      return updateExisting(raced)
     }
-    const created = await docMetaRepo.getByDocId(input.docId)
-    if (!created) throw new Error('html doc missing after create')
-    return { meta: created, created: true }
+  },
+
+  async createCanonicalHtml(input: CanonicalHtmlInput): Promise<{ meta: DocMeta; created: boolean }> {
+    const keyHash = createHash('sha256').update(input.idempotencyKey, 'utf8').digest()
+    const find = async () => {
+      const rows = await query<DocMeta>(
+        `SELECT * FROM doc_meta
+         WHERE space_id = ? AND owner_id = ? AND html_idempotency_key_hash = ? AND doc_type = 'html'
+         LIMIT 1`,
+        [input.spaceId, input.ownerId, keyHash],
+      )
+      return rows[0] ?? null
+    }
+    const accept = (meta: DocMeta) => {
+      if (meta.space_id !== input.spaceId || meta.owner_id !== input.ownerId || input.createdBy !== input.ownerId) {
+        throw new DocOwnershipError()
+      }
+      // A canonical key remains consumed after deletion or archival.
+      if (meta.status === 0) throw new CanonicalHtmlDeletedError()
+      if (meta.status === 2) throw new CanonicalHtmlArchivedError()
+      return { meta, created: false as const }
+    }
+
+    const existing = await find()
+    if (existing) return accept(existing)
+    try {
+      const created = await transaction(async (tx) => {
+        await tx.query(
+          `INSERT INTO doc_meta
+             (doc_id, document_name, title, owner_id, owner_space_id, space_id, folder_id, doc_type, octo_doc_slug,
+              html_idempotency_key_hash, status, permission_epoch, created_by, updated_by)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, '')`,
+          [input.docId, input.documentName, input.title, input.ownerId, input.spaceId, input.spaceId, input.folderId,
+            'html', input.docId, keyHash, input.createdBy],
+        )
+        if (input.humanOwnerUid && input.humanOwnerUid !== input.ownerId) {
+          await docMemberRepo.upsertDirectTx(tx, {
+            docId: input.docId,
+            uid: input.humanOwnerUid,
+            principalSpaceId: input.spaceId,
+            roleNum: ROLE_ADMIN,
+            grantedBy: input.ownerId,
+          })
+        }
+        const meta = await docMetaRepo.getByDocIdTx(tx, input.docId)
+        if (!meta) throw new Error('canonical html doc missing after create')
+        return meta
+      })
+      return { meta: created, created: true }
+    } catch (err) {
+      if (!isDupEntry(err)) throw err
+      const raced = await find()
+      if (!raced) throw err
+      return accept(raced)
+    }
   },
 
   async getByDocId(docId: string): Promise<DocMeta | null> {
@@ -235,29 +354,58 @@ export const docMetaRepo = {
   },
 
   /**
-   * Update a doc's share settings (#64) AND bump permission_epoch in the SAME
-   * transaction, so a narrowing (e.g. anyone_in_space -> restricted) is atomic:
+   * Compare-and-set all share settings (#64) AND bump permission_epoch in the
+   * SAME statement, so a narrowing (e.g. anyone_in_space -> restricted) is atomic:
    * the row can never be observed at its new scope with a stale epoch, which
    * would leave live non-members editing until the next unrelated bump. Mirrors
    * softDelete's flip-status-and-bump pattern. The caller (PUT /share handler)
    * has already validated + normalized scopeNum/roleNum (restricted forces
    * role=1); the migration CHECK constraints are a defense-in-depth backstop.
-   * Returns the new epoch so the caller refreshes caches + publishes the
-   * invalidation event (via refreshAndPublish), exactly like softDelete.
+   * Returns either the updated authoritative settings or a distinguishable
+   * conflict with the current row so the caller never publishes a stale write.
    */
-  async setShareSettings(docId: string, scopeNum: number, roleNum: number): Promise<number> {
+  async setShareSettings(
+    docId: string,
+    scopeNum: number,
+    roleNum: number,
+    spaceSearchable: boolean,
+    expectedPermissionEpoch: number,
+  ): Promise<SetShareSettingsResult> {
     return transaction(async (tx) => {
-      await tx.query('UPDATE doc_meta SET share_scope = ?, share_role = ? WHERE doc_id = ?', [
-        scopeNum,
-        roleNum,
-        docId,
-      ])
-      await docMetaRepo.bumpEpochTx(tx, docId)
-      const rows = await tx.query<{ permission_epoch: number }>(
-        'SELECT permission_epoch FROM doc_meta WHERE doc_id = ? LIMIT 1',
+      const update = await tx.query<{ affectedRows?: number }>(
+        `UPDATE doc_meta
+         SET share_scope = ?, share_role = ?, discoverability_scope = ?,
+             permission_epoch = permission_epoch + 1
+         WHERE doc_id = ? AND permission_epoch = ?`,
+        [
+          scopeNum,
+          roleNum,
+          spaceSearchable ? DISCOVERABILITY_SPACE : DISCOVERABILITY_HIDDEN,
+          docId,
+          expectedPermissionEpoch,
+        ],
+      )
+      const rows = await tx.query<Pick<DocMeta,
+        'share_scope' | 'share_role' | 'discoverability_scope' | 'permission_epoch'
+      >>(
+        `SELECT share_scope, share_role, discoverability_scope, permission_epoch
+         FROM doc_meta WHERE doc_id = ? LIMIT 1 FOR UPDATE`,
         [docId],
       )
-      return Number(rows[0]?.permission_epoch ?? 0)
+      const row = rows[0]
+      const settings = row
+        ? {
+            shareScope: Number(row.share_scope),
+            shareRole: Number(row.share_role),
+            spaceSearchable: row.discoverability_scope === DISCOVERABILITY_SPACE,
+            permissionEpoch: Number(row.permission_epoch),
+          }
+        : null
+      if ((update as unknown as { affectedRows?: number }).affectedRows !== 1) {
+        return { updated: false, current: settings }
+      }
+      if (!settings) throw new Error('share settings update succeeded but row could not be reloaded')
+      return { updated: true, settings }
     })
   },
 
@@ -304,6 +452,7 @@ export const docMetaRepo = {
     uid: string
     spaceId: string
     isSpaceMember?: boolean
+    principalSpaceId: string
     folderId?: string
     owner?: 'me'
     ownedBots?: string[]
@@ -370,14 +519,14 @@ export const docMetaRepo = {
         ...(params.ownedBots ?? []).filter((b) => typeof b === 'string' && b !== ''),
       ].filter((v, i, arr) => arr.indexOf(v) === i)
       // ownerSet always has >=1 element (params.uid); empty ownedBots => IN (?).
-      visibility = `m.owner_id IN (${ownerSet.map(() => '?').join(', ')})`
-      visibilityArgs.push(...ownerSet)
+      visibility = `(m.owner_id IN (${ownerSet.map(() => '?').join(', ')}) AND m.owner_space_id = ?)`
+      visibilityArgs.push(...ownerSet, params.principalSpaceId)
     } else if (includeSpaceShare) {
-      visibility = `(m.owner_id = ? OR ${validMemberRole} OR m.share_scope = ${SHARE_SCOPE_ANYONE})`
-      visibilityArgs.push(params.uid)
+      visibility = `(m.owner_id = ? AND m.owner_space_id = ? OR ${validMemberRole} OR (m.share_scope = ${SHARE_SCOPE_ANYONE} AND m.discoverability_scope = ${DISCOVERABILITY_SPACE}))`
+      visibilityArgs.push(params.uid, params.principalSpaceId)
     } else {
-      visibility = `(m.owner_id = ? OR ${validMemberRole})`
-      visibilityArgs.push(params.uid)
+      visibility = `(m.owner_id = ? AND m.owner_space_id = ? OR ${validMemberRole})`
+      visibilityArgs.push(params.uid, params.principalSpaceId)
     }
     // Placeholders in `base`, in order: JOIN `dm.uid = ?`, then the optional
     // space/folder/q filters, then the trailing visibility `m.owner_id IN (...)`
@@ -385,7 +534,7 @@ export const docMetaRepo = {
     // the visibility owner set(s) trail — they are not interchangeable. The bind
     // count MUST match the placeholder count exactly or mysql2 execute errno
     // 1210 fires.
-    const args: unknown[] = [params.uid, ...filterArgs, ...visibilityArgs]
+    const args: unknown[] = [params.uid, params.principalSpaceId, ...filterArgs, ...visibilityArgs]
     const whereSql = where.join(' AND ')
     const order = params.sort === 'updatedAt:asc' ? 'ASC' : 'DESC'
     // `query()` runs on mysql2 `.execute()` (a prepared statement), which rejects
@@ -399,7 +548,7 @@ export const docMetaRepo = {
 
     const base = `
       FROM doc_meta m
-      LEFT JOIN doc_member dm ON dm.doc_id = m.doc_id AND dm.uid = ?
+      LEFT JOIN doc_member dm ON dm.doc_id = m.doc_id AND dm.uid = ? AND dm.principal_space_id = ?
       WHERE ${whereSql} AND ${visibility}
     `
     const countRows = await query<{ cnt: number }>(`SELECT COUNT(*) AS cnt ${base}`, args)
@@ -410,14 +559,16 @@ export const docMetaRepo = {
     // Stored commenter=4 is not privilege-ordered, so the share merge uses an
     // explicit writer/admin set instead of a raw numeric GREATEST.
     const roleOwnerPredicate = ownerSet
-      ? `m.owner_id IN (${ownerSet.map(() => '?').join(', ')})`
-      : 'm.owner_id = ?'
-    const roleOwnerArgs: unknown[] = ownerSet ?? [params.uid]
+      ? `(m.owner_id IN (${ownerSet.map(() => '?').join(', ')}) AND m.owner_space_id = ?)`
+      : '(m.owner_id = ? AND m.owner_space_id = ?)'
+    const roleOwnerArgs: unknown[] = ownerSet ? [...ownerSet, params.principalSpaceId] : [params.uid, params.principalSpaceId]
     const roleExpr = includeSpaceShare
       ? `CASE WHEN ${roleOwnerPredicate} THEN 3
-              WHEN m.share_scope = ${SHARE_SCOPE_ANYONE} AND m.share_role = ${SHARE_ROLE_EDIT}
+              WHEN m.share_scope = ${SHARE_SCOPE_ANYONE} AND m.discoverability_scope = ${DISCOVERABILITY_SPACE} AND m.share_role = ${SHARE_ROLE_EDIT}
                 THEN CASE WHEN dm.role = 3 THEN 3 WHEN dm.role = 2 THEN 2 ELSE 2 END
-              WHEN m.share_scope = ${SHARE_SCOPE_ANYONE}
+              WHEN m.share_scope = ${SHARE_SCOPE_ANYONE} AND m.discoverability_scope = ${DISCOVERABILITY_SPACE} AND m.share_role = ${SHARE_ROLE_COMMENT}
+                THEN CASE WHEN dm.role = 3 THEN 3 WHEN dm.role = 2 THEN 2 ELSE 4 END
+              WHEN m.share_scope = ${SHARE_SCOPE_ANYONE} AND m.discoverability_scope = ${DISCOVERABILITY_SPACE}
                 THEN CASE WHEN dm.role = 3 THEN 3 WHEN dm.role = 2 THEN 2 WHEN dm.role = 4 THEN 4 WHEN dm.role = 1 THEN 1 ELSE 1 END
               WHEN dm.role = 3 THEN 3 WHEN dm.role = 2 THEN 2 WHEN dm.role = 4 THEN 4 WHEN dm.role = 1 THEN 1
               ELSE NULL END`
@@ -465,6 +616,7 @@ export const docMetaRepo = {
   async listVisibleDocIdSet(params: {
     uid: string
     spaceId: string
+    principalSpaceId: string
     docType?: string[]
     isSpaceMember?: boolean
     limit?: number
@@ -483,7 +635,7 @@ export const docMetaRepo = {
     // doc_type IN (...), then the owner IN (...) set in the visibility tail.
     const ownerPlaceholders = ownerSet.map(() => '?').join(', ')
     const where = ['m.status = 1', 'm.space_id = ?']
-    const args: unknown[] = [params.uid, params.spaceId]
+    const args: unknown[] = [params.uid, params.principalSpaceId, params.spaceId]
     if (docTypes.length > 0) {
       where.push(`m.doc_type IN (${docTypes.map(() => '?').join(', ')})`)
       args.push(...docTypes)
@@ -496,9 +648,11 @@ export const docMetaRepo = {
     // OS to carry a fresh share_scope/status — an already-soft-deleted doc simply
     // isn't in this set, so it can't be searched even if OS still holds a stale
     // copy. SHARE_SCOPE_ANYONE is a numeric constant, inlined (no extra bind).
-    const spaceShare = params.isSpaceMember === true ? ` OR m.share_scope = ${SHARE_SCOPE_ANYONE}` : ''
-    where.push(`(m.owner_id IN (${ownerPlaceholders}) OR ${validMemberRole}${spaceShare})`)
-    args.push(...ownerSet)
+    const spaceShare = params.isSpaceMember === true
+      ? ` OR (m.share_scope = ${SHARE_SCOPE_ANYONE} AND m.discoverability_scope = ${DISCOVERABILITY_SPACE})`
+      : ''
+    where.push(`(m.owner_id IN (${ownerPlaceholders}) AND m.owner_space_id = ? OR ${validMemberRole}${spaceShare})`)
+    args.push(...ownerSet, params.principalSpaceId)
 
     // Cap rows at limit+1 (when a limit is given) so overflow is detectable by
     // the caller (length > limit) without materializing the whole set. No ORDER
@@ -512,7 +666,7 @@ export const docMetaRepo = {
     const sql = `
       SELECT m.doc_id
       FROM doc_meta m
-      LEFT JOIN doc_member dm ON dm.doc_id = m.doc_id AND dm.uid = ?
+      LEFT JOIN doc_member dm ON dm.doc_id = m.doc_id AND dm.uid = ? AND dm.principal_space_id = ?
       WHERE ${where.join(' AND ')}${limitClause}
     `
     const rows = await query<{ doc_id: string }>(sql, args)

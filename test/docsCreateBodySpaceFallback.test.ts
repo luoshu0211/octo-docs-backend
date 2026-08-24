@@ -66,6 +66,7 @@ describe('POST /api/v1/docs — body.spaceId fallback is removed (P3)', () => {
     const req = {
       uid: 'u_owner',
       spaceId: 's_header',
+      principalSpaceId: 's_header',
       body: { spaceId: 's_body_attacker', folderId: 'f_x', title: 'Hi', docType: 'doc' },
     } as never
     await collectionHandler('post')(req, res as never)
@@ -83,6 +84,7 @@ describe('POST /api/v1/docs — body.spaceId fallback is removed (P3)', () => {
     const req = {
       uid: 'u_owner',
       spaceId: 's_header',
+      principalSpaceId: 's_header',
       body: { folderId: 'f_x', title: 'Hi', docType: 'doc' },
     } as never
     await collectionHandler('post')(req, res as never)

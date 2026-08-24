@@ -140,6 +140,7 @@ async function setup(
       documentName: DOCNAME,
       role: o.role,
       permission_epoch: o.epoch ?? liveEpoch,
+      principalSpaceId: 's_1',
       snapshotVersion: 0,
       homeSpaceVerified: true,
       ...(o.name ? { name: o.name } : {}),
@@ -1136,6 +1137,7 @@ describe('PPT relay: share-aware role re-resolution (B6 / P1-7)', () => {
       documentName: DOCNAME,
       role: 'writer',
       permission_epoch: 0,
+      principalSpaceId: 's_1',
       snapshotVersion: 0,
       homeSpaceVerified: true,
       spaceMember: true,
@@ -1157,6 +1159,7 @@ describe('PPT relay: share-aware role re-resolution (B6 / P1-7)', () => {
       documentName: DOCNAME,
       role: 'writer',
       permission_epoch: 0,
+      principalSpaceId: 's_1',
       snapshotVersion: 0,
       homeSpaceVerified: true,
       spaceMember: false,
@@ -1688,6 +1691,7 @@ describe('PPT relay: round-6 fixes (XIN-1693)', () => {
       documentName: DOCNAME,
       role: 'writer',
       permission_epoch: 0,
+      principalSpaceId: 's_1',
       snapshotVersion: 0,
       homeSpaceVerified: true,
       spaceMember: true,
@@ -1727,6 +1731,7 @@ describe('PPT relay: round-6 fixes (XIN-1693)', () => {
       documentName: DOCNAME,
       role: 'writer',
       permission_epoch: 0,
+      principal_space_id: 's_1',
       space_member: true,
       home_space_verified: true,
       jti: randomUUID(),
@@ -1761,6 +1766,7 @@ describe('PPT relay: round-6 fixes (XIN-1693)', () => {
       documentName: DOCNAME,
       role: 'writer',
       permission_epoch: 0,
+      principal_space_id: 's_1',
       space_member: true,
       home_space_verified: true,
       jti: randomUUID(),
@@ -2347,9 +2353,9 @@ describe('PPT relay: ordering-model redesign (XIN-1739)', () => {
   })
 
   /** Sign a fresh single-use ticket (the client mints this via the collab-token endpoint). */
-  const freshTicket = (o: { uid: string; role: Role; spaceMember: boolean; epoch?: number; ttl?: number }): string =>
+  const freshTicket = (o: { uid: string; role: Role; spaceMember: boolean; epoch?: number; ttl?: number; principalSpaceId?: string }): string =>
     jwt.sign(
-      { uid: o.uid, docId: DOC, documentName: DOCNAME, role: o.role, permission_epoch: o.epoch ?? 0, space_member: o.spaceMember, home_space_verified: true, jti: randomUUID() },
+      { uid: o.uid, docId: DOC, documentName: DOCNAME, role: o.role, permission_epoch: o.epoch ?? 0, principal_space_id: o.principalSpaceId ?? 's_1', space_member: o.spaceMember, home_space_verified: true, jti: randomUUID() },
       config.collabToken.secret,
       { algorithm: 'HS256', audience: PPT_RELAY_TICKET_AUD, expiresIn: o.ttl ?? 30 },
     )
@@ -2434,11 +2440,23 @@ describe('PPT relay: ordering-model redesign (XIN-1739)', () => {
     const c = await h.connect({ uid: 'u_share', role: 'writer', ticket: freshTicket({ uid: 'u_share', role: 'writer', spaceMember: true }) })
     await helloReady(c)
     const foreign = jwt.sign(
-      { uid: 'someone_else', docId: DOC, documentName: DOCNAME, role: 'writer', permission_epoch: 0, space_member: true, home_space_verified: true, jti: randomUUID() },
+      { uid: 'someone_else', docId: DOC, documentName: DOCNAME, role: 'writer', permission_epoch: 0, principal_space_id: 's_1', space_member: true, home_space_verified: true, jti: randomUUID() },
       config.collabToken.secret,
       { algorithm: 'HS256', audience: PPT_RELAY_TICKET_AUD, expiresIn: 30 },
     )
     c.send({ t: 'reauth', pv: 2, ticket: foreign })
+    expect((await c.closed).code).toBe(4403)
+  })
+
+  it('P1-3: a reauth cannot migrate the same uid/doc connection to another principal Space', async () => {
+    const h = await setup({ roleProvider: async () => 'writer' })
+    const c = await h.connect({ uid: 'u_share', role: 'writer', ticket: freshTicket({ uid: 'u_share', role: 'writer', spaceMember: true }) })
+    await helloReady(c)
+    c.send({
+      t: 'reauth',
+      pv: 2,
+      ticket: freshTicket({ uid: 'u_share', role: 'writer', spaceMember: true, principalSpaceId: 's_other' }),
+    })
     expect((await c.closed).code).toBe(4403)
   })
 
@@ -2582,7 +2600,7 @@ describe('PPT relay: round-18 fixes (XIN-1754)', () => {
   /** Sign a fresh single-use ticket (mirrors the ordering-model block's helper). */
   const freshTicket = (o: { uid: string; role: Role; spaceMember: boolean; epoch?: number; ttl?: number }): string =>
     jwt.sign(
-      { uid: o.uid, docId: DOC, documentName: DOCNAME, role: o.role, permission_epoch: o.epoch ?? 0, space_member: o.spaceMember, home_space_verified: true, jti: randomUUID() },
+      { uid: o.uid, docId: DOC, documentName: DOCNAME, role: o.role, permission_epoch: o.epoch ?? 0, principal_space_id: 's_1', space_member: o.spaceMember, home_space_verified: true, jti: randomUUID() },
       config.collabToken.secret,
       { algorithm: 'HS256', audience: PPT_RELAY_TICKET_AUD, expiresIn: o.ttl ?? 30 },
     )

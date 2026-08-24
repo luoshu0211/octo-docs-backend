@@ -62,6 +62,9 @@ const metaRow = {
   doc_type: 'doc',
   status: 1,
   permission_epoch: 7,
+  share_scope: 0,
+  share_role: 1,
+  discoverability_scope: 0,
   created_at: new Date(0),
   updated_at: new Date(1000),
   created_by: 'u_owner',
@@ -103,6 +106,7 @@ describe('GET /api/v1/docs/:docId — read one (§8.4)', () => {
       // as the fail-safe default (restricted / read).
       shareScope: 'restricted',
       shareRole: 'read',
+      spaceSearchable: false,
       permissionEpoch: 7,
     })
     // snake_case columns are never leaked on the wire.

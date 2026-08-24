@@ -20,6 +20,7 @@ const base = {
   requestId: 'req_1',
   documentName: 'dn-1',
   uid: 'u_req',
+  principalSpaceId: 's_req',
   roleNum: 2,
   grantedBy: 'u_admin',
 }
@@ -30,12 +31,36 @@ beforeEach(() => {
 })
 
 describe('grantRequestWithBots', () => {
+  it("uses the requester's verified current Space for both the human and carried Bots", async () => {
+    await grantRequestWithBots({ ...base, botUids: ['bot_a'] })
+
+    expect(vi.mocked(grantForwardAccess)).toHaveBeenNthCalledWith(1, expect.objectContaining({
+      uid: 'u_req', principalSpaceId: 's_req', roleNum: 2,
+    }))
+    expect(vi.mocked(grantForwardAccess)).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      uid: 'bot_a', principalSpaceId: 's_req', roleNum: 2,
+    }))
+  })
+
   it('grants the requester then each bot at the same role', async () => {
     const out = await grantRequestWithBots({ ...base, botUids: ['bot_a', 'bot_b'] })
     expect(out).toEqual({ requesterRole: 'writer', botsSucceeded: ['bot_a', 'bot_b'], botsFailed: [] })
     expect(vi.mocked(grantForwardAccess)).toHaveBeenCalledTimes(3)
     for (const uid of ['u_req', 'bot_a', 'bot_b']) {
       expect(vi.mocked(grantForwardAccess)).toHaveBeenCalledWith(expect.objectContaining({ uid, roleNum: 2 }))
+    }
+  })
+
+  it('threads an admin approval to both the requester and every carried Bot', async () => {
+    await grantRequestWithBots({ ...base, roleNum: 3, allowAdmin: true, botUids: ['bot_a', 'bot_b'] })
+
+    expect(vi.mocked(grantForwardAccess)).toHaveBeenCalledTimes(3)
+    for (const uid of ['u_req', 'bot_a', 'bot_b']) {
+      expect(vi.mocked(grantForwardAccess)).toHaveBeenCalledWith(expect.objectContaining({
+        uid,
+        roleNum: 3,
+        allowAdmin: true,
+      }))
     }
   })
 

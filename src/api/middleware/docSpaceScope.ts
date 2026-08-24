@@ -1,11 +1,12 @@
 /**
  * Temporary Human document Space policy.
  *
- * Documents remain docId-first: X-Space-Id never selects a document. Before the
- * Space-qualified ACL model ships, every Human single-document authorization
- * requires a non-empty current Space, verifies the session is a member of that
- * Space, and requires it to equal doc_meta.space_id. Bot requests retain their
- * server-resolved Space and existing same-Space isolation.
+ * Documents remain docId-first: X-Space-Id never selects a document. Every
+ * Human single-document authorization requires a non-empty current Space and
+ * verifies the session is a member of that Space. The verified current Space
+ * may differ from doc_meta.space_id; direct ACL and share-scope authorization
+ * decide document access. Bot requests retain their server-resolved Space and
+ * existing same-Space isolation.
  */
 import type { Request, Response, NextFunction } from 'express'
 import type { DocMeta } from '../../db/repos/docMetaRepo.js'
@@ -36,7 +37,8 @@ declare global {
 
 /**
  * Mark the Human mount and parse its current-Space candidate. The shared guard
- * performs membership and document-home equality checks after docId lookup.
+ * verifies membership in that current Space after docId lookup; it does not use
+ * the header as a document locator or require document-home equality.
  */
 export function humanDocSpaceScopeMiddleware(req: Request, _res: Response, next: NextFunction): void {
   req.docSpaceScope = { mode: 'human' }
@@ -51,13 +53,13 @@ export function humanDocSpaceScopeMiddleware(req: Request, _res: Response, next:
  * Temporary pre-Space-qualified safety gate.
  *
  * Human requests still locate by docId, but may authorize only while the
- * caller's server-verified current Space is the document's home Space. The full
- * qualified-principal model will replace this equality gate.
+ * caller's current Space is server-verified. Document authorization remains
+ * docId/ACL based; equality with the document home Space is not required.
  */
-export async function requireVerifiedHumanHomeSpace(
+export async function requireVerifiedHumanCurrentSpace(
   req: Request,
   res: Response,
-  meta: Pick<DocMeta, 'space_id'>,
+  _meta: Pick<DocMeta, 'space_id'>,
 ): Promise<boolean> {
   const candidate = (req.viewerSpaceId ?? '').trim()
   if (candidate === '') {
@@ -66,7 +68,7 @@ export async function requireVerifiedHumanHomeSpace(
   }
   const verified = req.verifiedViewerSpaceId === candidate
     || await confirmSpaceMembership(req.uid ?? '', candidate, req.octoToken ?? '')
-  if (!verified || candidate !== meta.space_id) {
+  if (!verified) {
     res.status(404).json({ error: 'not_found' })
     return false
   }

@@ -182,6 +182,7 @@ export async function patchDocSceneHandler(req: Request, res: Response): Promise
       uid: req.uid!,
       docId: guard.meta.doc_id,
       documentName: guard.meta.document_name,
+      principalSpaceId: req.principalSpaceId!,
       clientBaseVersion: parseBaseVersion(baseVersionRaw),
       ops,
       authorizedEpoch: guard.meta.permission_epoch,

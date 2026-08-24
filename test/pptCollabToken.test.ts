@@ -125,6 +125,7 @@ function seedDoc(over: Partial<FakeMeta> = {}): void {
     doc_id: 'd_ppt1',
     document_name: 'octo:s_1:f_default:ppt:d_ppt1',
     owner_id: 'u_owner',
+    owner_space_id: 's_1',
     space_id: 's_1',
     folder_id: 'f_default',
     doc_type: 'html_ppt',
@@ -204,6 +205,7 @@ describe('POST /api/v1/ppt/docs/collab-token (§7.1)', () => {
 
   it('PPT-TOKEN-001: legacy Hocuspocus collab-token is NOT issued for html_ppt (422)', async () => {
     seedDoc()
+    setOctoIdentity(stub({ verifyToken: async () => ({ uid: 'u_writer' }), isSpaceMember: async () => true }))
     const r = await issueCollabToken('user-tok', 'octo:s_1:f_default:ppt:d_ppt1', 's_1')
     expect(r.ok).toBe(false)
     if (!r.ok) {

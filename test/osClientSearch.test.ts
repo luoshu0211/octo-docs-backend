@@ -41,6 +41,7 @@ describe('searchDocs — visible-set down-push + search_after pagination', () =>
     searchSpy.mockResolvedValue(osResponse([], 0))
     await searchDocs({
       spaceId: 's1',
+      principalSpaceId: 's1',
       query: 'hello',
       visibleDocIds: ['d1', 'd2'],
       size: 20,
@@ -81,6 +82,7 @@ describe('searchDocs — visible-set down-push + search_after pagination', () =>
     searchSpy.mockResolvedValue(osResponse([], 0))
     await searchDocs({
       spaceId: 's1',
+      principalSpaceId: 's1',
       query: 'x',
       visibleDocIds: ['d1'],
       size: 20,
@@ -95,6 +97,7 @@ describe('searchDocs — visible-set down-push + search_after pagination', () =>
   it('empty visible set => total=0, searchAfter=null WITHOUT calling OpenSearch', async () => {
     const res = await searchDocs({
       spaceId: 's1',
+      principalSpaceId: 's1',
       query: 'x',
       visibleDocIds: [],
       size: 20,
@@ -107,6 +110,7 @@ describe('searchDocs — visible-set down-push + search_after pagination', () =>
     searchSpy.mockResolvedValue(osResponse([], 0))
     await searchDocs({
       spaceId: 's1',
+      principalSpaceId: 's1',
       query: 'x',
       docType: ['doc', 'sheet'],
       visibleDocIds: ['d1'],
@@ -137,6 +141,7 @@ describe('searchDocs — visible-set down-push + search_after pagination', () =>
     )
     const res = await searchDocs({
       spaceId: 's1',
+      principalSpaceId: 's1',
       query: 'x',
       visibleDocIds: ['d1', 'd2'],
       size: 20,

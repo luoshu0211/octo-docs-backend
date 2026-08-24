@@ -16,7 +16,7 @@ import { docVersionRepo } from '../src/db/repos/docVersionRepo.js'
 import { docCommentRepo } from '../src/db/repos/docCommentRepo.js'
 import { docMetaRepo } from '../src/db/repos/docMetaRepo.js'
 import { pptCollabOpRepo } from '../src/db/repos/pptCollabOpRepo.js'
-import { query } from '../src/db/pool.js'
+import { query, transaction } from '../src/db/pool.js'
 
 const mockQuery = vi.mocked(query)
 
@@ -30,6 +30,10 @@ function lastCall(): { sql: string; params: unknown[] } {
 beforeEach(() => {
   mockQuery.mockReset()
   mockQuery.mockResolvedValue([] as never)
+  vi.mocked(transaction).mockReset().mockImplementation(async (fn) => fn({
+    query: mockQuery,
+    execute: vi.fn(),
+  } as never))
 })
 
 describe('paginated repos inline a validated integer LIMIT/OFFSET (no numeric `?` bind)', () => {
@@ -154,6 +158,7 @@ describe('docMetaRepo.listForUser binds space/folder filters positionally', () =
     await docMetaRepo.listForUser({
       uid: 'u_1',
       spaceId: 's_42',
+      principalSpaceId: 's_42',
       page: 1,
       pageSize: 10,
       sort: 'updatedAt:desc',
@@ -164,7 +169,7 @@ describe('docMetaRepo.listForUser binds space/folder filters positionally', () =
     const params = (countCall[1] ?? []) as unknown[]
     expect(sql).toMatch(/COUNT\(\*\)/)
     // Placeholder order in `base`: dm.uid, m.space_id, m.owner_id.
-    expect(params).toEqual(['u_1', 's_42', 'u_1'])
+    expect(params).toEqual(['u_1', 's_42', 's_42', 'u_1', 's_42'])
     // The old buggy order would have been ['u_1', 'u_1', 's_42'] — owner_id bound
     // to the spaceId. Assert that specifically is gone.
     expect(params).not.toEqual(['u_1', 'u_1', 's_42'])
@@ -174,6 +179,7 @@ describe('docMetaRepo.listForUser binds space/folder filters positionally', () =
     await docMetaRepo.listForUser({
       uid: 'u_1',
       spaceId: 's_42',
+      principalSpaceId: 's_42',
       page: 1,
       pageSize: 10,
       sort: 'updatedAt:desc',
@@ -181,13 +187,14 @@ describe('docMetaRepo.listForUser binds space/folder filters positionally', () =
     // The items SELECT is the last query() call. Its placeholder order is:
     // CASE m.owner_id=?, JOIN dm.uid=?, m.space_id=?, WHERE m.owner_id=?.
     const { params } = lastCall()
-    expect(params).toEqual(['u_1', 'u_1', 's_42', 'u_1'])
+    expect(params).toEqual(['u_1', 's_42', 'u_1', 's_42', 's_42', 'u_1', 's_42'])
   })
 
   it('orders space then folder, with join uid first and owner uid last', async () => {
     await docMetaRepo.listForUser({
       uid: 'owner_x',
       spaceId: 'space_y',
+      principalSpaceId: 'space_y',
       folderId: 'folder_z',
       page: 1,
       pageSize: 10,
@@ -196,7 +203,7 @@ describe('docMetaRepo.listForUser binds space/folder filters positionally', () =
     const countCall = mockQuery.mock.calls[0]!
     const params = (countCall[1] ?? []) as unknown[]
     // JOIN dm.uid, m.space_id, m.folder_id, WHERE m.owner_id.
-    expect(params).toEqual(['owner_x', 'space_y', 'folder_z', 'owner_x'])
+    expect(params).toEqual(['owner_x', 'space_y', 'space_y', 'folder_z', 'owner_x', 'space_y'])
   })
 
   // Behavioural framing of the same fix: with the misaligned binding, the row's
@@ -209,6 +216,7 @@ describe('docMetaRepo.listForUser binds space/folder filters positionally', () =
     await docMetaRepo.listForUser({
       uid: 'u_owner',
       spaceId: 's_correct',
+      principalSpaceId: 's_correct',
       page: 1,
       pageSize: 10,
       sort: 'updatedAt:desc',
@@ -217,7 +225,7 @@ describe('docMetaRepo.listForUser binds space/folder filters positionally', () =
     // space_id placeholder (index 1) must carry the space, not the uid…
     expect(countParams[1]).toBe('s_correct')
     // …and the trailing owner_id placeholder (last) must carry the uid, not the space.
-    expect(countParams.at(-1)).toBe('u_owner')
+    expect(countParams.at(-2)).toBe('u_owner')
   })
 })
 
@@ -245,6 +253,7 @@ describe('docMetaRepo.listForUser owner=me spans caller + owned bots', () => {
     await docMetaRepo.listForUser({
       uid: 'u_human',
       spaceId: 's_1',
+      principalSpaceId: 's_1',
       owner: 'me',
       ownedBots: ['bot_a', 'bot_b'],
       page: 1,
@@ -257,21 +266,22 @@ describe('docMetaRepo.listForUser owner=me spans caller + owned bots', () => {
     // Shared-with-me is still excluded (no OR dm.role IN (1, 2, 3, 4) on owner=me).
     expect(countSql).not.toMatch(/dm\.uid IS NOT NULL/)
     // COUNT bind order: JOIN dm.uid, m.space_id, then the owner set.
-    expect(countParams).toEqual(['u_human', 's_1', 'u_human', 'bot_a', 'bot_b'])
+    expect(countParams).toEqual(['u_human', 's_1', 's_1', 'u_human', 'bot_a', 'bot_b', 's_1'])
     // fail-before: the pre-feature code bound a single trailing uid here, so the
     // bot uids were absent and bot-owned docs could never match.
     expect(countParams).toContain('bot_a')
     expect(countParams).toContain('bot_b')
     // Role projection uses the same owner set, so bot-owned rows are admin even
     // when no doc_member row exists for the human.
-    expect(itemsParams).toEqual(['u_human', 'bot_a', 'bot_b', 'u_human', 's_1', 'u_human', 'bot_a', 'bot_b'])
-    expect(itemsSql).toMatch(/CASE WHEN m\.owner_id IN \(\?, \?, \?\) THEN 3/)
+    expect(itemsParams).toEqual(['u_human', 'bot_a', 'bot_b', 's_1', 'u_human', 's_1', 's_1', 'u_human', 'bot_a', 'bot_b', 's_1'])
+    expect(itemsSql).toMatch(/CASE WHEN \(m\.owner_id IN \(\?, \?, \?\) AND m\.owner_space_id = \?\) THEN 3/)
   })
 
   it('empty ownedBots degrades to exactly the pre-feature single-owner behavior', async () => {
     await docMetaRepo.listForUser({
       uid: 'u_human',
       spaceId: 's_1',
+      principalSpaceId: 's_1',
       owner: 'me',
       ownedBots: [],
       page: 1,
@@ -283,14 +293,15 @@ describe('docMetaRepo.listForUser owner=me spans caller + owned bots', () => {
     // one bind) — backward compatible, still owner-only (no shared-with-me).
     expect(countSql).toMatch(/m\.owner_id IN \(\?\)/)
     expect(countSql).not.toMatch(/dm\.uid IS NOT NULL/)
-    expect(countParams).toEqual(['u_human', 's_1', 'u_human'])
-    expect(itemsParams).toEqual(['u_human', 'u_human', 's_1', 'u_human'])
+    expect(countParams).toEqual(['u_human', 's_1', 's_1', 'u_human', 's_1'])
+    expect(itemsParams).toEqual(['u_human', 's_1', 'u_human', 's_1', 's_1', 'u_human', 's_1'])
   })
 
   it('absent ownedBots (field omitted) also degrades to single-owner behavior', async () => {
     await docMetaRepo.listForUser({
       uid: 'u_human',
       spaceId: 's_1',
+      principalSpaceId: 's_1',
       owner: 'me',
       page: 1,
       pageSize: 10,
@@ -298,13 +309,14 @@ describe('docMetaRepo.listForUser owner=me spans caller + owned bots', () => {
     } as never)
     const { countSql, countParams } = ownerCall()
     expect(countSql).toMatch(/m\.owner_id IN \(\?\)/)
-    expect(countParams).toEqual(['u_human', 's_1', 'u_human'])
+    expect(countParams).toEqual(['u_human', 's_1', 's_1', 'u_human', 's_1'])
   })
 
   it('dedupes and strips empties so placeholder count === bind count (no errno 1210)', async () => {
     await docMetaRepo.listForUser({
       uid: 'u_human',
       spaceId: 's_1',
+      principalSpaceId: 's_1',
       owner: 'me',
       // duplicate of self, a repeated bot, and empty strings must all collapse.
       ownedBots: ['u_human', 'bot_a', 'bot_a', '', 'bot_c'],
@@ -317,16 +329,17 @@ describe('docMetaRepo.listForUser owner=me spans caller + owned bots', () => {
     const countPlaceholders = (countSql.match(/m\.owner_id IN \(([^)]*)\)/)![1].match(/\?/g) || [])
       .length
     // count query trailing binds after [joinUid, spaceId] are the owner set.
-    expect(countParams.slice(2).length).toBe(countPlaceholders)
-    expect(countParams).toEqual(['u_human', 's_1', 'u_human', 'bot_a', 'bot_c'])
+    expect(countParams.slice(3, -1).length).toBe(countPlaceholders)
+    expect(countParams).toEqual(['u_human', 's_1', 's_1', 'u_human', 'bot_a', 'bot_c', 's_1'])
     // items query: leading CASE owner-set binds + [joinUid, spaceId] + owner set.
-    expect(itemsParams).toEqual(['u_human', 'bot_a', 'bot_c', 'u_human', 's_1', 'u_human', 'bot_a', 'bot_c'])
+    expect(itemsParams).toEqual(['u_human', 'bot_a', 'bot_c', 's_1', 'u_human', 's_1', 's_1', 'u_human', 'bot_a', 'bot_c', 's_1'])
   })
 
   it('folder + q + owner=me: bind count still matches across every placeholder', async () => {
     await docMetaRepo.listForUser({
       uid: 'u_human',
       spaceId: 's_1',
+      principalSpaceId: 's_1',
       folderId: 'f_9',
       owner: 'me',
       ownedBots: ['bot_a'],
@@ -341,7 +354,7 @@ describe('docMetaRepo.listForUser owner=me spans caller + owned bots', () => {
     const totalPlaceholders = (countSql.match(/\?/g) || []).length
     expect(countParams.length).toBe(totalPlaceholders)
     // Positional order: JOIN dm.uid, space, folder, q, then owner set.
-    expect(countParams).toEqual(['u_human', 's_1', 'f_9', '%report%', 'u_human', 'bot_a'])
+    expect(countParams).toEqual(['u_human', 's_1', 's_1', 'f_9', '%report%', 'u_human', 'bot_a', 's_1'])
   })
 })
 
@@ -370,6 +383,7 @@ describe('docMetaRepo html registration slug SQL', () => {
       title: 'HTML',
       ownerId: 'bot_1',
       spaceId: 's_1',
+      principalSpaceId: 's_1',
       folderId: 'f_default',
       docType: 'html',
       octoDocSlug: 'html-slug-1',
@@ -388,6 +402,7 @@ describe('docMetaRepo html registration slug SQL', () => {
       title: 'Doc 1',
       ownerId: 'u_1',
       spaceId: 's_1',
+      principalSpaceId: 's_1',
       folderId: 'f_default',
       docType: 'doc',
       createdBy: 'u_1',
@@ -398,6 +413,7 @@ describe('docMetaRepo html registration slug SQL', () => {
       title: 'Board 1',
       ownerId: 'u_1',
       spaceId: 's_1',
+      principalSpaceId: 's_1',
       folderId: 'f_default',
       docType: 'whiteboard',
       octoDocSlug: 'ignored-for-non-html',
@@ -406,8 +422,8 @@ describe('docMetaRepo html registration slug SQL', () => {
 
     const firstParams = mockQuery.mock.calls.at(-2)?.[1] as unknown[]
     const secondParams = mockQuery.mock.calls.at(-1)?.[1] as unknown[]
-    expect(firstParams[7]).toBeNull()
-    expect(secondParams[7]).toBeNull()
+    expect(firstParams[8]).toBeNull()
+    expect(secondParams[8]).toBeNull()
   })
 
   it('finds html metadata by octo_doc_slug scoped to the space (P0)', async () => {
@@ -437,6 +453,7 @@ describe('docMetaRepo html registration slug SQL', () => {
       title: 'HTML 2',
       ownerId: 'bot_1',
       spaceId: 's_1',
+      principalSpaceId: 's_1',
       folderId: 'f_default',
       docType: 'html',
       octoDocSlug: 'html-slug-1',
@@ -488,6 +505,7 @@ describe('docMetaRepo html registration slug SQL', () => {
       title: 'HTML raced',
       ownerId: 'bot_1',
       spaceId: 's_1',
+      principalSpaceId: 's_1',
       folderId: 'f_default',
       docType: 'html',
       octoDocSlug: 'html-slug-1',

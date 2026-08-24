@@ -29,10 +29,10 @@ import {
   type DocAccessNotifyCardRow,
 } from '../../db/repos/docAccessNotifyCardRepo.js'
 import { resolveOperatorName } from './decisionDisplay.js'
+import { getOctoIdentity } from '../../auth/octoIdentity.js'
 import { formatCardTimestamp, formatCardTimestampFromSeconds } from '../../util/cardTime.js'
 
 const INTERNAL_MUTATE_PATH = '/v1/internal/cards/mutate'
-const INTERNAL_NOTIFY_PATH = '/v1/internal/notify'
 const INTERNAL_TOKEN_HEADER = 'X-Internal-Token'
 const KIND_ACCESS_GRANTED = 'access_granted'
 const KIND_ACCESS_DENIED = 'access_denied'
@@ -79,6 +79,8 @@ export interface DecisionCardSyncParams {
    * OCTO_SERVER_TOKEN. The signed callback has no session and passes none.
    */
   callerToken?: string
+  /** Space-qualified principal of the decider, used for display context. */
+  deciderSpaceId?: string
 }
 
 /** POST helper with a bounded timeout. Returns the Response or null on network error. */
@@ -113,6 +115,7 @@ async function postJson(path: string, token: string, body: unknown): Promise<Res
  */
 interface DeciderDisplay {
   operatorName: string
+  operatorSpaceName: string
   decidedAtDisplay: string
 }
 
@@ -133,7 +136,9 @@ async function mutateOneCard(
     doc_id: p.docId,
     title: p.title,
     deny_reason: p.denied ? (p.denyReason ?? '') : '',
+    operator_uid: p.deciderUid,
     operator_name: decider.operatorName,
+    operator_space_name: decider.operatorSpaceName,
     decided_at_display: decider.decidedAtDisplay,
   })
   return res !== null && res.ok
@@ -144,29 +149,6 @@ async function mutateOneCard(
  * decider identity + time as the in-place mutate so a card that lands on the
  * fallback is not the odd one out showing a generic label and no time.
  */
-async function reNotifyTerminal(
-  p: DecisionCardSyncParams,
-  kind: string,
-  card: DocAccessNotifyCardRow,
-  token: string,
-  decider: DeciderDisplay,
-): Promise<void> {
-  await postJson(INTERNAL_NOTIFY_PATH, token, {
-    space_id: p.spaceId,
-    service: config.notify.service,
-    targets: [card.recipient_uid],
-    actor_uid: '',
-    docs_card: {
-      doc_id: p.docId,
-      request_id: p.requestId,
-      kind,
-      title: p.title,
-      actor_name: decider.operatorName,
-      excerpt: p.denied ? (p.denyReason ?? '') : '',
-      updated_at: decider.decidedAtDisplay,
-    },
-  })
-}
 
 /**
  * Drive all sibling approver cards for a decided request to terminal. Best-effort
@@ -193,8 +175,12 @@ export async function syncDecisionCards(p: DecisionCardSyncParams): Promise<void
     // resolved it for the decider's own card (no second lookup for the same uid);
     // the time is the authoritative decision time so all cards agree to the
     // minute. Either may be empty — the endpoint then keeps its generic copy.
+    const identity = getOctoIdentity()
     const decider: DeciderDisplay = {
       operatorName: p.deciderName ?? (await resolveOperatorName(p.deciderUid, p.callerToken)),
+      operatorSpaceName: p.deciderSpaceId && typeof identity.getSpaceName === 'function'
+        ? await identity.getSpaceName(p.deciderSpaceId, p.callerToken ?? '').catch(() => '')
+        : '',
       decidedAtDisplay:
         p.decidedAtSeconds !== undefined
           ? formatCardTimestampFromSeconds(p.decidedAtSeconds)
@@ -206,8 +192,13 @@ export async function syncDecisionCards(p: DecisionCardSyncParams): Promise<void
         try {
           const applied = await mutateOneCard(p, kind, card, docsToken, decider)
           if (!applied) {
-            // Fallback so the approver still gets a terminal card.
-            await reNotifyTerminal(p, kind, card, docsToken, decider)
+            // Do not create a second terminal card. The original card remains
+            // authoritative; mutation failures are observable and retryable.
+            // eslint-disable-next-line no-console
+            console.error('[octo-docs] decision card mutate was not applied', {
+              requestId: p.requestId,
+              recipientUid: card.recipient_uid,
+            })
             return
           }
           // Best-effort audit; a failure here is harmless.
