@@ -273,6 +273,49 @@ describe('bot html doc registration', () => {
     expect(upsertDirect).not.toHaveBeenCalled()
   })
 
+  it('uses only the server-verified Space and ignores a client-supplied Space when creating canonical HTML', async () => {
+    setOctoIdentity(stub({ verifyBot: async () => ({ uid: 's_tmos_bot', spaceId: 's_verified', ownerUid: 'u_human' }) }))
+    createCanonicalHtml.mockResolvedValue({
+      meta: { ...htmlMeta, doc_id: 'd_verified', octo_doc_slug: 'd_verified', owner_space_id: 's_verified', space_id: 's_verified' },
+      created: true,
+    } as never)
+
+    const response = await fetch(`${base}/v1/bot/docs`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer bot-tok',
+        'content-type': 'application/json',
+        'X-Space-Id': 's_spoofed',
+      },
+      body: JSON.stringify({ docType: 'html', idempotencyKey: 'verified-space' }),
+    })
+
+    expect(response.status).toBe(201)
+    expect(createCanonicalHtml).toHaveBeenCalledWith(expect.objectContaining({
+      spaceId: 's_verified',
+      ownerId: 's_tmos_bot',
+    }))
+    expect(createCanonicalHtml.mock.calls[0]![0].spaceId).not.toBe('s_spoofed')
+  })
+
+  it.each([
+    ['missing verified Space', null],
+    ['invalid verified Space', { uid: 's_tmos_bot', spaceId: 'space/invalid', ownerUid: 'u_human' }],
+  ])('rejects %s before creating canonical HTML', async (_label, identity) => {
+    setOctoIdentity(stub({ verifyBot: async () => identity as never }))
+
+    const response = await fetch(`${base}/v1/bot/docs`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer bot-tok', 'content-type': 'application/json' },
+      body: JSON.stringify({ docType: 'html', idempotencyKey: 'invalid-space' }),
+    })
+
+    expect(response.status).toBe(identity === null ? 401 : 400)
+    expect(createCanonicalHtml).not.toHaveBeenCalled()
+    expect(upsertHtmlByOctoDocSlug).not.toHaveBeenCalled()
+    expect(upsertDirect).not.toHaveBeenCalled()
+  })
+
   it('rejects mixing a canonical idempotencyKey with a legacy octoDocSlug', async () => {
     setOctoIdentity(stub({ verifyBot: async () => ({ uid: 's_tmos_bot', spaceId: 's_1', ownerUid: 'u_human' }) }))
 

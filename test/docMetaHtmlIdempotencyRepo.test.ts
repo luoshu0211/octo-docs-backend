@@ -56,9 +56,10 @@ describe('docMetaRepo.createCanonicalHtml', () => {
       .mockResolvedValueOnce([{ ...existing, doc_id: 'd_new', octo_doc_slug: 'd_new' }] as never)
     const result = await docMetaRepo.createCanonicalHtml({ ...input, humanOwnerUid: 'u_human' })
     expect(result.created).toBe(true)
-    const args = tx.query.mock.calls[0]![1] as unknown[]
+    const [insertSql, args] = tx.query.mock.calls[0]! as [string, unknown[]]
+    expect(insertSql).toContain('owner_id, owner_space_id, space_id')
     expect(args).toEqual([
-      'd_new', input.documentName, 'Initial title', 'bot_a', 's_a', 'f_default',
+      'd_new', input.documentName, 'Initial title', 'bot_a', 's_a', 's_a', 'f_default',
       'html', 'd_new', hash, 'bot_a',
     ])
     expect(args).not.toContain(input.idempotencyKey)

@@ -285,10 +285,10 @@ export const docMetaRepo = {
       const created = await transaction(async (tx) => {
         await tx.query(
           `INSERT INTO doc_meta
-             (doc_id, document_name, title, owner_id, space_id, folder_id, doc_type, octo_doc_slug,
+             (doc_id, document_name, title, owner_id, owner_space_id, space_id, folder_id, doc_type, octo_doc_slug,
               html_idempotency_key_hash, status, permission_epoch, created_by, updated_by)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, '')`,
-          [input.docId, input.documentName, input.title, input.ownerId, input.spaceId, input.folderId,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, '')`,
+          [input.docId, input.documentName, input.title, input.ownerId, input.spaceId, input.spaceId, input.folderId,
             'html', input.docId, keyHash, input.createdBy],
         )
         if (input.humanOwnerUid && input.humanOwnerUid !== input.ownerId) {
