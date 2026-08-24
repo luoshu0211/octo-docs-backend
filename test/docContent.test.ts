@@ -14,7 +14,7 @@ vi.mock('../src/collab/liveDocWrite.js', () => ({
   commitLiveEdit: vi.fn(),
 }))
 
-import { getDocContentHandler, patchDocContentHandler } from '../src/api/routes/docContent.js'
+import { getDocContentHandler, patchDocContentHandler, getSummarySourceHandler } from '../src/api/routes/docContent.js'
 import { requireDocRole } from '../src/api/guard.js'
 import { transaction } from '../src/db/pool.js'
 import { readLiveForEdit, commitLiveEdit } from '../src/collab/liveDocWrite.js'
@@ -753,6 +753,47 @@ describe('PATCH /content — safety marker is compensated on a rejected live com
     expect(deleteSpy).not.toHaveBeenCalled()
     vi.mocked(docVersionRepo.createTx).mockRestore()
     deleteSpy.mockRestore()
+  })
+})
+
+describe('GET /:docId/summary-source', () => {
+  beforeEach(() => vi.clearAllMocks())
+
+  it('returns summarize-ready plain text in the #201 contract shape', async () => {
+    const readerGuard = {
+      meta: { doc_id: 'd_1', document_name: 'octo:s1:f_default:d_1', doc_type: 'doc', title: '季度财报' },
+      role: 'reader',
+    } as never
+    vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
+    vi.mocked(readLiveForEdit).mockResolvedValue(liveView([para('营收同比增长'), para('风险与展望')]) as never)
+
+    const res = mockRes()
+    await getSummarySourceHandler(req({ docId: 'd_1' }), res as never)
+
+    expect(res.statusCode).toBe(200)
+    const body = res.body as {
+      document_id: string
+      title: string
+      version: string
+      content: string
+      chunks: unknown[]
+    }
+    expect(body.document_id).toBe('d_1')
+    expect(body.title).toBe('季度财报')
+    expect(typeof body.version).toBe('string')
+    // Block-flattened plain text: both paragraphs present, no ProseMirror JSON.
+    expect(body.content).toContain('营收同比增长')
+    expect(body.content).toContain('风险与展望')
+    expect(body.content).not.toContain('"type"')
+    expect(Array.isArray(body.chunks)).toBe(true)
+  })
+
+  it('bails when the reader guard rejects (no body read)', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(null) // guard already wrote 403/404
+    const res = mockRes()
+    await getSummarySourceHandler(req({ docId: 'd_x' }), res as never)
+    expect(readLiveForEdit).not.toHaveBeenCalled()
+    expect(res.statusCode).toBe(0)
   })
 })
 
