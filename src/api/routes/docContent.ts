@@ -174,11 +174,14 @@ docContentRouter.get('/:docId/summary-source', getSummarySourceHandler)
 
 /**
  * Block-aware plain text for the AI-preview source: block nodes separated by a
- * blank line, and each leaf/atom node emits the DISPLAYED text it stores in attrs
- * rather than a bare newline. Without this, `textBetween`'s string leaf-substitute
- * drops attribute-backed content — a formula-only doc would flatten to '' and
- * mention/emoji/attachment text would vanish — leaving the summary service to
- * summarize nothing or misleading text (mirrors each node's schema toDOM).
+ * blank line, and each attribute-backed leaf/atom node emits the DISPLAYED text it
+ * stores in attrs rather than a bare newline. All 7 attr-backed leaf types are
+ * covered (inlineMath/blockMath latex, mention label, emoji name, fileAttachment
+ * fileName, image alt/title, bookmark title/description); only truly text-less
+ * leaves (hardBreak) keep the newline substitution. Without this, `textBetween`'s
+ * string leaf-substitute drops attribute-backed content — a formula- or bookmark-
+ * only doc would flatten to '' — leaving the summary service to summarize nothing
+ * or misleading text (mirrors each node's schema toDOM).
  */
 function pmDocToPlainText(pmDoc: PMNode): string {
   return pmDoc.textBetween(0, pmDoc.content.size, '\n\n', leafDisplayText).trim()
@@ -197,7 +200,19 @@ function leafDisplayText(node: PMNode): string {
       return typeof attrs.name === 'string' ? `:${attrs.name}:` : ''
     case 'fileAttachment':
       return typeof attrs.fileName === 'string' ? attrs.fileName : ''
+    case 'image': {
+      const alt = typeof attrs.alt === 'string' ? attrs.alt : ''
+      const title = typeof attrs.title === 'string' ? attrs.title : ''
+      return alt || title
+    }
+    case 'bookmark': {
+      const parts = [attrs.title, attrs.description].filter(
+        (v): v is string => typeof v === 'string' && v.length > 0,
+      )
+      return parts.join(' — ')
+    }
     default:
+      // Truly text-less leaves (e.g. hardBreak) keep the newline substitution.
       return '\n'
   }
 }
