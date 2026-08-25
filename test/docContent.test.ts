@@ -842,6 +842,54 @@ describe('GET /:docId/summary-source', () => {
     expect(content).toContain('季度财报.xlsx') // attachment file name
   })
 
+  it('preserves bookmark title/description — a bookmark-only doc does not flatten to empty', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(summaryReaderGuard)
+    vi.mocked(readLiveForEdit).mockResolvedValue({
+      pmDoc: docNode([
+        {
+          type: 'bookmark',
+          attrs: {
+            url: 'https://example.com/review',
+            title: '设计评审会议纪要',
+            description: '本周设计评审要点与结论',
+            image: null,
+            siteName: null,
+            fetchedAt: null,
+          },
+        },
+      ]),
+      baseSV: new Uint8Array(),
+    } as never)
+
+    const res = mockRes()
+    await getSummarySourceHandler(req({ docId: 'd_1' }), res as never)
+
+    expect(res.statusCode).toBe(200)
+    const content = (res.body as { content: string }).content
+    expect(content).not.toBe('')
+    expect(content).toContain('设计评审会议纪要')
+    expect(content).toContain('本周设计评审要点与结论')
+  })
+
+  it('preserves image alt text in flattening', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(summaryReaderGuard)
+    vi.mocked(readLiveForEdit).mockResolvedValue({
+      pmDoc: docNode([
+        para('见下图'),
+        { type: 'image', attrs: { attachId: 'a1', src: null, alt: '系统架构图', title: null, width: null, align: null } },
+      ]),
+      baseSV: new Uint8Array(),
+    } as never)
+
+    const res = mockRes()
+    await getSummarySourceHandler(req({ docId: 'd_1' }), res as never)
+
+    expect(res.statusCode).toBe(200)
+    const content = (res.body as { content: string }).content
+    expect(content).toContain('见下图')
+    expect(content).toContain('系统架构图') // image alt
+  })
+
   it('bails when the reader guard rejects (no body read)', async () => {
     vi.mocked(requireDocRole).mockResolvedValue(null) // guard already wrote 403/404
     const res = mockRes()
