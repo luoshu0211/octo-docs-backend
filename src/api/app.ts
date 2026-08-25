@@ -85,7 +85,7 @@ import { attachmentsRouter } from './routes/attachments.js'
 import { linkCardRouter } from './routes/linkCard.js'
 import { commentsRouter } from './routes/comments.js'
 import { versionsRouter } from './routes/versions.js'
-import { docContentRouter } from './routes/docContent.js'
+import { docContentRouter, getSummarySourceHandler } from './routes/docContent.js'
 import { docSheetRouter } from './routes/docSheet.js'
 import { docSceneRouter } from './routes/docScene.js'
 import { exportRouter } from './routes/export.js'
@@ -292,6 +292,18 @@ export function createApp(
 
   // Mounted only on the public surface: this is the browser-facing human API.
   if (servePublic) app.use('/api/v1/docs', api)
+  // Compat alias for octo-smart-summary's FetchSummarySource, which requests the
+  // summary source at `/api/documents/:docId/summary-source` while the canonical
+  // route above lives under `/api/v1/docs`. Scoped to that single read (same auth +
+  // human space-scope chain the handler needs), never the whole doc API, so the
+  // two services interoperate without exposing a second copy of every endpoint.
+  if (servePublic) {
+    const summarySourceAlias = Router()
+    summarySourceAlias.use(authMiddleware)
+    summarySourceAlias.use(humanDocSpaceScopeMiddleware)
+    summarySourceAlias.get('/:docId/summary-source', getSummarySourceHandler)
+    app.use('/api/documents', summarySourceAlias)
+  }
 
   // Internal surface: the html service registers published docs here with the
   // shared internal token — no browser ever calls it.
