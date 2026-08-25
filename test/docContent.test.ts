@@ -788,6 +788,60 @@ describe('GET /:docId/summary-source', () => {
     expect(Array.isArray(body.chunks)).toBe(true)
   })
 
+  const summaryReaderGuard = {
+    meta: { doc_id: 'd_1', document_name: 'octo:s1:f_default:d_1', doc_type: 'doc', title: '' },
+    role: 'reader',
+  } as never
+
+  it('preserves formula latex — a formula-only doc does not flatten to empty', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(summaryReaderGuard)
+    vi.mocked(readLiveForEdit).mockResolvedValue({
+      pmDoc: docNode([
+        { type: 'blockMath', attrs: { latex: 'E = mc^2' } },
+        { type: 'paragraph', content: [{ type: 'inlineMath', attrs: { latex: 'a^2 + b^2 = c^2' } }] },
+      ]),
+      baseSV: new Uint8Array(),
+    } as never)
+
+    const res = mockRes()
+    await getSummarySourceHandler(req({ docId: 'd_1' }), res as never)
+
+    expect(res.statusCode).toBe(200)
+    const content = (res.body as { content: string }).content
+    // The whole doc is formulas; the old string leaf-substitute produced ''.
+    expect(content).not.toBe('')
+    expect(content).toContain('E = mc^2')
+    expect(content).toContain('a^2 + b^2 = c^2')
+  })
+
+  it('preserves attribute-backed leaf text (mention label, emoji name, attachment file name)', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(summaryReaderGuard)
+    vi.mocked(readLiveForEdit).mockResolvedValue({
+      pmDoc: docNode([
+        {
+          type: 'paragraph',
+          content: [
+            { type: 'text', text: '交给 ' },
+            { type: 'mention', attrs: { id: 'u1', label: '张三', mentionSuggestionChar: '@', type: 'user' } },
+            { type: 'text', text: ' 跟进 ' },
+            { type: 'emoji', attrs: { name: 'rocket' } },
+          ],
+        },
+        { type: 'fileAttachment', attrs: { attachId: 'a1', fileName: '季度财报.xlsx', mime: null, sizeBytes: null } },
+      ]),
+      baseSV: new Uint8Array(),
+    } as never)
+
+    const res = mockRes()
+    await getSummarySourceHandler(req({ docId: 'd_1' }), res as never)
+
+    expect(res.statusCode).toBe(200)
+    const content = (res.body as { content: string }).content
+    expect(content).toContain('张三') // mention label
+    expect(content).toContain('rocket') // emoji name (:rocket:)
+    expect(content).toContain('季度财报.xlsx') // attachment file name
+  })
+
   it('bails when the reader guard rejects (no body read)', async () => {
     vi.mocked(requireDocRole).mockResolvedValue(null) // guard already wrote 403/404
     const res = mockRes()

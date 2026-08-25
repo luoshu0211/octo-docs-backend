@@ -172,9 +172,34 @@ export async function getDocContentHandler(req: Request, res: Response): Promise
 // rejected by requireBodyEditableDocType, matching /content).
 docContentRouter.get('/:docId/summary-source', getSummarySourceHandler)
 
-/** Block-aware plain text: block nodes separated by a blank line, leaves by \n. */
+/**
+ * Block-aware plain text for the AI-preview source: block nodes separated by a
+ * blank line, and each leaf/atom node emits the DISPLAYED text it stores in attrs
+ * rather than a bare newline. Without this, `textBetween`'s string leaf-substitute
+ * drops attribute-backed content — a formula-only doc would flatten to '' and
+ * mention/emoji/attachment text would vanish — leaving the summary service to
+ * summarize nothing or misleading text (mirrors each node's schema toDOM).
+ */
 function pmDocToPlainText(pmDoc: PMNode): string {
-  return pmDoc.textBetween(0, pmDoc.content.size, '\n\n', '\n').trim()
+  return pmDoc.textBetween(0, pmDoc.content.size, '\n\n', leafDisplayText).trim()
+}
+
+/** Displayed text of a leaf/atom node, taken from its attrs; other leaves keep \n. */
+function leafDisplayText(node: PMNode): string {
+  const attrs = node.attrs as Record<string, unknown>
+  switch (node.type.name) {
+    case 'inlineMath':
+    case 'blockMath':
+      return typeof attrs.latex === 'string' ? attrs.latex : ''
+    case 'mention':
+      return typeof attrs.label === 'string' ? attrs.label : ''
+    case 'emoji':
+      return typeof attrs.name === 'string' ? `:${attrs.name}:` : ''
+    case 'fileAttachment':
+      return typeof attrs.fileName === 'string' ? attrs.fileName : ''
+    default:
+      return '\n'
+  }
 }
 
 export async function getSummarySourceHandler(req: Request, res: Response): Promise<void> {
