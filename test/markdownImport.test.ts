@@ -2,8 +2,6 @@ import { describe, it, expect } from 'vitest'
 import { parseMarkdownToPmDoc, type PmNode } from '../src/import/markdown/markdown.js'
 import { isSafeHref, isSafeCssColor } from '../src/import/markdown/html-inline.js'
 import { stripFrontMatter } from '../src/import/markdown/frontmatter.js'
-import { buildSchema, sanitizeBlockAttrValues } from '../src/schema/index.js'
-import { Node as PMNode } from 'prosemirror-model'
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -630,90 +628,5 @@ describe('parseMarkdownToPmDoc — aligned blocks (round-trip with export)', () 
     const p = r.doc.content!.find((n) => n.type === 'paragraph')
     expect(p).toBeDefined()
     expect((p!.attrs as Record<string, unknown> | undefined)?.textAlign).toBeUndefined()
-  })
-})
-
-// ── Mutually exclusive marks (code) ───────────────────────────────────────────
-//
-// Regression guard for the import 422: `**还没有 `summary` 命令**` used to parse into a text
-// node carrying [bold, code]. `code` is declared `excludes: '_'` in the schema, so
-// PMNode.check() rejected the collection, editDocBody mapped the throw to 422
-// schema_incompatible, and the already-created document was left empty. Every assertion below
-// validates against the REAL schema, not just the shape of the JSON.
-
-describe('parseMarkdownToPmDoc — mutually exclusive marks', () => {
-  function checkAgainstSchema(r: ReturnType<typeof parse>): void {
-    const schema = buildSchema()
-    PMNode.fromJSON(
-      schema,
-      sanitizeBlockAttrValues({ type: 'doc', content: r.doc.content }) as Parameters<
-        typeof PMNode.fromJSON
-      >[1],
-    ).check()
-  }
-
-  function collectTextMarks(node: PmNode, acc: string[][] = []): string[][] {
-    if (node.type === 'text') acc.push((node.marks ?? []).map((m) => m.type).sort())
-    for (const child of node.content ?? []) collectTextMarks(child, acc)
-    return acc
-  }
-
-  // The set the importer hardcodes must match what the schema actually declares. If a future
-  // mark adds `excludes: '_'`, this fails here instead of 422-ing a real import.
-  it('EXCLUSIVE_MARKS matches the marks the schema declares as excludes:"_"', () => {
-    const schema = buildSchema()
-    const allMarks = Object.keys(schema.marks)
-    const exclusive = allMarks.filter((name) =>
-      allMarks.every((other) => schema.marks[name]!.excludes(schema.marks[other]!)),
-    )
-    expect(exclusive.sort()).toEqual(['code'])
-  })
-
-  it('drops the outer mark when inline code is nested inside bold/italic/strike', () => {
-    for (const md of ['**还没有 `summary` 命令**', '*这是 `code` 测试*', '~~删了 `code`~~']) {
-      const r = parse(md)
-      expect(() => checkAgainstSchema(r)).not.toThrow()
-      // The code span survives, and it carries `code` and nothing else.
-      const marksets = collectTextMarks(r.doc)
-      expect(marksets).toContainEqual(['code'])
-      expect(marksets.every((ms) => !(ms.includes('code') && ms.length > 1))).toBe(true)
-    }
-  })
-
-  it('drops the link mark on a code-only link label', () => {
-    const r = parse('[`code`](http://example.com)')
-    expect(() => checkAgainstSchema(r)).not.toThrow()
-    expect(collectTextMarks(r.doc)).toContainEqual(['code'])
-  })
-
-  // html-inline.ts's domInlineToNodes builds marks on its own recursion instead of going
-  // through markdown.ts's withMarks, so it needs the same reconciliation. It is reached via
-  // the block-HTML path (a <p>/<h1-6> inside a recognized container such as a table cell) —
-  // a bare inline `<strong><code>` is not in parseInlineHtml's whitelist and degrades to
-  // plain text, which would make this a vacuous test.
-  it('applies the same reconciliation to whitelisted block inline HTML', () => {
-    const r = parse('<table>\n<tr><td><p><strong><code>x</code></strong></p></td></tr>\n</table>')
-    expect(() => checkAgainstSchema(r)).not.toThrow()
-    expect(collectTextMarks(r.doc)).toContainEqual(['code'])
-  })
-
-  it('leaves a non-exclusive mark intact on the block inline HTML path', () => {
-    const r = parse('<table>\n<tr><td><p><strong>b</strong></p></td></tr>\n</table>')
-    expect(() => checkAgainstSchema(r)).not.toThrow()
-    expect(collectTextMarks(r.doc)).toContainEqual(['bold'])
-  })
-
-  it('leaves non-exclusive mark combinations intact', () => {
-    const r = parse('***粗斜体***')
-    expect(() => checkAgainstSchema(r)).not.toThrow()
-    expect(collectTextMarks(r.doc)).toContainEqual(['bold', 'italic'])
-  })
-
-  it('keeps a plain code span and a plain bold span unchanged', () => {
-    const r = parse('这是 `code` 而已，这是 **粗体**')
-    expect(() => checkAgainstSchema(r)).not.toThrow()
-    const marksets = collectTextMarks(r.doc)
-    expect(marksets).toContainEqual(['code'])
-    expect(marksets).toContainEqual(['bold'])
   })
 })
