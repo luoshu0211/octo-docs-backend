@@ -302,6 +302,12 @@ export function createApp(
   api.use(importRouter) // /:docId/import/docx (server-side .docx -> ProseMirror JSON)
 
   // Mounted only on the public surface: this is the browser-facing human API.
+  // summary-source is reachable here at /api/v1/docs/:docId/summary-source, which is
+  // where octo-smart-summary's FetchSummarySource asks for it. An earlier revision of
+  // this file also mounted a compat alias at /api/documents/:docId/summary-source,
+  // because the consumer used to request that path; the consumer has since aligned to
+  // this canonical namespace, so the alias was removed rather than kept as a second
+  // externally reachable entry to the same handler.
   if (servePublic) app.use('/api/v1/docs', api)
 
   // Internal surface: the html service registers published docs here with the
