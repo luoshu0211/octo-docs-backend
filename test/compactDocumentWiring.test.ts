@@ -52,6 +52,11 @@ vi.mock('../src/collab/compactionRunner.js', () => ({
   runCompactionOffThread: (...a: unknown[]) => runCompactionOffThread(...a),
 }))
 
+const markCompacted = vi.fn(async (_documentName: string, _at: number) => {})
+vi.mock('../src/collab/compactionNotice.js', () => ({
+  markCompacted: (documentName: string, at: number) => markCompacted(documentName, at),
+}))
+
 const otherLiveHolders = vi.fn(async () => [] as string[])
 /**
  * Mirrors the real `withCompactionLock` result shape: `{ ran: false }` (lock held
@@ -333,5 +338,104 @@ describe('compactDocument — the fleet-wide guards are actually wired in', () =
     )
     expect(upsertStateTx).toHaveBeenCalledTimes(1)
     expect(upsertStateTx.mock.calls[0]?.[3]).toBe(2)
+  })
+})
+
+/**
+ * The compaction generation stamp is what tells the next client its IndexedDB
+ * copy is stale. Without it compaction is undone on the next open (the browser
+ * syncs the old history back), so "did we stamp" is part of the wiring, not a
+ * detail — and "did we NOT stamp when nothing was written" is a data-loss guard:
+ * a stamp left by a refused compaction makes clients clear a cache that is
+ * still correct, and a cache clear costs whatever that client had not synced.
+ */
+describe('compactDocument — the cache-invalidation stamp', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    documents.clear()
+    otherLiveHolders.mockResolvedValue([])
+    withCompactionLock.mockImplementation(async (_n, fn) => ({ ran: true, value: await fn() }))
+    healthyRow()
+  })
+
+  it('stamps the generation after a compaction that was written', async () => {
+    await compactDocument(DOC)
+    expect(upsertStateTx).toHaveBeenCalledTimes(1)
+    expect(markCompacted).toHaveBeenCalledTimes(1)
+    expect(markCompacted).toHaveBeenCalledWith(DOC, expect.any(Number))
+  })
+
+  it('does NOT stamp when the saving was too small to write', async () => {
+    runCompactionOffThread.mockResolvedValue({
+      ok: true,
+      compacted: new Uint8Array(504_447),
+      backupV1: new Uint8Array(966_535),
+      entries: 1500,
+      beforeBytes: 504_483,
+      baselineBytes: 504_483,
+    })
+
+    await expect(compactDocument(DOC)).rejects.toThrow(CompactionNotWorthItError)
+    expectNothingWritten()
+    expect(markCompacted).not.toHaveBeenCalled()
+  })
+
+  it('does NOT stamp when another replica holds the document', async () => {
+    otherLiveHolders.mockResolvedValue(['pod-b'])
+
+    await expect(compactDocument(DOC)).rejects.toThrow(DocumentLoadedError)
+    expect(markCompacted).not.toHaveBeenCalled()
+  })
+
+  it('does NOT stamp when the lock was lost', async () => {
+    withCompactionLock.mockResolvedValue({ ran: false })
+
+    await expect(compactDocument(DOC)).rejects.toThrow(CompactionLockedError)
+    expect(markCompacted).not.toHaveBeenCalled()
+  })
+
+  it('does NOT stamp when the worker refused the rebuild', async () => {
+    runCompactionOffThread.mockResolvedValue({ ok: false, reason: 'the rebuild is not smaller' })
+
+    await expect(compactDocument(DOC)).rejects.toThrow(/not smaller/)
+    expect(markCompacted).not.toHaveBeenCalled()
+  })
+
+  /**
+   * The stamp must sit OUTSIDE the transaction.
+   *
+   * Every other refusal in this file aborts before the UPSERT, so a stamp placed
+   * just after the write would still look correct in all of them — this case is
+   * the one that separates the two placements: the write runs, and THEN the
+   * commit fails. A stamp recorded inside the transaction survives a rollback
+   * that undid the very compaction it advertises, and every client would then
+   * clear a cache that is still correct, losing whatever it had not synced.
+   *
+   * (Added because mutation testing showed moving the call inside the
+   * transaction left all 23 tests green.)
+   */
+  it('does NOT stamp when the write happened but the commit failed', async () => {
+    const { transaction } = await import('../src/db/pool.js')
+    // `transaction` is generic in its return type, which a one-off mock cannot
+    // satisfy structurally (it never returns R — it throws). The cast is on the
+    // MOCK, not on production code, and the behaviour it stands in for is exactly
+    // what the test name says: callback completes, commit fails.
+    const rollbackAfterWrite = async (fn: (tx: unknown) => Promise<unknown>) => {
+      await fn({}) // the callback runs to completion, UPSERT included
+      throw new Error('commit failed') // ...and then the commit rolls it all back
+    }
+    vi.mocked(transaction).mockImplementationOnce(
+      rollbackAfterWrite as unknown as typeof transaction,
+    )
+
+    await expect(compactDocument(DOC)).rejects.toThrow('commit failed')
+    expect(upsertStateTx).toHaveBeenCalledTimes(1)
+    expect(markCompacted).not.toHaveBeenCalled()
+  })
+
+  /** Stamping is best-effort; it must not turn a committed rewrite into a failure. */
+  it('still reports success when stamping fails', async () => {
+    markCompacted.mockRejectedValueOnce(new Error('redis down'))
+    await expect(compactDocument(DOC)).resolves.toMatchObject({ afterBytes: 3_000_000 })
   })
 })
