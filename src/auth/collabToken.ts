@@ -116,6 +116,28 @@ export interface CollabTokenResult {
   // can seed its own presence name without a separate directory round-trip;
   // omitted when the directory supplied none (XIN-694).
   name?: string
+  /**
+   * When this document was last compacted (epoch millis), or absent if never.
+   *
+   * WHY IT RIDES ON THIS RESPONSE AND NOT A STATELESS FRAME. Compaction rewrites
+   * the row under one fresh clientID; a browser holding a pre-compaction copy in
+   * IndexedDB syncs the removed history straight back up and undoes the whole
+   * saving. Measured end-to-end 2026-08-25 on the local stack: 348,335 bytes
+   * compacted to 52,836, then a client reconnected with its old cache and the
+   * document went to 365,233 / 2 clientIDs — and the pollution was persisted.
+   *
+   * A stateless frame over the WS CANNOT fix that, and this was measured too, not
+   * argued: the client hydrates its Y.Doc from IndexedDB BEFORE the socket opens
+   * (CollabSheet: persistence, then provider), so its first SyncStep1 has already
+   * pushed the old history by the time any frame arrives. The A/B was identical —
+   * 365,233 / 2 clientIDs whether the frame was handled or ignored.
+   *
+   * This response, by contrast, is awaited BEFORE the client constructs its
+   * persistence (CollabSheet.create awaits the token, then calls the constructor),
+   * so a stale cache can be deleted while it is still harmless. The fix has to sit
+   * on this side of that await; anything later is too late by construction.
+   */
+  compactedAt?: number
 }
 
 /**

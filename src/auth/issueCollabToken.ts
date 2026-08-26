@@ -19,6 +19,8 @@
 import { confirmSpaceMembership } from '../permission/spaceMembership.js'
 import { signCollabToken, signCollabTokenV2, type CollabTokenResult } from './collabToken.js'
 import { getOctoIdentity } from './octoIdentity.js'
+import { compactedAt, isOverCapAnywhere } from '../collab/compactionNotice.js'
+import { getOversized, mayInvalidateClientCaches } from '../collab/oversizeGuard.js'
 import { parseDocumentName, isDocTypeConsistentWithName } from '../permission/documentName.js'
 import { resolveRole, resolveDocMetaByName } from '../permission/resolveRole.js'
 import { docMetaRepo } from '../db/repos/docMetaRepo.js'
@@ -147,7 +149,57 @@ export async function issueCollabToken(
     current_space_verified: true,
     current_space_id: currentSpace,
   })
+  await attachCompactedAt(result, documentName)
   return { ok: true, result }
+}
+
+/**
+ * Stamp the response with the document's compaction generation, if any.
+ *
+ * Never throws and never blocks issuance: a token that fails to carry the stamp
+ * just means the client keeps a cache it could have dropped — the behaviour
+ * before this field existed. Failing the handshake over a Redis blip would be
+ * strictly worse than a missed optimisation.
+ *
+ * THE OVER-CAP INTERLOCK. The stamp is not advisory: the client acts on it by
+ * DELETING its IndexedDB copy before it loads (`dropStaleCacheBeforeLoad`), and
+ * it does so on the token response — strictly earlier than any socket frame.
+ * So this path needs the same interlock `noticeStaleCacheOnJoin` carries, and
+ * for the same measured reason: while a document is over the persistence cap
+ * its stores are being REJECTED, which makes the client's cache the only copy
+ * of everything typed since the cap was hit. Telling that client "a compaction
+ * happened, drop your cache" destroys exactly the content the over-size-cap
+ * banner is asking the user to copy out by hand.
+ *
+ * Gating only the stateless frame and leaving this path open would have left
+ * the interlock decorative: the token is the earlier of the two, so a capped
+ * document would still have wiped the cache one handshake before the frame
+ * that was supposed to be suppressed.
+ *
+ * Both reads fail in the direction that keeps the cache: `isOverCapAnywhere`
+ * fails closed (unreadable Redis => assume over cap => no stamp), and any throw
+ * lands in the catch below, which also leaves the stamp off.
+ */
+/** Test seam: the behaviour above is what keeps a Redis blip from costing a handshake. */
+export const attachCompactedAtForTest = (r: CollabTokenResult, d: string): Promise<void> =>
+  attachCompactedAt(r, d)
+
+async function attachCompactedAt(result: CollabTokenResult, documentName: string): Promise<void> {
+  try {
+    // Local mark first: it needs no network and is authoritative for the replica
+    // that is actually rejecting this document's stores.
+    // Startup interlock FIRST (MR98-010): the two checks below answer from this
+    // replica's memory and from Redis, and neither can see a rejection still
+    // sitting only in `overcap_unrestored`. Until this process has mirrored those
+    // rows once, "Redis is healthy and has no marker" does not mean "not over cap".
+    if (!mayInvalidateClientCaches()) return
+    if (getOversized(documentName) !== null) return
+    if (await isOverCapAnywhere(documentName)) return
+    const at = await compactedAt(documentName)
+    if (at !== null) result.compactedAt = at
+  } catch {
+    // Best effort by design — see above. Leaving the stamp off keeps the cache.
+  }
 }
 
 /**
@@ -239,5 +291,6 @@ export async function issueCollabTokenByDocId(
     currentSpaceVerified: true,
     currentSpaceId: currentSpace,
   })
+  await attachCompactedAt(result, meta.document_name)
   return { ok: true, result }
 }

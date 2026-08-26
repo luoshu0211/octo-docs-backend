@@ -19,6 +19,13 @@
  */
 import { Redis } from 'ioredis'
 import { startNodeHeartbeat, withdrawNode } from './collab/compactionCluster.js'
+import {
+  startOverCapHeartbeat,
+  flushUnrestoredRetries,
+  reconcileDurableUnrestored,
+  setUnrestoredDurableStore,
+} from './collab/oversizeGuard.js'
+import { overcapUnrestoredRepo } from './db/repos/overcapUnrestoredRepo.js'
 import type { Server } from 'node:http'
 // B3: load .env before config/env.js is evaluated (must be the first import).
 import './config/loadEnv.js'
@@ -75,6 +82,14 @@ async function main(): Promise<void> {
 
   const hocuspocus = createServer()
 
+  // MR98-006: wire the DURABLE bottom of the over-cap retry chain BEFORE any
+  // store can be rejected, so the very first rejection's state vector is written
+  // to the database (outside replica memory) at rejection time. This is what
+  // survives a pod that is SIGKILLed/OOMed during the outage window — the proven
+  // failure shape of this system — where the in-memory retry queue evaporates
+  // with the process. See oversizeGuard `UnrestoredDurableStore`.
+  setUnrestoredDurableStore(overcapUnrestoredRepo)
+
   // R4-B1: construct the Bento-frame PPT relay BEFORE the epoch-invalidation
   // subscriber below — `handleInvalidate` closes over `pptRelay`, so creating the
   // relay after wiring `sub.on('message', ...)` left a temporal-dead-zone window
@@ -124,6 +139,39 @@ async function main(): Promise<void> {
     // and close(4403) revoked / flip readOnly on downgraded connections.
   }
 
+  // MR98-008 / MR98-006 startup reconciliation: this replica may be REPLACING a
+  // pod that died with an undurable over-cap record still in its memory. Drain the
+  // durable DB store into the Redis marker now — through the same atomic RECORD
+  // script — BEFORE the WS server starts accepting joins, so the over-cap guard is
+  // already armed for the first reconnecting client. Awaited (NOT fire-and-forget)
+  // precisely to close the startup window in which a stale-cache client could join
+  // between listen() and the first reconcile and have its only copy cleared while
+  // the durable marks were not yet mirrored into Redis. reconcileDurableUnrestored
+  // never throws (a store/Redis failure degrades to a logged no-op and leaves the
+  // DB rows for the heartbeat to retry); the try/catch is a defensive backstop so a
+  // reconcile failure can never block the server from starting.
+  try {
+    // The return value is the point (MR98-010): a false here means the durable rows
+    // are NOT mirrored into Redis yet, so `mayInvalidateClientCaches()` keeps every
+    // cache-invalidation signal withheld until a later heartbeat pass succeeds.
+    // Startup itself is deliberately NOT blocked — refusing to serve would turn a
+    // transient DB blip into an outage, while withholding the stamp costs only a
+    // skipped optimisation.
+    if (!(await reconcileDurableUnrestored())) {
+      // eslint-disable-next-line no-console
+      console.error(
+        '[octo-docs] durable over-cap reconcile did not complete at startup; ' +
+          'cache-invalidation signals are withheld until a heartbeat pass succeeds',
+      )
+    }
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error(
+      '[octo-docs] durable over-cap reconcile failed at startup (continuing; heartbeat will retry):',
+      err,
+    )
+  }
+
   await hocuspocus.listen()
   // eslint-disable-next-line no-console
   console.log(`[octo-docs] Hocuspocus listening on :${config.hocuspocusPort}`)
@@ -133,6 +181,13 @@ async function main(): Promise<void> {
   // this point the node holds nothing, and a liveness key without a server
   // behind it would only delay other replicas' compactions.
   const stopHeartbeat = startNodeHeartbeat()
+
+  // Keep the shared over-cap mark alive while this replica holds an unresolved
+  // over-cap document, independent of client activity. A rejected store is no
+  // longer the only thing refreshing it, so an idle client (lunch, overnight)
+  // can no longer let the mark lapse and have its IndexedDB cache wiped on the
+  // next handshake (MR98-003). An empty condition set makes each tick a no-op.
+  const stopOverCapHeartbeat = startOverCapHeartbeat()
 
   const app = createApp({ surface: config.internalHttpPort > 0 ? 'public' : 'all' })
   const httpServer = app.listen(config.httpPort, () => {
@@ -211,8 +266,17 @@ async function main(): Promise<void> {
       // before destroy() means the handover costs no compaction window, and the
       // 90 s TTL is the backstop for the kill -9 case where none of this runs.
       stopHeartbeat()
+      stopOverCapHeartbeat()
       await withdrawNode()
       await hocuspocus.destroy() // flushes in-memory docs (triggers onStoreDocument)
+      // MR98-006: one last in-memory retry drain before Redis closes below. This
+      // is explicitly SECONDARY, not the durability mechanism: a rejection's
+      // vector is already written to the durable DB store at rejection time
+      // (setUnrestoredDurableStore above), so it survives ANY stop — including a
+      // SIGKILL that never runs this handler at all. This flush only shortens the
+      // window for a raced record on a CLEAN shutdown by landing it in Redis now
+      // instead of on the next replica's startup reconcile. Never throws.
+      await flushUnrestoredRetries()
       // TODO(§5.3 / §9.4): releaseAllDocumentLocks() so a takeover node can
       // become primary writer immediately without waiting for the lock TTL.
       pptRelay.close()

@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest'
 import {
+  applyOversizeDecision,
   markOversized,
   clearOversized,
   getOversized,
@@ -206,5 +207,92 @@ describe('a client that joins AFTER the document went over the cap', () => {
     // e.g. compaction shrank it, or the document unloaded and was refetched.
     clearOversized(DOC)
     expect(noticeOversizeOnJoin(DOC, () => {})).toBe(false)
+  })
+})
+
+/**
+ * The enforcement half, and the regression cover for the defect that made a
+ * capped document UNREADABLE.
+ *
+ * `beforeHandleMessage` runs on EVERY inbound message. The first version threw
+ * from it, which closes the connection — including on `messageYjsSyncStep1`,
+ * the client asking for the document and the only path that sends content back.
+ * Measured in production 2026-08-25 on a capped sheet: connect -> authenticate ->
+ * receive the over-size-cap frame -> send SyncStep1 -> closed, with zero bytes of
+ * content delivered; 348 closes / 353 reloads in 16 h on one document.
+ *
+ * So the assertions below are mostly NEGATIVE — `not.toThrow()` is the one that
+ * matters. Re-introducing the throw turns this block red.
+ */
+describe('applyOversizeDecision — refuse writes without refusing to serve', () => {
+  beforeEach(() => resetOversizedForTest())
+
+  const conn = () => ({ readOnly: false })
+
+  it('leaves a healthy document completely alone', () => {
+    const c = conn()
+    expect(applyOversizeDecision(DOC, c)).toBe(false)
+    expect(c.readOnly).toBe(false)
+  })
+
+  it('flips a capped document read-only and reports it', () => {
+    markOversized(DOC, 18_320_896, LIMIT)
+    const c = conn()
+    expect(applyOversizeDecision(DOC, c)).toBe(true)
+    expect(c.readOnly).toBe(true)
+  })
+
+  /** The one that matters: a throw here is what closed the connection. */
+  it('NEVER throws on a capped document (a throw closes the connection)', () => {
+    markOversized(DOC, 18_320_896, LIMIT)
+    expect(() => applyOversizeDecision(DOC, conn())).not.toThrow()
+  })
+
+  it('NEVER throws on a healthy document either', () => {
+    expect(() => applyOversizeDecision(DOC, conn())).not.toThrow()
+  })
+
+  /**
+   * Enforcement must survive repetition: the hook fires per message, so the
+   * decision has to be idempotent rather than one-shot.
+   */
+  it('stays read-only across repeated messages on the same connection', () => {
+    markOversized(DOC, 18_320_896, LIMIT)
+    const c = conn()
+    for (let i = 0; i < 5; i++) expect(applyOversizeDecision(DOC, c)).toBe(true)
+    expect(c.readOnly).toBe(true)
+  })
+
+  /** A document that shrank back under the cap must become writable again. */
+  it('stops enforcing once the mark is cleared', () => {
+    markOversized(DOC, 18_320_896, LIMIT)
+    clearOversized(DOC)
+    const c = conn()
+    expect(applyOversizeDecision(DOC, c)).toBe(false)
+    expect(c.readOnly).toBe(false)
+  })
+
+  it('is per-document: a capped doc never flips a healthy doc read-only', () => {
+    markOversized(DOC, 18_320_896, LIMIT)
+    const c = conn()
+    expect(applyOversizeDecision('octo:space:f_default:d_other', c)).toBe(false)
+    expect(c.readOnly).toBe(false)
+  })
+
+  /**
+   * Enforcement must NOT depend on the announcement working. A broken announcer
+   * that threw would otherwise take the read-only flip down with it.
+   */
+  it('enforces even when the mark was made with an announcer that throws', async () => {
+    const { setOversizeAnnouncer } = await import('../src/collab/oversizeGuard.js')
+    setOversizeAnnouncer(() => {
+      throw new Error('announcer down')
+    })
+    markOversized(DOC, 18_320_896, LIMIT)
+    setOversizeAnnouncer(null)
+
+    const c = conn()
+    expect(applyOversizeDecision(DOC, c)).toBe(true)
+    expect(c.readOnly).toBe(true)
   })
 })

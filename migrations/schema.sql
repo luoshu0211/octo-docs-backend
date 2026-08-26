@@ -168,6 +168,21 @@ CREATE TABLE yjs_document (
   UNIQUE KEY uk_document_name (document_name)     -- 每文档单行，store 走 UPSERT + merge-on-write
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- MR98-006：over-cap 拒绝态的持久重试载体（跨副本、跨进程存活）。
+-- 记录被 size cap 拒绝的文档的 REJECTED state vector（JSON {clientId: clock}，
+-- 按 client 取 max 合并，与 Redis marker 一致）。当拒绝时刻 Redis 不可达、且副本随后
+-- 被 SIGKILL/OOM，进程内重试队列会随之蒸发；本表在拒绝时刻落库，使 rejected state
+-- 在副本死亡后仍然存在：新副本（或 10 分钟 over-cap 心跳）通过同一原子 RECORD 脚本把它
+-- 回灌到 Redis marker，只有当该 record 落地或被支配性 store 清除后才删除本行。DB 是天然底座：
+-- 拒绝路径本就位于持久化层，DB 不可用时整条写路径已降级。
+CREATE TABLE overcap_unrestored (
+  document_name VARCHAR(256) NOT NULL,            -- Hocuspocus 路由/持久化键，非 doc_id
+  state_vector  TEXT         NOT NULL,            -- rejected Yjs state vector as JSON {clientId: clock}，按 client 取 max 合并
+  recorded_at   DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at    DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (document_name)                     -- 每文档单行；put() 走 UPSERT + per-client-max 合并
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 -- 可选：基线 snapshot（仅「增量日志」备选模型启用时建；与上表二选一作真相源，见 §3.3）
 CREATE TABLE yjs_snapshot (
   document_name VARCHAR(256) NOT NULL,            -- 与 yjs_update_log 同键
