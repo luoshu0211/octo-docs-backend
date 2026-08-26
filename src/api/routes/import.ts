@@ -194,41 +194,6 @@ function shouldApplyImport(req: Request): boolean {
   return req.header('x-octo-import-apply') === 'true'
 }
 
-/** Recursively drop all inline marks (schema-compat fallback tier 1). */
-function stripAllMarks(content: unknown[]): unknown[] {
-  const walk = (n: unknown): unknown => {
-    if (!n || typeof n !== 'object') return n
-    const node = { ...(n as Record<string, unknown>) }
-    delete node.marks
-    if (Array.isArray(node.content)) node.content = node.content.map(walk)
-    return node
-  }
-  return content.map(walk)
-}
-
-/**
- * Flatten arbitrary block content to plain paragraphs (schema-compat fallback
- * tier 2). doc > paragraph+ > text is always schema-valid, so this can never
- * itself be schema_incompatible. Newlines are collapsed to spaces (PM text
- * nodes hold no line breaks). Lossy — last resort only.
- */
-function flattenToPlainParagraphs(content: unknown[]): unknown[] {
-  const textOf = (n: unknown): string => {
-    if (!n || typeof n !== 'object') return ''
-    const node = n as Record<string, unknown>
-    if (node.type === 'text') return typeof node.text === 'string' ? node.text : ''
-    if (node.type === 'hardBreak') return ' '
-    if (Array.isArray(node.content)) return node.content.map(textOf).join('')
-    return ''
-  }
-  const paras: unknown[] = []
-  for (const block of content) {
-    const t = textOf(block).replace(/\s+/g, ' ').trim()
-    if (t) paras.push({ type: 'paragraph', content: [{ type: 'text', text: t }] })
-  }
-  return paras.length ? paras : [{ type: 'paragraph' }]
-}
-
 async function applyImportedDoc(
   req: Request,
   res: Response,
@@ -264,17 +229,22 @@ async function applyImportedDoc(
   }
 
   let result: Awaited<ReturnType<typeof editDocBody>>
-  const runEdit = async (content: unknown[]): Promise<Awaited<ReturnType<typeof editDocBody>>> => {
+  try {
+    const strippedAttachmentIds = await stripForeignAttachmentIds(doc.content, guard.meta.doc_id)
+    if (strippedAttachmentIds > 0) {
+      warnings.push(`docs.import.foreignImageAttachmentsSkipped:${strippedAttachmentIds}`)
+    }
+
     const { pmDoc, baseSV } = await readLiveForEdit(guard.meta.document_name)
     const op: DocEditOp =
       pmDoc.childCount === 0
-        ? { type: 'insert', at: { path: [], position: 'inside_end' }, content }
+        ? { type: 'insert', at: { path: [], position: 'inside_end' }, content: doc.content }
         : {
             type: 'replace',
             range: { from: { path: [0] }, to: { path: [pmDoc.childCount - 1] } },
-            content,
+            content: doc.content,
           }
-    return editDocBody({
+    result = await editDocBody({
       uid: req.uid!,
       docId: guard.meta.doc_id,
       documentName: guard.meta.document_name,
@@ -285,27 +255,6 @@ async function applyImportedDoc(
       isBot: req.botToken !== undefined,
       token: req.octoToken,
     })
-  }
-  try {
-    const strippedAttachmentIds = await stripForeignAttachmentIds(doc.content, guard.meta.doc_id)
-    if (strippedAttachmentIds > 0) {
-      warnings.push(`docs.import.foreignImageAttachmentsSkipped:${strippedAttachmentIds}`)
-    }
-
-    result = await runEdit(doc.content)
-    // Safety net: an import must never hard-fail on a schema mismatch. Tier 1 —
-    // retry with every inline mark stripped (covers any unforeseen mark conflict
-    // while keeping block structure). Tier 2 — flatten to plain paragraphs, which
-    // is always schema-valid. A schema_incompatible fails at reconcile before any
-    // mutation, so the live base version stays valid across retries.
-    if (!result.ok && result.error === 'schema_incompatible') {
-      result = await runEdit(stripAllMarks(doc.content))
-      if (result.ok) warnings.push('docs.import.marksStrippedForCompat')
-    }
-    if (!result.ok && result.error === 'schema_incompatible') {
-      result = await runEdit(flattenToPlainParagraphs(doc.content))
-      if (result.ok) warnings.push('docs.import.flattenedForCompat')
-    }
   } catch (err) {
     await Promise.allSettled(migration.createdAttachIds.map((attachId) => cleanupCopiedAttachment(attachId)))
     throw err
