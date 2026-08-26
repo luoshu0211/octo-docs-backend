@@ -180,8 +180,8 @@ async function resolveAccessRequestDisplayContext(
  * Authorization principals are Space-qualified: `(uid, principalSpaceId)`. Only
  * the exact requester principal is excluded. The same Octo uid in another Space
  * remains a valid approver (for example, test-Space owner `admin` approving a
- * request from 123-Space `admin`). Delivery is still uid-addressed, so collapse
- * qualifying principals to unique recipient uids only after principal filtering.
+ * request from 123-Space `admin`). Delivery is addressed by uid but scoped by
+ * Space, so distinct qualifying principals must remain distinct deliveries.
  */
 interface NotifyRecipient {
   uid: string
@@ -209,13 +209,7 @@ async function resolveApprovers(
 
   principals.delete(`${requester.principalSpaceId}\u0000${requester.uid}`)
 
-  // Transport is UID-addressed, but visibility is Space-scoped. Preserve the
-  // first qualifying principal (owner is inserted first) as the delivery Space.
-  const recipients = new Map<string, NotifyRecipient>()
-  for (const principal of principals.values()) {
-    if (!recipients.has(principal.uid)) recipients.set(principal.uid, principal)
-  }
-  return [...recipients.values()]
+  return [...principals.values()]
 }
 
 /**
@@ -330,6 +324,7 @@ async function postNotify(
     const card: NotifyCardCoord | null = found
       ? {
           recipientUid,
+          deliverySpaceId: spaceId,
           channelId: found.channel_id,
           channelType: found.channel_type,
           messageId: found.message_id,

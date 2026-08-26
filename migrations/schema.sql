@@ -139,8 +139,10 @@ CREATE TABLE doc_access_request (
   reason         VARCHAR(512) NOT NULL DEFAULT '',
   status         TINYINT      NOT NULL DEFAULT 1,  -- 1=pending 2=approved 3=denied 4=cancelled
   request_id     VARCHAR(64)  NOT NULL,            -- 高熵 id，供 approve/deny 路由寻址
-  decided_by     VARCHAR(64)  NOT NULL DEFAULT '', -- 处理人 uid
+  decided_by     VARCHAR(64)  NOT NULL DEFAULT '', -- 处理人 uid（CAS 胜者写入，权威决策人）
+  decided_by_space_id VARCHAR(64) NOT NULL DEFAULT '', -- 处理人可信 Space（octo 回调 operator_space_id，与 status 原子写入）；空=旧行/未知，回调按可选 Space 降级、绝不猜测
   decision_note  VARCHAR(512) NOT NULL DEFAULT '', -- 处理人拒绝理由（卡片 inputs["deny_reason"] 原样传入，存前截断）
+  decided_at_unix BIGINT UNSIGNED NULL DEFAULT NULL, -- 权威决策时间（unix 秒，同回调 acted_at 单位）；NULL=旧行/未知，回调按可选时间降级
   bot_uids       JSON         NULL,                -- 申请人携带的本人 Space Bot 快照（JSON 字符串数组）；空/NULL=零 Bot，兼容旧行为。批准时逐个复用 forward-grant 授同一角色
   created_at     DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   updated_at     DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
@@ -289,7 +291,7 @@ CREATE TABLE card_action_receipt (
 
 -- Ledger of the notification cards delivered to a document's approvers
 -- (owner + admins) when someone submits an access request. One row per
--- (request_id, recipient) records the IM coordinates (channel + message id) of
+-- (request_id, recipient principal) records the IM coordinates (channel + message id) of
 -- that recipient's card, so a later approve/deny can drive EVERY approver's card
 -- to a terminal state — not just the one the decider clicked.
 -- PRIVACY: stores only the opaque Octo uid needed to locate the card; no display
@@ -297,6 +299,7 @@ CREATE TABLE card_action_receipt (
 CREATE TABLE doc_access_notify_card (
   request_id    VARCHAR(64)  NOT NULL,               -- doc_access_request.request_id this card belongs to
   recipient_uid VARCHAR(64)  NOT NULL,               -- approver who received the card (owner or admin)
+  delivery_space_id VARCHAR(64) NOT NULL,             -- Space in which this concrete card was delivered
   channel_id    VARCHAR(64)  NOT NULL,               -- IM channel the card was delivered on (DM = recipient)
   channel_type  TINYINT      NOT NULL DEFAULT 1,     -- IM channel type (1=person)
   message_id    VARCHAR(64)  NOT NULL,               -- IM message id (string: int64 exceeds JS safe integer)
@@ -304,7 +307,7 @@ CREATE TABLE doc_access_notify_card (
   status        TINYINT      NOT NULL DEFAULT 1,     -- 1=active(sent) 2=terminalized
   created_at    DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   updated_at    DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
-  PRIMARY KEY (request_id, recipient_uid)            -- leftmost prefix serves the decision-time lookup by request_id
+  PRIMARY KEY (request_id, recipient_uid, delivery_space_id) -- leftmost prefix serves lookup by request_id
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- ---------------------------------------------------------------------------

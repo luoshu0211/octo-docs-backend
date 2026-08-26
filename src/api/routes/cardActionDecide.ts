@@ -31,7 +31,7 @@ import { grantApprovedRequestBots } from '../services/grantRequestWithBots.js'
 import { approveAccessRequest } from '../services/approveAccessRequest.js'
 import { logBotGrantSummary } from '../services/botGrantAudit.js'
 import { syncDecisionCards } from '../services/docsDecisionCardSync.js'
-import { buildDecisionDisplay, buildDecisionDisplayAt } from '../services/decisionDisplay.js'
+import { buildDecisionDisplay } from '../services/decisionDisplay.js'
 import { isAccessRequestRole, roleFromNumber } from '../../permission/role.js'
 
 
@@ -54,6 +54,13 @@ interface DecisionRequest {
   action_id: string
   decision: string
   operator_uid: string
+  /**
+   * The operator's trusted Space, stamped server-side by octo-server (it owns the
+   * card session, so this is authoritative — not a client assertion). docs still
+   * validates it as a bounded, non-empty id at the point the decision is applied,
+   * and persists it as the authoritative `decided_by_space_id`.
+   */
+  operator_space_id?: string
   doc_id?: string
   request_id?: string
   inputs: Record<string, unknown>
@@ -71,16 +78,53 @@ interface DecisionResult {
   disposition: Disposition
   state: DecisionState
   requester_uid?: string
+  /** Authoritative winning decider uid (persisted `decided_by`). */
+  decider_uid?: string
+  /**
+   * Authoritative winning decider Space (persisted `decided_by_space_id`).
+   * Omitted when unknown (a legacy row decided before the decider-space
+   * migration) — octo-server then renders without a Space rather than being
+   * handed a guessed one.
+   */
+  decider_space_id?: string
+  /** Authoritative decision time, unix SECONDS (same unit as `acted_at`). */
+  decided_at?: number
+  /** Compatibility copy — `title` only; identity/time ride the fields above. */
   display?: Record<string, string>
 }
 
-const DECISION_RESULT_KEYS = new Set(['disposition', 'state', 'requester_uid', 'display'])
+const DECISION_RESULT_KEYS = new Set([
+  'disposition',
+  'state',
+  'requester_uid',
+  'decider_uid',
+  'decider_space_id',
+  'decided_at',
+  'display',
+])
 const MAX_DISPLAY_RUNES = 500
+/** Space / uid columns are VARCHAR(64); reject anything that could not have been persisted. */
+const MAX_ID_CHARS = 64
 
 /** Keep the callback response aligned with octo-server's strict decoder. */
 export function assertDecisionResultContract(value: unknown): asserts value is DecisionResult {
   if (!isRecord(value) || Object.keys(value).some((key) => !DECISION_RESULT_KEYS.has(key))) {
     throw new Error('invalid decision result shape')
+  }
+  for (const key of ['decider_uid', 'decider_space_id'] as const) {
+    const v = value[key]
+    if (v !== undefined && (typeof v !== 'string' || v.length > MAX_ID_CHARS)) {
+      throw new Error(`invalid ${key}`)
+    }
+  }
+  if (value.decider_space_id !== undefined && !value.decider_uid) {
+    throw new Error('decider_space_id requires decider_uid')
+  }
+  if (
+    value.decided_at !== undefined &&
+    (typeof value.decided_at !== 'number' || !Number.isSafeInteger(value.decided_at) || value.decided_at < 0)
+  ) {
+    throw new Error('invalid decided_at')
   }
   if (value.display !== undefined) {
     if (!isRecord(value.display)) throw new Error('invalid decision display')
@@ -155,10 +199,15 @@ function parseDecisionRequest(value: unknown): DecisionRequest {
   if (!isRecord(value.inputs) || (value.data !== undefined && !isRecord(value.data))) {
     throw new Error('invalid action data')
   }
-  for (const key of ['doc_id', 'request_id', 'space_id']) {
+  for (const key of ['doc_id', 'request_id', 'space_id', 'operator_space_id']) {
     if (value[key] !== undefined && typeof value[key] !== 'string') throw new Error(`invalid ${key}`)
   }
   return value as unknown as DecisionRequest
+}
+
+/** A persisted-shaped id: non-empty and within the VARCHAR(64) column bound. */
+function isBoundedId(value: string | undefined): value is string {
+  return typeof value === 'string' && value.length > 0 && value.length <= MAX_ID_CHARS
 }
 
 /** Read a string field from top-level or from the server-authoritative `data` map. */
@@ -203,9 +252,10 @@ async function computeDecision(req: DecisionRequest): Promise<DecisionResult> {
   if (!docId || !requestId) return { disposition: 'not_found', state: 'cancelled' }
 
   const meta = await docMetaRepo.getByDocId(docId)
-  // Missing / deleted doc, or a cross-space callback, is indistinguishable from not-found.
+  // Missing / deleted doc is indistinguishable from not-found. `space_id` is the
+  // card's delivery Space, not the document's owner/home Space, so cross-Space
+  // approver cards must not be rejected by comparing those two distinct facts.
   if (!meta || meta.status === 0) return { disposition: 'not_found', state: 'cancelled' }
-  if (req.space_id && meta.space_id !== req.space_id) return { disposition: 'not_found', state: 'cancelled' }
   // Archived doc (status===2): the normal approve route rejects with 409 via
   // requireDocRole before granting, so the signed callback must not be a weaker
   // path that grants membership the HTTP API would refuse. Report `conflict`
@@ -213,11 +263,7 @@ async function computeDecision(req: DecisionRequest): Promise<DecisionResult> {
   // archived doc must not take effect and become live if it is later unarchived.
   if (meta.status === 2) {
     const current = await docAccessRequestRepo.getByRequestId(docId, requestId)
-    return {
-      disposition: 'conflict',
-      state: statusToState(current?.status ?? REQUEST_STATUS_PENDING),
-      requester_uid: current?.uid,
-    }
+    return terminalAwareResult('conflict', current, meta.title)
   }
 
   const request = await docAccessRequestRepo.getByRequestId(docId, requestId)
@@ -227,16 +273,25 @@ async function computeDecision(req: DecisionRequest): Promise<DecisionResult> {
     ? ['reader', 'commenter']
     : ['reader', 'commenter', 'writer']
   if (!isAccessRequestRole(requestedRole) || !grantableRoles.includes(requestedRole)) {
-    return { disposition: 'conflict', state: statusToState(request.status), requester_uid: request.uid }
+    return terminalAwareResult('conflict', request, meta.title)
   }
 
 
   // operator_uid is an authenticated identity assertion, NOT authorization —
-  // re-check the operator is currently an admin/owner of this doc.
-  if (!req.space_id) return { disposition: 'forbidden', state: statusToState(request.status), requester_uid: request.uid }
-  const opRole = await resolveRole(req.operator_uid, docId, req.space_id)
+  // re-check the operator is currently an admin/owner of this doc, IN THEIR OWN
+  // trusted Space. New producers stamp operator_space_id. During the compatible
+  // rollout, old queued/replayed callbacks may omit it; only then use the signed
+  // card delivery `space_id`, and still revalidate the exact (uid, Space)
+  // principal through resolveRole. Never fall back to the document owner Space.
+  const operatorSpaceId = req.operator_space_id === undefined
+    ? req.space_id
+    : req.operator_space_id
+  if (!isBoundedId(operatorSpaceId)) {
+    return terminalAwareResult('forbidden', request, meta.title)
+  }
+  const opRole = await resolveRole(req.operator_uid, docId, operatorSpaceId)
   if (opRole !== 'admin') {
-    return { disposition: 'forbidden', state: statusToState(request.status), requester_uid: request.uid }
+    return terminalAwareResult('forbidden', request, meta.title)
   }
 
   const targetStatus = req.decision === 'approve' ? REQUEST_STATUS_APPROVED : REQUEST_STATUS_DENIED
@@ -252,6 +307,8 @@ async function computeDecision(req: DecisionRequest): Promise<DecisionResult> {
         roleNum: Number(request.requested_role),
         allowAdmin: false,
         decidedBy: req.operator_uid,
+        decidedBySpaceId: operatorSpaceId,
+        decidedAtUnix: req.acted_at,
       })
     : null
   const transitioned = approval
@@ -261,6 +318,8 @@ async function computeDecision(req: DecisionRequest): Promise<DecisionResult> {
         requestId,
         status: targetStatus,
         decidedBy: req.operator_uid,
+        decidedBySpaceId: operatorSpaceId,
+        decidedAtUnix: req.acted_at,
         note: decisionNote(req),
       })
   if (!transitioned) {
@@ -282,19 +341,19 @@ async function computeDecision(req: DecisionRequest): Promise<DecisionResult> {
     if (currentStatus !== targetStatus) {
       return { disposition: 'conflict', state: statusToState(currentStatus), requester_uid: request.uid }
     }
-    // Already at our target, decided by someone else — report the ACTUAL decider
-    // (current.decided_by / when the row transitioned), NEVER this losing caller.
-    // A duplicate or concurrent click on a not-yet-synced card must not rewrite
-    // the result card to show the late clicker as the approver, nor their click
-    // time as the decision time. Fall back safely (empty → octo-server shows the
-    // generic operator label) rather than fabricate this caller's identity.
+    // Already at our target, decided by someone else — report the PERSISTED
+    // winning decider (current.decided_by / decided_by_space_id / decided_at_unix),
+    // NEVER this losing caller. A duplicate or concurrent click on a not-yet-synced
+    // card must not rewrite the result card to show the late clicker as the
+    // approver, nor their click time as the decision time. A legacy row lacking a
+    // persisted Space / time simply omits those fields (optional-Space / optional-
+    // time degradation) rather than guessing — octo-server renders without them.
     return {
       disposition: 'applied',
       state: req.decision === 'approve' ? 'approved' : 'denied',
       requester_uid: request.uid,
-      display: (
-        await buildDecisionDisplayAt(meta.title, current?.decided_by ?? '', current?.updated_at, undefined, req.space_id)
-      ).display,
+      ...deciderFields(current?.decided_by, current?.decided_by_space_id, current?.decided_at_unix),
+      display: buildDecisionDisplay(meta.title),
     }
   }
 
@@ -336,31 +395,22 @@ async function computeDecision(req: DecisionRequest): Promise<DecisionResult> {
   // card; this covers the rest. Gated on transitioned===true so it fires exactly
   // once (the sole decider execution) and never on a redelivery/replay. On this
   // card-callback path the finalizer already handled the decider's clicked card,
-  // so it is skipped here (deciderCardHandledExternally: true). Fire-and-forget:
+  // so it is skipped here (deciderCardHandledExternally: true). The sync carries
+  // the authoritative decider IDs + decision time (unix seconds) so octo-server
+  // renders each sibling card itself — docs resolves no names. Fire-and-forget:
   // never blocks or fails the callback response, and the 409/receipt guards stay
   // the authoritative protection.
-  // Resolve the decider's display copy ONCE for this decision and reuse it for
-  // both the response display and the sibling-card sync — otherwise the same uid
-  // is looked up twice per callback (and logs two misses in the default
-  // deployment). acted_at is the authoritative decision time for every card.
-  const { display, operatorName } = await buildDecisionDisplay(
-    meta.title,
-    req.operator_uid,
-    req.acted_at,
-    undefined,
-    req.space_id,
-  )
   void syncDecisionCards({
     requestId,
     spaceId: meta.space_id,
     docId,
     title: meta.title,
     deciderUid: req.operator_uid,
-    deciderSpaceId: req.space_id,
+    deciderSpaceId: operatorSpaceId,
     deciderCardHandledExternally: true,
+    clickedCardSpaceId: req.space_id,
     denied: req.decision === 'deny',
     denyReason: decisionNote(req),
-    deciderName: operatorName,
     decidedAtSeconds: req.acted_at,
   }).catch(() => {})
 
@@ -368,7 +418,59 @@ async function computeDecision(req: DecisionRequest): Promise<DecisionResult> {
     disposition: 'applied',
     state: req.decision === 'approve' ? 'approved' : 'denied',
     requester_uid: request.uid,
-    display,
+    decider_uid: req.operator_uid,
+    decider_space_id: operatorSpaceId,
+    decided_at: req.acted_at,
+    display: buildDecisionDisplay(meta.title),
+  }
+}
+
+/**
+ * Build the optional authoritative decider fields for a response, from a
+ * persisted row. Each field is emitted ONLY when it is present and well-shaped:
+ *   - decider_uid  — the persisted `decided_by` (empty => omitted)
+ *   - decider_space_id — the persisted `decided_by_space_id` (empty / over-bound
+ *     => omitted; a legacy row lacking it degrades to no Space, never a guess)
+ *   - decided_at   — the persisted `decided_at_unix` (null => omitted)
+ * This is the fail-safe degradation for legacy rows required by the contract.
+ */
+function deciderFields(
+  decidedBy: string | undefined,
+  decidedBySpaceId: string | undefined,
+  decidedAtUnix: number | null | undefined,
+): Partial<Pick<DecisionResult, 'decider_uid' | 'decider_space_id' | 'decided_at'>> {
+  const out: Partial<Pick<DecisionResult, 'decider_uid' | 'decider_space_id' | 'decided_at'>> = {}
+  if (isBoundedId(decidedBy)) out.decider_uid = decidedBy
+  if (isBoundedId(decidedBySpaceId)) out.decider_space_id = decidedBySpaceId
+  if (typeof decidedAtUnix === 'number' && Number.isSafeInteger(decidedAtUnix) && decidedAtUnix >= 0) {
+    out.decided_at = decidedAtUnix
+  }
+  return out
+}
+
+/**
+ * Build every terminal guard/report response from persisted state. Winner fields
+ * are emitted only after the row is already terminal; pending archived,
+ * invalid-role and lost-admin requests disclose no would-be decider and never
+ * grant. This also keeps all early terminal branches consistent.
+ */
+function terminalAwareResult(
+  disposition: 'conflict' | 'forbidden',
+  row: Awaited<ReturnType<typeof docAccessRequestRepo.getByRequestId>>,
+  title: string,
+): DecisionResult {
+  const status = row?.status ?? REQUEST_STATUS_PENDING
+  const terminal = status !== REQUEST_STATUS_PENDING
+  return {
+    disposition,
+    state: statusToState(status),
+    requester_uid: row?.uid,
+    ...(terminal
+      ? {
+          ...deciderFields(row?.decided_by, row?.decided_by_space_id, row?.decided_at_unix),
+          display: buildDecisionDisplay(title),
+        }
+      : {}),
   }
 }
 
