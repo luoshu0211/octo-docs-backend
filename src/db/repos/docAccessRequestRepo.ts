@@ -26,10 +26,31 @@ export interface DocAccessRequestRow {
   status: number // 1=pending 2=approved 3=denied 4=cancelled
   request_id: string
   decided_by: string
+  /**
+   * The winning decider's trusted Space (octo callback `operator_space_id`, or
+   * the REST caller's verified current Space). Written atomically with `status`
+   * in the pending→terminal CAS. '' for rows decided before the decider-space
+   * migration OR never decided — the callback treats an empty value as an
+   * optional-Space degradation and never guesses a Space.
+   */
+  decided_by_space_id: string
   decision_note: string
+  /**
+   * Authoritative decision time in unix SECONDS (same unit as the callback
+   * `acted_at`), written atomically with `status`. `null` for legacy / pending
+   * rows — the callback then omits `decided_at` rather than fabricate one.
+   */
+  decided_at_unix: number | null
   bot_uids: string[] // normalized snapshot of the requester's own Space bots (JSON column); [] when none
   created_at: Date
   updated_at: Date
+}
+
+/** Coerce the nullable unix-seconds column (mysql2 may hand back a string) to a number|null. */
+function normalizeDecidedAt(value: unknown): number | null {
+  if (value === null || value === undefined) return null
+  const n = Number(value)
+  return Number.isFinite(n) ? n : null
 }
 
 export const docAccessRequestRepo = {
@@ -78,7 +99,9 @@ export const docAccessRequestRepo = {
          reason         = VALUES(reason),
          status         = ${REQUEST_STATUS_PENDING},
          decided_by     = '',
+         decided_by_space_id = '',
          decision_note  = '',
+         decided_at_unix = NULL,
          request_id     = VALUES(request_id),
          bot_uids       = VALUES(bot_uids)`,
       [params.docId, params.uid, params.principalSpaceId, params.requestedRoleNum, params.reason, candidateId, botUidsJson],
@@ -102,7 +125,11 @@ export const docAccessRequestRepo = {
     )
     // Fail-closed normalize the JSON snapshot on the read path so a corrupt /
     // hand-edited DB value can never authorize a bot downstream.
-    return rows.map((r) => ({ ...r, bot_uids: parseStoredBotUids((r as { bot_uids?: unknown }).bot_uids) }))
+    return rows.map((r) => ({
+      ...r,
+      bot_uids: parseStoredBotUids((r as { bot_uids?: unknown }).bot_uids),
+      decided_at_unix: normalizeDecidedAt((r as { decided_at_unix?: unknown }).decided_at_unix),
+    }))
   },
 
   /** Fetch a single request by (doc_id, request_id) for approve/deny addressing. */
@@ -113,30 +140,38 @@ export const docAccessRequestRepo = {
     )
     const row = rows[0]
     if (!row) return null
-    return { ...row, bot_uids: parseStoredBotUids((row as { bot_uids?: unknown }).bot_uids) }
+    return {
+      ...row,
+      bot_uids: parseStoredBotUids((row as { bot_uids?: unknown }).bot_uids),
+      decided_at_unix: normalizeDecidedAt((row as { decided_at_unix?: unknown }).decided_at_unix),
+    }
   },
 
   /**
-   * Transition a pending request to approved/denied, recording the decider.
-   * Only flips rows still pending (guards against double-processing / races).
-   * Returns true when a pending row was transitioned.
+   * Transition a pending request to approved/denied, recording the authoritative
+   * decider identity (uid + trusted Space) and decision time. Only flips rows
+   * still pending (guards against double-processing / races). Returns true when a
+   * pending row was transitioned.
    */
   async decide(params: {
     docId: string
     requestId: string
     status: number
     decidedBy: string
+    decidedBySpaceId: string
+    decidedAtUnix: number
     note?: string
   }): Promise<boolean> {
-    // decision_note is written in the SAME CAS-guarded UPDATE as the status
-    // flip, so the note is recorded atomically with (and only on) the
-    // pending→approved/denied transition — a losing racer / replay that finds
-    // the row already decided flips nothing and cannot clobber the note.
+    // decided_by, decided_by_space_id, decided_at_unix and decision_note are all
+    // written in the SAME CAS-guarded UPDATE as the status flip, so the winning
+    // decider's identity/Space/time are recorded atomically with (and only on)
+    // the pending→approved/denied transition — a losing racer / replay that finds
+    // the row already decided flips nothing and cannot clobber them.
     const rows = await query<{ affectedRows?: number }>(
       `UPDATE doc_access_request
-         SET status = ?, decided_by = ?, decision_note = ?
+         SET status = ?, decided_by = ?, decided_by_space_id = ?, decided_at_unix = ?, decision_note = ?
        WHERE doc_id = ? AND request_id = ? AND status = ${REQUEST_STATUS_PENDING}`,
-      [params.status, params.decidedBy, params.note ?? '', params.docId, params.requestId],
+      [params.status, params.decidedBy, params.decidedBySpaceId, params.decidedAtUnix, params.note ?? '', params.docId, params.requestId],
     )
     return (rows as unknown as { affectedRows?: number }).affectedRows! > 0
   },
@@ -147,13 +182,15 @@ export const docAccessRequestRepo = {
     requestId: string
     status: number
     decidedBy: string
+    decidedBySpaceId: string
+    decidedAtUnix: number
     note?: string
   }): Promise<boolean> {
     const result = await tx.execute(
       `UPDATE doc_access_request
-         SET status = ?, decided_by = ?, decision_note = ?
+         SET status = ?, decided_by = ?, decided_by_space_id = ?, decided_at_unix = ?, decision_note = ?
        WHERE doc_id = ? AND request_id = ? AND status = ${REQUEST_STATUS_PENDING}`,
-      [params.status, params.decidedBy, params.note ?? '', params.docId, params.requestId],
+      [params.status, params.decidedBy, params.decidedBySpaceId, params.decidedAtUnix, params.note ?? '', params.docId, params.requestId],
     )
     return result.affectedRows > 0
   },

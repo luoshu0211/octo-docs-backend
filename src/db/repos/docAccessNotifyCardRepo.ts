@@ -3,7 +3,7 @@
  *
  * Ledger of the notification cards delivered to a document's approvers (owner +
  * admins — "某审批人") when an access request is submitted. One row per
- * (request_id, recipient) records the card's IM coordinates so the approve/deny
+ * (request_id, recipient principal) records the card's IM coordinates so the approve/deny
  * path can locate EVERY approver's card and drive it to a terminal state, not
  * just the one the decider clicked.
  *
@@ -20,6 +20,8 @@ export const NOTIFY_CARD_STATUS_TERMINALIZED = 2
 export interface DocAccessNotifyCardRow {
   request_id: string
   recipient_uid: string
+  /** Space in which this concrete card was delivered; part of its identity. */
+  delivery_space_id: string
   channel_id: string
   channel_type: number
   message_id: string
@@ -32,6 +34,7 @@ export interface DocAccessNotifyCardRow {
 /** One delivered card's coordinates, as returned by octo-server's notify. */
 export interface NotifyCardCoord {
   recipientUid: string
+  deliverySpaceId: string
   channelId: string
   channelType: number
   messageId: string
@@ -41,17 +44,19 @@ export interface NotifyCardCoord {
 export const docAccessNotifyCardRepo = {
   /**
    * Persist the delivered-card coordinates for one access request. Idempotent by
-   * (request_id, recipient_uid): a resend refreshes the row to the latest card
+   * (request_id, recipient_uid, delivery_space_id): a resend refreshes that
+   * principal's row to the latest card
    * and resets it to ACTIVE. No-op on an empty list.
    */
   async record(requestId: string, cards: NotifyCardCoord[]): Promise<void> {
     if (cards.length === 0) return
-    const values = cards.map(() => '(?, ?, ?, ?, ?, ?, ?)').join(', ')
+    const values = cards.map(() => '(?, ?, ?, ?, ?, ?, ?, ?)').join(', ')
     const params: unknown[] = []
     for (const c of cards) {
       params.push(
         requestId,
         c.recipientUid,
+        c.deliverySpaceId,
         c.channelId,
         c.channelType,
         c.messageId,
@@ -61,7 +66,7 @@ export const docAccessNotifyCardRepo = {
     }
     await query(
       `INSERT INTO doc_access_notify_card
-         (request_id, recipient_uid, channel_id, channel_type, message_id, client_msg_no, status)
+         (request_id, recipient_uid, delivery_space_id, channel_id, channel_type, message_id, client_msg_no, status)
        VALUES ${values}
        ON DUPLICATE KEY UPDATE
          channel_id    = VALUES(channel_id),
@@ -82,11 +87,11 @@ export const docAccessNotifyCardRepo = {
   },
 
   /** Mark one card terminalized after a successful mutate (best-effort audit). */
-  async markTerminalized(requestId: string, recipientUid: string): Promise<void> {
+  async markTerminalized(requestId: string, recipientUid: string, deliverySpaceId: string): Promise<void> {
     await query(
       `UPDATE doc_access_notify_card SET status = ${NOTIFY_CARD_STATUS_TERMINALIZED}
-       WHERE request_id = ? AND recipient_uid = ?`,
-      [requestId, recipientUid],
+       WHERE request_id = ? AND recipient_uid = ? AND delivery_space_id = ?`,
+      [requestId, recipientUid, deliverySpaceId],
     )
   },
 }

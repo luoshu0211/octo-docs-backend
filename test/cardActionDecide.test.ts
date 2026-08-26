@@ -52,11 +52,10 @@ vi.mock('../src/api/services/botGrantAudit.js', () => ({
   logBotGrantFailure: vi.fn(),
   logBotGrantSummary: vi.fn(),
 }))
-// getUser backs buildDecisionDisplay's operator-name resolution. Default returns
-// undefined (name omitted); individual tests set an implementation to assert the
-// resolved operator identity.
-const { mockGetUser } = vi.hoisted(() => ({ mockGetUser: vi.fn() }))
-vi.mock('../src/auth/octoIdentity.js', () => ({ getOctoIdentity: () => ({ getUser: mockGetUser }) }))
+const { mockSyncDecisionCards } = vi.hoisted(() => ({ mockSyncDecisionCards: vi.fn(async () => {}) }))
+vi.mock('../src/api/services/docsDecisionCardSync.js', () => ({
+  syncDecisionCards: mockSyncDecisionCards,
+}))
 
 import {
   verifyOctoSignature,
@@ -100,7 +99,7 @@ beforeEach(() => {
     })
     return { transitioned: true, requesterRole: grant.finalRole }
   })
-  mockGetUser.mockReset()
+  mockSyncDecisionCards.mockReset().mockResolvedValue(undefined)
 })
 
 describe('callback response contract guard', () => {
@@ -113,6 +112,109 @@ describe('callback response contract guard', () => {
     expect(() => assertDecisionResultContract({
       disposition: 'applied', state: 'approved', display: { title: '😀'.repeat(500) },
     })).not.toThrow()
+  })
+
+  it('accepts the authoritative decider fields', () => {
+    expect(() => assertDecisionResultContract({
+      disposition: 'applied', state: 'approved', requester_uid: 'req-u',
+      decider_uid: 'admin-A', decider_space_id: 'space-A', decided_at: 1_784_073_600,
+      display: { title: 'T' },
+    })).not.toThrow()
+  })
+
+  it('rejects a malformed decider_space_id / decided_at', () => {
+    expect(() => assertDecisionResultContract({
+      disposition: 'applied', state: 'approved', decider_space_id: 'space-without-decider',
+    })).toThrow('decider_space_id requires decider_uid')
+    expect(() => assertDecisionResultContract({
+      disposition: 'applied', state: 'approved', decider_space_id: 'x'.repeat(65),
+    })).toThrow('invalid decider_space_id')
+    expect(() => assertDecisionResultContract({
+      disposition: 'applied', state: 'approved', decided_at: -1,
+    })).toThrow('invalid decided_at')
+    expect(() => assertDecisionResultContract({
+      disposition: 'applied', state: 'approved', decided_at: 1.5,
+    })).toThrow('invalid decided_at')
+  })
+})
+
+// Compatible rollout: old signed queued events omitted operator_space_id. Only
+// that missing-field shape may use the signed card delivery space_id, and the
+// exact derived principal is still revalidated before any transition.
+describe('cardActionDecideHandler (legacy missing operator_space_id)', () => {
+  it('revalidates (operator_uid, card space_id) and applies when that exact principal is still admin', async () => {
+    const { docAccessRequestRepo } = await import('../src/db/repos/docAccessRequestRepo.js')
+    const { resolveRole } = await import('../src/permission/resolveRole.js')
+    vi.mocked(docAccessRequestRepo.decide).mockClear()
+    const eventId = '4200'
+    const ts = String(Math.floor(Date.now() / 1000))
+    const body = JSON.stringify({
+      event_id: eventId, action_id: 'approval-approve', decision: 'approve', operator_uid: 'op-1',
+      // operator_space_id deliberately omitted
+      inputs: {}, doc_id: 'doc-1', request_id: 'req-1', message_id: 'm-1', channel_id: 'notification',
+      channel_type: 1, space_id: 'space-1', acted_at: Number(ts),
+    })
+    const { req, res } = makeReqRes({
+      'X-Octo-Timestamp': ts, 'X-Octo-Event-ID': eventId,
+      'X-Octo-Signature': sign(CARD_ACTION_DECIDE_PATH, body, ts, eventId, HANDLER_SECRET),
+    }, body)
+    await cardActionDecideHandler(req, res as unknown as Parameters<typeof cardActionDecideHandler>[1])
+    expect(res.statusCode).toBe(200)
+    expect((res.payload as { disposition: string }).disposition).toBe('applied')
+    expect(resolveRole).toHaveBeenCalledWith('op-1', 'doc-1', 'space-1')
+    expect(mockApproveAccessRequest).toHaveBeenCalledWith(expect.objectContaining({
+      decidedBy: 'op-1', decidedBySpaceId: 'space-1',
+    }))
+  })
+
+  it('forbids an old queued event when the exact legacy principal lost admin', async () => {
+    const { docAccessRequestRepo } = await import('../src/db/repos/docAccessRequestRepo.js')
+    const { resolveRole } = await import('../src/permission/resolveRole.js')
+    vi.mocked(resolveRole).mockResolvedValueOnce('reader')
+    vi.mocked(docAccessRequestRepo.decide).mockClear()
+    vi.mocked(docAccessRequestRepo.getByRequestId).mockResolvedValueOnce({
+      uid: 'req-u', principal_space_id: 'space-requester', requested_role: 1, status: 2, bot_uids: [],
+      decided_by: 'winner', decided_by_space_id: 'winner-space', decided_at_unix: 789,
+    } as unknown as Awaited<ReturnType<typeof docAccessRequestRepo.getByRequestId>>)
+    const eventId = '4201'
+    const ts = String(Math.floor(Date.now() / 1000))
+    const body = JSON.stringify({
+      event_id: eventId, action_id: 'approval-approve', decision: 'approve', operator_uid: 'op-1',
+      inputs: {}, doc_id: 'doc-1', request_id: 'req-1', message_id: 'm-1', channel_id: 'notification',
+      channel_type: 1, space_id: 'space-legacy', acted_at: Number(ts),
+    })
+    const { req, res } = makeReqRes({
+      'X-Octo-Timestamp': ts, 'X-Octo-Event-ID': eventId,
+      'X-Octo-Signature': sign(CARD_ACTION_DECIDE_PATH, body, ts, eventId, HANDLER_SECRET),
+    }, body)
+    await cardActionDecideHandler(req, res as unknown as Parameters<typeof cardActionDecideHandler>[1])
+    expect((res.payload as { disposition: string }).disposition).toBe('forbidden')
+    expect(res.payload).toEqual(expect.objectContaining({
+      state: 'approved', decider_uid: 'winner', decider_space_id: 'winner-space', decided_at: 789,
+    }))
+    expect(resolveRole).toHaveBeenCalledWith('op-1', 'doc-1', 'space-legacy')
+    expect(docAccessRequestRepo.decide).not.toHaveBeenCalled()
+  })
+
+  it('does not reinterpret a present-but-invalid operator_space_id as legacy missing', async () => {
+    const { docAccessRequestRepo } = await import('../src/db/repos/docAccessRequestRepo.js')
+    vi.mocked(docAccessRequestRepo.decide).mockClear()
+    const eventId = '4202'
+    const ts = String(Math.floor(Date.now() / 1000))
+    const body = JSON.stringify({
+      event_id: eventId, action_id: 'approval-approve', decision: 'approve', operator_uid: 'op-1',
+      operator_space_id: '', inputs: {}, doc_id: 'doc-1', request_id: 'req-1', message_id: 'm-1',
+      channel_id: 'notification', channel_type: 1, space_id: 'space-legacy', acted_at: Number(ts),
+    })
+    const { req, res } = makeReqRes({
+      'X-Octo-Timestamp': ts, 'X-Octo-Event-ID': eventId,
+      'X-Octo-Signature': sign(CARD_ACTION_DECIDE_PATH, body, ts, eventId, HANDLER_SECRET),
+    }, body)
+    await cardActionDecideHandler(req, res as unknown as Parameters<typeof cardActionDecideHandler>[1])
+    expect((res.payload as { disposition: string }).disposition).toBe('forbidden')
+    expect(res.payload).not.toHaveProperty('decider_uid')
+    expect(res.payload).not.toHaveProperty('decider_space_id')
+    expect(docAccessRequestRepo.decide).not.toHaveBeenCalled()
   })
 })
 
@@ -208,7 +310,7 @@ describe('cardActionDecideHandler (production path consistency)', () => {
     event_id: eventId,
     action_id: 'approval-approve',
     decision: 'approve',
-    operator_uid: 'op-1',
+    operator_uid: 'op-1', operator_space_id: 'space-op',
     inputs: {},
     data: { owner: 'docs', action_type: 'access_request.decision', doc_id: 'doc-1', request_id: 'req-1' },
     doc_id: 'doc-1',
@@ -255,7 +357,7 @@ describe('cardActionDecideHandler (archived-doc guard)', () => {
     event_id: eventId,
     action_id: 'approval-approve',
     decision: 'approve',
-    operator_uid: 'op-1',
+    operator_uid: 'op-1', operator_space_id: 'space-op',
     inputs: {},
     data: { owner: 'docs', action_type: 'access_request.decision', doc_id: 'doc-1', request_id: 'req-1' },
     doc_id: 'doc-1',
@@ -280,6 +382,10 @@ describe('cardActionDecideHandler (archived-doc guard)', () => {
     } as unknown as Awaited<ReturnType<typeof docMetaRepo.getByDocId>>)
     vi.mocked(grantForwardAccess).mockClear()
     vi.mocked(docAccessRequestRepo.decide).mockClear()
+    vi.mocked(docAccessRequestRepo.getByRequestId).mockResolvedValueOnce({
+      uid: 'req-u', requested_role: 1, status: 2,
+      decided_by: 'winner', decided_by_space_id: 'winner-space', decided_at_unix: 123,
+    } as unknown as Awaited<ReturnType<typeof docAccessRequestRepo.getByRequestId>>)
 
     const sig = sign(CARD_ACTION_DECIDE_PATH, body, ts, eventId, HANDLER_SECRET)
     const { req, res } = makeReqRes(
@@ -289,6 +395,9 @@ describe('cardActionDecideHandler (archived-doc guard)', () => {
     await cardActionDecideHandler(req, res as unknown as Parameters<typeof cardActionDecideHandler>[1])
     expect(res.statusCode).toBe(200)
     expect((res.payload as { disposition: string }).disposition).toBe('conflict')
+    expect(res.payload).toEqual(expect.objectContaining({
+      state: 'approved', decider_uid: 'winner', decider_space_id: 'winner-space', decided_at: 123,
+    }))
     // The archived gate must short-circuit BEFORE any status transition or grant.
     expect(grantForwardAccess).not.toHaveBeenCalled()
     expect(docAccessRequestRepo.decide).not.toHaveBeenCalled()
@@ -311,7 +420,7 @@ describe('cardActionDecideHandler (commenter on every document type)', () => {
     const eventId = '4020'
     const ts = String(Math.floor(Date.now() / 1000))
     const body = JSON.stringify({
-      event_id: eventId, action_id: 'approval-approve', decision: 'approve', operator_uid: 'op-1',
+      event_id: eventId, action_id: 'approval-approve', decision: 'approve', operator_uid: 'op-1', operator_space_id: 'space-op',
       inputs: {}, doc_id: 'doc-1', request_id: 'req-1', message_id: 'm-1', channel_id: 'notification',
       channel_type: 1, space_id: 'space-1', acted_at: Number(ts),
     })
@@ -335,7 +444,8 @@ describe('cardActionDecideHandler (historical admin access request)', () => {
       doc_id: 'doc-1', space_id: 'space-1', document_name: 'dn-1', title: 'T', status: 1,
     } as unknown as Awaited<ReturnType<typeof docMetaRepo.getByDocId>>)
     vi.mocked(docAccessRequestRepo.getByRequestId).mockResolvedValueOnce({
-      uid: 'req-u', principal_space_id: 'space-requester', requested_role: 3, status: 1, bot_uids: [],
+      uid: 'req-u', principal_space_id: 'space-requester', requested_role: 3, status: 3, bot_uids: [],
+      decided_by: 'winner', decided_by_space_id: 'winner-space', decided_at_unix: 456,
     } as unknown as Awaited<ReturnType<typeof docAccessRequestRepo.getByRequestId>>)
     vi.mocked(docAccessRequestRepo.decide).mockResolvedValueOnce(true)
     vi.mocked(grantForwardAccess).mockClear()
@@ -343,7 +453,7 @@ describe('cardActionDecideHandler (historical admin access request)', () => {
     const eventId = '4021'
     const ts = String(Math.floor(Date.now() / 1000))
     const body = JSON.stringify({
-      event_id: eventId, action_id: 'approval-approve', decision: 'approve', operator_uid: 'op-1',
+      event_id: eventId, action_id: 'approval-approve', decision: 'approve', operator_uid: 'op-1', operator_space_id: 'space-op',
       inputs: {}, doc_id: 'doc-1', request_id: 'req-1', message_id: 'm-1', channel_id: 'notification',
       channel_type: 1, space_id: 'space-1', acted_at: Number(ts),
     })
@@ -355,6 +465,9 @@ describe('cardActionDecideHandler (historical admin access request)', () => {
     await cardActionDecideHandler(req, res as unknown as Parameters<typeof cardActionDecideHandler>[1])
 
     expect((res.payload as { disposition: string }).disposition).toBe('conflict')
+    expect(res.payload).toEqual(expect.objectContaining({
+      state: 'denied', decider_uid: 'winner', decider_space_id: 'winner-space', decided_at: 456,
+    }))
     expect(grantForwardAccess).not.toHaveBeenCalled()
   })
 })
@@ -373,7 +486,7 @@ describe('cardActionDecideHandler (grant gated on decide() CAS, not claim)', () 
     event_id: eventId,
     action_id: 'approval-approve',
     decision: 'approve',
-    operator_uid: 'op-1',
+    operator_uid: 'op-1', operator_space_id: 'space-op',
     inputs: {},
     data: { owner: 'docs', action_type: 'access_request.decision', doc_id: 'doc-1', request_id: 'req-1' },
     doc_id: 'doc-1',
@@ -429,7 +542,7 @@ describe('cardActionDecideHandler (grant gated on decide() CAS, not claim)', () 
       event_id: '4010',
       action_id: 'approval-deny',
       decision: 'deny',
-      operator_uid: 'op-1',
+      operator_uid: 'op-1', operator_space_id: 'space-op',
       inputs: { deny_reason: '  范围不符，请对齐后再申请  ' }, // whitespace trimmed on store
       data: { owner: 'docs', action_type: 'access_request.decision', doc_id: 'doc-1', request_id: 'req-1' },
       doc_id: 'doc-1',
@@ -518,11 +631,11 @@ describe('cardActionDecideHandler (grant gated on decide() CAS, not claim)', () 
 })
 
 // Invariant: a duplicate/concurrent click on an already-decided request must
-// render the ACTUAL decider on the result card, never the late caller. Admin
+// report the ACTUAL persisted decider on the result, never the late caller. Admin
 // A truly decided (won the CAS); admin B then taps the same not-yet-synced card,
 // loses the pending CAS, and lands in the report-only branch. B's response must
-// carry A's operator identity (and A's decision time), not B's — otherwise a
-// repeat submit rewrites the card to show the wrong approver.
+// carry A's persisted decider uid / Space / time, not B's — otherwise a repeat
+// submit rewrites the card to show the wrong approver. docs resolves NO names.
 describe('cardActionDecideHandler (duplicate same-terminal callback → real decider)', () => {
   const eventId = '4020'
   const ts = String(Math.floor(Date.now() / 1000))
@@ -531,6 +644,7 @@ describe('cardActionDecideHandler (duplicate same-terminal callback → real dec
     action_id: 'approval-approve',
     decision: 'approve',
     operator_uid: 'admin-B', // the LATE duplicate clicker
+    operator_space_id: 'space-B', // the late clicker's own Space — must NOT appear in the response
     inputs: {},
     data: { owner: 'docs', action_type: 'access_request.decision', doc_id: 'doc-1', request_id: 'req-1' },
     doc_id: 'doc-1',
@@ -543,14 +657,12 @@ describe('cardActionDecideHandler (duplicate same-terminal callback → real dec
   })
 
   // Restoration belongs here, NOT at the end of an `it` body: these blocks set
-  // `getByRequestId` with mockResolvedValue (not …Once) and give mockGetUser an
-  // implementation, so if an assertion above ever fails, in-body cleanup never
-  // runs and every later block inherits an always-approved row plus a
-  // uid-dependent getUser — failing for unrelated reasons, or silently
-  // exercising the duplicate branch.
+  // `getByRequestId` with mockResolvedValue (not …Once), so if an assertion above
+  // ever fails, in-body cleanup never runs and every later block inherits an
+  // always-approved row — failing for unrelated reasons, or silently exercising
+  // the duplicate branch.
   afterEach(async () => {
     const { docAccessRequestRepo } = await import('../src/db/repos/docAccessRequestRepo.js')
-    mockGetUser.mockReset()
     vi.mocked(docAccessRequestRepo.getByRequestId).mockResolvedValue({
       uid: 'req-u',
       requested_role: 1,
@@ -558,7 +670,7 @@ describe('cardActionDecideHandler (duplicate same-terminal callback → real dec
     } as unknown as Awaited<ReturnType<typeof docAccessRequestRepo.getByRequestId>>)
   })
 
-  it('renders operator_name from the persisted decider (admin-A), never the late clicker (admin-B)', async () => {
+  it('reports the PERSISTED decider (admin-A / its Space / its time), never the late clicker (admin-B)', async () => {
     const { docAccessRequestRepo, REQUEST_STATUS_APPROVED } = await import('../src/db/repos/docAccessRequestRepo.js')
     const { docCardActionReceiptRepo } = await import('../src/db/repos/docCardActionReceiptRepo.js')
     const { docMetaRepo } = await import('../src/db/repos/docMetaRepo.js')
@@ -570,19 +682,16 @@ describe('cardActionDecideHandler (duplicate same-terminal callback → real dec
       title: 'T',
       status: 1,
     } as unknown as Awaited<ReturnType<typeof docMetaRepo.getByDocId>>)
-    // Row already APPROVED by admin-A at a fixed time; B's CAS will lose.
+    // Row already APPROVED by admin-A from admin-A's Space at a fixed time; B's CAS loses.
     vi.mocked(docAccessRequestRepo.getByRequestId).mockResolvedValue({
       uid: 'req-u',
       requested_role: 1,
       status: REQUEST_STATUS_APPROVED,
       decided_by: 'admin-A',
-      updated_at: new Date('2026-07-24T07:35:00.000Z'),
+      decided_by_space_id: 'space-A',
+      decided_at_unix: 1_784_073_600,
     } as unknown as Awaited<ReturnType<typeof docAccessRequestRepo.getByRequestId>>)
     vi.mocked(docAccessRequestRepo.decide).mockResolvedValueOnce(false) // B loses the pending CAS
-    // Distinct names so a wrong identity would be visible in the assertion.
-    mockGetUser.mockImplementation(async (uid: string) =>
-      uid === 'admin-A' ? { uid, name: 'Alice' } : { uid, name: 'Bob' },
-    )
 
     const sig = sign(CARD_ACTION_DECIDE_PATH, body, ts, eventId, HANDLER_SECRET)
     const { req, res } = makeReqRes(
@@ -592,16 +701,52 @@ describe('cardActionDecideHandler (duplicate same-terminal callback → real dec
     await cardActionDecideHandler(req, res as unknown as Parameters<typeof cardActionDecideHandler>[1])
 
     expect(res.statusCode).toBe(200)
-    const display = (res.payload as { display?: Record<string, string> }).display
-    expect(display?.operator_name).toBe('Alice') // the real decider (admin-A)
-    expect(display?.operator_name).not.toBe('Bob') // never the late clicker (admin-B)
-    expect(display?.decided_at).toBeTruthy() // A's decision time, from the persisted row
-    // The name was resolved for the persisted decider, not for the losing caller.
-    expect(mockGetUser.mock.calls.map((c) => c[0])).toContain('admin-A')
-    expect(mockGetUser.mock.calls.map((c) => c[0])).not.toContain('admin-B')
+    const payload = res.payload as {
+      decider_uid?: string; decider_space_id?: string; decided_at?: number; display?: Record<string, string>
+    }
+    expect(payload.decider_uid).toBe('admin-A') // the real decider
+    expect(payload.decider_uid).not.toBe('admin-B') // never the late clicker
+    expect(payload.decider_space_id).toBe('space-A') // A's persisted Space, not B's 'space-B'
+    expect(payload.decided_at).toBe(1_784_073_600) // A's persisted decision time
+    // display stays title-only — docs never resolves a name here.
+    expect(payload.display).toEqual({ title: 'T' })
   })
 
-  it('renders operator_name for the CAS-winning decider on the primary path', async () => {
+  it('degrades a legacy persisted decider that lacks a Space/time (omits, never guesses)', async () => {
+    const { docAccessRequestRepo, REQUEST_STATUS_APPROVED } = await import('../src/db/repos/docAccessRequestRepo.js')
+    const { docCardActionReceiptRepo } = await import('../src/db/repos/docCardActionReceiptRepo.js')
+    const { docMetaRepo } = await import('../src/db/repos/docMetaRepo.js')
+    vi.mocked(docCardActionReceiptRepo.claim).mockResolvedValueOnce(true)
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValueOnce({
+      doc_id: 'doc-1', space_id: 'space-1', document_name: 'dn-1', title: 'T', status: 1,
+    } as unknown as Awaited<ReturnType<typeof docMetaRepo.getByDocId>>)
+    // Legacy row: decided_by present, but decided_by_space_id '' and decided_at_unix null.
+    vi.mocked(docAccessRequestRepo.getByRequestId).mockResolvedValue({
+      uid: 'req-u',
+      requested_role: 1,
+      status: REQUEST_STATUS_APPROVED,
+      decided_by: 'admin-A',
+      decided_by_space_id: '',
+      decided_at_unix: null,
+    } as unknown as Awaited<ReturnType<typeof docAccessRequestRepo.getByRequestId>>)
+    vi.mocked(docAccessRequestRepo.decide).mockResolvedValueOnce(false)
+
+    const sig = sign(CARD_ACTION_DECIDE_PATH, body, ts, eventId, HANDLER_SECRET)
+    const { req, res } = makeReqRes(
+      { 'X-Octo-Timestamp': ts, 'X-Octo-Event-ID': eventId, 'X-Octo-Signature': sig },
+      body,
+    )
+    await cardActionDecideHandler(req, res as unknown as Parameters<typeof cardActionDecideHandler>[1])
+
+    expect(res.statusCode).toBe(200)
+    const payload = res.payload as Record<string, unknown>
+    expect(payload.decider_uid).toBe('admin-A') // still the persisted decider uid
+    // No Space / time to attribute — omitted, never guessed from doc/card/default.
+    expect(payload).not.toHaveProperty('decider_space_id')
+    expect(payload).not.toHaveProperty('decided_at')
+  })
+
+  it('reports the CAS-winning decider IDs on the primary path (winner is admin-B)', async () => {
     const { docAccessRequestRepo, REQUEST_STATUS_PENDING } = await import('../src/db/repos/docAccessRequestRepo.js')
     const { docCardActionReceiptRepo } = await import('../src/db/repos/docCardActionReceiptRepo.js')
     const { docMetaRepo } = await import('../src/db/repos/docMetaRepo.js')
@@ -619,7 +764,6 @@ describe('cardActionDecideHandler (duplicate same-terminal callback → real dec
       status: REQUEST_STATUS_PENDING,
     } as unknown as Awaited<ReturnType<typeof docAccessRequestRepo.getByRequestId>>)
     vi.mocked(docAccessRequestRepo.decide).mockResolvedValueOnce(true) // this caller IS the decider
-    mockGetUser.mockResolvedValueOnce({ uid: 'admin-B', name: 'Bob' })
 
     const sig = sign(CARD_ACTION_DECIDE_PATH, body, ts, eventId, HANDLER_SECRET)
     const { req, res } = makeReqRes(
@@ -629,11 +773,43 @@ describe('cardActionDecideHandler (duplicate same-terminal callback → real dec
     await cardActionDecideHandler(req, res as unknown as Parameters<typeof cardActionDecideHandler>[1])
 
     expect(res.statusCode).toBe(200)
-    const display = (res.payload as { display?: Record<string, string> }).display
-    // The winner's own operator_uid (admin-B here) is the right identity on this path.
-    expect(display?.operator_name).toBe('Bob')
-    expect(display?.decided_at).toBeTruthy()
-    expect(mockGetUser.mock.calls.map((c) => c[0])).toContain('admin-B')
+    const payload = res.payload as { decider_uid?: string; decider_space_id?: string; decided_at?: number }
+    // The winner's own operator_uid / operator_space_id / acted_at are authoritative here.
+    expect(payload.decider_uid).toBe('admin-B')
+    expect(payload.decider_space_id).toBe('space-B')
+    expect(payload.decided_at).toBe(Number(ts))
+    expect(mockSyncDecisionCards).toHaveBeenCalledWith(expect.objectContaining({
+      deciderUid: 'admin-B',
+      deciderSpaceId: 'space-B',
+      clickedCardSpaceId: 'space-1', // card delivery/origin, distinct from operator Space
+      deciderCardHandledExternally: true,
+    }))
+  })
+})
+
+describe('cardActionDecideHandler (finalized receipt compatibility)', () => {
+  it('replays an already-finalized legacy forbidden result without reauthorization or grant', async () => {
+    const { resolveRole } = await import('../src/permission/resolveRole.js')
+    vi.mocked(resolveRole).mockClear()
+    vi.mocked(docCardActionReceiptRepo.claim).mockResolvedValueOnce(false)
+    vi.mocked(docCardActionReceiptRepo.getResponse).mockResolvedValueOnce(JSON.stringify({
+      disposition: 'forbidden', state: 'pending', requester_uid: 'req-u',
+    }))
+    const eventId = '4299'
+    const ts = String(Math.floor(Date.now() / 1000))
+    const body = JSON.stringify({
+      event_id: eventId, action_id: 'approval-approve', decision: 'approve', operator_uid: 'op-1',
+      inputs: {}, doc_id: 'doc-1', request_id: 'req-1', message_id: 'm-1', channel_id: 'notification',
+      channel_type: 1, space_id: 'space-legacy', acted_at: Number(ts),
+    })
+    const { req, res } = makeReqRes({
+      'X-Octo-Timestamp': ts, 'X-Octo-Event-ID': eventId,
+      'X-Octo-Signature': sign(CARD_ACTION_DECIDE_PATH, body, ts, eventId, HANDLER_SECRET),
+    }, body)
+    await cardActionDecideHandler(req, res as unknown as Parameters<typeof cardActionDecideHandler>[1])
+    expect(res.payload).toEqual({ disposition: 'forbidden', state: 'pending', requester_uid: 'req-u' })
+    expect(resolveRole).not.toHaveBeenCalled()
+    expect(mockApproveAccessRequest).not.toHaveBeenCalled()
   })
 })
 
@@ -648,7 +824,7 @@ describe('cardActionDecideHandler (carried Space-bot snapshot grants)', () => {
       event_id: eventId,
       action_id: 'approval-approve',
       decision: 'approve',
-      operator_uid: 'op-1',
+      operator_uid: 'op-1', operator_space_id: 'space-op',
       inputs: {},
       data: { owner: 'docs', action_type: 'access_request.decision', doc_id: 'doc-1', request_id: 'req-1' },
       doc_id: 'doc-1',
@@ -686,7 +862,7 @@ describe('cardActionDecideHandler (carried Space-bot snapshot grants)', () => {
     expect(res.statusCode).toBe(200)
     const payload = res.payload as Record<string, unknown>
     expect(payload.disposition).toBe('applied')
-    expect(Object.keys(payload).sort()).toEqual(['display', 'disposition', 'requester_uid', 'state'])
+    expect(Object.keys(payload).sort()).toEqual(['decided_at', 'decider_space_id', 'decider_uid', 'display', 'disposition', 'requester_uid', 'state'])
     // Card approval uses the same split principal contract as REST approval.
     expect(vi.mocked(grantForwardAccess)).toHaveBeenCalledTimes(3)
     expect(vi.mocked(grantForwardAccess)).toHaveBeenCalledWith(expect.objectContaining({
@@ -716,7 +892,7 @@ describe('cardActionDecideHandler (carried Space-bot snapshot grants)', () => {
     expect(res.statusCode).toBe(200)
     const payload = res.payload as Record<string, unknown>
     expect(payload.disposition).toBe('applied')
-    expect(Object.keys(payload).sort()).toEqual(['display', 'disposition', 'requester_uid', 'state'])
+    expect(Object.keys(payload).sort()).toEqual(['decided_at', 'decider_space_id', 'decider_uid', 'display', 'disposition', 'requester_uid', 'state'])
     expect(payload).not.toHaveProperty('botGrantResult')
     expect(payload).not.toHaveProperty('bot_summary')
     expect(vi.mocked(logBotGrantFailure)).toHaveBeenCalledWith(expect.objectContaining({
@@ -764,7 +940,7 @@ describe('cardActionDecideHandler (carried Space-bot snapshot grants)', () => {
     expect(res.statusCode).toBe(200)
     const payload = res.payload as Record<string, unknown>
     expect(payload.disposition).toBe('applied')
-    expect(Object.keys(payload).sort()).toEqual(['display', 'disposition', 'requester_uid', 'state'])
+    expect(Object.keys(payload).sort()).toEqual(['decided_at', 'decider_space_id', 'decider_uid', 'display', 'disposition', 'requester_uid', 'state'])
     expect(vi.mocked(grantForwardAccess)).toHaveBeenCalledTimes(1) // requester only
   })
 

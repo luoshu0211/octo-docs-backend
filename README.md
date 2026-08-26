@@ -125,6 +125,22 @@ For local development before building, `npm run migrate:dev` runs the same
 runner directly from TypeScript. Plain `mysql < migrations/upgrades/...` remains
 valid as a low-level fallback, but production deploys should use `npm run
 migrate` as an explicit step before starting the new server version.
+
+### Approval-card rolling-upgrade compatibility
+
+The approval callback normally carries the operator's trusted
+`operator_space_id`. During a compatible octo-server rollout, an older queued or
+replayed callback may omit that newly-added field. Only for that missing-field
+legacy shape, Docs uses the signed card delivery `space_id` and revalidates the
+exact `(operator_uid, space_id)` principal as a current document admin before
+the pending→terminal CAS; it never substitutes the document owner/Home Space.
+An explicitly present but empty/invalid `operator_space_id` remains forbidden.
+
+Callback receipts are immutable idempotency records. An event whose receipt was
+already finalized as `forbidden` before the compatible deployment replays that
+same result and is not re-authorized; a still-unfinalized/queued legacy event can
+be revalidated and succeed after rollout. This preserves replay-exact behavior
+without weakening authorization.
 When adopting the runner on a database previously migrated by hand, its first
 run will re-run the idempotent upgrade files once to populate the
 `schema_migrations` ledger.
