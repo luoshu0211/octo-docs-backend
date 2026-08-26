@@ -74,14 +74,22 @@ function reconcileMarks(
     const m = marks[i]
     if (m && EXCLUSIVE_MARKS.has(m.type)) return [{ ...m }]
   }
-  const seen = new Set<string>()
-  const out: Array<{ type: string; attrs?: Record<string, unknown> }> = []
+  // CSS cascade invariant: when the same mark type nests, the CLOSEST ancestor wins.
+  // `marks` is outermost-first, so a later (inner) occurrence overrides an earlier
+  // (outer) one. Merge per attribute rather than replacing wholesale: an inner
+  // `<span color:blue>` inside an outer `<span font-size:24px>` keeps both — the inner
+  // layer only overrides the attributes it actually defines (here `color`), inheriting
+  // the rest. Nested colored spans / <mark> backgrounds therefore resolve innermost-wins.
+  const byType = new Map<string, { type: string; attrs?: Record<string, unknown> }>()
   for (const m of marks) {
-    if (seen.has(m.type)) continue
-    seen.add(m.type)
-    out.push({ ...m })
+    const prev = byType.get(m.type)
+    if (prev) {
+      if (m.attrs || prev.attrs) prev.attrs = { ...(prev.attrs ?? {}), ...(m.attrs ?? {}) }
+    } else {
+      byType.set(m.type, m.attrs ? { type: m.type, attrs: { ...m.attrs } } : { type: m.type })
+    }
   }
-  return out
+  return [...byType.values()]
 }
 
 function domInlineToNodes(root: DomElement): PmNode[] {

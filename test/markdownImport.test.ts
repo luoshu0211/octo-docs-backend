@@ -758,3 +758,68 @@ describe('parseMarkdownToPmDoc — mutually exclusive marks', () => {
     expect(marksets).toContainEqual(['bold'])
   })
 })
+
+// ── Nested marks of the same type (CSS cascade: closest ancestor wins) ─────────
+//
+// De-duplicating nested marks by type used to keep the OUTERMOST occurrence, so
+// `<span color:red><span color:blue>x` imported RED even though the CSS cascade
+// makes the inner blue win. Nested colored spans / <mark> backgrounds are common in
+// rich-text editor exports, and the wrong-attribute result is schema-legal, so it
+// never tripped the import fallback — it silently mis-colored text. The importer now
+// lets the innermost occurrence win, merging per attribute so an inner layer only
+// overrides what it actually defines.
+
+describe('parseMarkdownToPmDoc — nested same-type marks', () => {
+  // Find the first text node carrying a mark of the given type, on either mark path.
+  function firstMarkAttrs(node: PmNode, type: string): Record<string, unknown> | undefined {
+    if (node.type === 'text') {
+      const m = (node.marks ?? []).find((mk) => mk.type === type)
+      if (m) return m.attrs ?? {}
+    }
+    for (const child of node.content ?? []) {
+      const found = firstMarkAttrs(child, type)
+      if (found) return found
+    }
+    return undefined
+  }
+
+  it('nested colored spans: the inner color wins (markdown-token path)', () => {
+    const r = parse('<span style="color:red"><span style="color:blue">x</span></span>')
+    expect(firstMarkAttrs(r.doc, 'textStyle')).toEqual({ color: 'blue' })
+  })
+
+  it('nested colored spans: the inner color wins (block inline HTML path)', () => {
+    const r = parse(
+      '<table>\n<tr><td><p><span style="color:red"><span style="color:blue">x</span></span></p></td></tr>\n</table>',
+    )
+    expect(firstMarkAttrs(r.doc, 'textStyle')).toEqual({ color: 'blue' })
+  })
+
+  it('nested <mark> backgrounds: the inner highlight color wins', () => {
+    const r = parse(
+      '<mark style="background-color:yellow"><mark style="background-color:green">x</mark></mark>',
+    )
+    expect(firstMarkAttrs(r.doc, 'highlight')).toEqual({ color: 'green' })
+  })
+
+  it('nested textStyle marks with disjoint attributes: closest ancestor wins per attribute', () => {
+    // Outer sets font-size, inner sets color: both survive, and where they overlap
+    // (they do not here) the inner would win. The inner attributes must NOT be dropped.
+    const r = parse('<span style="font-size:24px"><span style="color:blue">x</span></span>')
+    expect(firstMarkAttrs(r.doc, 'textStyle')).toEqual({ fontSize: '24px', color: 'blue' })
+  })
+
+  it('nested textStyle marks with an overlapping attribute: the inner value wins', () => {
+    const r = parse(
+      '<span style="color:red;font-size:24px"><span style="color:blue">x</span></span>',
+    )
+    expect(firstMarkAttrs(r.doc, 'textStyle')).toEqual({ fontSize: '24px', color: 'blue' })
+  })
+
+  it('exclusive marks (code) still resolve innermost-wins, unaffected by the dedup change', () => {
+    const r = parse('*这是 `code` 测试*')
+    // code wins outright over the surrounding italic (mutually exclusive).
+    const nested = r.doc.content!.flatMap((b) => b.content ?? []).find((n) => n.text === 'code')
+    expect(nested?.marks).toEqual([{ type: 'code' }])
+  })
+})
