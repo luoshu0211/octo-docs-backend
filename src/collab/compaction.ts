@@ -44,6 +44,7 @@ import { config } from '../config/env.js'
 import { transaction } from '../db/pool.js'
 import { runCompactionOffThread } from './compactionRunner.js'
 import { otherLiveHolders, withCompactionLock } from './compactionCluster.js'
+import { markCompacted } from './compactionNotice.js'
 import { persistedEncoding } from './persistedEncoding.js'
 import { yjsDocumentRepo } from '../db/repos/yjsDocumentRepo.js'
 import { docVersionRepo, KIND_AUTO } from '../db/repos/docVersionRepo.js'
@@ -282,6 +283,23 @@ export async function compactDocument(documentName: string): Promise<CompactionR
   })
 
   if (!outcome.ran) throw new CompactionLockedError(documentName)
+
+  // The rewrite is committed. Stamp the generation so the next client to open
+  // this document is told its IndexedDB copy predates the compaction and must be
+  // dropped — without that, the browser syncs the old history straight back and
+  // the saving is undone (see compactionNotice.ts for the production capture).
+  //
+  // AFTER the transaction, never inside it: a stamp left behind by a rolled-back
+  // compaction would make every client clear a cache that is still correct, and
+  // a cache clear costs whatever that client had not yet synced.
+  //
+  // Swallowed HERE as well as inside markCompacted. The rewrite is already
+  // committed at this point, so anything thrown on this line would turn a
+  // compaction that really happened into a reported failure — and autoCompact
+  // logs that as `failed`, hiding a row rewrite that did occur. Belt and braces
+  // is right for a best-effort side channel guarding a committed transaction.
+  await markCompacted(documentName, Date.now()).catch(() => {})
+
   return outcome.value
 }
 

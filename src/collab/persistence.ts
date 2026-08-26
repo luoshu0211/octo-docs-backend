@@ -12,8 +12,23 @@ import * as Y from 'yjs'
 import { transaction } from '../db/pool.js'
 import { yjsDocumentRepo, type StoredYjsState, type YjsEncoding } from '../db/repos/yjsDocumentRepo.js'
 import { config } from '../config/env.js'
-import { clearOversized, markOversized } from './oversizeGuard.js'
+import { clearOversized, clearOverCapResolved, markOversized, resolvePendingUnrestored, resolveDurableUnrestored } from './oversizeGuard.js'
+import { clearOverCapShared, resolveUnrestoredOverCap, type StateVectorMap } from './compactionNotice.js'
 import { encodeForPersistence } from './persistedEncoding.js'
+
+/**
+ * Flatten a document's Yjs state vector to plain JSON (`clientId -> clock`) for
+ * the durable over-cap interlock. Cheap: a state vector is one entry per client,
+ * not proportional to the document size, so this adds nothing measurable next to
+ * the full encode `store` already paid for.
+ */
+function stateVectorMap(doc: Y.Doc): StateVectorMap {
+  const out: StateVectorMap = {}
+  for (const [client, clock] of Y.decodeStateVector(Y.encodeStateVector(doc))) {
+    out[String(client)] = clock
+  }
+  return out
+}
 
 /**
  * An empty Yjs v1 update encodes as two zero bytes (no structs, empty delete
@@ -150,7 +165,13 @@ export const persistence = {
       // persist (incident 2026-08-21: 9.06 MB -> 17.47 MB in ~20 min, 23 pod
       // restarts). Without this the throw below is swallowed by the database
       // extension and the client simply retries.
-      markOversized(documentName, incoming.length, config.maxDocBytes)
+      //
+      // Pass the rejected document's state vector so the DURABLE interlock is
+      // bound to the state that was actually refused: only a later store that
+      // carries this exact state (or an explicit reconcile) may lift it, so an
+      // unrelated small store on another connection can no longer dissolve the
+      // protection for a client whose edits are still unpersisted (MR98-004).
+      markOversized(documentName, incoming.length, config.maxDocBytes, stateVectorMap(liveDoc))
       throw new Error(
         `document ${documentName} exceeds max size ${config.maxDocBytes} bytes (got ${incoming.length})`,
       )
@@ -186,5 +207,38 @@ export const persistence = {
     // then shrunk — e.g. the owner deleted rows). Lift the write guard so the
     // recovery needs no operator action.
     clearOversized(documentName)
+    // End the durable over-cap condition too, so the heartbeat stops refreshing
+    // the shared mark now that a store has PROVEN the document fits. `clearOversized`
+    // above only lifts the write guard and also runs on unload, which is exactly
+    // why the durable condition needs its own clear on this — the resolving — path.
+    clearOverCapResolved(documentName)
+    // Clear the cross-replica mark HERE and only here. `clearOversized` is also
+    // called on unload (server.ts), but unloading proves nothing about size —
+    // dropping the shared mark there would re-open the stale-cache notice for a
+    // document that still cannot be persisted, and the next client to connect
+    // would be told to wipe the only copy of its unsaved edits. A store that
+    // reached this line is the one event that proves the document fits.
+    void clearOverCapShared(documentName)
+    // Retire the DURABLE unrestored marker only if THIS store actually accounts
+    // for the state that was rejected — its state vector must dominate the
+    // recorded one. A store that does not (B opening the doc from a persisted
+    // row that never held A's over-cap edit, then saving a small change) leaves
+    // the marker standing, so the interlock survives until A's bytes genuinely
+    // land or the condition is explicitly reconciled (MR98-004). The replica
+    // retraction above is not sufficient evidence and never was.
+    void resolveUnrestoredOverCap(documentName, stateVectorMap(liveDoc))
+    // Same dominance evidence, applied to the IN-MEMORY retry queue (MR98-006):
+    // a record that never reached Redis (blip at rejection time) lives only in
+    // that queue, so a genuine recovery must clear it there too — otherwise the
+    // over-cap heartbeat would resurrect a phantom durable marker after the
+    // state was already recovered. Synchronous and local; leaves an undominated
+    // entry standing, exactly as `resolveUnrestoredOverCap` leaves the marker.
+    resolvePendingUnrestored(documentName, stateVectorMap(liveDoc))
+    // And the DURABLE DB record (MR98-006): the record persisted at rejection
+    // time outlives replica death, so a dominating recovery must clear it there
+    // too, or a later reconcile would rebuild a phantom Redis marker for state
+    // that already landed. Fire-and-forget with the SAME dominance evidence; an
+    // undominated store leaves the row standing (fail closed).
+    void resolveDurableUnrestored(documentName, stateVectorMap(liveDoc))
   },
 }
