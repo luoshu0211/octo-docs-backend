@@ -17,10 +17,10 @@ import { persistence } from './persistence.js'
 import { maybeCompactOnUnload } from './autoCompact.js'
 import { markLoaded, markUnloaded } from './compactionCluster.js'
 import { compactDocument } from './compaction.js'
+import { noticeStaleCacheOnJoin } from './compactionNotice.js'
 import {
+  applyOversizeDecision,
   clearOversized,
-  DocumentTooLargeError,
-  getOversized,
   noticeOversizeOnJoin,
   setOversizeAnnouncer,
 } from './oversizeGuard.js'
@@ -326,7 +326,27 @@ export function createServer() {
       // A document already over the cap has to tell THIS connection so, on its
       // way in — see noticeOversizeOnJoin for why the broadcast alone is not
       // enough for someone who arrives after the rejection.
-      noticeOversizeOnJoin(data.documentName, (payload) =>
+      const overCap = noticeOversizeOnJoin(data.documentName, (payload) =>
+        data.connection.sendStateless(payload),
+      )
+
+      // If this document was compacted since the client last saw it, its
+      // IndexedDB copy still carries the history the compaction removed and will
+      // sync it straight back — undoing the saving entirely (compactionNotice.ts
+      // has the production capture: 659,725 bytes served, 10,483,130 pushed back).
+      // Tell it to drop that cache and re-fetch.
+      //
+      // Passing `overCap` is the interlock, not a detail: a capped document
+      // cannot persist what the client is holding, so asking it to drop its
+      // cache would destroy exactly the unsaved edits the over-size-cap banner
+      // is telling the user to copy out. The notice waits until a store succeeds
+      // and clears the mark.
+      //
+      // Not awaited: a Redis round trip must not sit in front of the sync this
+      // connection is here for. The frame is advisory and the client acts on it
+      // whenever it arrives — and `noticeStaleCacheOnJoin` never throws, so a
+      // floating rejection is not possible.
+      void noticeStaleCacheOnJoin(data.documentName, overCap, (payload) =>
         data.connection.sendStateless(payload),
       )
 
@@ -358,19 +378,21 @@ export function createServer() {
       // only inflates the in-memory state — which is re-encoded on every store
       // attempt and blocks the single JS thread until the liveness probe fails.
       //
-      // This hook's job is ONLY to stop the inflation. Telling the user happens
-      // elsewhere and earlier: markOversized pushes a stateless frame the moment
-      // the first store is rejected, and `connected` sends one to anyone who
-      // arrives later. Do not be tempted to carry a 1009 close code on the error
-      // below — Hocuspocus's close does not close the socket and the code never
-      // reaches the browser (see oversizeGuard.ts). readOnly is still flipped so
-      // the connection cannot be used to write again. O(1) lookup: the size came
-      // from a store that already ran.
-      const oversize = getOversized(data.documentName)
-      if (oversize) {
-        data.connection.readOnly = true
-        throw new DocumentTooLargeError(data.documentName, oversize.bytes, oversize.limit)
-      }
+      // The decision lives in oversizeGuard.applyOversizeDecision, which flips
+      // the connection read-only and RETURNS. It must not throw and neither must
+      // this branch: throwing here closes the connection, and this hook runs on
+      // every inbound message including SyncStep1 — the client asking for the
+      // document. See that function's comment for the production measurement.
+      //
+      // It deliberately does NOT return early. Returning here would skip the
+      // §4.5 recheck below, so a user whose access was revoked while connected
+      // would stop being rechecked the moment the document went over the cap —
+      // the cap would silently switch off revocation enforcement. Read-only is
+      // a write guard, not an authorization decision, and the two are not
+      // interchangeable: read-only still serves document CONTENT, which is
+      // exactly what a revoked principal must no longer receive. Enforcement
+      // order is authorization first, capacity second.
+      const capped = applyOversizeDecision(data.documentName, data.connection)
 
       const watermark = epochWatermark.get(data.documentName) ?? ctx.permission_epoch
       if (ctx.permission_epoch >= watermark) return // not stale => allow (no IO)
@@ -384,6 +406,9 @@ export function createServer() {
         data.connection.readOnly = true
         throw new Error('Forbidden')
       }
+      // Authorization held. NOW the capacity guard applies: a capped document
+      // takes no further writes, but the connection stays open and readable.
+      if (capped) return
       // Role not lowered (epoch advanced only due to someone else's change):
       // refresh the connection's epoch view in place and allow (P1-B).
       ctx.permission_epoch = watermark
@@ -495,6 +520,15 @@ export function createServer() {
       // later load re-derives the mark from its own first store attempt, and
       // clearing at all is what keeps this from leaking one slot per document
       // that ever tripped the cap.
+      //
+      // This clears ONLY the write guard, NOT the shared over-cap condition.
+      // Unloading resolves nothing — the oversized copy sits in the client's
+      // IndexedDB, and it will re-inflate and be rejected again on reconnect — so
+      // the cross-replica mark must keep blocking cache-stale stamping until a
+      // store actually succeeds. `oversizeGuard` holds that condition in a
+      // durable set the over-cap heartbeat refreshes, so the interlock survives
+      // this unload and the idle period after it (MR98-003); only a successful
+      // store (persistence.store -> clearOverCapResolved) lets it go.
       clearOversized(data.documentName)
 
       // Withdraw this replica from the document's holder set BEFORE attempting
