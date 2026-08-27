@@ -465,11 +465,12 @@ export const config = {
     // Service token sent as the `token` header on octo-server lookups (e.g.
     // GET /v1/users/:uid, which requires auth) on the HUMAN path. Empty = not
     // configured; callers then fall back to the authenticated user's own session
-    // token. OPTIONAL for the human path (/api/v1/docs). REQUIRED for bot
-    // member-add roster validation: those human/service directory endpoints do
-    // not accept bot bearer credentials, so that operation fails closed with
-    // 503 when OCTO_SERVER_TOKEN is empty. Bot-realm operations such as
-    // forward-grant may still use GET /v1/bot/user/info with the bot token.
+    // token. OPTIONAL for the human path (/api/v1/docs), whose directory lookups
+    // prefer this token when configured. Bot PUT defaults an omitted target Space
+    // to its bearer-authenticated Space and validates there with that bearer. An
+    // explicitly selected other Space is intentionally not directory-revalidated
+    // and is existing-row/update-only. Bot DELETE is exact and directory-free;
+    // Human DELETE follows the same service-token-first directory policy.
     serviceToken: str('OCTO_SERVER_TOKEN', ''),
     // Space-membership check cache TTL (#64). isSpaceMember(uid, spaceId, token)
     // is resolved server-side by reusing POST /v1/auth/verify?include=context

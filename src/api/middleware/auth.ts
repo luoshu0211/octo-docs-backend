@@ -22,8 +22,8 @@ declare global {
       // identity source omits it (fail-closed: caller sees only their own docs).
       ownedBots?: string[]
       // Set only on the bot mount (verifyBot): the bot's own bearer token, used
-      // only for bot-realm octo-server lookups. Human/service directory APIs
-      // must use OCTO_SERVER_TOKEN instead. Never set on the human path.
+      // only for bot-realm octo-server lookups, including exact own-Space
+      // principal validation. Never set on the human path.
       botToken?: string
       // Set only on the bot mount (verifyBot): the uid of the human who owns the
       // bot (robot.creator_uid, from the verify-bot reverse lookup). Absent for a

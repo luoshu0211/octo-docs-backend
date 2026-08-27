@@ -1,7 +1,13 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { HttpOctoIdentity } from '../src/auth/octoIdentity.js'
+import { config } from '../src/config/env.js'
 
-afterEach(() => vi.unstubAllGlobals())
+const originalServiceToken = config.octoIdentity.serviceToken
+
+afterEach(() => {
+  config.octoIdentity.serviceToken = originalServiceToken
+  vi.unstubAllGlobals()
+})
 
 describe('HttpOctoIdentity.spaceBots', () => {
   it('returns the Space-qualified Bot ownership directory', async () => {
@@ -18,6 +24,18 @@ describe('HttpOctoIdentity.spaceBots', () => {
     expect(fetchMock).toHaveBeenCalledWith(
       'http://octo.test/v1/robot/space_bots?space_id=s_1',
       { headers: { token: 'tok' } },
+    )
+  })
+
+  it('prefers the configured service token over the caller session token', async () => {
+    config.octoIdentity.serviceToken = 'service-token'
+    const fetchMock = vi.fn(async () => new Response('[]', { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(new HttpOctoIdentity('http://octo.test').spaceBots('s_1', 'caller-token')).resolves.toEqual([])
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://octo.test/v1/robot/space_bots?space_id=s_1',
+      { headers: { token: 'service-token' } },
     )
   })
 
