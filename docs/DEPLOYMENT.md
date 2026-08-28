@@ -352,7 +352,7 @@ S3/MinIO/COS-only vars (used when `ATTACHMENT_DRIVER=s3|minio`):
 | `ATTACHMENT_S3_SECRET_KEY` | _(empty)_ | supply at runtime; never commit |
 | `ATTACHMENT_S3_FORCE_PATH_STYLE` | `true` | addressing mode — see §3.3 |
 | `ATTACHMENT_S3_SIGNING_HOST` | _(empty)_ | SigV4 `host` override for the public/browser path — see §3.3 |
-| `ATTACHMENT_S3_INTERNAL_ENDPOINT` | _(empty)_ | container-network origin for **server-side** PUT/GET/DELETE (DOCX import, Excalidraw import, SVG upload, copy, markdown ingest, delete). See §3.4 |
+| `ATTACHMENT_S3_INTERNAL_ENDPOINT` | _(empty)_ | container-network origin for **server-side** PUT/GET/DELETE (DOCX import, Excalidraw import, SVG upload, copy, markdown ingest, delete, and PDF/Typst, DOCX, and board export image reads). See §3.4 |
 
 ### 3.3 Tencent Cloud COS via a custom CDN domain — the three switches
 
@@ -407,10 +407,11 @@ When the backend runs inside a container (docker, k8s) and
 `http://127.0.0.1:28090` — an nginx bound to the docker-host loopback that
 forwards to MinIO), that address is **unreachable from inside the backend
 container** (127.0.0.1 inside the container is the container itself). All
-server-side attachment operations (DOCX embedded images, Excalidraw import,
-SVG inline upload, copy/relocate, markdown image ingest, delete) would
-otherwise fail with `ECONNREFUSED` at TCP connect time. Browser uploads are
-unaffected because the browser runs on the host.
+server-side attachment operations (DOCX import embedded images, Excalidraw
+import, SVG inline upload, copy/relocate, markdown image ingest, delete, and
+PDF/Typst, DOCX, and board export image reads) would otherwise fail with
+`ECONNREFUSED` at TCP connect time. Browser uploads are unaffected because the
+browser runs on the host.
 
 Set `ATTACHMENT_S3_INTERNAL_ENDPOINT` to the **in-cluster / container-network
 address** of your object store so server-side operations stay on the

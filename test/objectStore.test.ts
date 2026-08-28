@@ -201,3 +201,39 @@ describe('LocalHmacObjectStore public base URL (XIN-713)', () => {
     expect(url.toString()).not.toContain('object-store.local')
   })
 })
+
+describe('LocalHmacObjectStore direct server-side download', () => {
+  it('rejects an oversized blob through the incremental maxBytes cap', async () => {
+    const store = new LocalHmacObjectStore({
+      bucket: 'test-bucket',
+      secret: 'test-secret',
+      keyPrefix: `download-cap-${process.pid}`,
+    })
+    const key = 'd_1/att_big/blob.bin'
+    try {
+      await store.upload(key, 'application/octet-stream', Buffer.alloc(128 * 1024, 0x61))
+      await expect(store.download(key, { maxBytes: 1024 })).rejects.toThrow('payload_too_large')
+    } finally {
+      await store.delete(key)
+    }
+  })
+
+  it('honours an already-aborted signal before returning local blob bytes', async () => {
+    const store = new LocalHmacObjectStore({
+      bucket: 'test-bucket',
+      secret: 'test-secret',
+      keyPrefix: `download-abort-${process.pid}`,
+    })
+    const key = 'd_1/att_abort/blob.bin'
+    try {
+      await store.upload(key, 'application/octet-stream', Buffer.alloc(4096, 0x62))
+      const controller = new AbortController()
+      controller.abort()
+      await expect(store.download(key, { signal: controller.signal })).rejects.toMatchObject({
+        name: 'AbortError',
+      })
+    } finally {
+      await store.delete(key)
+    }
+  })
+})
