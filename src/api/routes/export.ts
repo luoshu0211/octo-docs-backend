@@ -15,13 +15,10 @@
  * speed, memory) before choosing one.
  *
  * Images: Typst compiles OFFLINE (no network), so unlike the browser path we
- * cannot hand it signed URLs to fetch at render time. We pre-download each
- * image attachment's bytes here (size-bounded) and place them in the compile
- * root for `image()` to read. When a store driver serves attachments from a
- * non-fetchable synthetic host (the local-hmac dev driver's
- * `*.object-store.local`), the download is skipped and the image node is dropped
- * — exactly how the HTML path treats an unresolved attachment. In prod (S3/MinIO)
- * the signed GET URL is a real endpoint and the bytes embed normally.
+ * cannot hand it signed URLs to fetch at render time. We download each image
+ * attachment through ObjectStore's server-side path (size-bounded) and place
+ * its bytes in the compile root for `image()` to read. A failed download drops
+ * only that image; S3/MinIO deployments use their configured internal endpoint.
  */
 import { Router, type Router as ExpressRouter, type Request, type Response } from 'express'
 import { requireDocRole } from '../guard.js'
@@ -107,8 +104,9 @@ export function prepareTypstImage(buf: Buffer): { ext: 'png' | 'jpg' | 'gif' | '
  * the concrete image inputs (bytes) to place in the compile root.
  *
  * Non-image attachments are metadata-only (file cards render as text). Image
- * downloads are size-bounded and best-effort: a fetch failure (e.g. the dev
- * synthetic host) just drops that image, never fails the whole export.
+ * downloads are size-bounded and best-effort: a storage failure just drops that
+ * image, never fails the whole export. The bytes use ObjectStore.download so a
+ * container deployment stays on its internal object-storage endpoint.
  */
 async function resolveInputs(
   docId: string,
@@ -119,7 +117,6 @@ async function resolveInputs(
   images: TypstImageInput[]
 }> {
   const store = getObjectStore()
-  const ttl = config.attachments.readUrlTtlSeconds
   const attachments = new Map<string, ResolvedAttachment>()
   const imagePaths = new Map<string, string>()
   const images: TypstImageInput[] = []
@@ -130,8 +127,7 @@ async function resolveInputs(
   let attempts = 0
   let totalBytes = 0
   for (const a of list) {
-    const url = store.presignGet(a.objectKey, ttl)
-    attachments.set(a.attachId, { url, fileName: a.fileName, mime: a.mime, sizeBytes: a.sizeBytes })
+    attachments.set(a.attachId, { fileName: a.fileName, mime: a.mime, sizeBytes: a.sizeBytes })
     if (!a.mime.startsWith('image/')) continue
     // Only embed images the document actually references — never prefetch the
     // full attachment list (a doc can carry orphaned/unreferenced uploads).
@@ -146,7 +142,7 @@ async function resolveInputs(
     if (typeof a.sizeBytes === 'number' && a.sizeBytes > 0 && totalBytes + a.sizeBytes > maxImageTotalBytes) {
       continue
     }
-    const bytes = await tryDownload(url, maxImageBytes)
+    const bytes = await tryDownload(store, a.objectKey, maxImageBytes)
     if (!bytes) continue // unfetchable host or oversize/failed — drop the image
     // Defensive: a corrupt or mislabeled (renamed non-image) object would abort
     // the WHOLE typst compile with a decode error. Sniff the magic bytes and
@@ -284,34 +280,30 @@ export async function probeFailingFormulas(
 }
 
 /**
- * Fetch up to maxBytes from a signed GET URL. Aborts and returns null on any
- * failure, non-200, or over-size body (streamed, so an oversize response can't
- * blow memory before the limit trips). A synthetic/dev host that isn't a real
- * endpoint simply throws and yields null.
+ * Download up to maxBytes through ObjectStore's server-side path. S3-backed
+ * deployments therefore use ATTACHMENT_S3_INTERNAL_ENDPOINT rather than making
+ * the Pod hairpin through the public browser endpoint. Abort and size limits
+ * preserve the previous best-effort export behavior.
  */
-async function tryDownload(url: string, maxBytes: number): Promise<Buffer | null> {
+async function tryDownload(
+  store: ReturnType<typeof getObjectStore>,
+  objectKey: string,
+  maxBytes: number,
+): Promise<Buffer | null> {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), 10_000)
   try {
-    const res = await fetch(url, { signal: controller.signal })
-    if (!res.ok || !res.body) return null
-    const reader = res.body.getReader()
-    const chunks: Uint8Array[] = []
-    let total = 0
-    for (;;) {
-      const { done, value } = await reader.read()
-      if (done) break
-      if (value) {
-        total += value.byteLength
-        if (total > maxBytes) {
-          await reader.cancel().catch(() => {})
-          return null
-        }
-        chunks.push(value)
-      }
-    }
-    return Buffer.concat(chunks.map((c) => Buffer.from(c)))
-  } catch {
+    const bytes = await store.download(objectKey, {
+      maxBytes,
+      signal: controller.signal,
+    })
+    return Buffer.from(bytes)
+  } catch (err) {
+    // eslint-disable-next-line no-console -- best-effort export failures must remain operationally visible
+    console.warn(
+      `[export:image] server-side download failed for ${objectKey}:`,
+      err instanceof Error ? err.message : String(err),
+    )
     return null
   } finally {
     clearTimeout(timer)
@@ -430,13 +422,15 @@ async function resolveDocxImages(
   const attachments = await docAttachmentRepo.listByDoc(docId)
   const store = getObjectStore()
   let total = 0
+  let attempts = 0
   for (const attachment of attachments) {
-    if (!referencedIds.has(attachment.attachId) || images.size >= config.typstExport.maxImageCount) continue
+    if (!referencedIds.has(attachment.attachId)) continue
+    // Bound download attempts, not just successful embeds. Otherwise many
+    // missing/corrupt referenced images can each consume the 10-second timeout.
+    if (attempts >= config.typstExport.maxImageCount) break
     if (attachment.sizeBytes > config.typstExport.maxImageBytes) continue
-    const bytes = await tryDownload(
-      store.presignGet(attachment.objectKey, config.attachments.readUrlTtlSeconds),
-      config.typstExport.maxImageBytes,
-    )
+    attempts++
+    const bytes = await tryDownload(store, attachment.objectKey, config.typstExport.maxImageBytes)
     if (!bytes || total + bytes.length > config.typstExport.maxImageTotalBytes) continue
     const type = sniffImageExt(bytes)
     if (!type) continue
@@ -512,7 +506,6 @@ export async function exportPdfHandler(req: Request, res: Response): Promise<voi
     return
   }
 
-  // Gate the whole pipeline (prep + compile) behind the queue, matching the
   // Gate the whole pipeline (prep + compile) behind the queue so heavy prep
   // (Yjs fetch, image downloads) must not run
   // unbounded ahead of the compile limit.

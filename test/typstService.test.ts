@@ -42,7 +42,7 @@ d('typstService — real compile (integration)', () => {
       doc([{ type: 'image', attrs: { attachId: 'svg-1', width: '80px' } }]),
       {
         title: 'SVG image',
-        attachments: new Map([['svg-1', { url: '', fileName: 'shape.svg', mime: 'image/svg+xml', sizeBytes: svg.length }]]),
+        attachments: new Map([['svg-1', { fileName: 'shape.svg', mime: 'image/svg+xml', sizeBytes: svg.length }]]),
         imagePaths: new Map([['svg-1', 'img_0.svg']]),
       },
     )
@@ -239,7 +239,7 @@ d('fresh user-file visual regressions', () => {
     ctx.fillStyle = '#e11d48'; ctx.fillRect(0, 0, 40, 40)
     const image = canvas.toBuffer('image/png')
     const src = renderTypst(doc([{ type: 'image', attrs: { attachId: 'tiny' } }]), {
-      title: 'case06', attachments: new Map([['tiny', { url: '', fileName: 'tiny.png', mime: 'image/png', sizeBytes: image.length }]]),
+      title: 'case06', attachments: new Map([['tiny', { fileName: 'tiny.png', mime: 'image/png', sizeBytes: image.length }]]),
       imagePaths: new Map([['tiny', 'tiny.png']]),
     })
     const pdf = await compileTypst(src, [{ fileName: 'tiny.png', bytes: image }])

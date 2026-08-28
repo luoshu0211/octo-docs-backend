@@ -356,6 +356,34 @@ describe('S3ObjectStore internal Authorization-header requests (server-side)', (
     await expect(store.download('d_1/att_1/big.png', { maxBytes: 150 })).rejects.toThrow(/maxBytes/)
   })
 
+  it('caps and cancels a large non-2xx response body', async () => {
+    let delivered = 0
+    let cancelled = false
+    const stream = new ReadableStream({
+      pull(controller) {
+        delivered += 4096
+        controller.enqueue(new Uint8Array(4096).fill(0x61))
+      },
+      cancel() { cancelled = true },
+    })
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(stream, { status: 502 })))
+    const store = new S3ObjectStore({
+      endpoint: 'http://localhost:9000',
+      internalEndpoint: 'http://object-store.local:9000',
+      region: 'us-east-1',
+      bucket: 'octo-docs-attachments',
+      accessKeyId: 'minio',
+      secretAccessKey: 'test-secret-key',
+      nowSec: () => 1_700_000_000,
+    })
+
+    await expect(store.download('d_1/att_1/error.png')).rejects.toThrow(
+      /^internal GET d_1\/att_1\/error\.png failed: 502 a+$/,
+    )
+    expect(delivered).toBeLessThanOrEqual(20 * 1024)
+    expect(cancelled).toBe(true)
+  })
+
   it('download with maxBytes returns full buffer when body is under cap', async () => {
     const body = new Uint8Array(100).fill(0x63)
     const stream = new ReadableStream({
@@ -387,6 +415,29 @@ describe('S3ObjectStore internal Authorization-header requests (server-side)', (
       nowSec: () => 1_700_000_000,
     })
     await store.upload('d_1/att_1/photo.png', 'image/png', new Uint8Array([1]), { signal: controller.signal })
+    const calls = (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls
+    const [, init] = calls[0] as [string, RequestInit]
+    expect(init.signal).toBe(controller.signal)
+  })
+
+  it('download passes AbortSignal through to the internal fetch', async () => {
+    const stream = new ReadableStream({
+      start(controller) { controller.enqueue(new Uint8Array([1])); controller.close() },
+    })
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(stream, { status: 200 })))
+    const controller = new AbortController()
+    const store = new S3ObjectStore({
+      endpoint: 'https://cdn.example.com',
+      internalEndpoint: 'http://minio:9000',
+      region: 'us-east-1',
+      bucket: 'octo-docs-attachments',
+      accessKeyId: 'minio',
+      secretAccessKey: 'test-secret-key',
+      nowSec: () => 1_700_000_000,
+    })
+
+    await store.download('d_1/att_1/photo.png', { signal: controller.signal })
+
     const calls = (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls
     const [, init] = calls[0] as [string, RequestInit]
     expect(init.signal).toBe(controller.signal)

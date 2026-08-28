@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 vi.mock('../src/api/guard.js', () => ({ requireDocRole: vi.fn() }))
 vi.mock('../src/collab/liveDocRead.js', () => ({ readLiveDocState: vi.fn(async () => new Uint8Array([1])) }))
@@ -19,6 +19,16 @@ vi.mock('../src/collab/versionRestore.js', async () => {
   }
 })
 
+vi.mock('../src/export/typstService.js', async () => {
+  const actual = await vi.importActual<typeof import('../src/export/typstService.js')>('../src/export/typstService.js')
+  return {
+    ...actual,
+    acquireSlot: vi.fn(async () => {}),
+    releaseSlot: vi.fn(),
+    compileTypst: vi.fn(async () => Buffer.from('%PDF-1.4 test')),
+  }
+})
+
 import { exportFileHandler, readBoundedSvgDimensions, safeDocxSourceDimensions } from '../src/api/routes/export.js'
 import { requireDocRole } from '../src/api/guard.js'
 import { yDocStateToProsemirrorJSON } from '../src/agent/conversion.js'
@@ -26,6 +36,9 @@ import { decodeSheetSnapshot } from '../src/collab/versionRestore.js'
 import { exportDocx } from '../src/export/docx.js'
 import { exportXlsx } from '../src/export/xlsx.js'
 import { docAttachmentRepo } from '../src/db/repos/docAttachmentRepo.js'
+import { getObjectStore } from '../src/storage/objectStore.js'
+import { compileTypst } from '../src/export/typstService.js'
+import { config } from '../src/config/env.js'
 
 function response() {
   return {
@@ -37,6 +50,7 @@ function response() {
   }
 }
 const req = (format: string) => ({ params: { docId: 'd1' }, query: { format }, uid: 'u1', spaceId: 's1', headers: {} })
+const objectStore = getObjectStore()
 
 beforeEach(() => {
   vi.mocked(requireDocRole).mockResolvedValue({
@@ -46,6 +60,8 @@ beforeEach(() => {
   vi.mocked(yDocStateToProsemirrorJSON).mockReturnValue({ type: 'doc', content: [{ type: 'heading', attrs: { level: 1 }, content: [{ type: 'text', text: 'Hello' }] }] })
   vi.mocked(docAttachmentRepo.listByDoc).mockResolvedValue([])
 })
+
+afterEach(() => vi.restoreAllMocks())
 
 describe('GET /:docId/export/file handler', () => {
   it('rejects an unknown format before permission/storage work', async () => {
@@ -92,6 +108,114 @@ describe('GET /:docId/export/file handler', () => {
     expect(url.searchParams.get('response-content-type')).toBe('text/plain')
     expect(url.searchParams.get('response-content-disposition')).toBe('attachment; filename="badname.txt"')
     expect(url.hash).toBe('#octo-attachment%3Ad1%3Aatt_1')
+  })
+
+  it('embeds PDF images through the server-side object-store path', async () => {
+    vi.mocked(yDocStateToProsemirrorJSON).mockReturnValue({
+      type: 'doc',
+      content: [{ type: 'image', attrs: { attachId: 'att_pdf' } }],
+    })
+    vi.mocked(docAttachmentRepo.listByDoc).mockResolvedValue([{
+      attachId: 'att_pdf', docId: 'd1', objectKey: 'd1/att_pdf/image.png',
+      mime: 'image/png', sizeBytes: 68, fileName: 'image.png', createdBy: 'u1', createdAt: new Date(0),
+    }])
+    const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Z4QAAAABJRU5ErkJggg==', 'base64')
+    const download = vi.spyOn(objectStore, 'download').mockResolvedValue(png)
+    const presignGet = vi.spyOn(objectStore, 'presignGet')
+
+    const res = response()
+    await exportFileHandler(req('pdf') as never, res as never)
+
+    expect(res.statusCode).toBe(200)
+    expect(res.headers['content-type']).toBe('application/pdf')
+    expect(download).toHaveBeenCalledWith('d1/att_pdf/image.png', {
+      maxBytes: expect.any(Number),
+      signal: expect.any(AbortSignal),
+    })
+    expect(presignGet).not.toHaveBeenCalled()
+    expect(compileTypst).toHaveBeenCalledWith(expect.any(String), [{
+      fileName: 'img_0.png',
+      bytes: png,
+    }])
+  })
+
+  it('embeds DOCX images through the server-side object-store path', async () => {
+    vi.mocked(yDocStateToProsemirrorJSON).mockReturnValue({
+      type: 'doc',
+      content: [{ type: 'image', attrs: { attachId: 'att_1', width: 1, height: 1 } }],
+    })
+    vi.mocked(docAttachmentRepo.listByDoc).mockResolvedValue([{
+      attachId: 'att_1', docId: 'd1', objectKey: 'd1/att_1/image.png',
+      mime: 'image/png', sizeBytes: 68, fileName: 'image.png', createdBy: 'u1', createdAt: new Date(0),
+    }])
+    const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Z4QAAAABJRU5ErkJggg==', 'base64')
+    const download = vi.spyOn(objectStore, 'download').mockResolvedValue(png)
+
+    const res = response()
+    await exportFileHandler(req('docx') as never, res as never)
+
+    expect(res.statusCode).toBe(200)
+    expect(download).toHaveBeenCalledWith('d1/att_1/image.png', {
+      maxBytes: expect.any(Number),
+      signal: expect.any(AbortSignal),
+    })
+    const JSZip = (await import('jszip')).default
+    const zip = await JSZip.loadAsync(res.body as Buffer)
+    expect(Object.keys(zip.files).some((name) => name.startsWith('word/media/'))).toBe(true)
+  })
+
+  it('bounds DOCX image download attempts even when every download fails', async () => {
+    const originalMaxImageCount = config.typstExport.maxImageCount
+    config.typstExport.maxImageCount = 2
+    try {
+      vi.mocked(yDocStateToProsemirrorJSON).mockReturnValue({
+        type: 'doc',
+        content: [1, 2, 3].map((i) => ({ type: 'image', attrs: { attachId: `att_${i}` } })),
+      })
+      vi.mocked(docAttachmentRepo.listByDoc).mockResolvedValue([1, 2, 3].map((i) => ({
+        attachId: `att_${i}`, docId: 'd1', objectKey: `d1/att_${i}/image.png`,
+        mime: 'image/png', sizeBytes: 68, fileName: `image-${i}.png`, createdBy: 'u1', createdAt: new Date(0),
+      })))
+      const download = vi.spyOn(objectStore, 'download').mockRejectedValue(new Error('storage unavailable'))
+      vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+      const res = response()
+      await exportFileHandler(req('docx') as never, res as never)
+
+      expect(res.statusCode).toBe(200)
+      expect(download).toHaveBeenCalledTimes(2)
+      expect(download.mock.calls.map(([objectKey]) => objectKey)).toEqual([
+        'd1/att_1/image.png',
+        'd1/att_2/image.png',
+      ])
+    } finally {
+      config.typstExport.maxImageCount = originalMaxImageCount
+    }
+  })
+
+  it('logs an internal image download failure and degrades DOCX export to a placeholder', async () => {
+    vi.mocked(yDocStateToProsemirrorJSON).mockReturnValue({
+      type: 'doc',
+      content: [{ type: 'image', attrs: { attachId: 'att_1', alt: 'missing' } }],
+    })
+    vi.mocked(docAttachmentRepo.listByDoc).mockResolvedValue([{
+      attachId: 'att_1', docId: 'd1', objectKey: 'd1/att_1/image.png',
+      mime: 'image/png', sizeBytes: 68, fileName: 'image.png', createdBy: 'u1', createdAt: new Date(0),
+    }])
+    vi.spyOn(objectStore, 'download').mockRejectedValue(new Error('storage unavailable'))
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    const res = response()
+    await exportFileHandler(req('docx') as never, res as never)
+
+    expect(res.statusCode).toBe(200)
+    expect(warn).toHaveBeenCalledWith(
+      '[export:image] server-side download failed for d1/att_1/image.png:',
+      'storage unavailable',
+    )
+    const JSZip = (await import('jszip')).default
+    const zip = await JSZip.loadAsync(res.body as Buffer)
+    expect(Object.keys(zip.files).filter((name) => name.startsWith('word/media/'))).toEqual([])
   })
 
   it('enforces doc_type before decoding', async () => {

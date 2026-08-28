@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import * as Y from 'yjs'
 
 // Offline unit test for W3 — server-side whiteboard image export.
@@ -12,11 +12,19 @@ import * as Y from 'yjs'
 vi.mock('../src/api/guard.js', () => ({ requireDocRole: vi.fn() }))
 vi.mock('../src/db/pool.js', () => ({ query: vi.fn(async () => []), transaction: vi.fn() }))
 
-const { live } = vi.hoisted(() => ({ live: { state: new Uint8Array([0, 0]) } }))
+const { live, objectStore } = vi.hoisted(() => ({
+  live: { state: new Uint8Array([0, 0]) },
+  objectStore: {
+    download: vi.fn(),
+    presignGet: vi.fn(() => 'https://public.example.invalid/signed'),
+  },
+}))
 vi.mock('../src/collab/liveDocRead.js', () => ({
   readLiveDocState: vi.fn(async () => live.state),
 }))
-// No images in these scenes → listByDoc returns []; objectStore/fetch untouched.
+vi.mock('../src/storage/objectStore.js', () => ({
+  getObjectStore: vi.fn(() => objectStore),
+}))
 vi.mock('../src/db/repos/docAttachmentRepo.js', () => ({
   docAttachmentRepo: { listByDoc: vi.fn(async () => []), getById: vi.fn(async () => null) },
 }))
@@ -31,6 +39,7 @@ import { exportBoardHandler } from '../src/api/routes/boardExport.js'
 import { sanitizeSceneImage } from '../src/api/routes/boardExport.js'
 import { requireDocRole } from '../src/api/guard.js'
 import { COLLAB_FIELD } from '../src/schema/index.js'
+import { docAttachmentRepo } from '../src/db/repos/docAttachmentRepo.js'
 
 // ── scene builders (same shape as boardVersionSnapshot.test.ts) ──────────────
 
@@ -390,8 +399,13 @@ describe('rasterizeSvgToPng — source image decompression-bomb guard', () => {
 })
 
 describe('exportBoardHandler', () => {
+  afterEach(() => vi.restoreAllMocks())
+
   beforeEach(() => {
     vi.mocked(requireDocRole).mockReset()
+    vi.mocked(docAttachmentRepo.listByDoc).mockResolvedValue([])
+    objectStore.download.mockReset()
+    objectStore.presignGet.mockClear()
   })
 
   it('rejects a non-board doc with 409 unsupported_doc_type', async () => {
@@ -432,6 +446,55 @@ describe('exportBoardHandler', () => {
     const png = res.body as Buffer
     expect([png[0], png[1], png[2], png[3]]).toEqual([0x89, 0x50, 0x4e, 0x47])
     expect(res.headers['Content-Disposition']).toContain('b_1.png')
+  })
+
+  it('downloads referenced images through the server-side object-store path', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(boardGuard)
+    live.state = liveBoard(
+      [el('i1', 'image', { fileId: 'file_1' })],
+      { file_1: { attachId: 'att_1' } },
+    )
+    vi.mocked(docAttachmentRepo.listByDoc).mockResolvedValue([{
+      attachId: 'att_1', docId: 'b_1', objectKey: 'b_1/att_1/image.png',
+      mime: 'image/png', sizeBytes: 68, fileName: 'image.png', createdBy: 'u1', createdAt: new Date(0),
+    }])
+    const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Z4QAAAABJRU5ErkJggg==', 'base64')
+    objectStore.download.mockResolvedValue(png)
+
+    const res = mockRes()
+    await exportBoardHandler(req({ docId: 'b_1' }, { format: 'svg' }), res as never)
+
+    expect(objectStore.download).toHaveBeenCalledWith('b_1/att_1/image.png', {
+      maxBytes: expect.any(Number),
+      signal: expect.any(AbortSignal),
+    })
+    expect(objectStore.presignGet).not.toHaveBeenCalled()
+    expect(String(res.body)).toContain('data:image/png;base64,')
+  })
+
+  it('degrades an internal image download failure to a placeholder', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(boardGuard)
+    live.state = liveBoard(
+      [el('i1', 'image', { fileId: 'file_1' })],
+      { file_1: { attachId: 'att_1' } },
+    )
+    vi.mocked(docAttachmentRepo.listByDoc).mockResolvedValue([{
+      attachId: 'att_1', docId: 'b_1', objectKey: 'b_1/att_1/image.png',
+      mime: 'image/png', sizeBytes: 68, fileName: 'image.png', createdBy: 'u1', createdAt: new Date(0),
+    }])
+    objectStore.download.mockRejectedValue(new Error('storage unavailable'))
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    const res = mockRes()
+    await exportBoardHandler(req({ docId: 'b_1' }, { format: 'svg' }), res as never)
+
+    expect(res.statusCode).toBe(200)
+    expect(warn).toHaveBeenCalledWith(
+      '[board-export:image] server-side download failed for b_1/att_1/image.png:',
+      'storage unavailable',
+    )
+    expect(String(res.body)).toContain('stroke-dasharray="4 4"')
+    expect(String(res.body)).not.toContain('<image')
   })
 
   it('maps a wrong-kind (prosemirror) blob to 409 board_snapshot_invalid', async () => {

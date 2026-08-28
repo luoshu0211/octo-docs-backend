@@ -15,7 +15,7 @@
  * horizontally-scaled production API, which uses the s3/minio drivers.
  */
 import { createHash, randomBytes } from 'node:crypto'
-import { createWriteStream, promises as fs } from 'node:fs'
+import { createReadStream, createWriteStream, promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { Transform, type Readable } from 'node:stream'
@@ -76,6 +76,15 @@ export interface BlobStore {
     limit: number,
   ): Promise<{ bytes: number }>
   get(objectKey: string): Promise<StoredObject | null>
+  /**
+   * Read one blob incrementally, aborting before retained bytes exceed maxBytes.
+   * Unlike get(), this is suitable for server-side export paths where stored
+   * metadata may be missing or dishonest and the process must stay memory-safe.
+   */
+  readBytes(
+    objectKey: string,
+    opts?: { maxBytes?: number; signal?: AbortSignal },
+  ): Promise<Buffer | null>
   delete(objectKey: string): Promise<void>
 }
 
@@ -136,6 +145,32 @@ class LocalFsBlobStore implements BlobStore {
       return { bytes, contentType }
     } catch {
       return null
+    }
+  }
+
+  async readBytes(
+    objectKey: string,
+    opts?: { maxBytes?: number; signal?: AbortSignal },
+  ): Promise<Buffer | null> {
+    const { blobPath } = pathsFor(objectKey)
+    const maxBytes = opts?.maxBytes
+    const chunks: Buffer[] = []
+    let total = 0
+    try {
+      const source = createReadStream(blobPath, { signal: opts?.signal })
+      for await (const chunk of source) {
+        const bytes = Buffer.from(chunk)
+        total += bytes.length
+        if (maxBytes !== undefined && total > maxBytes) {
+          source.destroy()
+          throw new PayloadTooLargeError()
+        }
+        chunks.push(bytes)
+      }
+      return Buffer.concat(chunks, total)
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return null
+      throw err
     }
   }
 

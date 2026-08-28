@@ -640,9 +640,10 @@ export const config = {
       // (e.g. http://127.0.0.1:28090) is not reachable from inside the
       // backend container; set this to the in-cluster S3/MinIO address
       // (e.g. http://minio:9000) so server-side media operations stay on
-      // the container network. Browser-facing presignPut/presignGet URLs
-      // always use the public endpoint above. Empty (default) falls back
-      // to the public endpoint for all operations (single-network/dev).
+      // the container network. Browser-facing presignPut/presignGet URLs always
+      // use the public endpoint above; server-side export image reads use the
+      // direct ObjectStore.download path. Empty (default) falls back to the
+      // public endpoint for all operations (single-network/dev).
       internalEndpoint: str('ATTACHMENT_S3_INTERNAL_ENDPOINT', ''),
     },
     // Secret keying the HMAC signature over (objectKey + expiry). Dev fallback;

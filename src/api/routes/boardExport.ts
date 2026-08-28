@@ -100,34 +100,30 @@ export function sanitizeSceneImage(buf: Buffer): ResolvedSceneImage | null {
 }
 
 /**
- * Fetch up to maxBytes from a signed GET URL. Aborts and returns null on any
- * failure, non-200, or over-size body (streamed, so an oversize response can't
- * blow memory). A synthetic/dev host that isn't a real endpoint yields null and
- * the image simply renders as a placeholder. Copied from export.ts (PDF path).
+ * Download up to maxBytes through ObjectStore's server-side path. S3-backed
+ * deployments therefore use ATTACHMENT_S3_INTERNAL_ENDPOINT rather than making
+ * the Pod hairpin through the public browser endpoint. Abort and size limits
+ * preserve the previous best-effort placeholder behavior.
  */
-async function tryDownload(url: string, maxBytes: number): Promise<Buffer | null> {
+async function tryDownload(
+  store: ReturnType<typeof getObjectStore>,
+  objectKey: string,
+  maxBytes: number,
+): Promise<Buffer | null> {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), 10_000)
   try {
-    const res = await fetch(url, { signal: controller.signal })
-    if (!res.ok || !res.body) return null
-    const reader = res.body.getReader()
-    const chunks: Uint8Array[] = []
-    let total = 0
-    for (;;) {
-      const { done, value } = await reader.read()
-      if (done) break
-      if (value) {
-        total += value.byteLength
-        if (total > maxBytes) {
-          await reader.cancel().catch(() => {})
-          return null
-        }
-        chunks.push(value)
-      }
-    }
-    return Buffer.concat(chunks.map((c) => Buffer.from(c)))
-  } catch {
+    const bytes = await store.download(objectKey, {
+      maxBytes,
+      signal: controller.signal,
+    })
+    return Buffer.from(bytes)
+  } catch (err) {
+    // eslint-disable-next-line no-console -- best-effort export failures must remain operationally visible
+    console.warn(
+      `[board-export:image] server-side download failed for ${objectKey}:`,
+      err instanceof Error ? err.message : String(err),
+    )
     return null
   } finally {
     clearTimeout(timer)
@@ -137,7 +133,7 @@ async function tryDownload(url: string, maxBytes: number): Promise<Buffer | null
 /**
  * Resolve the bytes for the scene's image elements, keyed by the element's
  * fileId. Walks image elements → files[fileId].attachId → the doc's attachment
- * rows → a signed GET URL → downloaded bytes (bounded by count / per-image /
+ * rows → ObjectStore's server-side download path (bounded by count / per-image /
  * aggregate budgets). Best-effort: an unresolvable or oversize image is simply
  * omitted (rendered as a placeholder), never fatal — matching the PDF path.
  */
@@ -160,7 +156,6 @@ async function resolveSceneImages(
   if (fileIdToAttach.size === 0) return out
 
   const store = getObjectStore()
-  const ttl = config.attachments.readUrlTtlSeconds
   const { maxImageBytes, maxImageCount, maxImageTotalBytes } = config.boardExport
 
   // One query for the doc's attachment set, then O(1) membership (anti-enum).
@@ -177,8 +172,7 @@ async function resolveSceneImages(
     if (typeof a.sizeBytes === 'number' && a.sizeBytes > 0 && totalBytes + a.sizeBytes > maxImageTotalBytes) {
       continue
     }
-    const url = store.presignGet(a.objectKey, ttl)
-    const bytes = await tryDownload(url, maxImageBytes)
+    const bytes = await tryDownload(store, a.objectKey, maxImageBytes)
     if (!bytes) continue
     const image = sanitizeSceneImage(bytes)
     if (!image) continue // corrupt/unsupported — drop like the PDF path
