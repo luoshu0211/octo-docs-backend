@@ -28,9 +28,13 @@ data:
 
   OCTO_IDENTITY_MODE: "http"
   OCTO_SERVER_BASE_URL: "http://octo-server-{{BRANCH}}:8080"
-  # Secret (not ConfigMap data): configure OCTO_SERVER_TOKEN on the Deployment
-  # wherever Bot member-add/delete is enabled. Bot directory validation fails
-  # closed with 503 when absent and never forwards the Bot bearer to those APIs.
+  # Secret (not ConfigMap data): OCTO_SERVER_TOKEN is optional. Human member
+  # directory lookups prefer it when configured and otherwise use the caller's
+  # session token. Bot PUT defaults an omitted principalSpaceId to the Bot bearer
+  # Space and validates there with that bearer. An explicitly selected other Space
+  # gets no current directory revalidation and is existing-row/update-only. Bot
+  # DELETE is exact and directory-free; Human DELETE follows the service-token-
+  # first policy for its creator-owned-Bot cascade.
 
   ATTACHMENT_BUCKET: "octo-docs-attachments"
   ATTACHMENT_DRIVER: "local-hmac"

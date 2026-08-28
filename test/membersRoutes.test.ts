@@ -13,6 +13,11 @@ vi.mock("../src/db/repos/docMemberRepo.js", () => ({
   docMemberRepo: {
     upsertDirect: vi.fn(async () => {}),
     updateExistingDirect: vi.fn(async () => true),
+    removePrincipalExact: vi.fn(async () => ({
+      changed: true,
+      removedUids: [],
+      newEpoch: 2,
+    })),
     removePrincipalWithBots: vi.fn(async () => ({
       changed: true,
       removedUids: [],
@@ -30,6 +35,7 @@ import { membersRouter } from "../src/api/routes/members.js";
 import { requireDocRole } from "../src/api/guard.js";
 import { docMemberRepo } from "../src/db/repos/docMemberRepo.js";
 import {
+  getOctoIdentity,
   setOctoIdentity,
   type OctoIdentity,
   type OctoSpaceBot,
@@ -141,6 +147,7 @@ function stubIdentity(
   const identity: OctoIdentity = {
     verifyToken: vi.fn(async () => null),
     getUser,
+    lookupSpacePrincipalAsBot: vi.fn(async () => ({ status: "not_found" })),
     getUsers: vi.fn(async () => []),
     spaceMembers: vi.fn(async () => roster),
     spaceBots: vi.fn(async () => spaceBots),
@@ -154,6 +161,12 @@ beforeEach(() => {
   vi.mocked(docMemberRepo.upsertDirect).mockClear();
   vi.mocked(docMemberRepo.updateExistingDirect).mockReset();
   vi.mocked(docMemberRepo.updateExistingDirect).mockResolvedValue(true);
+  vi.mocked(docMemberRepo.removePrincipalExact).mockReset();
+  vi.mocked(docMemberRepo.removePrincipalExact).mockResolvedValue({
+    changed: true,
+    removedUids: [],
+    newEpoch: 2,
+  });
   vi.mocked(docMemberRepo.removePrincipalWithBots).mockReset();
   vi.mocked(docMemberRepo.removePrincipalWithBots).mockResolvedValue({
     changed: true,
@@ -736,11 +749,15 @@ describe("GET /api/v1/docs/:docId/members — synthesized owner row", () => {
   });
 });
 
-describe("DELETE /api/v1/docs/:docId/members/:uid — creator Bot cascade", () => {
-  function deleteReq(uid: string, principalSpaceId = "s_home") {
+describe("DELETE /api/v1/docs/:docId/members/:uid — Human creator Bot cascade", () => {
+  function deleteReq(
+    uid: string,
+    principalSpaceId = "s_home",
+    octoToken = "caller-token",
+  ) {
     return {
       uid: "u_admin",
-      octoToken: "caller-token",
+      octoToken,
       params: { docId: "d_1", uid },
       query: { principalSpaceId },
     } as never;
@@ -760,12 +777,13 @@ describe("DELETE /api/v1/docs/:docId/members/:uid — creator Bot cascade", () =
     } as never);
   });
 
-  it("removes a human and only Bots they own in the same principal Space", async () => {
+  it("uses req.octoToken to remove a Human and their authorized same-Space Bots", async () => {
     stubIdentity({}, [
       { uid: "bot_a", creatorUid: "u_human" },
       { uid: "bot_b", creatorUid: "u_human" },
       { uid: "bot_other", creatorUid: "u_other" },
     ]);
+    const identity = getOctoIdentity();
     vi.mocked(docMemberRepo.removePrincipalWithBots).mockResolvedValue({
       changed: true,
       removedUids: ["u_human", "bot_a", "bot_b"],
@@ -780,16 +798,18 @@ describe("DELETE /api/v1/docs/:docId/members/:uid — creator Bot cascade", () =
       ok: true,
       removedUids: ["u_human", "bot_a", "bot_b"],
     });
+    expect(identity.spaceBots).toHaveBeenCalledWith("s_home", "caller-token");
     expect(docMemberRepo.removePrincipalWithBots).toHaveBeenCalledWith({
       docId: "d_1",
       uid: "u_human",
       principalSpaceId: "s_home",
       botUids: ["bot_a", "bot_b"],
     });
+    expect(docMemberRepo.removePrincipalExact).not.toHaveBeenCalled();
     expect(refreshAndPublish).toHaveBeenCalledWith("doc-d_1", 8);
   });
 
-  it("removing a Bot directly removes only that Bot", async () => {
+  it("removes an explicitly targeted Bot without cascading sibling Bots", async () => {
     stubIdentity({}, [
       { uid: "bot_a", creatorUid: "u_human" },
       { uid: "bot_b", creatorUid: "u_human" },
@@ -800,22 +820,45 @@ describe("DELETE /api/v1/docs/:docId/members/:uid — creator Bot cascade", () =
 
     expect(res.statusCode).toBe(200);
     expect(docMemberRepo.removePrincipalWithBots).toHaveBeenCalledWith({
-      docId: "d_1",
-      uid: "bot_a",
-      principalSpaceId: "s_home",
-      botUids: [],
+      docId: "d_1", uid: "bot_a", principalSpaceId: "s_home", botUids: [],
     });
   });
 
-  it("fails closed without deleting when the authoritative Bot directory is unavailable", async () => {
+  it("does not read OCTO_SERVER_TOKEN and fails closed without req.octoToken", async () => {
+    stubIdentity({}, []);
+    const identity = getOctoIdentity();
+    const res = mockRes();
+
+    await deleteMemberHandler()(deleteReq("u_human", "s_home", ""), res as never);
+
+    expect(res.statusCode).toBe(503);
+    expect(res.body).toEqual({ error: "bot_directory_unavailable" });
+    expect(identity.spaceBots).not.toHaveBeenCalled();
+    expect(docMemberRepo.removePrincipalWithBots).not.toHaveBeenCalled();
+  });
+
+  it("fails closed before writes when the Human Bot directory is unavailable", async () => {
     stubIdentity({}, null);
     const res = mockRes();
 
     await deleteMemberHandler()(deleteReq("u_human"), res as never);
 
     expect(res.statusCode).toBe(503);
-    expect(res.body).toEqual({ error: "bot_directory_unavailable" });
     expect(docMemberRepo.removePrincipalWithBots).not.toHaveBeenCalled();
+    expect(refreshAndPublish).not.toHaveBeenCalled();
+  });
+
+  it("is idempotent and does not publish when no authorized row exists", async () => {
+    stubIdentity({}, []);
+    vi.mocked(docMemberRepo.removePrincipalWithBots).mockResolvedValue({
+      changed: false, removedUids: [],
+    });
+    const res = mockRes();
+
+    await deleteMemberHandler()(deleteReq("missing"), res as never);
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toEqual({ ok: true, removedUids: [] });
     expect(refreshAndPublish).not.toHaveBeenCalled();
   });
 

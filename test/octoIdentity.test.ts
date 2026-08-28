@@ -49,6 +49,89 @@ describe('HttpOctoIdentity.getUser — token header', () => {
   })
 })
 
+describe('HttpOctoIdentity.lookupSpacePrincipalAsBot — exact bearer lookup', () => {
+  it('routes uid and space id to the exact endpoint with Authorization Bearer', async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+      uid: 'u/a',
+      principal_type: 'human',
+    }), { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const identity = new HttpOctoIdentity('http://octo.test')
+    expect(await identity.lookupSpacePrincipalAsBot('u/a', 's&1', 'bot-token')).toEqual({ status: 'eligible' })
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://octo.test/v1/bot/space/principals/u%2Fa?space_id=s%261',
+      { headers: { Authorization: 'Bearer bot-token' } },
+    )
+  })
+
+  it.each(['human', 'user_bot'] as const)('accepts only the approved %s principal type', async (principalType) => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      uid: 'u',
+      principal_type: principalType,
+    }), { status: 200 })))
+    const identity = new HttpOctoIdentity('http://octo.test')
+    expect(await identity.lookupSpacePrincipalAsBot('u', 's', 'tok')).toEqual({ status: 'eligible' })
+  })
+
+  it('rejects app_bot as outside the approved User Bot scope', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      uid: 'u',
+      principal_type: 'app_bot',
+    }), { status: 200 })))
+    const identity = new HttpOctoIdentity('http://octo.test')
+    expect(await identity.lookupSpacePrincipalAsBot('u', 's', 'tok')).toEqual({ status: 'not_eligible' })
+  })
+
+  it.each([
+    ['204 response', new Response(null, { status: 204 })],
+    ['other 2xx response', new Response(JSON.stringify({ uid: 'u', principal_type: 'human' }), { status: 201 })],
+    ['empty JSON', new Response('', { status: 200 })],
+    ['malformed JSON', new Response('{', { status: 200 })],
+    ['array JSON', new Response(JSON.stringify([{ uid: 'u', principal_type: 'human' }]), { status: 200 })],
+    ['mismatched uid', new Response(JSON.stringify({ uid: 'other', principal_type: 'human' }), { status: 200 })],
+    ['missing principal type', new Response(JSON.stringify({ uid: 'u' }), { status: 200 })],
+    ['unknown principal type', new Response(JSON.stringify({ uid: 'u', principal_type: 'service' }), { status: 200 })],
+  ])('maps a %s to unavailable', async (_label, response) => {
+    vi.stubGlobal('fetch', vi.fn(async () => response))
+    const identity = new HttpOctoIdentity('http://octo.test')
+    expect(await identity.lookupSpacePrincipalAsBot('u', 's', 'tok')).toEqual({ status: 'unavailable' })
+  })
+
+  it('maps only the canonical user-not-found 404 envelope to not_found', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      error: { code: 'err.server.bot_api.user_not_found' },
+    }), { status: 404 })))
+    const identity = new HttpOctoIdentity('http://octo.test')
+    expect(await identity.lookupSpacePrincipalAsBot('u', 's', 'tok')).toEqual({ status: 'not_found' })
+  })
+
+  it.each([
+    ['Gin no-route 404', new Response('404 page not found', { status: 404 })],
+    ['malformed 404 JSON', new Response('{', { status: 404 })],
+    ['unknown 404 envelope', new Response(JSON.stringify({ error: { code: 'other' } }), { status: 404 })],
+  ])('maps a %s to unavailable', async (_label, response) => {
+    vi.stubGlobal('fetch', vi.fn(async () => response))
+    const identity = new HttpOctoIdentity('http://octo.test')
+    expect(await identity.lookupSpacePrincipalAsBot('u', 's', 'tok')).toEqual({ status: 'unavailable' })
+  })
+
+  it.each([
+    [401, 'forbidden'],
+    [403, 'forbidden'],
+    [500, 'unavailable'],
+  ] as const)('maps HTTP %i to %s', async (httpStatus, status) => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, status: httpStatus }) as Response))
+    const identity = new HttpOctoIdentity('http://octo.test')
+    expect(await identity.lookupSpacePrincipalAsBot('u', 's', 'tok')).toEqual({ status })
+  })
+
+  it('distinguishes transport failure from target absence', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('down') }))
+    const identity = new HttpOctoIdentity('http://octo.test')
+    expect(await identity.lookupSpacePrincipalAsBot('u', 's', 'tok')).toEqual({ status: 'unavailable' })
+  })
+})
+
 // verifyToken must surface octo-server's `owned_bots` (snake_case) as
 // `ownedBots` (camelCase) so "my documents" can include bot-owned docs. It is
 // FAIL-CLOSED: a missing / malformed list degrades to [] (caller sees only

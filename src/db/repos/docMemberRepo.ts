@@ -2,7 +2,7 @@
  * doc_member repository (§3.4 / §4.2 / §8.4).
  *
  * Document-autonomous membership. resolveRole queries this table + owner only
- * (§4.2); no group inheritance. PK (doc_id, uid) => at most one row per pair.
+ * (§4.2); no group inheritance. PK (doc_id, uid, principal_space_id) => at most one row per compound principal.
  */
 import { query, getPool, transaction, type Tx } from '../pool.js'
 import { roleFromNumber, type Role } from '../../permission/role.js'
@@ -99,15 +99,45 @@ export const docMemberRepo = {
     return rows.length > 0
   },
 
-  async remove(docId: string, uid: string, principalSpaceId: string): Promise<void> {
-    await query('DELETE FROM doc_member WHERE doc_id = ? AND uid = ? AND principal_space_id = ?', [docId, uid, principalSpaceId])
+  /** Atomically remove exactly one Space-qualified principal and bump epoch on change. */
+  async removePrincipalExact(params: {
+    docId: string
+    principalSpaceId: string
+    uid: string
+  }): Promise<{ changed: boolean; removedUids: string[]; newEpoch?: number }> {
+    return transaction(async (tx) => {
+      const present = await tx.query<{ uid: string }>(
+        `SELECT uid FROM doc_member
+         WHERE doc_id = ? AND uid = ? AND principal_space_id = ?
+         FOR UPDATE`,
+        [params.docId, params.uid, params.principalSpaceId],
+      )
+      if (present.length === 0) return { changed: false, removedUids: [] }
+
+      await tx.query(
+        'DELETE FROM doc_member WHERE doc_id = ? AND uid = ? AND principal_space_id = ?',
+        [params.docId, params.uid, params.principalSpaceId],
+      )
+      await tx.query(
+        'UPDATE doc_meta SET permission_epoch = permission_epoch + 1 WHERE doc_id = ?',
+        [params.docId],
+      )
+      const epochRows = await tx.query<{ permission_epoch: number }>(
+        'SELECT permission_epoch FROM doc_meta WHERE doc_id = ? LIMIT 1',
+        [params.docId],
+      )
+      return {
+        changed: true,
+        removedUids: [params.uid],
+        newEpoch: Number(epochRows[0]?.permission_epoch ?? 0),
+      }
+    })
   },
 
   /**
-   * Atomically remove one principal plus an optional set of Bots from the same
-   * Space and bump the document epoch exactly once. The caller derives botUids
-   * from Octo's authoritative Space Bot directory; this repository only applies
-   * the already Space-qualified set.
+   * Atomically remove a Human plus the already-resolved set of Bots created by
+   * that Human in the same Space. The caller must complete the authoritative
+   * Bot-directory lookup before entering this write transaction.
    */
   async removePrincipalWithBots(params: {
     docId: string
