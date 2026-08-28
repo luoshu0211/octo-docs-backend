@@ -491,9 +491,9 @@ describe('renderTypst — nodes', () => {
 
   it('uses the image align attr for raster and SVG assets instead of Typst figure centering', () => {
     const attachments = new Map<string, ResolvedAttachment>([
-      ['png-left', { url: '', fileName: 'left.png', mime: 'image/png', sizeBytes: 1 }],
-      ['svg-center', { url: '', fileName: 'center.svg', mime: 'image/svg+xml', sizeBytes: 1 }],
-      ['svg-right', { url: '', fileName: 'right.svg', mime: 'image/svg+xml', sizeBytes: 1 }],
+      ['png-left', { fileName: 'left.png', mime: 'image/png', sizeBytes: 1 }],
+      ['svg-center', { fileName: 'center.svg', mime: 'image/svg+xml', sizeBytes: 1 }],
+      ['svg-right', { fileName: 'right.svg', mime: 'image/svg+xml', sizeBytes: 1 }],
     ])
     const out = renderTypst(doc([
       { type: 'image', attrs: { attachId: 'png-left', align: 'left' } },
@@ -519,7 +519,7 @@ describe('renderTypst — nodes', () => {
       { type: 'image', attrs: { attachId: 'plain' } },
     ]), {
       title: 'T',
-      attachments: new Map([['plain', { url: '', fileName: 'plain.png', mime: 'image/png', sizeBytes: 1 }]]),
+      attachments: new Map([['plain', { fileName: 'plain.png', mime: 'image/png', sizeBytes: 1 }]]),
       imagePaths: new Map([['plain', 'plain.png']]),
     })
     expect(out).toContain('#align(left)[#figure(__capImage("plain.png"))]')
@@ -532,7 +532,7 @@ describe('renderTypst — nodes', () => {
       ] },
     ]), {
       title: 'T',
-      attachments: new Map([['legacy', { url: '', fileName: 'legacy.svg', mime: 'image/svg+xml', sizeBytes: 1 }]]),
+      attachments: new Map([['legacy', { fileName: 'legacy.svg', mime: 'image/svg+xml', sizeBytes: 1 }]]),
       imagePaths: new Map([['legacy', 'legacy.svg']]),
     })
     expect(out).toContain('#align(right)[#figure(__capImage("legacy.svg"))]')
