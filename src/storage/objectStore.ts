@@ -46,7 +46,7 @@ export interface ObjectStore {
    * When `maxBytes` is set, reads the response as a stream and aborts past the cap,
    * preventing oversized objects from being fully buffered in memory (OOM defence).
    */
-  download(objectKey: string, opts?: { maxBytes?: number }): Promise<Uint8Array>
+  download(objectKey: string, opts?: { maxBytes?: number; signal?: AbortSignal }): Promise<Uint8Array>
 }
 
 export interface PresignGetOptions {
@@ -253,14 +253,14 @@ export class LocalHmacObjectStore implements ObjectStore {
     await getLocalBlobStore().put(applyKeyPrefix(this.keyPrefix, objectKey), mime, Buffer.from(body))
   }
 
-  async download(objectKey: string, opts?: { maxBytes?: number }): Promise<Uint8Array> {
+  async download(objectKey: string, opts?: { maxBytes?: number; signal?: AbortSignal }): Promise<Uint8Array> {
     const { getLocalBlobStore } = await import('./localBlobStore.js')
-    const stored = await getLocalBlobStore().get(applyKeyPrefix(this.keyPrefix, objectKey))
-    if (!stored) throw new Error(`object not found: ${objectKey}`)
-    if (opts?.maxBytes !== undefined && stored.bytes.length > opts.maxBytes) {
-      throw new Error(`downloaded object exceeds maxBytes cap: ${stored.bytes.length} > ${opts.maxBytes}`)
-    }
-    return new Uint8Array(stored.bytes)
+    const bytes = await getLocalBlobStore().readBytes(
+      applyKeyPrefix(this.keyPrefix, objectKey),
+      opts,
+    )
+    if (!bytes) throw new Error(`object not found: ${objectKey}`)
+    return new Uint8Array(bytes)
   }
 
   /**
@@ -382,6 +382,33 @@ function hmac(key: Buffer | string, data: string): Buffer {
 
 function sha256Hex(data: string | Buffer | Uint8Array): string {
   return createHash('sha256').update(data).digest('hex')
+}
+
+async function readErrorBodyPrefix(response: Response, maxBytes: number): Promise<string> {
+  if (!response.body) return ''
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let total = 0
+  let text = ''
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      if (!value) continue
+      const remaining = maxBytes - total
+      if (remaining <= 0) break
+      const chunk = value.subarray(0, remaining)
+      total += chunk.byteLength
+      text += decoder.decode(chunk, { stream: total < maxBytes })
+      if (chunk.byteLength < value.byteLength || total >= maxBytes) break
+    }
+    text += decoder.decode()
+    return text
+  } catch {
+    return text
+  } finally {
+    await reader.cancel().catch(() => {})
+  }
 }
 
 /**
@@ -566,8 +593,11 @@ export class S3ObjectStore implements ObjectStore {
     await this.internalRequest('PUT', objectKey, { mime, body, signal: opts?.signal })
   }
 
-  async download(objectKey: string, opts?: { maxBytes?: number }): Promise<Uint8Array> {
-    return this.internalRequest('GET', objectKey, { maxBytes: opts?.maxBytes })
+  async download(objectKey: string, opts?: { maxBytes?: number; signal?: AbortSignal }): Promise<Uint8Array> {
+    return this.internalRequest('GET', objectKey, {
+      maxBytes: opts?.maxBytes,
+      signal: opts?.signal,
+    })
   }
 
   /**
@@ -655,7 +685,10 @@ export class S3ObjectStore implements ObjectStore {
 
     if (!response.ok) {
       if (method === 'DELETE' && response.status === 404) return new Uint8Array()
-      const text = await response.text().catch(() => '')
+      // Error payloads come from an external storage/proxy boundary. Read only a
+      // small diagnostic prefix so a malicious or misconfigured endpoint cannot
+      // defeat download caps by returning an unbounded non-2xx body.
+      const text = await readErrorBodyPrefix(response, 16 * 1024)
       throw new Error(`internal ${method} ${objectKey} failed: ${response.status} ${text.slice(0, 200)}`)
     }
 

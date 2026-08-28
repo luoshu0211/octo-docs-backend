@@ -25,9 +25,8 @@
  */
 import { gitHubEmojis } from '@tiptap/extension-emoji'
 
-/** A resolved attachment reference the route hands us (already signed). */
+/** Attachment metadata needed while rendering file cards and image nodes. */
 export interface ResolvedAttachment {
-  url: string
   fileName: string
   mime: string
   sizeBytes: number
