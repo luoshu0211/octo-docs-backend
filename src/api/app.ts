@@ -89,6 +89,7 @@ import { versionsRouter } from './routes/versions.js'
 import { docContentRouter } from './routes/docContent.js'
 import { docSheetRouter } from './routes/docSheet.js'
 import { docSceneRouter } from './routes/docScene.js'
+import { docHtmlPreviewRouter } from './routes/docHtmlPreview.js'
 import { exportRouter } from './routes/export.js'
 import { boardExportRouter } from './routes/boardExport.js'
 import { importRouter } from './routes/import.js'
@@ -291,11 +292,22 @@ export function createApp(
   api.use(docContentRouter) // /:docId/content (bot incremental body edit + live read)
   api.use(docSheetRouter) // /:docId/sheet (live spreadsheet content read, R-A)
   api.use(docSceneRouter) // /:docId/scene (live board/Excalidraw scene read + edit)
+  // /:docId/html-preview (ACL-safe first-screen excerpt for the type-18 share card).
+  // HUMAN CHAIN ONLY, deliberately: the bot exposure surface is evaluated separately
+  // and is not in scope for this change — do not add it to botApi below without that
+  // review. (The other content routers are mounted on both chains.)
+  api.use(docHtmlPreviewRouter)
   api.use(exportRouter) // /:docId/export/pdf (server-side Typst render)
   api.use(boardExportRouter) // /:docId/export (server-side whiteboard PNG/SVG, W3)
   api.use(importRouter) // /:docId/import/docx (server-side .docx -> ProseMirror JSON)
 
   // Mounted only on the public surface: this is the browser-facing human API.
+  // summary-source is reachable here at /api/v1/docs/:docId/summary-source, which is
+  // where octo-smart-summary's FetchSummarySource asks for it. An earlier revision of
+  // this file also mounted a compat alias at /api/documents/:docId/summary-source,
+  // because the consumer used to request that path; the consumer has since aligned to
+  // this canonical namespace, so the alias was removed rather than kept as a second
+  // externally reachable entry to the same handler.
   if (servePublic) app.use('/api/v1/docs', api)
 
   // Internal surface: the html service registers published docs here with the

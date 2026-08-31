@@ -818,7 +818,7 @@ describe('POST /:docId/access-requests/:requestId/approve — carried Space-bot 
 
 describe('POST /:docId/access-requests/:requestId/deny', () => {
   const denyHandler = () => handlerFor('/:docId/access-requests/:requestId/deny', 'post')
-  const req = () => ({ uid: 'u_admin', params: { docId: 'd_1', requestId: 'req_x' }, body: {} }) as never
+  const req = () => ({ uid: 'u_admin', principalSpaceId: 's_doc_home', params: { docId: 'd_1', requestId: 'req_x' }, body: {} }) as never
 
   it('marks denied -> 200, no grant', async () => {
     vi.mocked(requireDocRole).mockResolvedValue(okGuard)
@@ -843,6 +843,8 @@ describe('POST /:docId/access-requests/:requestId/deny', () => {
       requestId: 'req_x',
       status: REQUEST_STATUS_DENIED,
       decidedBy: 'u_admin',
+      decidedBySpaceId: 's_doc_home',
+      decidedAtUnix: expect.any(Number),
     })
     expect(vi.mocked(grantForwardAccess)).not.toHaveBeenCalled()
   })
@@ -896,6 +898,8 @@ describe('POST /:docId/access-requests/:requestId/deny', () => {
       requestId: 'req_x',
       status: REQUEST_STATUS_DENIED,
       decidedBy: 'u_admin',
+      decidedBySpaceId: 's_doc_home',
+      decidedAtUnix: expect.any(Number),
     })
     expect(vi.mocked(grantForwardAccess)).not.toHaveBeenCalled()
   })

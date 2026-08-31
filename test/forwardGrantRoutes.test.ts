@@ -58,6 +58,7 @@ function stubIdentity(known: Record<string, OctoUser>) {
   const identity: OctoIdentity = {
     verifyToken: vi.fn(async () => null),
     getUser,
+    lookupSpacePrincipalAsBot: vi.fn(async () => ({ status: 'not_found' })),
     getUsers: vi.fn(async () => []),
   }
   setOctoIdentity(identity)

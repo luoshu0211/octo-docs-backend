@@ -1,9 +1,8 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
 // Offline unit tests for credential selection. Bot forward-grant resolves the
-// target user through the bot realm. Bot member-add instead uses the configured
-// service token for the authoritative Space roster; it never sends req.botToken
-// to that human/service directory API.
+// target user through the bot realm. Bot member-add uses the Bot bearer on the
+// exact Space-principal endpoint and does not depend on the service token.
 //
 // The guard + repos + grant core are mocked; only the resolver-credential
 // selection and the 200/404 mapping are under test. The human path (req.octoToken
@@ -12,7 +11,10 @@ vi.mock("../src/api/guard.js", () => ({
   requireDocRole: vi.fn(),
 }));
 vi.mock("../src/db/repos/docMemberRepo.js", () => ({
-  docMemberRepo: { upsertDirect: vi.fn(async () => {}) },
+  docMemberRepo: {
+    upsertDirect: vi.fn(async () => {}),
+    updateExistingDirect: vi.fn(async () => true),
+  },
 }));
 vi.mock("../src/permission/epoch.js", () => ({
   bumpEpoch: vi.fn(async () => {}),
@@ -92,17 +94,21 @@ function stubIdentity(known: Record<string, OctoUser>) {
     Object.values(known).map((user) => ({ uid: user.uid, isBot: false })),
   );
   const spaceBots = vi.fn(async () => []);
+  const lookupSpacePrincipalAsBot = vi.fn(async (uid: string) => ({
+    status: known[uid] ? "eligible" as const : "not_found" as const,
+  }));
   const identity = {
     verifyToken: vi.fn(async () => null),
     verifyBot: vi.fn(async () => null),
     getUser,
     getUserAsBot,
+    lookupSpacePrincipalAsBot,
     getUsers: vi.fn(async () => []),
     spaceMembers,
     spaceBots,
   } as unknown as OctoIdentity;
   setOctoIdentity(identity);
-  return { getUser, getUserAsBot, spaceMembers, spaceBots };
+  return { getUser, getUserAsBot, lookupSpacePrincipalAsBot, spaceMembers, spaceBots };
 }
 
 // Bot-path request: verifyBot set req.uid + req.spaceId + req.botToken and
@@ -111,6 +117,7 @@ function botReq(body: Record<string, unknown>, botToken = "bf_bottok") {
   return {
     uid: "bot_1",
     spaceId: "s_bot",
+    principalSpaceId: "s_bot",
     botToken,
     params: { docId: "d_1" },
     body,
@@ -145,14 +152,15 @@ beforeEach(() => {
   vi.mocked(requireDocRole).mockReset();
   vi.mocked(requireDocRole).mockResolvedValue(okGuard);
   vi.mocked(docMemberRepo.upsertDirect).mockClear();
+  vi.mocked(docMemberRepo.updateExistingDirect).mockClear();
   vi.mocked(grantForwardAccess).mockClear();
 });
 
 describe("bot path selects the credential realm for each directory API", () => {
-  it("PUT members: uses OCTO_SERVER_TOKEN for the Space roster; user resolvers untouched", async () => {
+  it("PUT members: service token empty + Bot bearer exact lookup succeeds", async () => {
     const original = config.octoIdentity.serviceToken;
-    config.octoIdentity.serviceToken = "service-token";
-    const { getUser, getUserAsBot, spaceMembers } = stubIdentity({
+    config.octoIdentity.serviceToken = "";
+    const { getUser, getUserAsBot, lookupSpacePrincipalAsBot, spaceMembers } = stubIdentity({
       u_real: { uid: "u_real", name: "Real" },
     });
     const res = mockRes();
@@ -164,16 +172,21 @@ describe("bot path selects the credential realm for each directory API", () => {
 
     expect(res.statusCode).toBe(200);
     expect(res.body).toEqual({ ok: true });
-    expect(spaceMembers).toHaveBeenCalledWith("s1", "service-token");
+    expect(lookupSpacePrincipalAsBot).toHaveBeenCalledWith("u_real", "s_bot", "bf_bottok");
+    expect(spaceMembers).not.toHaveBeenCalled();
     expect(getUserAsBot).not.toHaveBeenCalled();
     expect(getUser).not.toHaveBeenCalled();
-    expect(vi.mocked(docMemberRepo.upsertDirect)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(docMemberRepo.upsertDirect)).toHaveBeenCalledWith(
+      expect.objectContaining({ uid: "u_real", principalSpaceId: "s_bot" }),
+    );
+    expect(vi.mocked(docMemberRepo.updateExistingDirect)).not.toHaveBeenCalled();
   });
 
-  it("PUT members: missing service token -> 503 without a directory call or write", async () => {
+  it("PUT members: exact lookup unavailable -> 503 without a write", async () => {
     const original = config.octoIdentity.serviceToken;
     config.octoIdentity.serviceToken = "";
-    const { getUserAsBot, spaceMembers } = stubIdentity({});
+    const { getUserAsBot, lookupSpacePrincipalAsBot, spaceMembers } = stubIdentity({});
+    lookupSpacePrincipalAsBot.mockResolvedValue({ status: "unavailable" });
     const res = mockRes();
     try {
       await putMember()(botReq({ uid: "u_ghost", role: "writer" }), res as never);
@@ -183,9 +196,11 @@ describe("bot path selects the credential realm for each directory API", () => {
 
     expect(res.statusCode).toBe(503);
     expect(res.body).toEqual({ error: "identity_directory_unavailable" });
+    expect(lookupSpacePrincipalAsBot).toHaveBeenCalledWith("u_ghost", "s_bot", "bf_bottok");
     expect(spaceMembers).not.toHaveBeenCalled();
     expect(getUserAsBot).not.toHaveBeenCalled();
     expect(vi.mocked(docMemberRepo.upsertDirect)).not.toHaveBeenCalled();
+    expect(vi.mocked(docMemberRepo.updateExistingDirect)).not.toHaveBeenCalled();
   });
 
   it("POST forward-grant: real user resolved via getUserAsBot(botToken) -> 200; getUser untouched", async () => {

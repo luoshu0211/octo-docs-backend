@@ -48,13 +48,58 @@ function parseHtmlDocument(html: string): DomDocument | null {
   }
 }
 
+/**
+ * Marks that refuse to coexist with ANY other mark (ProseMirror `excludes: '_'`).
+ *
+ * Kept in sync with the identically-named set in markdown.ts; see the rationale there. This
+ * module walks whitelisted inline HTML (`<strong><code>x</code></strong>` round-tripped from
+ * our own exporter, or hand-written by an external editor) and builds its mark list on its
+ * OWN recursion rather than through markdown.ts's `withMarks`, so the fix has to be applied
+ * on this path too — otherwise the exact same `[bold, code]` collection reaches
+ * `PMNode.check()` and 422s the whole import.
+ */
+const EXCLUSIVE_MARKS = new Set(['code'])
+
+/**
+ * Drop marks that cannot legally coexist, keeping the innermost exclusive one.
+ *
+ * Mirrors `reconcileMarks` in markdown.ts: an exclusive mark wins outright, otherwise marks
+ * are de-duplicated by type (each non-exclusive mark excludes only its own type).
+ */
+function reconcileMarks(
+  marks: Array<{ type: string; attrs?: Record<string, unknown> }>,
+): Array<{ type: string; attrs?: Record<string, unknown> }> {
+  // Innermost wins: `marks` is built outermost-first as the walker descends.
+  for (let i = marks.length - 1; i >= 0; i--) {
+    const m = marks[i]
+    if (m && EXCLUSIVE_MARKS.has(m.type)) return [{ ...m }]
+  }
+  // CSS cascade invariant: when the same mark type nests, the CLOSEST ancestor wins.
+  // `marks` is outermost-first, so a later (inner) occurrence overrides an earlier
+  // (outer) one. Merge per attribute rather than replacing wholesale: an inner
+  // `<span color:blue>` inside an outer `<span font-size:24px>` keeps both — the inner
+  // layer only overrides the attributes it actually defines (here `color`), inheriting
+  // the rest. Nested colored spans / <mark> backgrounds therefore resolve innermost-wins.
+  const byType = new Map<string, { type: string; attrs?: Record<string, unknown> }>()
+  for (const m of marks) {
+    const prev = byType.get(m.type)
+    if (prev) {
+      if (m.attrs || prev.attrs) prev.attrs = { ...(prev.attrs ?? {}), ...(m.attrs ?? {}) }
+    } else {
+      byType.set(m.type, m.attrs ? { type: m.type, attrs: { ...m.attrs } } : { type: m.type })
+    }
+  }
+  return [...byType.values()]
+}
+
 function domInlineToNodes(root: DomElement): PmNode[] {
   const out: PmNode[] = []
   const walk = (
     node: DomNode,
-    marks: Array<{ type: string; attrs?: Record<string, unknown> }>,
+    rawMarks: Array<{ type: string; attrs?: Record<string, unknown> }>,
     inCode = false,
   ) => {
+    const marks = reconcileMarks(rawMarks)
     if (node.nodeType === 3) {
       if (node.textContent) out.push({ type: 'text', text: node.textContent, ...(marks.length ? { marks } : {}) })
       return

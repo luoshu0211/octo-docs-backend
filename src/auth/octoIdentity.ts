@@ -34,6 +34,13 @@ export interface OctoSpaceMember {
   isBot: boolean;
 }
 
+export type OctoSpacePrincipalLookup =
+  | { status: 'eligible' }
+  | { status: 'not_eligible' }
+  | { status: 'not_found' }
+  | { status: 'forbidden' }
+  | { status: 'unavailable' }
+
 /**
  * octo-server user `status` value that marks an ENABLED account (XIN-1850
  * frozen batch contract). Only enabled users are grantable; every other status
@@ -195,10 +202,21 @@ export interface OctoIdentity {
    * same anti ghost-member existence check: 200 -> OctoUser, 404 -> null.
    *
    * Bot-realm callers such as forward-grant therefore do not need
-   * OCTO_SERVER_TOKEN for this specific lookup. Human/service directory APIs
-   * such as member-add roster validation still require the service token.
+   * OCTO_SERVER_TOKEN for this specific lookup.
    */
   getUserAsBot(uid: string, botToken: string): Promise<OctoUser | null>;
+
+  /**
+   * Validate one exact `(uid, spaceId)` target on behalf of a Bot. The endpoint
+   * is authoritative for grant eligibility and is authenticated in the Bot
+   * bearer realm, so Bot member-add does not need the human/service directory
+   * token. Dependency/auth failures remain distinct from a confirmed absence.
+   */
+  lookupSpacePrincipalAsBot(
+    uid: string,
+    spaceId: string,
+    botToken: string,
+  ): Promise<OctoSpacePrincipalLookup>;
 
   /** (b) Batch profile lookup for awareness cursors (§4.7(b)). */
   getUsers(uids: string[], callerToken?: string): Promise<OctoUser[]>;
@@ -522,6 +540,55 @@ export class HttpOctoIdentity implements OctoIdentity {
     } | null;
     if (!body || typeof body.uid !== "string") return null;
     return { uid: body.uid, name: body.name ?? "", avatar: body.avatar };
+  }
+
+  async lookupSpacePrincipalAsBot(
+    uid: string,
+    spaceId: string,
+    botToken: string,
+  ): Promise<OctoSpacePrincipalLookup> {
+    if (!uid || !spaceId || !botToken) return { status: 'forbidden' }
+    let res: Response
+    try {
+      res = await fetch(
+        `${this.baseUrl}/v1/bot/space/principals/${encodeURIComponent(uid)}?space_id=${encodeURIComponent(spaceId)}`,
+        { headers: { Authorization: `Bearer ${botToken}` } },
+      )
+    } catch {
+      return { status: 'unavailable' }
+    }
+    if (res.status === 200) {
+      const body = (await res.json().catch(() => null)) as unknown
+      if (!body || typeof body !== 'object' || Array.isArray(body)) {
+        return { status: 'unavailable' }
+      }
+      const principal = body as { uid?: unknown; principal_type?: unknown }
+      if (principal.uid !== uid) return { status: 'unavailable' }
+      if (principal.principal_type === 'human' || principal.principal_type === 'user_bot') {
+        return { status: 'eligible' }
+      }
+      if (principal.principal_type === 'app_bot') return { status: 'not_eligible' }
+      return { status: 'unavailable' }
+    }
+    if (res.status === 404) {
+      // The exact endpoint uses a canonical error envelope for a confirmed
+      // absence. Gin's default no-route response is also 404 but plain text;
+      // treating that as not_found would hide a missing server capability as a
+      // product-level "principal not in Space" error during rolling deploys.
+      const body = (await res.json().catch(() => null)) as unknown
+      if (
+        body &&
+        typeof body === 'object' &&
+        !Array.isArray(body) &&
+        (body as { error?: { code?: unknown } }).error?.code ===
+          'err.server.bot_api.user_not_found'
+      ) {
+        return { status: 'not_found' }
+      }
+      return { status: 'unavailable' }
+    }
+    if (res.status === 401 || res.status === 403) return { status: 'forbidden' }
+    return { status: 'unavailable' }
   }
 
   async getUsers(uids: string[], callerToken?: string): Promise<OctoUser[]> {
@@ -950,6 +1017,14 @@ export class MiddlewareOctoIdentity implements OctoIdentity {
 
   getUserAsBot(uid: string, botToken: string): Promise<OctoUser | null> {
     return this.delegate.getUserAsBot(uid, botToken);
+  }
+
+  lookupSpacePrincipalAsBot(
+    uid: string,
+    spaceId: string,
+    botToken: string,
+  ): Promise<OctoSpacePrincipalLookup> {
+    return this.delegate.lookupSpacePrincipalAsBot(uid, spaceId, botToken)
   }
 
   verifyBot(

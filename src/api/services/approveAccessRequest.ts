@@ -16,6 +16,10 @@ export interface ApproveAccessRequestParams {
   roleNum: number
   allowAdmin?: boolean
   decidedBy: string
+  /** The winning decider's trusted Space, persisted atomically with the CAS. */
+  decidedBySpaceId: string
+  /** Authoritative decision time (unix seconds), persisted atomically with the CAS. */
+  decidedAtUnix: number
 }
 
 export interface ApproveAccessRequestResult {
@@ -42,6 +46,8 @@ export async function approveAccessRequest(
       requestId: params.requestId,
       status: REQUEST_STATUS_APPROVED,
       decidedBy: params.decidedBy,
+      decidedBySpaceId: params.decidedBySpaceId,
+      decidedAtUnix: params.decidedAtUnix,
     })
     if (!transitioned) return { transitioned: false as const }
 

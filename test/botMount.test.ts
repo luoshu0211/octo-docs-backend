@@ -27,11 +27,12 @@ vi.mock('../src/db/repos/docMemberRepo.js', () => ({
   docMemberRepo: {
     upsertDirect: vi.fn(async () => {}),
     updateExistingDirect: vi.fn(async () => true),
-    removePrincipalWithBots: vi.fn(async () => ({
+    removePrincipalExact: vi.fn(async () => ({
       changed: true,
       removedUids: ['u_target'],
       newEpoch: 2,
     })),
+    removePrincipalWithBots: vi.fn(),
   },
 }))
 vi.mock('../src/permission/epoch.js', () => ({
@@ -48,6 +49,7 @@ import { setOctoIdentity, type OctoIdentity, type OctoUser } from '../src/auth/o
 import { docMetaRepo } from '../src/db/repos/docMetaRepo.js'
 import { resolveRole } from '../src/permission/resolveRole.js'
 import { docMemberRepo } from '../src/db/repos/docMemberRepo.js'
+import { bumpEpoch } from '../src/permission/epoch.js'
 import { config } from '../src/config/env.js'
 
 const listForUser = vi.mocked(docMetaRepo.listForUser)
@@ -55,6 +57,9 @@ const getByDocId = vi.mocked(docMetaRepo.getByDocId)
 const setShareSettings = vi.mocked(docMetaRepo.setShareSettings)
 const resolveDocRole = vi.mocked(resolveRole)
 const upsertDirect = vi.mocked(docMemberRepo.upsertDirect)
+const updateExistingDirect = vi.mocked(docMemberRepo.updateExistingDirect)
+const bumpEpochMock = vi.mocked(bumpEpoch)
+const removePrincipalExact = vi.mocked(docMemberRepo.removePrincipalExact)
 const removePrincipalWithBots = vi.mocked(docMemberRepo.removePrincipalWithBots)
 const originalServiceToken = config.octoIdentity.serviceToken
 
@@ -81,6 +86,7 @@ function stub(overrides: Partial<OctoIdentity>): OctoIdentity {
     verifyToken: async () => null,
     verifyBot: async () => null,
     getUser: async (): Promise<OctoUser | null> => null,
+    lookupSpacePrincipalAsBot: async () => ({ status: 'not_found' }),
     getUsers: async (): Promise<OctoUser[]> => [],
     isSpaceMember: async () => false,
     ...overrides,
@@ -114,7 +120,15 @@ beforeEach(() => {
   })
   resolveDocRole.mockReset().mockResolvedValue('reader')
   upsertDirect.mockClear()
-  removePrincipalWithBots.mockClear()
+  updateExistingDirect.mockClear()
+  bumpEpochMock.mockClear()
+  removePrincipalExact.mockClear()
+  removePrincipalExact.mockResolvedValue({
+    changed: true,
+    removedUids: ['u_target'],
+    newEpoch: 2,
+  })
+  removePrincipalWithBots.mockReset()
   removePrincipalWithBots.mockResolvedValue({
     changed: true,
     removedUids: ['u_target'],
@@ -278,12 +292,11 @@ describe('bot mount /v1/bot/docs (§ v4.3)', () => {
     })
   })
 
-  it('fails Bot member-add closed without a service token and never sends the Bot bearer to the directory', async () => {
-    const spaceMembers = vi.fn(async () => [{ uid: 'u_target', isBot: false }])
+  it('defaults an omitted principalSpaceId to the bearer Space, not the document Home Space', async () => {
+    const lookupSpacePrincipalAsBot = vi.fn(async () => ({ status: 'eligible' as const }))
     setOctoIdentity(stub({
       verifyBot: async () => ({ uid: 'bot_1', spaceId: 's_real' }),
-      spaceMembers,
-      spaceBots: async () => [],
+      lookupSpacePrincipalAsBot,
     }))
     resolveDocRole.mockResolvedValue('admin')
 
@@ -293,40 +306,153 @@ describe('bot mount /v1/bot/docs (§ v4.3)', () => {
       body: JSON.stringify({ uid: 'u_target', role: 'reader' }),
     })
 
-    expect(res.status).toBe(503)
-    expect(await res.json()).toEqual({ error: 'identity_directory_unavailable' })
-    expect(spaceMembers).not.toHaveBeenCalled()
-    expect(upsertDirect).not.toHaveBeenCalled()
+    expect(res.status).toBe(200)
+    expect(await res.json()).toEqual({ ok: true })
+    expect(lookupSpacePrincipalAsBot).toHaveBeenCalledWith('u_target', 's_real', 'bot-secret')
+    expect(upsertDirect).toHaveBeenCalledWith(expect.objectContaining({
+      docId: 'd_bot', uid: 'u_target', principalSpaceId: 's_real', grantedBy: 'bot_1',
+    }))
   })
 
-  it('uses OCTO_SERVER_TOKEN, never the Bot bearer, for mounted Bot member-add directory validation', async () => {
-    config.octoIdentity.serviceToken = 'configured-service-token'
-    const spaceMembers = vi.fn(async () => [{ uid: 'u_target', isBot: false }])
+  it('updates an existing explicitly selected foreign-Space row without revalidating current eligibility', async () => {
+    const lookupSpacePrincipalAsBot = vi.fn(async () => ({ status: 'eligible' as const }))
     setOctoIdentity(stub({
-      verifyBot: async () => ({ uid: 'bot_1', spaceId: 's_real' }),
-      spaceMembers,
-      spaceBots: async () => [],
+      verifyBot: async () => ({ uid: 'bot_1', spaceId: 's_bot' }),
+      lookupSpacePrincipalAsBot,
+    }))
+    resolveDocRole.mockResolvedValue('admin')
+    updateExistingDirect.mockResolvedValue(true)
+
+    const res = await fetch(`${base}/v1/bot/docs/d_bot/members`, {
+      method: 'PUT',
+      headers: { authorization: 'Bearer bot-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({ uid: 'same_uid', principalSpaceId: 's_other', role: 'writer' }),
+    })
+
+    expect(res.status).toBe(200)
+    expect(lookupSpacePrincipalAsBot).not.toHaveBeenCalled()
+    expect(updateExistingDirect).toHaveBeenCalledWith({
+      docId: 'd_bot', uid: 'same_uid', principalSpaceId: 's_other', roleNum: 2, grantedBy: 'bot_1',
+    })
+    expect(upsertDirect).not.toHaveBeenCalled()
+    expect(bumpEpochMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('cannot mint a missing explicitly selected foreign-Space row without directory lookup', async () => {
+    const lookupSpacePrincipalAsBot = vi.fn(async () => ({ status: 'eligible' as const }))
+    setOctoIdentity(stub({
+      verifyBot: async () => ({ uid: 'bot_1', spaceId: 's_bot' }),
+      lookupSpacePrincipalAsBot,
+    }))
+    resolveDocRole.mockResolvedValue('admin')
+    updateExistingDirect.mockResolvedValue(false)
+
+    const res = await fetch(`${base}/v1/bot/docs/d_bot/members`, {
+      method: 'PUT',
+      headers: { authorization: 'Bearer bot-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({ uid: 'same_uid', principalSpaceId: 's_other', role: 'writer' }),
+    })
+
+    expect(res.status).toBe(404)
+    expect(await res.json()).toEqual({ error: 'member_not_found' })
+    expect(lookupSpacePrincipalAsBot).not.toHaveBeenCalled()
+    expect(upsertDirect).not.toHaveBeenCalled()
+    expect(bumpEpochMock).not.toHaveBeenCalled()
+  })
+
+  it('upserts its own Space on a foreign-Home document after exact lookup', async () => {
+    const lookupSpacePrincipalAsBot = vi.fn(async () => ({ status: 'eligible' as const }))
+    setOctoIdentity(stub({
+      verifyBot: async () => ({ uid: 'bot_1', spaceId: 's_bot' }),
+      lookupSpacePrincipalAsBot,
     }))
     resolveDocRole.mockResolvedValue('admin')
 
     const res = await fetch(`${base}/v1/bot/docs/d_bot/members`, {
       method: 'PUT',
       headers: { authorization: 'Bearer bot-secret', 'content-type': 'application/json' },
-      body: JSON.stringify({ uid: 'u_target', role: 'writer' }),
+      body: JSON.stringify({ uid: 'u_target', role: 'reader' }),
     })
 
     expect(res.status).toBe(200)
-    expect(await res.json()).toEqual({ ok: true })
-    expect(spaceMembers).toHaveBeenCalledWith('s_real', 'configured-service-token')
-    expect(spaceMembers).not.toHaveBeenCalledWith('s_real', 'bot-secret')
+    expect(lookupSpacePrincipalAsBot).toHaveBeenCalledWith('u_target', 's_bot', 'bot-secret')
     expect(upsertDirect).toHaveBeenCalledWith(expect.objectContaining({
-      docId: 'd_bot', uid: 'u_target', principalSpaceId: 's_real', grantedBy: 'bot_1',
+      uid: 'u_target', principalSpaceId: 's_bot',
     }))
+    expect(updateExistingDirect).not.toHaveBeenCalled()
   })
 
-  it('uses OCTO_SERVER_TOKEN, never the Bot bearer, for mounted Bot member-delete directory lookup', async () => {
-    config.octoIdentity.serviceToken = 'configured-service-token'
-    const spaceBots = vi.fn(async () => [])
+  it.each([
+    ['not_found', 404, 'principal_not_in_space'],
+    ['not_eligible', 404, 'principal_not_in_space'],
+    ['forbidden', 403, 'principal_lookup_forbidden'],
+    ['unavailable', 503, 'identity_directory_unavailable'],
+  ] as const)('maps exact principal %s to %i and performs zero writes', async (status, httpStatus, error) => {
+    setOctoIdentity(stub({
+      verifyBot: async () => ({ uid: 'bot_1', spaceId: 's_real' }),
+      lookupSpacePrincipalAsBot: async () => ({ status }),
+    }))
+    resolveDocRole.mockResolvedValue('admin')
+    const res = await fetch(`${base}/v1/bot/docs/d_bot/members`, {
+      method: 'PUT',
+      headers: { authorization: 'Bearer bot-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({ uid: 'u_target', role: 'writer' }),
+    })
+    expect(res.status).toBe(httpStatus)
+    expect(await res.json()).toEqual({ error })
+    expect(upsertDirect).not.toHaveBeenCalled()
+    expect(updateExistingDirect).not.toHaveBeenCalled()
+    expect(bumpEpochMock).not.toHaveBeenCalled()
+  })
+
+  it.each(['not_eligible', 'unavailable'] as const)(
+    'rejects %s on a Bot own-Space upsert with zero writes or epoch bump',
+    async (status) => {
+      setOctoIdentity(stub({
+        verifyBot: async () => ({ uid: 'bot_1', spaceId: 's_real' }),
+        lookupSpacePrincipalAsBot: async () => ({ status }),
+      }))
+      resolveDocRole.mockResolvedValue('admin')
+      const res = await fetch(`${base}/v1/bot/docs/d_bot/members`, {
+        method: 'PUT',
+        headers: { authorization: 'Bearer bot-secret', 'content-type': 'application/json' },
+        body: JSON.stringify({ uid: 'u_target', role: 'writer' }),
+      })
+      expect(res.status).toBe(status === 'not_eligible' ? 404 : 503)
+      expect(upsertDirect).not.toHaveBeenCalled()
+      expect(updateExistingDirect).not.toHaveBeenCalled()
+      expect(bumpEpochMock).not.toHaveBeenCalled()
+    },
+  )
+
+  it('requires principalSpaceId for delete before any mutation', async () => {
+    setOctoIdentity(stub({ verifyBot: async () => ({ uid: 'bot_1', spaceId: 's_real' }) }))
+    resolveDocRole.mockResolvedValue('admin')
+
+    const res = await fetch(`${base}/v1/bot/docs/d_bot/members/u_target`, {
+      method: 'DELETE', headers: { authorization: 'Bearer bot-secret' },
+    })
+
+    expect(res.status).toBe(400)
+    expect(await res.json()).toEqual({ error: 'principalSpaceId required' })
+    expect(removePrincipalExact).not.toHaveBeenCalled()
+  })
+
+  it('returns an idempotent empty removal without publishing when no exact row exists', async () => {
+    setOctoIdentity(stub({ verifyBot: async () => ({ uid: 'bot_1', spaceId: 's_real' }) }))
+    resolveDocRole.mockResolvedValue('admin')
+    removePrincipalExact.mockResolvedValue({ changed: false, removedUids: [] })
+
+    const res = await fetch(`${base}/v1/bot/docs/d_bot/members/missing?principalSpaceId=s_real`, {
+      method: 'DELETE', headers: { authorization: 'Bearer bot-secret' },
+    })
+
+    expect(res.status).toBe(200)
+    expect(await res.json()).toEqual({ ok: true, removedUids: [] })
+  })
+
+  it('deletes exactly without directory lookup or service token', async () => {
+    const spaceBots = vi.fn(async () => { throw new Error('must not be called') })
     setOctoIdentity(stub({
       verifyBot: async () => ({ uid: 'bot_1', spaceId: 's_real' }),
       spaceBots,
@@ -334,36 +460,15 @@ describe('bot mount /v1/bot/docs (§ v4.3)', () => {
     resolveDocRole.mockResolvedValue('admin')
 
     const res = await fetch(`${base}/v1/bot/docs/d_bot/members/u_target?principalSpaceId=s_real`, {
-      method: 'DELETE',
-      headers: { authorization: 'Bearer bot-secret' },
+      method: 'DELETE', headers: { authorization: 'Bearer bot-secret' },
     })
 
     expect(res.status).toBe(200)
     expect(await res.json()).toEqual({ ok: true, removedUids: ['u_target'] })
-    expect(spaceBots).toHaveBeenCalledWith('s_real', 'configured-service-token')
-    expect(spaceBots).not.toHaveBeenCalledWith('s_real', 'bot-secret')
-    expect(removePrincipalWithBots).toHaveBeenCalledWith({
-      docId: 'd_bot', uid: 'u_target', principalSpaceId: 's_real', botUids: [],
-    })
-  })
-
-  it('fails mounted Bot member-delete closed without a service token before directory lookup or write', async () => {
-    const spaceBots = vi.fn(async () => [])
-    setOctoIdentity(stub({
-      verifyBot: async () => ({ uid: 'bot_1', spaceId: 's_real' }),
-      spaceBots,
-    }))
-    resolveDocRole.mockResolvedValue('admin')
-
-    const res = await fetch(`${base}/v1/bot/docs/d_bot/members/u_target?principalSpaceId=s_real`, {
-      method: 'DELETE',
-      headers: { authorization: 'Bearer bot-secret' },
-    })
-
-    expect(res.status).toBe(503)
-    expect(await res.json()).toEqual({ error: 'bot_directory_unavailable' })
     expect(spaceBots).not.toHaveBeenCalled()
-    expect(removePrincipalWithBots).not.toHaveBeenCalled()
+    expect(removePrincipalExact).toHaveBeenCalledWith({
+      docId: 'd_bot', uid: 'u_target', principalSpaceId: 's_real',
+    })
   })
 })
 
@@ -427,7 +532,7 @@ describe('human mount /api/v1/docs stays unchanged', () => {
     expect(upsertDirect).toHaveBeenCalledTimes(1)
   })
 
-  it('continues using req.octoToken for mounted Human member-delete directory lookup', async () => {
+  it('threads the Human session token into the member-delete identity lookup', async () => {
     config.octoIdentity.serviceToken = 'configured-service-token'
     const spaceBots = vi.fn(async () => [])
     setOctoIdentity(stub({
@@ -444,7 +549,10 @@ describe('human mount /api/v1/docs stays unchanged', () => {
 
     expect(res.status).toBe(200)
     expect(spaceBots).toHaveBeenCalledWith('s_real', 'human-session-token')
-    expect(spaceBots).not.toHaveBeenCalledWith('s_real', 'configured-service-token')
-    expect(removePrincipalWithBots).toHaveBeenCalledTimes(1)
+    expect(removePrincipalWithBots).toHaveBeenCalledWith({
+      docId: 'd_bot', uid: 'u_target', principalSpaceId: 's_real', botUids: [],
+    })
+    expect(removePrincipalExact).not.toHaveBeenCalled()
   })
+
 })

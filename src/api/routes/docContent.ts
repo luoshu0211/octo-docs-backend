@@ -13,6 +13,7 @@
  * editDocBody service, because the live write path bypasses onAuthenticate.
  */
 import { Router, type Router as ExpressRouter, type Request, type Response } from 'express'
+import { Node as PMNode } from 'prosemirror-model'
 import { requireDocRole } from '../guard.js'
 import { readLiveForEdit } from '../../collab/liveDocWrite.js'
 import { editDocBody } from '../services/editDocBody.js'
@@ -157,6 +158,80 @@ export async function getDocContentHandler(req: Request, res: Response): Promise
       doc: pmDoc.toJSON(),
       schemaVersion: SCHEMA_VERSION,
       baseVersion: encodeBaseVersion(baseSV),
+    })
+  } catch {
+    res.status(500).json({ error: 'internal_error' })
+  }
+}
+
+// ── GET /:docId/summary-source — summarize-ready read (reader) ────────────────
+// Contract consumed by octo-smart-summary's FetchSummarySource (the AI 速览
+// preview / document summary): same reader authorization as /content, but the
+// ProseMirror body is flattened to plain text so the summary service never has to
+// understand the doc schema. Rich-text body docs only (board/sheet/whiteboard are
+// rejected by requireBodyEditableDocType, matching /content).
+docContentRouter.get('/:docId/summary-source', getSummarySourceHandler)
+
+/**
+ * Block-aware plain text for the AI-preview source: block nodes separated by a
+ * blank line, and each attribute-backed leaf/atom node emits the DISPLAYED text it
+ * stores in attrs rather than a bare newline. All 7 attr-backed leaf types are
+ * covered (inlineMath/blockMath latex, mention label, emoji name, fileAttachment
+ * fileName, image alt/title, bookmark title/description); only truly text-less
+ * leaves (hardBreak) keep the newline substitution. Without this, `textBetween`'s
+ * string leaf-substitute drops attribute-backed content — a formula- or bookmark-
+ * only doc would flatten to '' — leaving the summary service to summarize nothing
+ * or misleading text (mirrors each node's schema toDOM).
+ */
+function pmDocToPlainText(pmDoc: PMNode): string {
+  return pmDoc.textBetween(0, pmDoc.content.size, '\n\n', leafDisplayText).trim()
+}
+
+/** Displayed text of a leaf/atom node, taken from its attrs; other leaves keep \n. */
+function leafDisplayText(node: PMNode): string {
+  const attrs = node.attrs as Record<string, unknown>
+  switch (node.type.name) {
+    case 'inlineMath':
+    case 'blockMath':
+      return typeof attrs.latex === 'string' ? attrs.latex : ''
+    case 'mention':
+      return typeof attrs.label === 'string' ? attrs.label : ''
+    case 'emoji':
+      return typeof attrs.name === 'string' ? `:${attrs.name}:` : ''
+    case 'fileAttachment':
+      return typeof attrs.fileName === 'string' ? attrs.fileName : ''
+    case 'image': {
+      const alt = typeof attrs.alt === 'string' ? attrs.alt : ''
+      const title = typeof attrs.title === 'string' ? attrs.title : ''
+      return alt || title
+    }
+    case 'bookmark': {
+      const parts = [attrs.title, attrs.description].filter(
+        (v): v is string => typeof v === 'string' && v.length > 0,
+      )
+      return parts.join(' — ')
+    }
+    default:
+      // Truly text-less leaves (e.g. hardBreak) keep the newline substitution.
+      return '\n'
+  }
+}
+
+export async function getSummarySourceHandler(req: Request, res: Response): Promise<void> {
+  const guard = await requireDocRole(req, res, req.params.docId!, 'reader')
+  if (!guard) return
+  if (!requireBodyEditableDocType(res, guard.meta.doc_type)) return
+
+  try {
+    const { pmDoc, baseSV } = await readLiveForEdit(guard.meta.document_name)
+    res.status(200).json({
+      document_id: guard.meta.doc_id,
+      title: guard.meta.title ?? '',
+      version: encodeBaseVersion(baseSV),
+      content: pmDocToPlainText(pmDoc),
+      // chunks omitted in v1: the summary service treats content alone as the
+      // whole document and applies its own rune caps.
+      chunks: [],
     })
   } catch {
     res.status(500).json({ error: 'internal_error' })
