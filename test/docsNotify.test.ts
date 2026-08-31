@@ -29,6 +29,9 @@ vi.mock('../src/db/repos/docMetaRepo.js', () => ({
     })),
   },
 }))
+vi.mock('../src/db/repos/docAccessNotifyCardRepo.js', () => ({
+  docAccessNotifyCardRepo: { record: vi.fn(async () => {}) },
+}))
 const mockIdentity = vi.hoisted(() => ({
   getUser: vi.fn(async (uid: string) => ({ uid, name: uid === 'u-req' ? '申请人小明' : uid })),
   getSpaceName: vi.fn(async () => ''),
@@ -40,6 +43,7 @@ import { notifyDocAccessRequested, notifyDocMentioned, mentionedUserUids } from 
 import { config } from '../src/config/env.js'
 import { docMemberRepo } from '../src/db/repos/docMemberRepo.js'
 import { docMetaRepo } from '../src/db/repos/docMetaRepo.js'
+import { docAccessNotifyCardRepo } from '../src/db/repos/docAccessNotifyCardRepo.js'
 
 const cfg = config as unknown as { notify: { docsToken: string; service: string } }
 
@@ -62,6 +66,16 @@ function baseParams() {
 
 function okResp(delivered: string[]) {
   return new Response(JSON.stringify({ delivered, filtered: {} }), { status: 200 })
+}
+
+function cardResp(uid: string, spaceId: string) {
+  return new Response(JSON.stringify({
+    delivered: [uid], filtered: {},
+    delivered_cards: [{
+      uid, channel_id: `ch-${spaceId}`, channel_type: 1,
+      message_id: `m-${spaceId}`, client_msg_no: `cm-${spaceId}`,
+    }],
+  }), { status: 200 })
 }
 
 describe('notifyDocAccessRequested', () => {
@@ -138,7 +152,7 @@ describe('notifyDocAccessRequested', () => {
     expect(body.space_id).toBe('space-test')
   })
 
-  it('filters principals first, then de-duplicates uid-addressed delivery', async () => {
+  it('preserves same-UID approver principals in distinct Spaces after exact requester exclusion', async () => {
     ;(docMemberRepo.list as ReturnType<typeof vi.fn>).mockResolvedValue([
       { uid: 'admin', principal_space_id: 'space-123', role: 3 }, // exact requester principal: excluded
       { uid: 'admin', principal_space_id: 'space-other', role: 3 }, // qualifying approver principal
@@ -151,11 +165,32 @@ describe('notifyDocAccessRequested', () => {
       requesterUid: 'admin',
       requesterSpaceId: 'space-123',
     })
-    expect(delivered).toBe(2)
-    const recipients = (fetch as ReturnType<typeof vi.fn>).mock.calls
-      .map((call) => JSON.parse((call[1] as RequestInit).body as string).targets[0])
+    expect(delivered).toBe(3)
+    const deliveries = (fetch as ReturnType<typeof vi.fn>).mock.calls
+      .map((call) => {
+        const b = JSON.parse((call[1] as RequestInit).body as string)
+        return `${b.targets[0]}@${b.space_id}`
+      })
       .sort()
-    expect(recipients).toEqual(['admin', 'admin-2'])
+    expect(deliveries).toEqual(['admin-2@space-test', 'admin@space-other', 'admin@space-test'])
+    expect(deliveries).not.toContain('admin@space-123')
+  })
+
+  it('records two delivered cards for one uid in two Spaces with delivery Space coordinates', async () => {
+    ;(docMemberRepo.list as ReturnType<typeof vi.fn>).mockResolvedValue([
+      { uid: 'same-admin', principal_space_id: 'space-A', role: 3 },
+      { uid: 'same-admin', principal_space_id: 'space-B', role: 3 },
+    ])
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init: RequestInit) => {
+      const body = JSON.parse(init.body as string)
+      return cardResp(body.targets[0], body.space_id)
+    }))
+
+    expect(await notifyDocAccessRequested({ ...baseParams(), ownerId: '', ownerSpaceId: '' })).toBe(2)
+    expect(docAccessNotifyCardRepo.record).toHaveBeenCalledWith('req-1', [
+      expect.objectContaining({ recipientUid: 'same-admin', deliverySpaceId: 'space-A', messageId: 'm-space-A' }),
+      expect.objectContaining({ recipientUid: 'same-admin', deliverySpaceId: 'space-B', messageId: 'm-space-B' }),
+    ])
   })
 
   it('stamps each notification with the approver principal Space', async () => {

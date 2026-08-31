@@ -14,10 +14,9 @@
  *   2. It MUST NOT read or trust a client-supplied `X-Space-Id` header — the space
  *      is only ever the server-side reverse lookup (anti-spoof).
  *   3. It MUST NOT set req.octoToken. The bot path has no caller session token.
- *      It stashes the bot bearer on req.botToken for bot-realm operations. Code
- *      that calls human/service directory APIs (notably member-add roster
- *      validation) must instead use OCTO_SERVER_TOKEN and fail closed if that
- *      service credential is absent.
+ *      It stashes the bot bearer on req.botToken for bot-realm operations,
+ *      including exact own-Space principal validation for member upsert. Foreign-
+ *      Space updates and exact member deletion perform no directory lookup.
  *
  * Mount order: FIRST on the bot router, before any metadata router. On verify
  * failure return 401 (same envelope as authMiddleware).
@@ -52,9 +51,9 @@ export async function verifyBotMiddleware(
   // req.botToken in shared logic) so the boundary is declared at the mount.
   req.docSpaceScope = { mode: 'bot', spaceId: identity.spaceId }
   // Stash the bot's own bearer token for downstream bot-realm operations (for
-  // example forward-grant's GET /v1/bot/user/info lookup). This is NOT
-  // req.octoToken: the bot path has no caller session token, and member-add's
-  // human/service roster APIs deliberately use OCTO_SERVER_TOKEN instead.
+  // example forward-grant's user lookup and member-add's exact Space-principal
+  // lookup). This is NOT req.octoToken: the bot path has no caller session
+  // token. Human/service directory enumeration remains separately credentialed.
   req.botToken = token
   // Surface the bot's human owner (robot.creator_uid) when octo-server resolved
   // one. The doc-create path uses it to auto-grant that owner admin so the bot's

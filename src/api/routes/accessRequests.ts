@@ -62,15 +62,13 @@ const isApprovableRole = (role: AccessRequestRole, docType: string): boolean =>
   approvableRoles(docType).includes(role)
 
 /**
- * The decider's own session token, when this request carries one. The REST
- * decision paths are authenticated, so the approver name can resolve with the
- * caller's token instead of depending on OCTO_SERVER_TOKEN. Read defensively:
- * this feeds a fire-and-forget display detail, and it must never be the reason a
- * decision response fails.
+ * The decider's authoritative trusted Space for a REST decision — the caller's
+ * server-verified current Space (`req.principalSpaceId`). It deliberately does
+ * not fall back to the document's Space: those are different facts for a
+ * multi-Space user, and guessing would misattribute the approval.
  */
-function callerSessionToken(req: Request): string | undefined {
-  const header = typeof req.header === 'function' ? req.header('token') : undefined
-  return header && header !== '' ? header : undefined
+function deciderSpaceId(req: Request): string {
+  return req.principalSpaceId ?? ''
 }
 
 /**
@@ -303,6 +301,8 @@ accessRequestsRouter.post(
     }
 
 
+    const decidedAtUnix = Math.floor(Date.now() / 1000)
+    const decidedBySpaceId = deciderSpaceId(req)
     const approval = await approveAccessRequest({
       docId: req.params.docId!,
       requestId: req.params.requestId!,
@@ -314,6 +314,8 @@ accessRequestsRouter.post(
       roleNum: roleToNumber(humanRole),
       allowAdmin: humanRole === 'admin',
       decidedBy: req.uid!,
+      decidedBySpaceId,
+      decidedAtUnix,
     })
     if (!approval.transitioned) {
       // Already denied / approved / cancelled (or lost a concurrent race):
@@ -347,17 +349,17 @@ accessRequestsRouter.post(
     }
     // Best-effort sibling-card sync. REST path has no card-callback finalizer, so
     // the decider (req.uid) holds a live card and is terminalized here too
-    // (deciderCardHandledExternally omitted).
+    // (deciderCardHandledExternally omitted). Carries the authoritative decider
+    // IDs + decision time so octo-server renders each card itself.
     void syncDecisionCards({
       requestId: req.params.requestId!,
       spaceId: guard.meta.space_id,
       docId: guard.meta.doc_id,
       title: guard.meta.title,
       deciderUid: req.uid!,
-      deciderSpaceId: req.principalSpaceId ?? guard.meta.space_id,
+      deciderSpaceId: decidedBySpaceId,
       denied: false,
-      callerToken: callerSessionToken(req),
-      decidedAtSeconds: Math.floor(Date.now() / 1000),
+      decidedAtSeconds: decidedAtUnix,
     }).catch(() => {})
     // Response shape (per scheme): zero-bot requests keep the legacy { ok, role }
     // byte-for-byte (no empty field). Only when the request carried bots do we add
@@ -398,11 +400,15 @@ accessRequestsRouter.post(
     // reports whether it actually transitioned a row. Only report ok when a
     // genuine pending -> denied transition happened; a replayed / already-decided
     // (approved OR denied) request is a 409, never a false success.
+    const decidedAtUnix = Math.floor(Date.now() / 1000)
+    const decidedBySpaceId = deciderSpaceId(req)
     const decided = await docAccessRequestRepo.decide({
       docId: req.params.docId!,
       requestId: req.params.requestId!,
       status: REQUEST_STATUS_DENIED,
       decidedBy: req.uid!,
+      decidedBySpaceId,
+      decidedAtUnix,
     })
     if (!decided) {
       res.status(409).json({ error: 'not_pending' })
@@ -420,10 +426,9 @@ accessRequestsRouter.post(
       docId: guard.meta.doc_id,
       title: guard.meta.title,
       deciderUid: req.uid!,
-      deciderSpaceId: req.principalSpaceId ?? guard.meta.space_id,
+      deciderSpaceId: decidedBySpaceId,
       denied: true,
-      callerToken: callerSessionToken(req),
-      decidedAtSeconds: Math.floor(Date.now() / 1000),
+      decidedAtSeconds: decidedAtUnix,
     }).catch(() => {})
     res.status(200).json({ ok: true })
   },

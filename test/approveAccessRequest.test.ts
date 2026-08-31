@@ -33,12 +33,14 @@ vi.mock('../src/db/repos/docMetaRepo.js', () => ({
 vi.mock('../src/permission/epoch.js', () => ({ refreshAndPublish: vi.fn() }))
 
 import { approveAccessRequest } from '../src/api/services/approveAccessRequest.js'
+import { docAccessRequestRepo } from '../src/db/repos/docAccessRequestRepo.js'
 import { docMemberRepo } from '../src/db/repos/docMemberRepo.js'
 import { refreshAndPublish } from '../src/permission/epoch.js'
 
 const params = {
   docId: 'd1', requestId: 'r1', documentName: 'dn1', ownerUid: 'owner', ownerSpaceId: 'sp1',
   uid: 'human', principalSpaceId: 'sp1', roleNum: 1, decidedBy: 'admin',
+  decidedBySpaceId: 'sp-admin', decidedAtUnix: 1_784_073_600,
 }
 
 beforeEach(() => {
@@ -65,5 +67,18 @@ describe('approveAccessRequest atomic primary grant', () => {
     expect([first.transitioned, second.transitioned].sort()).toEqual([false, true])
     expect(docMemberRepo.upsertGrantMaxTx).toHaveBeenCalledTimes(1)
     expect(state.epoch).toBe(1)
+  })
+
+  it('persists the authoritative decider Space + decision time atomically in the CAS', async () => {
+    await approveAccessRequest(params)
+    expect(docAccessRequestRepo.decideTx).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        status: 2,
+        decidedBy: 'admin',
+        decidedBySpaceId: 'sp-admin',
+        decidedAtUnix: 1_784_073_600,
+      }),
+    )
   })
 })

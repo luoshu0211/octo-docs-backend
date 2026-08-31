@@ -78,7 +78,7 @@ Copy `.env.example` to `.env` and adjust. Summary:
 | `COLLAB_TOKEN_SECRET` / `COLLAB_TOKEN_TTL_SECONDS` | collab JWT signing + TTL (5 min) | §4.4 |
 | `COLLAB_ALLOW_LEGACY_TOKENS_WITHOUT_HOME_SPACE_PROOF` | temporary Home-Space/PPT compatibility only; it never bypasses Docs current-Space proof | §4.4 / deployment guide |
 | `OCTO_IDENTITY_MODE` (`http`/`middleware`) / `OCTO_SERVER_BASE_URL` | octo identity integration | §4.7 |
-| `OCTO_SERVER_TOKEN` | service token for octo-server directory lookups. Human member-add/delete use `req.octoToken`; Bot member-add/delete must use this service token (never the Bot bearer) and fail closed with 503 when it is unset. Bot-realm operations such as forward-grant may use the Bot token against the Bot user-info route | §4.7 / v4.3 bot API |
+| `OCTO_SERVER_TOKEN` | optional service token for octo-server human/service directory lookups. Human member writes prefer this token when configured and otherwise use `req.octoToken`. Bot PUT defaults an omitted `principalSpaceId` to the Bot bearer-authenticated Space (not the document Home Space), validates that exact target with the Bot bearer, and may upsert `(docId, uid, BotSpace)` regardless of the document Home Space. When a Bot explicitly selects another Space, PUT deliberately performs no current directory-membership/eligibility revalidation and may only change the role on an already-existing exact row; it cannot create that grant. Bot PUT and exact, directory-free Bot DELETE remain enabled without `OCTO_SERVER_TOKEN`. Human DELETE queries the target Space's Bot directory, cascades a Human removal to that Human's authorized same-Space Bots, and removes an explicitly targeted Bot exactly; directory failure is fail-closed. Deploy octo-server PR #819 before enabling Bot own-Space upserts. | §4.7 / v4.3 bot API |
 | `MAX_DOC_BYTES` | single-doc size hard cap (~10MB) | §9.5 |
 | `SEARCH_ENABLED` / `SEARCH_PAGE_SIZE_MAX` / `SEARCH_MAX_VISIBLE_TERMS` | full-text doc search: feature switch, per-page hit cap, and the OpenSearch `doc_id IN` down-push bound (over bound ⇒ 503 `terms_limit_exceeded`) | search |
 | `OPENSEARCH_NODE` / `OPENSEARCH_USERNAME` / `OPENSEARCH_PASSWORD` | read-only OpenSearch client for the `octo-doc` index | search |
@@ -125,6 +125,22 @@ For local development before building, `npm run migrate:dev` runs the same
 runner directly from TypeScript. Plain `mysql < migrations/upgrades/...` remains
 valid as a low-level fallback, but production deploys should use `npm run
 migrate` as an explicit step before starting the new server version.
+
+### Approval-card rolling-upgrade compatibility
+
+The approval callback normally carries the operator's trusted
+`operator_space_id`. During a compatible octo-server rollout, an older queued or
+replayed callback may omit that newly-added field. Only for that missing-field
+legacy shape, Docs uses the signed card delivery `space_id` and revalidates the
+exact `(operator_uid, space_id)` principal as a current document admin before
+the pending→terminal CAS; it never substitutes the document owner/Home Space.
+An explicitly present but empty/invalid `operator_space_id` remains forbidden.
+
+Callback receipts are immutable idempotency records. An event whose receipt was
+already finalized as `forbidden` before the compatible deployment replays that
+same result and is not re-authorized; a still-unfinalized/queued legacy event can
+be revalidated and succeed after rollout. This preserves replay-exact behavior
+without weakening authorization.
 When adopting the runner on a database previously migrated by hand, its first
 run will re-run the idempotent upgrade files once to populate the
 `schema_migrations` ledger.

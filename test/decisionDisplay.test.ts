@@ -1,20 +1,14 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect } from 'vitest'
 
 // Pin the card display zone so the expected strings are fixed literals and the
 // assertions hold in any process/CI timezone — the zone bug this guards against
 // is invisible when the expectation is built from the same local zone as input.
+import { vi } from 'vitest'
 vi.mock('../src/config/env.js', () => ({
   config: { cardDisplayTimeZone: 'Asia/Shanghai' },
 }))
-// Mock the identity module so the operator lookup is deterministic and importing
-// this module does not pull in the real config/repos.
-const getUser = vi.fn()
-const getSpaceName = vi.fn()
-vi.mock('../src/auth/octoIdentity.js', () => ({
-  getOctoIdentity: () => ({ getUser, getSpaceName }),
-}))
 
-const { buildDecisionDisplay, buildDecisionDisplayAt } = await import(
+const { buildDecisionDisplay, truncateDisplay } = await import(
   '../src/api/services/decisionDisplay.js'
 )
 const { formatCardTimestamp, formatCardTimestampFromSeconds } = await import(
@@ -48,62 +42,30 @@ describe('formatCardTimestamp (explicit zone)', () => {
   })
 })
 
-describe('buildDecisionDisplay (seconds source)', () => {
-  beforeEach(() => { getUser.mockReset(); getSpaceName.mockReset().mockResolvedValue('test Space') })
-
-  it('includes the resolved operator_name and the formatted decided_at', async () => {
-    getUser.mockResolvedValueOnce({ uid: 'op-1', name: '张三' })
-    const { display } = await buildDecisionDisplay('季度目标', 'op-1', AT_SECONDS)
-    expect(display).toEqual({ title: '季度目标', operator_name: '张三', decided_at: AT_DISPLAY })
+// The approval-card display is now identity-BY-ID: docs returns the decider IDs +
+// time as first-class result fields and octo-server resolves names itself. The
+// only `display` field docs still sends is the (bounded) title — it queries no
+// user/Space profile. These tests pin that title-only shape; there is deliberately
+// no operator-name resolution to assert anymore.
+describe('buildDecisionDisplay (title only)', () => {
+  it('returns just the title', () => {
+    expect(buildDecisionDisplay('季度目标')).toEqual({ title: '季度目标' })
   })
 
-  it('includes the operator Space when provided', async () => {
-    getUser.mockResolvedValueOnce({ uid: 'op-1', name: '张三' })
-    const { display } = await buildDecisionDisplay('季度目标', 'op-1', AT_SECONDS, undefined, 'space-1')
-    expect(display).toEqual({
-      title: '季度目标', operator_name: '张三', operator_space_name: 'test Space', decided_at: AT_DISPLAY,
-    })
+  it('falls back to a generic title when empty', () => {
+    expect(buildDecisionDisplay('')).toEqual({ title: '文档访问申请' })
   })
 
-  it('omits operator_name on a lookup miss (octo-server renders its generic label)', async () => {
-    getUser.mockResolvedValueOnce(null)
-    const { display } = await buildDecisionDisplay('季度目标', 'op-1', 0)
-    expect(display).toEqual({ title: '季度目标' })
+  it('never resolves or emits operator_name / decided_at', () => {
+    const display = buildDecisionDisplay('季度目标')
+    expect(display).not.toHaveProperty('operator_name')
+    expect(display).not.toHaveProperty('operator_space_name')
+    expect(display).not.toHaveProperty('decided_at')
   })
 
-  it('never throws when the lookup rejects; still returns title + decided_at', async () => {
-    getUser.mockRejectedValueOnce(new Error('identity unreachable'))
-    const { display } = await buildDecisionDisplay('', 'op-1', AT_SECONDS)
-    expect(display).toEqual({ title: '文档访问申请', decided_at: AT_DISPLAY })
-  })
-
-  it('never puts a request on the wire for an empty uid', async () => {
-    const { display } = await buildDecisionDisplay('季度目标', '', AT_SECONDS)
-    expect(getUser).not.toHaveBeenCalled()
-    expect(display).toEqual({ title: '季度目标', decided_at: AT_DISPLAY })
-  })
-
-  it('caps every free-text display value at 500 runes without splitting unicode', async () => {
-    getUser.mockResolvedValueOnce({ uid: 'op-1', name: '😀'.repeat(600) })
-    const { display } = await buildDecisionDisplay('文'.repeat(600), 'op-1', AT_SECONDS)
-    for (const value of Object.values(display)) expect([...value].length).toBeLessThanOrEqual(500)
+  it('caps the title at 500 runes without splitting unicode', () => {
+    const display = buildDecisionDisplay('文'.repeat(600))
     expect([...display.title!]).toHaveLength(500)
-    expect([...display.operator_name!]).toHaveLength(500)
-  })
-})
-
-describe('buildDecisionDisplayAt (persisted Date source)', () => {
-  beforeEach(() => { getUser.mockReset(); getSpaceName.mockReset().mockResolvedValue('test Space') })
-
-  it('formats a persisted decision Date in the configured zone', async () => {
-    getUser.mockResolvedValueOnce({ uid: 'admin-A', name: 'Alice' })
-    const { display } = await buildDecisionDisplayAt('季度目标', 'admin-A', new Date(AT_UTC))
-    expect(display).toEqual({ title: '季度目标', operator_name: 'Alice', decided_at: AT_DISPLAY })
-  })
-
-  it('omits decided_at when the persisted time is missing', async () => {
-    getUser.mockResolvedValueOnce({ uid: 'admin-A', name: 'Alice' })
-    const { display } = await buildDecisionDisplayAt('季度目标', 'admin-A', null)
-    expect(display).toEqual({ title: '季度目标', operator_name: 'Alice' })
+    expect([...truncateDisplay('😀'.repeat(600))]).toHaveLength(500)
   })
 })

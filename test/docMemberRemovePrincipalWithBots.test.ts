@@ -11,23 +11,30 @@ import { docMemberRepo } from '../src/db/repos/docMemberRepo.js'
 beforeEach(() => tx.query.mockReset())
 
 describe('docMemberRepo.removePrincipalWithBots', () => {
-  it('deletes the Human and same-Space Bots and increments epoch exactly once', async () => {
+  it('deletes only present authorized principals and increments epoch exactly once', async () => {
     tx.query
-      .mockResolvedValueOnce([{ uid: 'human' }, { uid: 'bot-a' }, { uid: 'bot-b' }])
+      .mockResolvedValueOnce([{ uid: 'human' }, { uid: 'bot-a' }])
       .mockResolvedValueOnce([])
       .mockResolvedValueOnce([])
       .mockResolvedValueOnce([{ permission_epoch: 12 }])
 
     await expect(docMemberRepo.removePrincipalWithBots({
-      docId: 'd1', principalSpaceId: 'sp1', uid: 'human', botUids: ['bot-a', 'bot-b'],
-    })).resolves.toEqual({ changed: true, removedUids: ['human', 'bot-a', 'bot-b'], newEpoch: 12 })
+      docId: 'd1', principalSpaceId: 'sp1', uid: 'human', botUids: ['bot-a', 'bot-missing'],
+    })).resolves.toEqual({ changed: true, removedUids: ['human', 'bot-a'], newEpoch: 12 })
 
-    const calls = tx.query.mock.calls
-    expect(calls).toHaveLength(4)
-    expect(calls[0]![0]).toContain('FOR UPDATE')
-    expect(calls[0]![1]).toEqual(['d1', 'sp1', 'human', 'bot-a', 'bot-b'])
-    expect(calls[1]![0]).toContain('DELETE FROM doc_member')
-    expect(calls[1]![1]).toEqual(['d1', 'sp1', 'human', 'bot-a', 'bot-b'])
-    expect(calls.filter(([sql]) => String(sql).includes('permission_epoch = permission_epoch + 1'))).toHaveLength(1)
+    expect(tx.query.mock.calls[0]![1]).toEqual(['d1', 'sp1', 'human', 'bot-a', 'bot-missing'])
+    expect(tx.query.mock.calls[1]![1]).toEqual(['d1', 'sp1', 'human', 'bot-a'])
+    expect(tx.query.mock.calls.filter(([sql]) =>
+      String(sql).includes('permission_epoch = permission_epoch + 1'))).toHaveLength(1)
+  })
+
+  it('is a no-op without epoch mutation when none of the authorized rows exist', async () => {
+    tx.query.mockResolvedValueOnce([])
+
+    await expect(docMemberRepo.removePrincipalWithBots({
+      docId: 'd1', principalSpaceId: 'sp1', uid: 'human', botUids: ['bot-a'],
+    })).resolves.toEqual({ changed: false, removedUids: [] })
+
+    expect(tx.query).toHaveBeenCalledTimes(1)
   })
 })

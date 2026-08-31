@@ -14,7 +14,6 @@ import { docMemberRepo } from "../../db/repos/docMemberRepo.js";
 import { requireDocRole } from "../guard.js";
 import { bumpEpoch, refreshAndPublish } from "../../permission/epoch.js";
 import { getOctoIdentity } from "../../auth/octoIdentity.js";
-import { config } from "../../config/env.js";
 import {
   isMemberRole,
   roleToNumber,
@@ -98,9 +97,10 @@ membersRouter.get('/:docId/members', async (req: Request, res: Response) => {
 });
 
 /**
- * PUT members — direct add / change role (upsert by uid; needs admin).
- * MUST first verify the target uid is a real octo user (§8.4 / §4.6 fix):
- * non-existent uid => 404 user_not_found (no ghost member written).
+ * PUT members — direct add / change role (Space-qualified; needs admin).
+ * Human targets and Bot own-Space upserts are directory-validated before writes.
+ * A Bot's explicit foreign-Space target is intentionally lookup-free and can
+ * update only an already-existing exact row; this route cannot mint that grant.
  */
 membersRouter.put("/:docId/members", async (req: Request, res: Response) => {
   const guard = await requireDocRole(req, res, req.params.docId!, "admin");
@@ -112,8 +112,11 @@ membersRouter.put("/:docId/members", async (req: Request, res: Response) => {
   }
   const requestedPrincipalSpaceId =
     typeof principalSpaceId === "string" ? principalSpaceId.trim() : "";
-  const targetPrincipalSpaceId =
-    requestedPrincipalSpaceId || guard.meta.space_id;
+  const isBotRequest = typeof req.botToken === "string";
+  // An omitted Space is mount-specific: Humans retain the document Home Space,
+  // while Bots default to the Space authenticated by their bearer.
+  const targetPrincipalSpaceId = requestedPrincipalSpaceId ||
+    (isBotRequest ? req.principalSpaceId ?? "" : guard.meta.space_id);
   const parsedRole = parseRole(role);
   if (!parsedRole) {
     res
@@ -122,51 +125,68 @@ membersRouter.put("/:docId/members", async (req: Request, res: Response) => {
     return;
   }
 
-  // The client may name a target principal, but it cannot prove that
-  // principal's Space. Validate the exact (uid, principalSpaceId) against
-  // Octo's authoritative roster before any write. isSpaceMember() is not used:
-  // it answers only for the token holder, not an arbitrary target.
+  // Own-Space Bot upserts and Human writes validate the exact principal before
+  // writing. An explicit foreign-Space Bot request is the deliberate exception:
+  // it performs no directory revalidation and can only update an exact row that
+  // already exists. isSpaceMember() is not used because it answers only for the
+  // token holder, not an arbitrary target.
   const identity = getOctoIdentity();
-  // The roster endpoints are human/service-directory APIs, not bot-realm APIs.
-  // A bot bearer must never be forwarded to them. Human requests retain their
-  // caller-session fallback; bot requests require the configured service token
-  // and fail closed before any directory call when it is absent.
-  const directoryToken = req.botToken
-    ? config.octoIdentity.serviceToken
-    : (req.octoToken ?? "");
-  if (!directoryToken) {
-    res.status(503).json({ error: "identity_directory_unavailable" });
-    return;
-  }
-  const roster = await identity.spaceMembers(
-    targetPrincipalSpaceId,
-    directoryToken,
-  );
-  if (roster === null) {
-    res.status(503).json({ error: "identity_directory_unavailable" });
-    return;
-  }
-  const target = roster.find((member) => member.uid === uid);
-  // The Space member roster is authoritative for Humans, but some Octo
-  // deployments omit robot rows from that endpoint. When the uid is absent (or
-  // explicitly marked as a Bot), resolve it through the authoritative Space Bot
-  // directory instead of rejecting a valid Bot before consulting that source.
-  if (!target || target.isBot) {
-    const bots = await identity.spaceBots(
+  const targetIsBotSpace = isBotRequest && targetPrincipalSpaceId === req.principalSpaceId;
+  if (targetIsBotSpace) {
+    // A Bot may create grants only in its bearer-authenticated Space. Validate
+    // the exact target there through the Bot-realm endpoint before upserting.
+    const lookup = await identity.lookupSpacePrincipalAsBot(
+      uid,
       targetPrincipalSpaceId,
-      directoryToken,
+      req.botToken!,
     );
-    if (bots === null) {
+    if (lookup.status === 'forbidden') {
+      res.status(403).json({ error: 'principal_lookup_forbidden' })
+      return
+    }
+    if (lookup.status === 'unavailable') {
       res.status(503).json({ error: "identity_directory_unavailable" });
       return;
     }
-    const bot = bots.find((candidate) => candidate.uid === uid);
-    const owner = bot?.creatorUid
-      ? roster.find((member) => member.uid === bot.creatorUid && !member.isBot)
-      : undefined;
-    if (!bot || !owner) {
+    if (lookup.status === 'not_found' || lookup.status === 'not_eligible') {
       res.status(404).json({ error: "principal_not_in_space" });
       return;
+    }
+  } else if (!isBotRequest) {
+    // Human behavior remains the established authoritative roster + Bot creator
+    // validation, authenticated with the caller session (or service fallback
+    // inside the HTTP identity wrapper).
+    const directoryToken = req.octoToken ?? "";
+    if (!directoryToken) {
+      res.status(503).json({ error: "identity_directory_unavailable" });
+      return;
+    }
+    const roster = await identity.spaceMembers(
+      targetPrincipalSpaceId,
+      directoryToken,
+    );
+    if (roster === null) {
+      res.status(503).json({ error: "identity_directory_unavailable" });
+      return;
+    }
+    const target = roster.find((member) => member.uid === uid);
+    if (!target || target.isBot) {
+      const bots = await identity.spaceBots(
+        targetPrincipalSpaceId,
+        directoryToken,
+      );
+      if (bots === null) {
+        res.status(503).json({ error: "identity_directory_unavailable" });
+        return;
+      }
+      const bot = bots.find((candidate) => candidate.uid === uid);
+      const owner = bot?.creatorUid
+        ? roster.find((member) => member.uid === bot.creatorUid && !member.isBot)
+        : undefined;
+      if (!bot || !owner) {
+        res.status(404).json({ error: "principal_not_in_space" });
+        return;
+      }
     }
   }
   const write = {
@@ -176,12 +196,14 @@ membersRouter.put("/:docId/members", async (req: Request, res: Response) => {
     roleNum: roleToNumber(parsedRole),
     grantedBy: req.uid!,
   };
-  if (targetPrincipalSpaceId === guard.meta.space_id) {
-    // The established home-Space add-member flow remains an upsert.
+  if (targetIsBotSpace || (!isBotRequest && targetPrincipalSpaceId === guard.meta.space_id)) {
+    // Humans retain Home-Space upsert semantics. Bots may upsert in their own
+    // authenticated Space even when the document belongs to another Space.
     await docMemberRepo.upsertDirect(write);
   } else {
-    // A non-home-Space principal is update-only. It may have been created by an
-    // approved access request/invite, but PUT /members cannot mint it directly.
+    // A foreign-Space principal is update-only. A Bot explicitly selecting this
+    // Space deliberately performs no current-membership/eligibility revalidation:
+    // the exact row must already exist and this route cannot mint a new grant.
     const updated = await docMemberRepo.updateExistingDirect(write);
     if (!updated) {
       res.status(404).json({ error: "member_not_found" });
@@ -223,40 +245,50 @@ membersRouter.delete(
       res.status(403).json({ error: "self_cannot_be_removed" });
       return;
     }
-    // Resolve ownership from Octo's authoritative Space Bot directory. A direct
-    // Bot removal deletes only that Bot. A human removal cascades to Bots whose
-    // creator_uid matches that human in this exact principal Space. Bot-mounted
-    // requests must use the service credential for this human/service directory;
-    // never forward the Bot bearer. Human requests retain their session token.
-    const directoryToken = req.botToken
-      ? config.octoIdentity.serviceToken
-      : (req.octoToken ?? "");
-    if (!directoryToken) {
-      res.status(503).json({ error: "bot_directory_unavailable" });
-      return;
+    const isBotRequest = typeof req.botToken === "string";
+    let removal: Awaited<ReturnType<typeof docMemberRepo.removePrincipalExact>>;
+    if (isBotRequest) {
+      // Bot-mounted requests are deliberately directory-free: the Bot bearer
+      // authorizes only the exact Space-qualified row named by the request.
+      // In particular, never substitute OCTO_SERVER_TOKEN and never infer a
+      // Human-to-Bot ownership cascade on this path.
+      removal = await docMemberRepo.removePrincipalExact({
+        docId: req.params.docId!,
+        uid: targetUid,
+        principalSpaceId,
+      });
+    } else {
+      // Human requests retain the product's creator cascade. Resolve the target
+      // through the authoritative Bot directory; the HTTP identity wrapper
+      // prefers OCTO_SERVER_TOKEN when configured and otherwise uses this caller
+      // session token. A missing/unavailable directory fails closed before writes.
+      const directoryToken = req.octoToken ?? "";
+      if (!directoryToken) {
+        res.status(503).json({ error: "bot_directory_unavailable" });
+        return;
+      }
+      const spaceBots = await getOctoIdentity().spaceBots(
+        principalSpaceId,
+        directoryToken,
+      );
+      if (spaceBots === null) {
+        res.status(503).json({ error: "bot_directory_unavailable" });
+        return;
+      }
+      const targetIsBot = spaceBots.some((bot) => bot.uid === targetUid);
+      const botUids = targetIsBot
+        ? []
+        : spaceBots
+            .filter((bot) => bot.creatorUid === targetUid)
+            .map((bot) => bot.uid);
+      removal = await docMemberRepo.removePrincipalWithBots({
+        docId: req.params.docId!,
+        uid: targetUid,
+        principalSpaceId,
+        botUids,
+      });
     }
-    const spaceBots = await getOctoIdentity().spaceBots(
-      principalSpaceId,
-      directoryToken,
-    );
-    if (spaceBots === null) {
-      res.status(503).json({ error: "bot_directory_unavailable" });
-      return;
-    }
-    const targetIsBot = spaceBots.some((bot) => bot.uid === targetUid);
-    const botUids = targetIsBot
-      ? []
-      : spaceBots
-          .filter((bot) => bot.creatorUid === targetUid)
-          .map((bot) => bot.uid);
-    const removal = await docMemberRepo.removePrincipalWithBots({
-      docId: req.params.docId!,
-      uid: targetUid,
-      principalSpaceId,
-      botUids,
-    });
     if (removal.changed && removal.newEpoch !== undefined) {
-      // One unscoped invalidation covers the removed human and every cascaded Bot.
       await refreshAndPublish(guard.meta.document_name, removal.newEpoch);
     }
     res.status(200).json({ ok: true, removedUids: removal.removedUids });

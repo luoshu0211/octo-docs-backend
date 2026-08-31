@@ -14,7 +14,7 @@ vi.mock('../src/collab/liveDocWrite.js', () => ({
   commitLiveEdit: vi.fn(),
 }))
 
-import { getDocContentHandler, patchDocContentHandler } from '../src/api/routes/docContent.js'
+import { getDocContentHandler, patchDocContentHandler, getSummarySourceHandler } from '../src/api/routes/docContent.js'
 import { requireDocRole } from '../src/api/guard.js'
 import { transaction } from '../src/db/pool.js'
 import { readLiveForEdit, commitLiveEdit } from '../src/collab/liveDocWrite.js'
@@ -753,6 +753,149 @@ describe('PATCH /content — safety marker is compensated on a rejected live com
     expect(deleteSpy).not.toHaveBeenCalled()
     vi.mocked(docVersionRepo.createTx).mockRestore()
     deleteSpy.mockRestore()
+  })
+})
+
+describe('GET /:docId/summary-source', () => {
+  beforeEach(() => vi.clearAllMocks())
+
+  it('returns summarize-ready plain text in the #201 contract shape', async () => {
+    const readerGuard = {
+      meta: { doc_id: 'd_1', document_name: 'octo:s1:f_default:d_1', doc_type: 'doc', title: '季度财报' },
+      role: 'reader',
+    } as never
+    vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
+    vi.mocked(readLiveForEdit).mockResolvedValue(liveView([para('营收同比增长'), para('风险与展望')]) as never)
+
+    const res = mockRes()
+    await getSummarySourceHandler(req({ docId: 'd_1' }), res as never)
+
+    expect(res.statusCode).toBe(200)
+    const body = res.body as {
+      document_id: string
+      title: string
+      version: string
+      content: string
+      chunks: unknown[]
+    }
+    expect(body.document_id).toBe('d_1')
+    expect(body.title).toBe('季度财报')
+    expect(typeof body.version).toBe('string')
+    // Block-flattened plain text: both paragraphs present, no ProseMirror JSON.
+    expect(body.content).toContain('营收同比增长')
+    expect(body.content).toContain('风险与展望')
+    expect(body.content).not.toContain('"type"')
+    expect(Array.isArray(body.chunks)).toBe(true)
+  })
+
+  const summaryReaderGuard = {
+    meta: { doc_id: 'd_1', document_name: 'octo:s1:f_default:d_1', doc_type: 'doc', title: '' },
+    role: 'reader',
+  } as never
+
+  it('preserves formula latex — a formula-only doc does not flatten to empty', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(summaryReaderGuard)
+    vi.mocked(readLiveForEdit).mockResolvedValue({
+      pmDoc: docNode([
+        { type: 'blockMath', attrs: { latex: 'E = mc^2' } },
+        { type: 'paragraph', content: [{ type: 'inlineMath', attrs: { latex: 'a^2 + b^2 = c^2' } }] },
+      ]),
+      baseSV: new Uint8Array(),
+    } as never)
+
+    const res = mockRes()
+    await getSummarySourceHandler(req({ docId: 'd_1' }), res as never)
+
+    expect(res.statusCode).toBe(200)
+    const content = (res.body as { content: string }).content
+    // The whole doc is formulas; the old string leaf-substitute produced ''.
+    expect(content).not.toBe('')
+    expect(content).toContain('E = mc^2')
+    expect(content).toContain('a^2 + b^2 = c^2')
+  })
+
+  it('preserves attribute-backed leaf text (mention label, emoji name, attachment file name)', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(summaryReaderGuard)
+    vi.mocked(readLiveForEdit).mockResolvedValue({
+      pmDoc: docNode([
+        {
+          type: 'paragraph',
+          content: [
+            { type: 'text', text: '交给 ' },
+            { type: 'mention', attrs: { id: 'u1', label: '张三', mentionSuggestionChar: '@', type: 'user' } },
+            { type: 'text', text: ' 跟进 ' },
+            { type: 'emoji', attrs: { name: 'rocket' } },
+          ],
+        },
+        { type: 'fileAttachment', attrs: { attachId: 'a1', fileName: '季度财报.xlsx', mime: null, sizeBytes: null } },
+      ]),
+      baseSV: new Uint8Array(),
+    } as never)
+
+    const res = mockRes()
+    await getSummarySourceHandler(req({ docId: 'd_1' }), res as never)
+
+    expect(res.statusCode).toBe(200)
+    const content = (res.body as { content: string }).content
+    expect(content).toContain('张三') // mention label
+    expect(content).toContain('rocket') // emoji name (:rocket:)
+    expect(content).toContain('季度财报.xlsx') // attachment file name
+  })
+
+  it('preserves bookmark title/description — a bookmark-only doc does not flatten to empty', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(summaryReaderGuard)
+    vi.mocked(readLiveForEdit).mockResolvedValue({
+      pmDoc: docNode([
+        {
+          type: 'bookmark',
+          attrs: {
+            url: 'https://example.com/review',
+            title: '设计评审会议纪要',
+            description: '本周设计评审要点与结论',
+            image: null,
+            siteName: null,
+            fetchedAt: null,
+          },
+        },
+      ]),
+      baseSV: new Uint8Array(),
+    } as never)
+
+    const res = mockRes()
+    await getSummarySourceHandler(req({ docId: 'd_1' }), res as never)
+
+    expect(res.statusCode).toBe(200)
+    const content = (res.body as { content: string }).content
+    expect(content).not.toBe('')
+    expect(content).toContain('设计评审会议纪要')
+    expect(content).toContain('本周设计评审要点与结论')
+  })
+
+  it('preserves image alt text in flattening', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(summaryReaderGuard)
+    vi.mocked(readLiveForEdit).mockResolvedValue({
+      pmDoc: docNode([
+        para('见下图'),
+        { type: 'image', attrs: { attachId: 'a1', src: null, alt: '系统架构图', title: null, width: null, align: null } },
+      ]),
+      baseSV: new Uint8Array(),
+    } as never)
+
+    const res = mockRes()
+    await getSummarySourceHandler(req({ docId: 'd_1' }), res as never)
+
+    expect(res.statusCode).toBe(200)
+    const content = (res.body as { content: string }).content
+    expect(content).toContain('见下图')
+    expect(content).toContain('系统架构图') // image alt
+  })
+
+  it('bails when the reader guard rejects (no body read)', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(null) // guard already wrote 403/404
+    const res = mockRes()
+    await getSummarySourceHandler(req({ docId: 'd_x' }), res as never)
+    expect(readLiveForEdit).not.toHaveBeenCalled()
+    expect(res.statusCode).toBe(0)
   })
 })
 
