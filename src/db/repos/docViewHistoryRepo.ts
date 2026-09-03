@@ -35,6 +35,8 @@ export interface RecentViewItem {
   doc_id: string
   title: string
   owner_id: string
+  /** The document's authoritative home Space, which can differ from v.space_id. */
+  space_id: string
   doc_type: string
   octo_doc_slug: string | null
   role: number // stored role code; owner => admin(3), commenter => 4
@@ -291,7 +293,7 @@ export const docViewHistoryRepo = {
     const cursorSql = cursor ? ' AND (v.viewed_at, v.doc_id) < (?, ?)' : ''
     const cursorArgs = cursor ? [new Date(cursor.viewedAt), cursor.docId] : []
     const items = await query<RecentViewItem>(
-      `SELECT m.doc_id, m.title, m.owner_id, m.doc_type, m.octo_doc_slug, m.updated_at, m.updated_by, v.viewed_at,
+      `SELECT m.doc_id, m.title, m.owner_id, m.space_id, m.doc_type, m.octo_doc_slug, m.updated_at, m.updated_by, v.viewed_at,
               ${roleProjection(params.isSpaceMember === true)} AS role
        ${base}${cursorSql}
        ORDER BY v.viewed_at DESC, v.doc_id DESC
