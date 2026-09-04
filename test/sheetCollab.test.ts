@@ -33,8 +33,15 @@ import {
   validateSheetDataValidationBatch,
   validateSheetDataValidationDeletionRepairBatch,
   materializeLegacyDefaultSheet,
+  prepareSheetListBatchForWrite,
   hasLegacyDefaultCheckboxRule,
   measureSheetAfterEdit,
+  SHEET_DEFAULT_COLUMNS,
+  SHEET_DEFAULT_ROWS,
+  SHEET_LEGACY_COLUMNS,
+  SHEET_LEGACY_ROWS,
+  SHEET_MAX_COLUMNS,
+  SHEET_MAX_ROWS,
   SHEET_HYPERLINKS_FIELD,
   SHEET_MERGES_FIELD,
   SHEET_LIST_FIELD,
@@ -824,7 +831,12 @@ describe('versionRestore — sheet data validations', () => {
     }, true)).toEqual({
       toDelete: [],
       toSet: [
-        ['default', { name: 'Sheet1', order: 0 }],
+        ['default', {
+          name: 'Sheet1',
+          order: 0,
+          rowCount: SHEET_LEGACY_ROWS,
+          columnCount: SHEET_LEGACY_COLUMNS,
+        }],
         ['detail', { name: 'Detail', order: 1 }],
       ],
     })
@@ -1574,7 +1586,7 @@ describe('versionRestore — sheetMerges restore + decode', () => {
 
 /** Build a Y.Doc state carrying sheetList tabs (+ optional cells). */
 function sheetListState(
-  sheets: Record<string, { name: string; order: number }>,
+  sheets: Record<string, { name: string; order: number; rowCount?: number; columnCount?: number }>,
   cells: Record<string, SheetCell> = {},
 ): Uint8Array {
   const doc = new Y.Doc()
@@ -1587,10 +1599,10 @@ function sheetListState(
   return Y.encodeStateAsUpdate(doc)
 }
 
-describe('sheetConversion — validateSheetListEntry (fail-closed logicalId + {name,order})', () => {
+describe('sheetConversion — validateSheetListEntry (fail-closed logicalId + grid size)', () => {
   it('accepts a well-formed tab entry', () => {
     expect(validateSheetListEntry('default', { name: 'Sheet1', order: 0 })).toEqual({ name: 'Sheet1', order: 0 })
-    expect(validateSheetListEntry('sheet-2', { name: '数据', order: 1 })).toBeTruthy()
+    expect(validateSheetListEntry('sheet-2', { name: '数据', order: 1, rowCount: 200 })).toBeTruthy()
   })
 
   it('rejects a logicalId containing ":" or "!" (would collide with cell/dims/merge keys)', () => {
@@ -1603,6 +1615,193 @@ describe('sheetConversion — validateSheetListEntry (fail-closed logicalId + {n
     expect(() => validateSheetListEntry('s', { name: '', order: 0 })).toThrow(SheetSnapshotInvalidError)
     expect(() => validateSheetListEntry('s', { name: 'x', order: Infinity } as never)).toThrow(SheetSnapshotInvalidError)
     expect(() => validateSheetListEntry('s', { name: 'x' } as never)).toThrow(SheetSnapshotInvalidError)
+  })
+
+  it('rejects rowCount outside the supported integer range', () => {
+    for (const rowCount of [0, 1.5, SHEET_MAX_ROWS + 1, '200']) {
+      expect(() => validateSheetListEntry('s', { name: 'x', order: 0, rowCount })).toThrow(
+        SheetSnapshotInvalidError,
+      )
+    }
+    expect(validateSheetListEntry('s', { name: 'x', order: 0, rowCount: SHEET_MAX_ROWS })).toEqual({
+      name: 'x',
+      order: 0,
+      rowCount: SHEET_MAX_ROWS,
+    })
+  })
+
+  it('rejects columnCount outside the supported integer range', () => {
+    for (const columnCount of [0, 1.5, SHEET_MAX_COLUMNS + 1, '20']) {
+      expect(() => validateSheetListEntry('s', { name: 'x', order: 0, columnCount })).toThrow(
+        SheetSnapshotInvalidError,
+      )
+    }
+    expect(validateSheetListEntry('s', { name: 'x', order: 0, columnCount: SHEET_MAX_COLUMNS })).toEqual({
+      name: 'x',
+      order: 0,
+      columnCount: SHEET_MAX_COLUMNS,
+    })
+  })
+})
+
+describe('sheetList — CLI cell writes keep declared grid cells visible', () => {
+  it('defaults a new tab to 200 rows and 20 columns', () => {
+    const batch = prepareSheetListBatchForWrite(
+      [],
+      { toDelete: [], toSet: [['detail', { name: 'Detail', order: 0 }]] },
+      {},
+    )
+    expect(batch.toSet).toEqual([[
+      'detail',
+      {
+        name: 'Detail',
+        order: 0,
+        rowCount: SHEET_DEFAULT_ROWS,
+        columnCount: SHEET_DEFAULT_COLUMNS,
+      },
+    ]])
+  })
+
+  it('preserves rowCount and columnCount when an older CLI renames a tab with only name/order', () => {
+    const batch = prepareSheetListBatchForWrite(
+      [['default', { name: 'Sheet1', order: 0, rowCount: 400, columnCount: 40 }]],
+      { toDelete: [], toSet: [['default', { name: 'Renamed', order: 0 }]] },
+      {},
+    )
+    expect(batch.toSet).toEqual([[
+      'default',
+      { name: 'Renamed', order: 0, rowCount: 400, columnCount: 40 },
+    ]])
+  })
+
+  it('preserves legacy 1000-by-100 dimensions when renaming a tab without stored counts', () => {
+    const batch = prepareSheetListBatchForWrite(
+      [['default', { name: 'Sheet1', order: 0 }]],
+      { toDelete: [], toSet: [['default', { name: 'Renamed', order: 0 }]] },
+      {},
+    )
+    expect(batch.toSet).toEqual([[
+      'default',
+      {
+        name: 'Renamed',
+        order: 0,
+        rowCount: 1000,
+        columnCount: 100,
+      },
+    ]])
+  })
+
+  it.each([
+    ['rename', { name: 'Renamed', order: 0 }],
+    ['reorder', { name: 'Sheet1', order: 2 }],
+  ])('preserves the implicit V1 default dimensions on %s', (_operation, requested) => {
+    const batch = prepareSheetListBatchForWrite(
+      [],
+      { toDelete: [], toSet: [['default', requested]] },
+      {},
+    )
+    expect(batch.toSet).toEqual([[
+      'default',
+      {
+        ...requested,
+        rowCount: 1000,
+        columnCount: 100,
+      },
+    ]])
+  })
+
+  it('does not shrink a legacy tab for a cell write inside its implicit dimensions', () => {
+    const batch = prepareSheetListBatchForWrite(
+      [['default', { name: 'Sheet1', order: 0 }]],
+      { toDelete: [], toSet: [] },
+      { 'default!500:20': { v: 'still inside the legacy grid' } },
+    )
+    expect(batch.toSet).toEqual([])
+  })
+
+  it('atomically grows a 200-row tab when a CLI writes row 300', () => {
+    const batch = prepareSheetListBatchForWrite(
+      [['default', { name: 'Sheet1', order: 0, rowCount: SHEET_DEFAULT_ROWS }]],
+      { toDelete: [], toSet: [] },
+      { 'default!299:0': { v: 'visible' } },
+    )
+    expect(batch.toSet).toEqual([[
+      'default',
+      { name: 'Sheet1', order: 0, rowCount: 300, columnCount: SHEET_LEGACY_COLUMNS },
+    ]])
+  })
+
+  it('defaults new tabs to 200 rows and 20 columns and grows them to include same-batch cells', () => {
+    const batch = prepareSheetListBatchForWrite(
+      [],
+      { toDelete: [], toSet: [['detail', { name: 'Detail', order: 0 }]] },
+      { 'detail!349:24': { v: 'visible' } },
+    )
+    expect(batch.toSet).toEqual([[
+      'detail',
+      { name: 'Detail', order: 0, rowCount: 350, columnCount: 25 },
+    ]])
+  })
+
+  it('atomically grows a 20-column tab when a CLI writes column U', () => {
+    const batch = prepareSheetListBatchForWrite(
+      [['default', {
+        name: 'Sheet1',
+        order: 0,
+        rowCount: SHEET_DEFAULT_ROWS,
+        columnCount: SHEET_DEFAULT_COLUMNS,
+      }]],
+      { toDelete: [], toSet: [] },
+      { [`default!0:${SHEET_DEFAULT_COLUMNS}`]: { v: 'visible' } },
+    )
+    expect(batch.toSet).toEqual([[
+      'default',
+      {
+        name: 'Sheet1',
+        order: 0,
+        rowCount: SHEET_DEFAULT_ROWS,
+        columnCount: SHEET_DEFAULT_COLUMNS + 1,
+      },
+    ]])
+  })
+
+  it('materializes an implicit legacy default only when a write exceeds 1000 rows', () => {
+    expect(prepareSheetListBatchForWrite(
+      [],
+      { toDelete: [], toSet: [] },
+      { 'default!999:0': { v: 'still legacy' } },
+    ).toSet).toEqual([])
+    expect(prepareSheetListBatchForWrite(
+      [],
+      { toDelete: [], toSet: [] },
+      { 'default!1200:0': { v: 'grow' } },
+    ).toSet).toEqual([['default', {
+      name: 'Sheet1',
+      order: 0,
+      rowCount: 1201,
+      columnCount: SHEET_LEGACY_COLUMNS,
+    }]])
+  })
+
+  it('rejects a cell write beyond the 10000-row ceiling', () => {
+    expect(() => prepareSheetListBatchForWrite(
+      [['default', { name: 'Sheet1', order: 0, rowCount: SHEET_LEGACY_ROWS }]],
+      { toDelete: [], toSet: [] },
+      { [`default!${SHEET_MAX_ROWS}:0`]: { v: 'hidden' } },
+    )).toThrow(SheetSnapshotInvalidError)
+  })
+
+  it('rejects a cell write beyond the 100-column ceiling', () => {
+    expect(() => prepareSheetListBatchForWrite(
+      [['default', {
+        name: 'Sheet1',
+        order: 0,
+        rowCount: SHEET_LEGACY_ROWS,
+        columnCount: SHEET_LEGACY_COLUMNS,
+      }]],
+      { toDelete: [], toSet: [] },
+      { [`default!0:${SHEET_MAX_COLUMNS}`]: { v: 'hidden' } },
+    )).toThrow(SheetSnapshotInvalidError)
   })
 })
 

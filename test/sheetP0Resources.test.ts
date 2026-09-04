@@ -4,6 +4,7 @@ import {
   SHEET_FREEZE_FIELD,
   SHEET_FILTERS_FIELD,
   SHEET_DATA_VALIDATIONS_FIELD,
+  SHEET_MAX_ROWS,
   SheetSnapshotInvalidError,
   applySheetFreezeToYMap,
   applySheetFiltersToYMap,
@@ -135,17 +136,32 @@ describe('P0 worksheet resource contract', () => {
 
   it('rejects resources outside the browser grid', () => {
     expect(() => validateSheetFreezeBatch({
-      default: { startRow: 1000, startColumn: -1, xSplit: 0, ySplit: 1 },
+      default: { startRow: SHEET_MAX_ROWS, startColumn: -1, xSplit: 0, ySplit: 1 },
     })).toThrow(SheetSnapshotInvalidError)
     expect(() => validateSheetFreezeBatch({
       default: { startRow: 0, startColumn: -1, xSplit: 0, ySplit: 1 },
     })).toThrow(SheetSnapshotInvalidError)
     expect(() => validateSheetFilterBatch({
       default: { ref: { ...range, endColumn: 100 } },
-    })).toThrow(SheetSnapshotInvalidError)
+    })).toThrow('outside the 10000x100 grid')
     expect(() => validateSheetDataValidationBatch({
-      default: [{ uid: 'bad', ranges: [{ ...range, endRow: 1000 }] }],
+      default: [{ uid: 'bad', ranges: [{ ...range, endRow: SHEET_MAX_ROWS }] }],
     })).toThrow(SheetSnapshotInvalidError)
+  })
+
+  it('accepts checkbox ranges throughout the expanded 10000-row grid', () => {
+    expect(validateSheetDataValidationBatch({
+      default: [{
+        uid: 'expanded-checkbox',
+        type: 'checkbox',
+        ranges: [{
+          startRow: 1000,
+          startColumn: 0,
+          endRow: SHEET_MAX_ROWS - 1,
+          endColumn: 0,
+        }],
+      }],
+    }).toSet).toHaveLength(1)
   })
 
   it('normalizes explicit filter columns and rejects malformed sparse column sets', () => {
