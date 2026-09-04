@@ -15,7 +15,9 @@
  * in lockstep or bot edits land in a Y.Map the clients never read.
  */
 import * as Y from 'yjs'
+import { isDeepStrictEqual } from 'node:util'
 import { persistedByteLength } from '../collab/persistedEncoding.js'
+import { config } from '../config/env.js'
 
 /** Y.Map field that holds the spreadsheet payload on the shared Y.Doc. */
 export const SHEET_YMAP_FIELD = 'sheet'
@@ -67,6 +69,506 @@ export const SHEET_MERGES_FIELD = 'sheetMerges'
  * tab's logicalId is 'default'. Two-way synced + persisted; on the GET read surface.
  */
 export const SHEET_LIST_FIELD = 'sheetList'
+
+/** Checkbox rules keyed `${logicalId}!${uid}` (matches the Docs frontend binding). */
+export const SHEET_DATA_VALIDATIONS_FIELD = 'sheetDataValidations'
+
+export interface StoredDataValidation {
+  uid: string
+  type: string
+  ranges: Array<{ startRow: number; startColumn: number; endRow: number; endColumn: number }>
+  formula1?: string
+  formula2?: string
+  error?: string
+  errorTitle?: string
+  prompt?: string
+  promptTitle?: string
+  allowBlank?: boolean
+  showDropDown?: boolean
+  showErrorMessage?: boolean
+  showInputMessage?: boolean
+  operator?: string
+  imeMode?: number
+  errorStyle?: number
+  renderMode?: number
+  bizInfo?: { showTime?: boolean }
+}
+
+const DATA_VALIDATION_KEY_RE = /^[^!\p{Cc}]{1,64}![^!\p{Cc}]{1,256}$/u
+const DATA_VALIDATION_OPERATORS = new Set([
+  'between', 'equal', 'greaterThan', 'greaterThanOrEqual', 'lessThan', 'lessThanOrEqual', 'notBetween', 'notEqual',
+])
+const DATA_VALIDATION_STRING_FIELDS = ['formula1', 'formula2', 'error', 'errorTitle', 'prompt', 'promptTitle'] as const
+const DATA_VALIDATION_BOOLEAN_FIELDS = ['allowBlank', 'showDropDown', 'showErrorMessage', 'showInputMessage'] as const
+const MAX_CHECKBOX_RANGES_PER_RULE = 100_000
+const MAX_CHECKBOX_VALIDATION_CELLS = 1_000_000
+const MAX_CHECKBOX_BITMAP_WORD_VISITS_PER_RULE = 1_000_000
+const MAX_CHECKBOX_BITMAP_WORD_VISITS_PER_SHEET = 2_000_000
+export interface SheetDataValidationStorageLimits {
+  maxRules: number
+  maxBytes: number
+}
+
+export interface SheetDataValidationStorageUsage {
+  rules: number
+  bytes: number
+  unmeasurableRules: number
+}
+
+function configuredSheetDataValidationStorageLimits(): SheetDataValidationStorageLimits {
+  return {
+    maxRules: config.sheetWrite.maxDataValidations,
+    maxBytes: config.sheetWrite.maxDataValidationBytes,
+  }
+}
+
+/** Validate a persisted rule before it can enter a restored live Y.Doc. */
+export function validateSheetDataValidation(key: unknown, value: unknown): StoredDataValidation {
+  if (typeof key !== 'string' || !DATA_VALIDATION_KEY_RE.test(key)) {
+    throw new SheetSnapshotInvalidError(`data validation key is invalid: ${String(key).slice(0, 64)}`)
+  }
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new SheetSnapshotInvalidError(`data validation ${key}: value is not a plain object`)
+  }
+  const source = value as Record<string, unknown>
+  const uid = key.slice(key.indexOf('!') + 1)
+  if (source.uid !== uid) throw new SheetSnapshotInvalidError(`data validation ${key}: uid must match its key`)
+  if (source.type !== 'checkbox') {
+    throw new SheetSnapshotInvalidError(`data validation ${key}: only checkbox rules are supported`)
+  }
+  if (
+    !Array.isArray(source.ranges) ||
+    source.ranges.length === 0 ||
+    source.ranges.length > MAX_CHECKBOX_RANGES_PER_RULE
+  ) {
+    throw new SheetSnapshotInvalidError(`data validation ${key}: ranges must be a non-empty array`)
+  }
+  const ranges = source.ranges.map((raw, index) => {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+      throw new SheetSnapshotInvalidError(`data validation ${key}: range ${index} is not an object`)
+    }
+    const range = raw as Record<string, unknown>
+    const values = [range.startRow, range.startColumn, range.endRow, range.endColumn]
+    if (!values.every(Number.isInteger)) {
+      throw new SheetSnapshotInvalidError(`data validation ${key}: range ${index} has non-integer bounds`)
+    }
+    const startRow = range.startRow as number
+    const startColumn = range.startColumn as number
+    const endRow = range.endRow as number
+    const endColumn = range.endColumn as number
+    if (startRow < 0 || startColumn < 0 || endRow < startRow || endColumn < startColumn || endRow >= 1000 || endColumn >= 100) {
+      throw new SheetSnapshotInvalidError(`data validation ${key}: range ${index} is outside the sheet bounds`)
+    }
+    return { startRow, startColumn, endRow, endColumn }
+  })
+  const allowed = new Set([
+    'uid', 'type', 'ranges', ...DATA_VALIDATION_STRING_FIELDS, ...DATA_VALIDATION_BOOLEAN_FIELDS,
+    'operator', 'imeMode', 'errorStyle', 'renderMode', 'bizInfo',
+  ])
+  if (Object.keys(source).some((field) => !allowed.has(field))) {
+    throw new SheetSnapshotInvalidError(`data validation ${key}: contains an unsupported field`)
+  }
+  const result: StoredDataValidation = { uid, type: source.type, ranges, allowBlank: true }
+  for (const field of DATA_VALIDATION_STRING_FIELDS) {
+    const fieldValue = source[field]
+    if (fieldValue === undefined) continue
+    if (typeof fieldValue !== 'string' || fieldValue.length > 10_000) {
+      throw new SheetSnapshotInvalidError(`data validation ${key}: ${field} must be a bounded string`)
+    }
+    if ((field === 'formula1' || field === 'formula2') && fieldValue.startsWith('=')) {
+      throw new SheetSnapshotInvalidError(`data validation ${key}: ${field} must be a literal value`)
+    }
+    result[field] = fieldValue
+  }
+  for (const field of DATA_VALIDATION_BOOLEAN_FIELDS) {
+    const fieldValue = source[field]
+    if (fieldValue === undefined) continue
+    if (typeof fieldValue !== 'boolean') {
+      throw new SheetSnapshotInvalidError(`data validation ${key}: ${field} must be boolean`)
+    }
+    result[field] = fieldValue
+  }
+  if (source.operator !== undefined) {
+    if (typeof source.operator !== 'string' || !DATA_VALIDATION_OPERATORS.has(source.operator)) {
+      throw new SheetSnapshotInvalidError(`data validation ${key}: operator is invalid`)
+    }
+    result.operator = source.operator
+  }
+  for (const field of ['imeMode', 'errorStyle', 'renderMode'] as const) {
+    const fieldValue = source[field]
+    const max = field === 'imeMode' ? 10 : 2
+    if (fieldValue === undefined) continue
+    if (!Number.isInteger(fieldValue) || (fieldValue as number) < 0 || (fieldValue as number) > max) {
+      throw new SheetSnapshotInvalidError(`data validation ${key}: ${field} is invalid`)
+    }
+    result[field] = fieldValue as number
+  }
+  if (source.bizInfo !== undefined) {
+    if (source.bizInfo === null || typeof source.bizInfo !== 'object' || Array.isArray(source.bizInfo)) {
+      throw new SheetSnapshotInvalidError(`data validation ${key}: bizInfo is invalid`)
+    }
+    const showTime = (source.bizInfo as Record<string, unknown>).showTime
+    if (showTime !== undefined && typeof showTime !== 'boolean') {
+      throw new SheetSnapshotInvalidError(`data validation ${key}: bizInfo.showTime must be boolean`)
+    }
+    result.bizInfo = showTime === undefined ? {} : { showTime }
+  }
+  if (result.type === 'checkbox' && (result.formula1 ?? '1') === (result.formula2 ?? '0')) {
+    throw new SheetSnapshotInvalidError(`data validation ${key}: checkbox values must differ`)
+  }
+  // The frontend intentionally does not fill every blank cell with 0 when a checkbox range is
+  // created. Preserve that sparse representation without restoring an immediately-invalid rule.
+  if (source.allowBlank === false) {
+    throw new SheetSnapshotInvalidError(`data validation ${key}: checkbox allowBlank must be true`)
+  }
+  return result
+}
+
+/** Parse every canonical backend-owned checkbox candidate without resolving overlaps. */
+export function validateSheetDataValidationCandidates(
+  rules: Record<string, unknown>,
+  allowedLogicalIds?: ReadonlySet<string>,
+  strictCheckboxCandidates = false,
+  storageLimits: SheetDataValidationStorageLimits = configuredSheetDataValidationStorageLimits(),
+): Record<string, StoredDataValidation> {
+  const validated: Array<[string, StoredDataValidation]> = []
+  let storedRules = 0
+  let storedBytes = 2 // `{}` framing
+  for (const [key, value] of Object.entries(rules).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
+    if (
+      value === null ||
+      typeof value !== 'object' ||
+      Array.isArray(value) ||
+      (value as Record<string, unknown>).type !== 'checkbox'
+    ) continue
+    let encodedValue: string
+    try {
+      encodedValue = JSON.stringify(value)
+    } catch {
+      throw new SheetDataValidationInspectionBudgetError(DATA_VALIDATION_KEY_RE.test(key) ? key : '')
+    }
+    storedRules++
+    storedBytes +=
+      (storedRules > 1 ? 1 : 0) +
+      Buffer.byteLength(JSON.stringify(key)) +
+      1 +
+      Buffer.byteLength(encodedValue)
+    if (storedRules > storageLimits.maxRules || storedBytes > storageLimits.maxBytes) {
+      // Invalid historical keys count toward storage pressure but are never reflected back as a
+      // repair key: an attacker-controlled or oversized key must not inflate the HTTP error body.
+      throw new SheetDataValidationInspectionBudgetError(DATA_VALIDATION_KEY_RE.test(key) ? key : '')
+    }
+    if (!DATA_VALIDATION_KEY_RE.test(key)) {
+      if (strictCheckboxCandidates) validateSheetDataValidation(key, value)
+      // Invalid historical keys are inert just like malformed values. REST and collaboration
+      // writes remain strict, so no new invalid key can enter through a supported write path.
+      continue
+    }
+    try {
+      const rule = validateSheetDataValidation(key, value)
+      validated.push([key, rule])
+    } catch (error) {
+      if (strictCheckboxCandidates || !(error instanceof SheetSnapshotInvalidError)) throw error
+      // Collaboration peers write this map directly. Invalid persisted candidates are inert on
+      // read and unrelated edits; explicit API creates/replacements still use the strict validator.
+    }
+  }
+  // Match the client's locale-independent UTF-16 ordering exactly.
+  validated.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+  const candidates: Record<string, StoredDataValidation> = Object.create(null)
+  for (const [key, rule] of validated) {
+    const logicalId = key.slice(0, key.indexOf('!'))
+    // Orphans are inert historical state on every read/restore surface. New writes are still
+    // rejected by validateSheetDataValidationBatch and the collaboration guard.
+    if (allowedLogicalIds && !allowedLogicalIds.has(logicalId)) continue
+    candidates[key] = rule
+  }
+  return candidates
+}
+
+export function validateSheetDataValidations(
+  rules: Record<string, unknown>,
+  allowedLogicalIds?: ReadonlySet<string>,
+  strictCheckboxCandidates = false,
+  storageLimits: SheetDataValidationStorageLimits = configuredSheetDataValidationStorageLimits(),
+): Record<string, StoredDataValidation> {
+  const candidates = validateSheetDataValidationCandidates(
+    rules,
+    allowedLogicalIds,
+    strictCheckboxCandidates,
+    storageLimits,
+  )
+  const out: Record<string, StoredDataValidation> = Object.create(null)
+  // Keys are sorted by logical id, so reuse one fixed-size bitmap and release each sheet's
+  // occupancy when the next sheet begins. Four uint32 words cover the 100 columns per row.
+  // This bounds memory independently of an attacker-controlled sheet count and avoids the
+  // per-cell Set entries that made many full-sheet rules prohibitively expensive.
+  const wordsPerRow = 4
+  const occupied = new Uint32Array(1000 * wordsPerRow)
+  const ruleBitmap = new Uint32Array(occupied.length)
+  const touchedWords: number[] = []
+  let currentLogicalId = ''
+  const countSetBits = (value: number): number => {
+    let bits = value >>> 0
+    bits -= (bits >>> 1) & 0x55555555
+    bits = (bits & 0x33333333) + ((bits >>> 2) & 0x33333333)
+    return (((bits + (bits >>> 4)) & 0x0f0f0f0f) * 0x01010101) >>> 24
+  }
+  const buildRuleBitmap = (
+    ranges: StoredDataValidation['ranges'],
+    maxCells: number,
+    maxWordVisits: number,
+  ): { cells: number; wordVisits: number; exceeded: boolean } => {
+    let cells = 0
+    let wordVisits = 0
+    for (const range of ranges) {
+      for (let row = range.startRow; row <= range.endRow; row++) {
+        const firstWord = range.startColumn >>> 5
+        const lastWord = range.endColumn >>> 5
+        for (let word = firstWord; word <= lastWord; word++) {
+          wordVisits++
+          if (wordVisits > maxWordVisits) return { cells, wordVisits, exceeded: true }
+          const firstBit = word === firstWord ? range.startColumn & 31 : 0
+          const lastBit = word === lastWord ? range.endColumn & 31 : 31
+          const lowMask = firstBit === 0 ? 0xffffffff : 0xffffffff << firstBit
+          const highMask = lastBit === 31 ? 0xffffffff : 0xffffffff >>> (31 - lastBit)
+          const mask = (lowMask & highMask) >>> 0
+          const index = row * wordsPerRow + word
+          const before = ruleBitmap[index]!
+          if (before === 0) touchedWords.push(index)
+          const added = (mask & ~before) >>> 0
+          ruleBitmap[index] = (before | mask) >>> 0
+          cells += countSetBits(added)
+          if (cells > maxCells) return { cells, wordVisits, exceeded: true }
+        }
+      }
+    }
+    return { cells, wordVisits, exceeded: false }
+  }
+  let bitmapWordVisits = 0
+  for (const [key, rule] of Object.entries(candidates)) {
+    const logicalId = key.slice(0, key.indexOf('!'))
+    if (logicalId !== currentLogicalId) {
+      currentLogicalId = logicalId
+      bitmapWordVisits = 0
+      occupied.fill(0)
+    }
+    touchedWords.length = 0
+    const built = buildRuleBitmap(
+      rule.ranges,
+      MAX_CHECKBOX_VALIDATION_CELLS,
+      MAX_CHECKBOX_BITMAP_WORD_VISITS_PER_RULE,
+    )
+    bitmapWordVisits += built.wordVisits
+    if (bitmapWordVisits > MAX_CHECKBOX_BITMAP_WORD_VISITS_PER_SHEET) {
+      throw new SheetDataValidationInspectionBudgetError(key)
+    }
+    // Bound each candidate independently. One syntactically-valid but expensive lexical-first
+    // rule must not consume a shared budget and make unrelated later rules disappear.
+    if (built.exceeded) {
+      for (const index of touchedWords) ruleBitmap[index] = 0
+      continue
+    }
+    const overlaps = touchedWords.some((index) => (occupied[index]! & ruleBitmap[index]!) !== 0)
+    // Concurrent offline inserts can persist temporarily overlapping rules. Match the frontend's
+    // deterministic winner selection instead of rejecting an otherwise recoverable snapshot.
+    if (!overlaps) {
+      out[key] = rule
+      for (const index of touchedWords) occupied[index] = (occupied[index]! | ruleBitmap[index]!) >>> 0
+    }
+    for (const index of touchedWords) ruleBitmap[index] = 0
+  }
+  return out
+}
+
+/** V1 sheets predate sheetList and implicitly expose a single `default` tab. */
+export function sheetLogicalIdsWithLegacyDefault(logicalIds: Iterable<string>): Set<string> {
+  const result = new Set(logicalIds)
+  if (result.size === 0) result.add('default')
+  return result
+}
+
+export interface SheetDataValidationBatch {
+  toDelete: string[]
+  toSet: Array<[string, StoredDataValidation]>
+}
+
+export interface SheetDataValidationDeletionRepairBatch extends SheetDataValidationBatch {
+  previousRawBytes: number
+  rawBytes: number
+}
+
+function isStoredCheckboxCandidate(value: unknown): boolean {
+  return value !== null && typeof value === 'object' && !Array.isArray(value) &&
+    (value as Record<string, unknown>).type === 'checkbox'
+}
+
+/** Measure every checkbox-shaped candidate, including malformed and non-canonical historical keys. */
+export function measureSheetDataValidationStorage(
+  entries: Iterable<[string, unknown]>,
+): SheetDataValidationStorageUsage {
+  let rules = 0
+  let bytes = 2 // `{}` framing
+  let unmeasurableRules = 0
+  for (const [key, value] of entries) {
+    if (!isStoredCheckboxCandidate(value)) continue
+    let encoded: string | undefined
+    try {
+      encoded = JSON.stringify(value)
+    } catch {
+      encoded = undefined
+    }
+    rules++
+    bytes += (rules > 1 ? 1 : 0) + Buffer.byteLength(JSON.stringify(key)) + 1
+    if (encoded === undefined) unmeasurableRules++
+    else bytes += Buffer.byteLength(encoded)
+  }
+  return { rules, bytes, unmeasurableRules }
+}
+
+/**
+ * Validate the narrow recovery operation used when the complete effective checkbox set is too
+ * expensive to inspect. It deliberately accepts only deletions of entries that are either absent
+ * or visibly backend-owned checkbox values. The comparable candidate footprint lets callers prove
+ * that the operation actually removes stored validation metadata without requiring every corrupt
+ * historical value to be JSON-serializable or constructing a partial winner set.
+ */
+export function validateSheetDataValidationDeletionRepairBatch(
+  existing: Iterable<[string, unknown]>,
+  changes: Record<string, StoredDataValidation | null>,
+): SheetDataValidationDeletionRepairBatch {
+  const stored: Record<string, unknown> = Object.create(null)
+  for (const [key, value] of existing) stored[key] = value
+  const next: Record<string, unknown> = Object.assign(Object.create(null), stored)
+  const toDelete: string[] = []
+  for (const [key, value] of Object.entries(changes)) {
+    if (value !== null) {
+      throw new SheetSnapshotInvalidError('data validation repair accepts deletions only')
+    }
+    const current = stored[key]
+    // A malformed key can only be named for deletion when that exact persisted entry visibly
+    // belongs to the checkbox feature. This lets replace/repair clean corrupt owned state without
+    // allowing a caller to delete a foreign validation or invent an arbitrary malformed key.
+    if (!DATA_VALIDATION_KEY_RE.test(key) && !isStoredCheckboxCandidate(current)) {
+      throw new SheetSnapshotInvalidError(`data validation key is invalid: ${key.slice(0, 64)}`)
+    }
+    if (current !== undefined && !isStoredCheckboxCandidate(current)) {
+      throw new SheetSnapshotInvalidError(`data validation ${key}: only checkbox rules can be deleted`)
+    }
+    delete next[key]
+    toDelete.push(key)
+  }
+  const previousUsage = measureSheetDataValidationStorage(Object.entries(stored))
+  const nextUsage = measureSheetDataValidationStorage(Object.entries(next))
+  return {
+    toDelete,
+    toSet: [],
+    previousRawBytes: previousUsage.bytes,
+    rawBytes: nextUsage.bytes,
+  }
+}
+
+function dataValidationRulesEqual(
+  left: StoredDataValidation | undefined,
+  right: StoredDataValidation | undefined,
+): boolean {
+  return left === right || (left !== undefined && right !== undefined && isDeepStrictEqual(left, right))
+}
+
+/** Validate a checkbox edit against the complete post-edit rule set. */
+export function validateSheetDataValidationBatch(
+  existing: Iterable<[string, unknown]>,
+  changes: Record<string, StoredDataValidation | null>,
+  allowedLogicalIds: ReadonlySet<string>,
+  deletedLogicalIds: ReadonlySet<string> = new Set(),
+  storageLimits: SheetDataValidationStorageLimits = configuredSheetDataValidationStorageLimits(),
+): SheetDataValidationBatch {
+  const stored: Record<string, unknown> = Object.create(null)
+  for (const [key, value] of existing) stored[key] = value
+  const currentLogicalIds = new Set([...allowedLogicalIds, ...deletedLogicalIds])
+  const effectiveBefore = validateSheetDataValidations(stored, currentLogicalIds, false, storageLimits)
+  // Keep the raw map for post-edit normalization. Historical overlapping losers remain stored but
+  // inert; an unrelated edit must not delete them, and moving/deleting their winner may make them
+  // effective again. Starting from only the current winners would miss that state transition.
+  const next: Record<string, unknown> = Object.assign(Object.create(null), stored)
+
+  const toDelete: string[] = []
+  for (const [key, value] of Object.entries(changes)) {
+    if (value === null) {
+      const current = stored[key]
+      if (!DATA_VALIDATION_KEY_RE.test(key) && !isStoredCheckboxCandidate(current)) {
+        throw new SheetSnapshotInvalidError(`data validation key is invalid: ${key.slice(0, 64)}`)
+      }
+      if (current !== undefined && !isStoredCheckboxCandidate(current)) {
+        throw new SheetSnapshotInvalidError(`data validation ${key}: only checkbox rules can be deleted`)
+      }
+      delete next[key]
+      toDelete.push(key)
+      continue
+    }
+    if (!DATA_VALIDATION_KEY_RE.test(key)) {
+      throw new SheetSnapshotInvalidError(`data validation key is invalid: ${key.slice(0, 64)}`)
+    }
+    const logicalId = key.slice(0, key.indexOf('!'))
+    if (!allowedLogicalIds.has(logicalId)) {
+      // Existing orphaned rules are normalized below, but a caller must not create a new orphan.
+      throw new SheetSnapshotInvalidError(`data validation ${key}: sheet does not exist`)
+    }
+    const current = stored[key]
+    if (
+      current !== undefined &&
+      (current === null || typeof current !== 'object' || Array.isArray(current) ||
+        (current as Record<string, unknown>).type !== 'checkbox')
+    ) {
+      throw new SheetSnapshotInvalidError(`data validation ${key}: only checkbox rules can be replaced`)
+    }
+    next[key] = validateSheetDataValidation(key, value)
+  }
+
+  // Deleting a tab owns the lifecycle of checkbox rules on that tab. Preserve
+  // unrelated legacy validation types, but remove existing checkbox entries so
+  // the long-standing sheets-only delete shape remains valid and leaves no
+  // orphan checkbox that could reappear after reload.
+  const explicitlyChanged = new Set(Object.keys(changes))
+  for (const [key, value] of Object.entries(stored)) {
+    const bang = key.indexOf('!')
+    const logicalId = bang > 0 ? key.slice(0, bang) : ''
+    if (
+      deletedLogicalIds.has(logicalId) &&
+      !explicitlyChanged.has(key) &&
+      value !== null &&
+      typeof value === 'object' &&
+      !Array.isArray(value) &&
+      (value as Record<string, unknown>).type === 'checkbox'
+    ) {
+      delete next[key]
+      toDelete.push(key)
+    }
+  }
+
+  const validated = validateSheetDataValidations(next, allowedLogicalIds, false, storageLimits)
+
+  // A requested rule must survive deterministic normalization, and it must not displace a
+  // different rule that was effective before this request. Historical losers may remain stored
+  // and may legitimately reappear when their old winner is moved or deleted.
+  for (const [key, previous] of Object.entries(effectiveBefore)) {
+    const logicalId = key.slice(0, key.indexOf('!'))
+    if (explicitlyChanged.has(key) || deletedLogicalIds.has(logicalId)) continue
+    if (!dataValidationRulesEqual(validated[key], previous)) {
+      throw new SheetSnapshotInvalidError('data validations must not overlap or exceed the sheet budget')
+    }
+  }
+  const toSet: Array<[string, StoredDataValidation]> = []
+  for (const [key, value] of Object.entries(changes)) {
+    if (value === null) continue
+    const requested = validateSheetDataValidation(key, value)
+    if (!dataValidationRulesEqual(validated[key], requested)) {
+      throw new SheetSnapshotInvalidError('data validations must not overlap or exceed the sheet budget')
+    }
+    toSet.push([key, requested])
+  }
+  return { toDelete, toSet }
+}
 
 /**
  * Range/worksheet PROTECTION rules, written by the web client (see octo-web
@@ -151,6 +653,21 @@ export class SheetSnapshotInvalidError extends Error {
   constructor(message: string) {
     super(`sheet_snapshot_invalid: ${message}`)
     this.name = 'SheetSnapshotInvalidError'
+  }
+}
+
+/**
+ * The snapshot can contain individually valid checkbox candidates while their aggregate bitmap
+ * work exceeds the bounded read budget. This is recoverable metadata pressure, not an arbitrary
+ * malformed snapshot: GET maps it to a repairable 413 and PATCH may accept a strictly shrinking
+ * checkbox-only deletion.
+ */
+export class SheetDataValidationInspectionBudgetError extends SheetSnapshotInvalidError {
+  readonly repairDataValidationKey: string
+  constructor(repairDataValidationKey: string) {
+    super('data validations exceed the sheet inspection budget')
+    this.name = 'SheetDataValidationInspectionBudgetError'
+    this.repairDataValidationKey = repairDataValidationKey
   }
 }
 
@@ -300,13 +817,16 @@ export function assertSheetWriteAllowed(
    * present to everyone. Optional so existing callers keep compiling.
    */
   sheets: Record<string, StoredSheetMeta | null> = {},
+  /** Checkbox data-validation set/delete batch, keyed `${logicalId}!${uid}`. */
+  dataValidations: Record<string, StoredDataValidation | null> = {},
 ): void {
   if (isAdmin) return
   const keys = Object.keys(cells)
   const dimKeys = Object.keys(dims)
   const mergeKeys = Object.keys(merges)
   const sheetKeys = Object.keys(sheets)
-  if (keys.length === 0 && dimKeys.length === 0 && mergeKeys.length === 0 && sheetKeys.length === 0) return
+  const validationKeys = Object.keys(dataValidations)
+  if (keys.length === 0 && dimKeys.length === 0 && mergeKeys.length === 0 && sheetKeys.length === 0 && validationKeys.length === 0) return
   const rules = doc.getMap<StoredProtectionRule>(SHEET_PROTECTION_FIELD)
   if (rules.size === 0) return
   const grants = doc.getMap<{ allow?: unknown }>(SHEET_PROTECTION_GRANTS_FIELD)
@@ -557,6 +1077,72 @@ export function assertSheetWriteAllowed(
     if (!blocked && entry) {
       blocked = wholeSheetBlocked(entry)
         || entry.rects.some(({ permissionId }) => !permitted(permissionId))
+    }
+    if (blocked) refused.push(key)
+  }
+
+  // A checkbox-rule change can also reveal a previously-overlapping loser. Compare the complete
+  // effective before/after views so protection covers every range whose visible validation state
+  // changes, not only the key named by the caller.
+  const currentValidations = doc.getMap<StoredDataValidation>(SHEET_DATA_VALIDATIONS_FIELD)
+  const rawBefore: Record<string, unknown> = Object.create(null)
+  for (const [key, value] of currentValidations.entries()) rawBefore[key] = value
+  const rawAfter: Record<string, unknown> = Object.assign(Object.create(null), rawBefore)
+  for (const [key, value] of Object.entries(dataValidations)) {
+    if (value === null) delete rawAfter[key]
+    else rawAfter[key] = value
+  }
+  const currentLogicalIds = sheetLogicalIdsWithLegacyDefault(
+    doc.getMap<StoredSheetMeta>(SHEET_LIST_FIELD).keys(),
+  )
+  const nextLogicalIds = new Set(currentLogicalIds)
+  for (const [logicalId, value] of Object.entries(sheets)) {
+    if (value === null) nextLogicalIds.delete(logicalId)
+    else nextLogicalIds.add(logicalId)
+  }
+  let effectiveBefore: Record<string, StoredDataValidation>
+  let effectiveAfter: Record<string, StoredDataValidation>
+  try {
+    effectiveBefore = validateSheetDataValidations(rawBefore, currentLogicalIds)
+    effectiveAfter = validateSheetDataValidations(rawAfter, nextLogicalIds)
+  } catch (error) {
+    if (error instanceof SheetDataValidationInspectionBudgetError) {
+      // A non-admin cannot safely prove that a recovery deletion stays outside protected ranges
+      // when the effective validation set itself cannot be resolved. Admins returned above, and a
+      // document with no protection rules returned before this scan, so this is the fail-closed
+      // branch for the only ambiguous authorization case.
+      throw new ProtectedRangeError(validationKeys.length > 0 ? validationKeys : ['sheetDataValidations'])
+    }
+    throw error
+  }
+  const effectiveKeys = new Set([...Object.keys(effectiveBefore), ...Object.keys(effectiveAfter)])
+  for (const key of effectiveKeys) {
+    const before = effectiveBefore[key]
+    const after = effectiveAfter[key]
+    if (dataValidationRulesEqual(before, after)) continue
+    const bang = key.indexOf('!')
+    if (bang <= 0) { refused.push(key); continue }
+    const entry = bySheet.get(key.slice(0, bang))
+    if (!entry && !docWideBlocked) continue
+    const affected = [before, after].filter((value): value is StoredDataValidation => value !== undefined)
+    if (affected.length === 0) continue
+    const parsed = affected.map((value) => readRects(value.ranges))
+    let blocked = docWideBlocked || parsed.some((result) => result.malformed || result.rects.length === 0)
+    if (!blocked && entry) {
+      blocked = wholeSheetBlocked(entry)
+      if (!blocked) {
+        for (const result of parsed) {
+          for (const changed of result.rects) {
+            for (const { rect, permissionId } of entry.rects) {
+              const disjoint = changed.endRow < rect.startRow || changed.startRow > rect.endRow ||
+                changed.endColumn < rect.startColumn || changed.startColumn > rect.endColumn
+              if (!disjoint && !permitted(permissionId)) { blocked = true; break }
+            }
+            if (blocked) break
+          }
+          if (blocked) break
+        }
+      }
     }
     if (blocked) refused.push(key)
   }
@@ -1203,6 +1789,49 @@ export function validateSheetListBatch(
   return { toDelete, toSet }
 }
 
+/**
+ * A V1 workbook has one implicit `default` tab and no sheetList entry. When the first API edit adds
+ * another explicit tab, materialize that legacy tab in the same transaction; otherwise sheetList
+ * becomes non-empty and subsequent reads can no longer distinguish the still-live default tab from
+ * an orphaned validation key.
+ */
+export function materializeLegacyDefaultSheet(
+  existingLogicalIds: Iterable<string>,
+  batch: SheetListBatch,
+  preserveLegacyDefault = false,
+): SheetListBatch {
+  const existing = new Set(existingLogicalIds)
+  if (
+    existing.size !== 0 ||
+    !preserveLegacyDefault ||
+    batch.toSet.length === 0 ||
+    batch.toDelete.includes('default') ||
+    batch.toSet.some(([logicalId]) => logicalId === 'default')
+  ) {
+    return batch
+  }
+  return {
+    toDelete: batch.toDelete,
+    toSet: [['default', { name: 'Sheet1', order: 0 }], ...batch.toSet],
+  }
+}
+
+/** Materialize V1 `default` only when this checkbox feature needs that implicit tab to survive. */
+export function hasLegacyDefaultCheckboxRule(
+  existing: Iterable<[string, unknown]>,
+  changes: Record<string, StoredDataValidation | null>,
+): boolean {
+  const postChange: Record<string, unknown> = Object.create(null)
+  for (const [key, value] of existing) {
+    postChange[key] = value
+  }
+  for (const [key, value] of Object.entries(changes)) {
+    if (value === null) delete postChange[key]
+    else postChange[key] = value
+  }
+  return Object.keys(validateSheetDataValidations(postChange, new Set(['default']))).length > 0
+}
+
 /** Pure mutation applied INSIDE a Yjs transaction. Validate-all-then-apply. */
 export function applySheetListToYMap(
   ymap: Y.Map<StoredSheetMeta>,
@@ -1265,7 +1894,14 @@ export function measureSheetAfterEdit(
   hyperlinks: Record<string, StoredHyperLink | null> = {},
   merges: Record<string, boolean | null> = {},
   sheets: Record<string, StoredSheetMeta | null> = {},
-): { docBytes: number; payloadBytes: number } {
+  dataValidations: Record<string, StoredDataValidation | null> = {},
+  dataValidationStorageLimits: SheetDataValidationStorageLimits = configuredSheetDataValidationStorageLimits(),
+): {
+  docBytes: number
+  payloadBytes: number | null
+  previousPayloadBytes: number | null
+  validationRepairShrank: boolean
+} {
   const scratch = new Y.Doc()
   Y.applyUpdate(scratch, preEditState)
   const ymap = scratch.getMap<SheetCell>(SHEET_YMAP_FIELD)
@@ -1274,6 +1910,36 @@ export function measureSheetAfterEdit(
   const linkMap = scratch.getMap<StoredHyperLink>(SHEET_HYPERLINKS_FIELD)
   const mergeMap = scratch.getMap<boolean>(SHEET_MERGES_FIELD)
   const listMap = scratch.getMap<StoredSheetMeta>(SHEET_LIST_FIELD)
+  const validationMap = scratch.getMap<StoredDataValidation>(SHEET_DATA_VALIDATIONS_FIELD)
+  const validationDeletionOnly = Object.keys(dataValidations).length > 0 &&
+    Object.values(dataValidations).every((value) => value === null) &&
+    Object.keys(cells).length === 0 && Object.keys(dims).length === 0 &&
+    Object.keys(drawings).length === 0 && Object.keys(hyperlinks).length === 0 &&
+    Object.keys(merges).length === 0 && Object.keys(sheets).length === 0
+  let previousPayloadBytes: number | null = null
+  try {
+    previousPayloadBytes = measureSheetReadPayloadBytes(scratch)
+  } catch (error) {
+    if (!(validationDeletionOnly && error instanceof SheetDataValidationInspectionBudgetError)) throw error
+  }
+  const requestedListBatch = validateSheetListBatch(sheets)
+  const listBatch = materializeLegacyDefaultSheet(
+    listMap.keys(),
+    requestedListBatch,
+    listMap.size === 0 &&
+      requestedListBatch.toSet.length > 0 &&
+      hasLegacyDefaultCheckboxRule(validationMap.entries(), dataValidations),
+  )
+  const nextLogicalIds = sheetLogicalIdsWithLegacyDefault(listMap.keys())
+  for (const key of listBatch.toDelete) nextLogicalIds.delete(key)
+  for (const [key] of listBatch.toSet) nextLogicalIds.add(key)
+  const repairBatch = validationDeletionOnly
+    ? validateSheetDataValidationDeletionRepairBatch(validationMap.entries(), dataValidations)
+    : null
+  const validationBatch = repairBatch ?? validateSheetDataValidationBatch(
+    validationMap.entries(), dataValidations, nextLogicalIds, new Set(listBatch.toDelete),
+    dataValidationStorageLimits,
+  )
   // Apply the batch exactly as the live commit will (validate-all-then-apply), so
   // the measured post-edit doc matches what commitLiveSheetEdit would persist.
   scratch.transact(() => {
@@ -1282,7 +1948,10 @@ export function measureSheetAfterEdit(
     applySheetDrawingsToYMap(drawingMap, drawings)
     applySheetHyperLinksToYMap(linkMap, hyperlinks)
     applySheetMergesToYMap(mergeMap, merges)
-    applySheetListToYMap(listMap, sheets)
+    for (const key of listBatch.toDelete) listMap.delete(key)
+    for (const [key, meta] of listBatch.toSet) listMap.set(key, meta)
+    for (const key of validationBatch.toDelete) validationMap.delete(key)
+    for (const [key, rule] of validationBatch.toSet) validationMap.set(key, rule)
   })
   const docBytes = persistedByteLength(scratch)
   // Decode + validate the READ maps exactly as GET does (decodeSheetSnapshot /
@@ -1290,21 +1959,43 @@ export function measureSheetAfterEdit(
   // read body. NOTE: drawings are NOT part of the GET payload (their inline base64
   // would blow the read cap); they only grow docBytes. Hyperlinks ARE small and
   // structured, so they ride the GET surface and count toward payloadBytes.
+  let payloadBytes: number | null = null
+  try {
+    payloadBytes = measureSheetReadPayloadBytes(scratch)
+  } catch (error) {
+    if (!(repairBatch && error instanceof SheetDataValidationInspectionBudgetError)) throw error
+  }
+  return {
+    docBytes,
+    payloadBytes,
+    previousPayloadBytes,
+    validationRepairShrank: repairBatch !== null &&
+      repairBatch.rawBytes < repairBatch.previousRawBytes,
+  }
+}
+
+/** Measure the decoded GET payload for one already-hydrated sheet document. */
+function measureSheetReadPayloadBytes(doc: Y.Doc): number {
   const rawCells: Record<string, unknown> = {}
-  for (const [key, val] of scratch.getMap(SHEET_YMAP_FIELD).entries()) rawCells[key] = val
+  for (const [key, val] of doc.getMap(SHEET_YMAP_FIELD).entries()) rawCells[key] = val
   const rawDims: Record<string, unknown> = {}
-  for (const [key, val] of scratch.getMap(SHEET_DIMS_FIELD).entries()) rawDims[key] = val
+  for (const [key, val] of doc.getMap(SHEET_DIMS_FIELD).entries()) rawDims[key] = val
   const rawLinks: Record<string, unknown> = {}
-  for (const [key, val] of scratch.getMap(SHEET_HYPERLINKS_FIELD).entries()) rawLinks[key] = val
+  for (const [key, val] of doc.getMap(SHEET_HYPERLINKS_FIELD).entries()) rawLinks[key] = val
   const rawMerges: Record<string, unknown> = {}
-  for (const [key, val] of scratch.getMap(SHEET_MERGES_FIELD).entries()) rawMerges[key] = val
+  for (const [key, val] of doc.getMap(SHEET_MERGES_FIELD).entries()) rawMerges[key] = val
   const rawSheets: Record<string, unknown> = {}
-  for (const [key, val] of scratch.getMap(SHEET_LIST_FIELD).entries()) rawSheets[key] = val
+  for (const [key, val] of doc.getMap(SHEET_LIST_FIELD).entries()) rawSheets[key] = val
+  const rawValidations: Record<string, unknown> = {}
+  for (const [key, val] of doc.getMap(SHEET_DATA_VALIDATIONS_FIELD).entries()) rawValidations[key] = val
   const sheetCells = validateSheetCells(rawCells)
   const sheetDims = validateSheetDims(rawDims)
   const sheetHyperLinks = validateSheetHyperLinks(rawLinks)
   const sheetMerges = validateSheetMerges(rawMerges)
   const sheetList = validateSheetList(rawSheets)
-  const payloadBytes = Buffer.byteLength(JSON.stringify({ sheetCells, sheetDims, sheetHyperLinks, sheetMerges, sheetList }))
-  return { docBytes, payloadBytes }
+  const sheetDataValidations = validateSheetDataValidations(
+    rawValidations,
+    sheetLogicalIdsWithLegacyDefault(Object.keys(sheetList)),
+  )
+  return Buffer.byteLength(JSON.stringify({ sheetCells, sheetDims, sheetHyperLinks, sheetMerges, sheetList, sheetDataValidations }))
 }

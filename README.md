@@ -206,7 +206,7 @@ apparent "dead zone" myth, so they are documented together here.
 
 | Dimension | What it measures | How | Cap (env) | Where enforced |
 | --- | --- | --- | --- | --- |
-| **Read payload** | The JSON body a `GET /:docId/sheet` returns | `Buffer.byteLength(JSON.stringify({ sheetCells, sheetDims }))` | `SHEET_READ_MAX_CELL_BYTES` (default **1 MB**) → `config.sheetRead.maxCellBytes` | Read gate `docSheet.ts` → **413 `sheet_too_large`**; write gate `editDocSheet.ts` measures it the SAME way and pre-rejects a write that would exceed it |
+| **Read payload** | The JSON body a `GET /:docId/sheet` returns | UTF-8 bytes of the decoded cells and whole-grid maps, including checkbox validations | `SHEET_READ_MAX_CELL_BYTES` (default **1 MB**) → `config.sheetRead.maxCellBytes` | Read gate `docSheet.ts` → **413 `sheet_too_large`**; write gate `editDocSheet.ts` measures it the SAME way and pre-rejects a write that would exceed it |
 | **Storage** | The persisted Y.Doc binary update | `Y.encodeStateAsUpdate(doc).length` | `MAX_DOC_BYTES` (default **10 MB**) → `config.maxDocBytes` | `persistence.store`; write gate `editDocSheet.ts` → **413 `doc_too_large`** |
 
 Key points:
@@ -231,6 +231,28 @@ Key points:
   returns 413 `sheet_too_large` on a whole read, but the **paginated read
   (`?limit=`/`?cursor=`) retrieves it page by page**, each page bounded by
   `maxCellBytes`. No cell is unreachable.
+
+- **Checkbox inspection-budget 413 is repairable too.** Collaboration peers can write enough
+  individually valid checkbox ranges to exceed the server's bounded overlap-inspection work.
+  In that case GET returns no partial validation set; it returns the snapshot `baseVersion` and one
+  `repairDataValidationKey`. Delete that key with a validation-only PATCH and retry. Each accepted
+  repair must strictly shrink the raw checkbox metadata, and repeated repairs remain available even
+  when one deletion is not yet enough to bring the sheet back under the inspection budget.
+
+- **Stored checkbox candidates are bounded at every write boundary.** REST batches and live
+  collaboration updates share `SHEET_WRITE_MAX_DATA_VALIDATIONS` (default **5000**) as the complete
+  persisted checkbox-candidate cap, plus `SHEET_WRITE_MAX_DATA_VALIDATION_BYTES` (default **1 MB**)
+  for raw checkbox metadata; malformed historical keys count toward both limits. Invalid new or
+  orphaned WebSocket validation writes are synchronously compensated before the debounced store,
+  while non-growing edits and deletions remain available to repair legacy state. If a validation
+  write is rejected, direct writes to other root maps from the same Yjs transaction are compensated
+  too, while validation deletions are retained as repair progress.
+
+- **Protection authorization differs by transport.** REST/agent Sheet writes enforce protected
+  ranges server-side. Raw collaboration WebSocket frames have writer-role admission and validation
+  shape/resource guards, but no per-frame principal-aware protected-range authorization; the web UI
+  keeps its existing client-side protection checks. This MR does not claim to close that pre-existing
+  WebSocket authorization gap for cells or checkbox validations.
 
 - **413 observability.** Both size-413 bodies name the dimension they measured so
   a caller sees at a glance which cap tripped and how far past it the payload sits:

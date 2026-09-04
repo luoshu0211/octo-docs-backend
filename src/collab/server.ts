@@ -32,6 +32,7 @@ import { handleAfterStore, handleBeforeUnload } from './autoSnapshot.js'
 import { parseDocumentName } from '../permission/documentName.js'
 import { enqueueDocIndex } from '../search/docIndexQueue.js'
 import { attachWhiteboardRepair, coldRepairLiveDoc } from '../whiteboard/repair.js'
+import { attachSheetDataValidationGuard } from './sheetDataValidationGuard.js'
 
 /**
  * Per-node epoch watermark (§4.5 step 4): beforeHandleMessage reads this local
@@ -41,9 +42,8 @@ import { attachWhiteboardRepair, coldRepairLiveDoc } from '../whiteboard/repair.
 const epochWatermark = new Map<string, number>()
 
 /**
- * Per-document disposer for the whiteboard repair observer (§4.1), keyed by
- * documentName. Set in afterLoadDocument for whiteboard keys, called in
- * beforeUnloadDocument so the observer is torn down with the document.
+ * Per-document disposer for server-authoritative Yjs guards, keyed by documentName.
+ * Called in beforeUnloadDocument so observers are torn down with the document.
  */
 const repairDisposers = new Map<string, () => void>()
 
@@ -445,15 +445,23 @@ export function createServer() {
       } catch {
         return // malformed key: nothing to repair (auth already rejected it)
       }
-      if (kind !== 'whiteboard') return
-      const dispose = attachWhiteboardRepair(data.document)
-      repairDisposers.set(data.documentName, dispose)
-      // Converge persisted state on load through the fixed-clientID
-      // materialization so two nodes cold-repairing the same blob on failover
-      // emit byte-identical structs (BE-M11); a plain repairLiveDoc here would
-      // attribute the corrective writes to this node's RANDOM clientID and
-      // diverge on failover.
-      coldRepairLiveDoc(data.document)
+      if (kind === 'whiteboard') {
+        const dispose = attachWhiteboardRepair(data.document)
+        repairDisposers.set(data.documentName, dispose)
+        // Converge persisted state on load through the fixed-clientID
+        // materialization so two nodes cold-repairing the same blob on failover
+        // emit byte-identical structs (BE-M11); a plain repairLiveDoc here would
+        // attribute the corrective writes to this node's RANDOM clientID and
+        // diverge on failover.
+        coldRepairLiveDoc(data.document)
+        return
+      }
+      if (kind === 'document') {
+        repairDisposers.set(data.documentName, attachSheetDataValidationGuard(data.document, {
+          maxRules: config.sheetWrite.maxDataValidations,
+          maxBytes: config.sheetWrite.maxDataValidationBytes,
+        }))
+      }
     },
 
     // A4 (§5.2): backend-autonomous KIND_AUTO snapshots. afterStoreDocument

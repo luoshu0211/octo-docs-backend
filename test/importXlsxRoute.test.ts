@@ -21,6 +21,7 @@ vi.mock('../src/collab/versionRestore.js', () => ({
   decodeSheetHyperLinksSnapshot: vi.fn(() => ({})),
   decodeSheetMergesSnapshot: vi.fn(() => ({})),
   decodeSheetListSnapshot: vi.fn(() => ({})),
+  decodeOwnedSheetDataValidationKeysSnapshot: vi.fn(() => ['default!checkbox-old']),
 }))
 vi.mock('../src/api/services/editDocSheet.js', () => ({
   editDocSheet: vi.fn(),
@@ -29,6 +30,7 @@ vi.mock('../src/api/services/editDocSheet.js', () => ({
 import { importXlsxHandler } from '../src/api/routes/import.js'
 import { requireDocRole } from '../src/api/guard.js'
 import { editDocSheet } from '../src/api/services/editDocSheet.js'
+import { decodeOwnedSheetDataValidationKeysSnapshot } from '../src/collab/versionRestore.js'
 
 const guard = vi.mocked(requireDocRole)
 const edit = vi.mocked(editDocSheet)
@@ -155,18 +157,45 @@ describe('importXlsxHandler — status mapping', () => {
     expect(edit).toHaveBeenCalledOnce()
     const arg = edit.mock.calls[0]![0]
     expect(arg.cells['default!0:0']).toEqual({ v: 'hi' })
+    expect(arg.dataValidations).toEqual({ 'default!checkbox-old': null })
+  })
+
+  it('includes malformed and overlap-loser checkbox keys in replace cleanup', async () => {
+    vi.mocked(decodeOwnedSheetDataValidationKeysSnapshot).mockReturnValueOnce([
+      'malformed-checkbox-key',
+      'default!overlap-loser',
+    ])
+    guard.mockResolvedValueOnce(sheetGuard())
+    edit.mockResolvedValueOnce({ ok: true, bytes: 10, baseVersion: 'bv2', newDocVersionSeq: 2 })
+
+    const res = mockRes()
+    await run(res, await xlsxBuffer())
+
+    expect(res.statusCode).toBe(200)
+    const dataValidations = edit.mock.calls.at(-1)![0].dataValidations!
+    expect(Object.hasOwn(dataValidations, 'malformed-checkbox-key')).toBe(true)
+    expect(dataValidations['malformed-checkbox-key']).toBeNull()
+    expect(dataValidations['default!overlap-loser']).toBeNull()
   })
 
   it('forwards editDocSheet failure status/body', async () => {
     guard.mockResolvedValueOnce(sheetGuard())
     edit.mockResolvedValueOnce({
       ok: false,
-      status: 412,
-      error: 'version_conflict',
+      status: 413,
+      error: 'sheet_too_large',
+      baseVersion: 'repair-bv',
+      repairDataValidationKey: 'default!checkbox-old',
+      hint: 'delete the returned checkbox validation key with PATCH, then retry the write',
     })
     const res = mockRes()
     await run(res, await xlsxBuffer())
-    expect(res.statusCode).toBe(412)
-    expect(field(res, 'error')).toBe('version_conflict')
+    expect(res.statusCode).toBe(413)
+    expect(res.body).toEqual({
+      error: 'sheet_too_large',
+      baseVersion: 'repair-bv',
+      repairDataValidationKey: 'default!checkbox-old',
+      hint: 'delete the returned checkbox validation key with PATCH, then retry the write',
+    })
   })
 })

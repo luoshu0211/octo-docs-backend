@@ -28,14 +28,24 @@ import {
   validateSheetHyperLink,
   validateSheetMerge,
   validateSheetListEntry,
+  validateSheetDataValidation,
+  validateSheetDataValidations,
+  validateSheetDataValidationBatch,
+  validateSheetDataValidationDeletionRepairBatch,
+  materializeLegacyDefaultSheet,
+  hasLegacyDefaultCheckboxRule,
+  measureSheetAfterEdit,
   SHEET_HYPERLINKS_FIELD,
   SHEET_MERGES_FIELD,
   SHEET_LIST_FIELD,
+  SHEET_DATA_VALIDATIONS_FIELD,
+  SheetDataValidationInspectionBudgetError,
   SheetSnapshotInvalidError,
   type SheetCell,
   type StoredDrawing,
   type StoredHyperLink,
   type StoredSheetMeta,
+  type StoredDataValidation,
 } from '../src/agent/sheetConversion.js'
 import {
   decodeSheetSnapshot,
@@ -43,6 +53,8 @@ import {
   decodeSheetHyperLinksSnapshot,
   decodeSheetMergesSnapshot,
   decodeSheetListSnapshot,
+  decodeSheetDataValidationsSnapshot,
+  decodeOwnedSheetDataValidationKeysSnapshot,
   reconcileSheetMap,
   decodeTargetSnapshot,
   SHEET_YMAP_FIELD as RESTORE_SHEET_FIELD,
@@ -51,6 +63,7 @@ import {
   SHEET_HYPERLINKS_FIELD as RESTORE_HYPERLINKS_FIELD,
   SHEET_MERGES_FIELD as RESTORE_MERGES_FIELD,
   SHEET_LIST_FIELD as RESTORE_LIST_FIELD,
+  SHEET_DATA_VALIDATIONS_FIELD as RESTORE_VALIDATIONS_FIELD,
 } from '../src/collab/versionRestore.js'
 import { prosemirrorJSONToYDocState } from '../src/agent/conversion.js'
 import { advanceEditVersion } from '../src/collab/liveDocWrite.js'
@@ -351,6 +364,773 @@ describe('versionRestore — reconcileSheetMap', () => {
 
     expect(touched).toBe(false) // neither side has a 'sheet' map
     expect(Array.from(after)).toEqual(Array.from(before)) // byte-identical
+  })
+})
+
+describe('versionRestore — sheet data validations', () => {
+  const key = 'default!checkbox-1'
+  const oldRule: StoredDataValidation = {
+    uid: 'checkbox-1',
+    type: 'checkbox',
+    formula1: 'YES',
+    formula2: 'NO',
+    allowBlank: true,
+    ranges: [{ startRow: 0, startColumn: 0, endRow: 1, endColumn: 1 }],
+  }
+
+  function registerDefaultSheet(doc: Y.Doc): void {
+    doc.getMap<StoredSheetMeta>(SHEET_LIST_FIELD).set('default', { name: 'Sheet1', order: 0 })
+  }
+
+  it('uses the same map name and decodes a valid rule', () => {
+    expect(SHEET_DATA_VALIDATIONS_FIELD).toBe('sheetDataValidations')
+    expect(RESTORE_VALIDATIONS_FIELD).toBe(SHEET_DATA_VALIDATIONS_FIELD)
+    const doc = new Y.Doc()
+    registerDefaultSheet(doc)
+    doc.getMap<StoredDataValidation>(SHEET_DATA_VALIDATIONS_FIELD).set(key, oldRule)
+    expect(decodeSheetDataValidationsSnapshot(Y.encodeStateAsUpdate(doc))).toEqual({ [key]: oldRule })
+    expect(validateSheetDataValidation(key, oldRule)).toEqual(oldRule)
+  })
+
+  it('rejects formula-like checkbox values at the persisted-state boundary', () => {
+    expect(() => validateSheetDataValidation(key, { ...oldRule, formula1: '=1+1' }))
+      .toThrow('formula1 must be a literal value')
+    expect(() => validateSheetDataValidation(key, { ...oldRule, formula2: '=CMD()' }))
+      .toThrow('formula2 must be a literal value')
+  })
+
+  it('lists every owned checkbox key for full-sheet replacement cleanup', () => {
+    const doc = new Y.Doc()
+    const validations = doc.getMap<unknown>(SHEET_DATA_VALIDATIONS_FIELD)
+    validations.set(key, oldRule)
+    validations.set('default!broken', { uid: 'broken', type: 'checkbox', ranges: null })
+    validations.set('default!foreign', { uid: 'foreign', type: 'list' })
+
+    expect(decodeOwnedSheetDataValidationKeysSnapshot(Y.encodeStateAsUpdate(doc))).toEqual([
+      key,
+      'default!broken',
+    ])
+  })
+
+  it('restores target rules and removes live-only rules even when no cells changed', () => {
+    const target = new Y.Doc()
+    registerDefaultSheet(target)
+    target.getMap<StoredDataValidation>(SHEET_DATA_VALIDATIONS_FIELD).set(key, oldRule)
+    const live = new Y.Doc()
+    const map = live.getMap<StoredDataValidation>(SHEET_DATA_VALIDATIONS_FIELD)
+    map.set(key, { ...oldRule, formula1: '1', formula2: '0' })
+    map.set('default!live-only', { ...oldRule, uid: 'live-only' })
+
+    let touched = false
+    live.transact(() => { touched = reconcileSheetMap(live, Y.encodeStateAsUpdate(target)) })
+
+    expect(touched).toBe(true)
+    expect(map.get(key)).toEqual(oldRule)
+    expect(map.has('default!live-only')).toBe(false)
+  })
+
+  it('preserves legacy non-checkbox validations while reconciling checkbox rules', () => {
+    const legacyKey = 'default!legacy-list'
+    const legacyRule = {
+      uid: 'legacy-list',
+      type: 'list',
+      formula1: 'yes,no',
+      ranges: [{ startRow: 4, startColumn: 0, endRow: 4, endColumn: 0 }],
+    }
+    const target = new Y.Doc()
+    registerDefaultSheet(target)
+    target.getMap(SHEET_DATA_VALIDATIONS_FIELD).set(legacyKey, legacyRule)
+    target.getMap<StoredDataValidation>(SHEET_DATA_VALIDATIONS_FIELD).set(key, oldRule)
+    const live = new Y.Doc()
+    registerDefaultSheet(live)
+    const map = live.getMap(SHEET_DATA_VALIDATIONS_FIELD)
+    map.set(legacyKey, legacyRule)
+    map.set('default!live-only-list', { ...legacyRule, uid: 'live-only-list' })
+
+    live.transact(() => reconcileSheetMap(live, Y.encodeStateAsUpdate(target)))
+
+    expect(map.get(legacyKey)).toEqual(legacyRule)
+    expect(map.get('default!live-only-list')).toEqual({ ...legacyRule, uid: 'live-only-list' })
+    expect(map.get(key)).toEqual(oldRule)
+  })
+
+  it.each([
+    {
+      name: 'target checkbox over live legacy rule',
+      targetRule: oldRule,
+      liveRule: { ...oldRule, type: 'list' },
+    },
+    {
+      name: 'target legacy rule over live checkbox',
+      targetRule: { ...oldRule, type: 'list' },
+      liveRule: oldRule,
+    },
+  ])('fails closed before mutation for $name', ({ targetRule, liveRule }) => {
+    const cellKey = sheetCellKey('default', 0, 0)
+    const target = new Y.Doc()
+    registerDefaultSheet(target)
+    target.getMap<SheetCell>(SHEET_YMAP_FIELD).set(cellKey, { v: 'target' })
+    target.getMap(SHEET_DATA_VALIDATIONS_FIELD).set(key, targetRule)
+    const live = new Y.Doc()
+    registerDefaultSheet(live)
+    live.getMap<SheetCell>(SHEET_YMAP_FIELD).set(cellKey, { v: 'live' })
+    live.getMap(SHEET_DATA_VALIDATIONS_FIELD).set(key, liveRule)
+
+    expect(() => live.transact(() => reconcileSheetMap(live, Y.encodeStateAsUpdate(target)))).toThrow(
+      SheetSnapshotInvalidError,
+    )
+    expect(live.getMap<SheetCell>(SHEET_YMAP_FIELD).get(cellKey)).toEqual({ v: 'live' })
+    expect(live.getMap(SHEET_DATA_VALIDATIONS_FIELD).get(key)).toEqual(liveRule)
+  })
+
+  it.each([
+    {
+      name: 'target checkbox over live legacy rule',
+      targetRule: oldRule,
+      liveRule: { ...oldRule, type: 'list' },
+    },
+    {
+      name: 'target legacy rule over live checkbox',
+      targetRule: { ...oldRule, type: 'list' },
+      liveRule: oldRule,
+    },
+  ])('keeps the complete live state unchanged through reconcileRestoreOntoDoc for $name', ({ targetRule, liveRule }) => {
+    const target = new Y.Doc()
+    registerDefaultSheet(target)
+    target.getMap(SHEET_DATA_VALIDATIONS_FIELD).set(key, targetRule)
+    const live = new Y.Doc()
+    registerDefaultSheet(live)
+    live.getMap(SHEET_DATA_VALIDATIONS_FIELD).set(key, liveRule)
+    const before = Y.encodeStateAsUpdate(live)
+
+    expect(() => live.transact(() => reconcileRestoreOntoDoc(
+      live,
+      decodeTargetSnapshot(Y.encodeStateAsUpdate(target)),
+      Y.encodeStateAsUpdate(target),
+    ))).toThrow(SheetSnapshotInvalidError)
+
+    expect(Y.encodeStateAsUpdate(live)).toEqual(before)
+  })
+
+  it('fails closed before changing cells when a target rule is malformed', () => {
+    const cellKey = sheetCellKey('default', 0, 0)
+    const live = liveDocFrom(sheetState({ [cellKey]: { v: 'safe' } }))
+    const target = new Y.Doc()
+    registerDefaultSheet(target)
+    target.getMap<SheetCell>(SHEET_YMAP_FIELD).set(cellKey, { v: 'changed' })
+    target.getMap(SHEET_DATA_VALIDATIONS_FIELD).set(key, { ...oldRule, ranges: null })
+
+    expect(() => live.transact(() => reconcileSheetMap(live, Y.encodeStateAsUpdate(target)))).toThrow(
+      SheetSnapshotInvalidError,
+    )
+    expect(live.getMap<SheetCell>(SHEET_YMAP_FIELD).get(cellKey)).toEqual({ v: 'safe' })
+    expect(live.getMap(SHEET_DATA_VALIDATIONS_FIELD).size).toBe(0)
+  })
+
+  it('preserves overlapping target candidates while reads expose the lexical winner', () => {
+    const cellKey = sheetCellKey('default', 0, 0)
+    const live = liveDocFrom(sheetState({ [cellKey]: { v: 'safe' } }))
+    const target = new Y.Doc()
+    registerDefaultSheet(target)
+    target.getMap<SheetCell>(SHEET_YMAP_FIELD).set(cellKey, { v: 'changed' })
+    const validations = target.getMap<StoredDataValidation>(SHEET_DATA_VALIDATIONS_FIELD)
+    validations.set(key, oldRule)
+    validations.set('default!checkbox-2', {
+      ...oldRule,
+      uid: 'checkbox-2',
+      ranges: [{ startRow: 1, startColumn: 1, endRow: 2, endColumn: 2 }],
+    })
+
+    live.transact(() => reconcileSheetMap(live, Y.encodeStateAsUpdate(target)))
+
+    expect(live.getMap<SheetCell>(SHEET_YMAP_FIELD).get(cellKey)).toEqual({ v: 'changed' })
+    expect(live.getMap(SHEET_DATA_VALIDATIONS_FIELD).toJSON()).toEqual({
+      [key]: oldRule,
+      'default!checkbox-2': {
+        ...oldRule,
+        uid: 'checkbox-2',
+        ranges: [{ startRow: 1, startColumn: 1, endRow: 2, endColumn: 2 }],
+      },
+    })
+    expect(decodeSheetDataValidationsSnapshot(Y.encodeStateAsUpdate(live))).toEqual({ [key]: oldRule })
+  })
+
+  it('validates a legal full-sheet singleton rule without quadratic range comparisons', () => {
+    const ranges = Array.from({ length: 1000 * 100 }, (_, index) => ({
+      startRow: Math.floor(index / 100),
+      startColumn: index % 100,
+      endRow: Math.floor(index / 100),
+      endColumn: index % 100,
+    }))
+    const rule = { ...oldRule, ranges }
+
+    expect(validateSheetDataValidations(
+      { [key]: rule },
+      undefined,
+      false,
+      { maxRules: 1, maxBytes: Number.MAX_SAFE_INTEGER },
+    )).toEqual({ [key]: rule })
+  })
+
+  it('ignores all foreign rules and orphaned checkbox rules on read paths', () => {
+    expect(() => validateSheetDataValidation(key, { ...oldRule, type: 'list' })).toThrow(
+      SheetSnapshotInvalidError,
+    )
+    expect(validateSheetDataValidations({
+      [key]: oldRule,
+      'default!decimal-1': {
+        uid: 'decimal-1',
+        type: 'decimal',
+        operator: 'equal',
+        formula1: '100',
+        ranges: [{ startRow: 8, startColumn: 3, endRow: 8, endColumn: 3 }],
+      },
+      'default!missing-type': { uid: 'missing-type' },
+      'default!numeric-type': { uid: 'numeric-type', type: 1 },
+      'default!null-value': null,
+      'default!scalar-value': 'checkbox',
+    })).toEqual({ [key]: oldRule })
+    expect(validateSheetDataValidations({ [key]: oldRule }, new Set(['other']))).toEqual({})
+  })
+
+  it('ignores an invalid lexical checkbox candidate before resolving overlaps', () => {
+    const invalid = { ...oldRule, uid: 'a-invalid', hostile: true }
+    const valid = { ...oldRule, uid: 'b-valid' }
+
+    expect(validateSheetDataValidations({
+      'default!a-invalid': invalid,
+      'default!b-valid': valid,
+    })).toEqual({ 'default!b-valid': valid })
+  })
+
+  it('keeps validation resources bounded across many full-sheet logical ids', () => {
+    const rules: Record<string, StoredDataValidation> = Object.create(null)
+    for (let index = 0; index < 5_000; index++) {
+      const uid = `checkbox-${index}`
+      rules[`sheet-${index}!${uid}`] = {
+        ...oldRule,
+        uid,
+        ranges: [{ startRow: 0, startColumn: 0, endRow: 999, endColumn: 99 }],
+      }
+    }
+    expect(Object.keys(validateSheetDataValidations(rules))).toHaveLength(5_000)
+  })
+
+  it('counts the checkbox expansion budget independently for each sheet', () => {
+    const rules: Record<string, StoredDataValidation> = Object.create(null)
+    for (let index = 0; index < 11; index++) {
+      const uid = `checkbox-${index}`
+      rules[`sheet-${index}!${uid}`] = {
+        ...oldRule,
+        uid,
+        ranges: [{ startRow: 0, startColumn: 0, endRow: 999, endColumn: 99 }],
+      }
+    }
+
+    expect(Object.keys(validateSheetDataValidations(rules))).toHaveLength(11)
+  })
+
+  it('drops later historical rules when one sheet exceeds the bounded inspection budget', () => {
+    const rules: Record<string, StoredDataValidation> = Object.create(null)
+    for (let index = 0; index < 11; index++) {
+      const uid = `checkbox-${index}`
+      rules[`default!${uid}`] = {
+        ...oldRule,
+        uid,
+        ranges: [{ startRow: 0, startColumn: 0, endRow: 999, endColumn: 99 }],
+      }
+    }
+
+    expect(Object.keys(validateSheetDataValidations(rules))).toEqual(['default!checkbox-0'])
+  })
+
+  it('counts overlapping ranges within one rule only once toward the inspection budget', () => {
+    const repeated = { startRow: 0, startColumn: 0, endRow: 499, endColumn: 99 }
+    const rules: Record<string, StoredDataValidation> = {
+      'default!a-hog': {
+        ...oldRule,
+        uid: 'a-hog',
+        ranges: Array.from({ length: 20 }, () => ({ ...repeated })),
+      },
+      'default!b-victim': {
+        ...oldRule,
+        uid: 'b-victim',
+        ranges: [{ startRow: 900, startColumn: 0, endRow: 900, endColumn: 0 }],
+      },
+    }
+
+    expect(Object.keys(validateSheetDataValidations(rules))).toEqual([
+      'default!a-hog',
+      'default!b-victim',
+    ])
+  })
+
+  it('does not let one rule consume another rule\'s bitmap work budget', () => {
+    const repeatedColumn = { startRow: 0, startColumn: 0, endRow: 999, endColumn: 0 }
+    const rules: Record<string, StoredDataValidation> = {
+      'default!a-hog': {
+        ...oldRule,
+        uid: 'a-hog',
+        ranges: Array.from({ length: 1000 }, () => ({ ...repeatedColumn })),
+      },
+      'default!b-victim': {
+        ...oldRule,
+        uid: 'b-victim',
+        ranges: [{ startRow: 0, startColumn: 1, endRow: 0, endColumn: 1 }],
+      },
+    }
+
+    expect(Object.keys(validateSheetDataValidations(rules))).toEqual([
+      'default!a-hog',
+      'default!b-victim',
+    ])
+  })
+
+  it('fails the whole sheet instead of silently truncating when total bitmap work is excessive', () => {
+    const repeatedColumn = { startRow: 0, startColumn: 0, endRow: 999, endColumn: 0 }
+    const rules: Record<string, StoredDataValidation> = Object.fromEntries(
+      ['a', 'b', 'c'].map((suffix, index) => [`default!${suffix}`, {
+        ...oldRule,
+        uid: suffix,
+        ranges: Array.from({ length: 1000 }, () => ({
+          ...repeatedColumn,
+          startColumn: index,
+          endColumn: index,
+        })),
+      }]),
+    )
+
+    expect(() => validateSheetDataValidations(rules)).toThrow('sheet inspection budget')
+  })
+
+  it('allows repeated deletion repair while the remaining rules are still over the inspection budget', () => {
+    const repeatedColumn = { startRow: 0, startColumn: 0, endRow: 999, endColumn: 0 }
+    const existing = new Map<string, unknown>(
+      ['a', 'b', 'c', 'd'].map((suffix, index) => [`default!${suffix}`, {
+        ...oldRule,
+        uid: suffix,
+        ranges: Array.from({ length: 1000 }, () => ({
+          ...repeatedColumn,
+          startColumn: index,
+          endColumn: index,
+        })),
+      }]),
+    )
+
+    const first = validateSheetDataValidationDeletionRepairBatch(
+      existing.entries(),
+      { 'default!c': null },
+    )
+    expect(first.rawBytes).toBeLessThan(first.previousRawBytes)
+    existing.delete('default!c')
+    expect(() => validateSheetDataValidations(Object.fromEntries(existing))).toThrow('sheet inspection budget')
+
+    const second = validateSheetDataValidationDeletionRepairBatch(
+      existing.entries(),
+      { 'default!d': null },
+    )
+    expect(second.rawBytes).toBeLessThan(second.previousRawBytes)
+    existing.delete('default!d')
+    expect(Object.keys(validateSheetDataValidations(Object.fromEntries(existing)))).toEqual([
+      'default!a',
+      'default!b',
+    ])
+  })
+
+  it('accepts raw-shrinking repair when deleting a winner reveals a larger overlap loser', () => {
+    const doc = new Y.Doc()
+    registerDefaultSheet(doc)
+    const validations = doc.getMap<StoredDataValidation>(SHEET_DATA_VALIDATIONS_FIELD)
+    validations.set('default!a', {
+      ...oldRule,
+      uid: 'a',
+      ranges: [{ startRow: 0, startColumn: 0, endRow: 0, endColumn: 0 }],
+    })
+    validations.set('default!b', {
+      ...oldRule,
+      uid: 'b',
+      error: 'larger overlap loser'.repeat(20),
+      ranges: [{ startRow: 0, startColumn: 0, endRow: 0, endColumn: 0 }],
+    })
+
+    const measured = measureSheetAfterEdit(
+      Y.encodeStateAsUpdate(doc),
+      {}, {}, {}, {}, {}, {},
+      { 'default!a': null },
+    )
+
+    expect(measured.previousPayloadBytes).not.toBeNull()
+    expect(measured.payloadBytes).not.toBeNull()
+    expect(measured.payloadBytes!).toBeGreaterThan(measured.previousPayloadBytes!)
+    expect(measured.validationRepairShrank).toBe(true)
+  })
+
+  it('drops a rule whose duplicate ranges exhaust the independent bitmap work budget', () => {
+    const fullSheet = { startRow: 0, startColumn: 0, endRow: 999, endColumn: 99 }
+    const rules: Record<string, StoredDataValidation> = {
+      'default!a-hostile': {
+        ...oldRule,
+        uid: 'a-hostile',
+        ranges: Array.from({ length: 100_000 }, () => ({ ...fullSheet })),
+      },
+    }
+
+    expect(validateSheetDataValidations(
+      rules,
+      undefined,
+      false,
+      { maxRules: 1, maxBytes: Number.MAX_SAFE_INTEGER },
+    )).toEqual({})
+  })
+
+  it('rejects a rule whose range count exceeds the frontend contract', () => {
+    expect(() => validateSheetDataValidation(key, {
+      ...oldRule,
+      ranges: Array.from(
+        { length: 100_001 },
+        () => ({ startRow: 0, startColumn: 0, endRow: 0, endColumn: 0 }),
+      ),
+    })).toThrow('ranges must be a non-empty array')
+  })
+
+  it('drops the whole candidate when valid and invalid ranges are mixed', () => {
+    expect(validateSheetDataValidations({
+      [key]: {
+        ...oldRule,
+        ranges: [
+          { startRow: 2, startColumn: 3, endRow: 4, endColumn: 5 },
+          { startRow: -1, startColumn: 0, endRow: 0, endColumn: 0 },
+        ],
+      },
+    })).toEqual({})
+  })
+
+  it('allows checkbox edits on the implicit default tab of a V1 sheet', () => {
+    const doc = new Y.Doc()
+    doc.getMap<SheetCell>(SHEET_YMAP_FIELD).set('default!0:0', { v: 0 })
+
+    expect(() => measureSheetAfterEdit(
+      Y.encodeStateAsUpdate(doc),
+      {},
+      {},
+      {},
+      {},
+      {},
+      {},
+      { [key]: oldRule },
+    )).not.toThrow()
+  })
+
+  it('materializes the implicit default tab when a V1 sheet first gains another tab', () => {
+    expect(materializeLegacyDefaultSheet([], {
+      toDelete: [],
+      toSet: [['detail', { name: 'Detail', order: 1 }]],
+    }, true)).toEqual({
+      toDelete: [],
+      toSet: [
+        ['default', { name: 'Sheet1', order: 0 }],
+        ['detail', { name: 'Detail', order: 1 }],
+      ],
+    })
+  })
+
+  it('does not materialize a checkbox-free V1 default tab', () => {
+    const batch = {
+      toDelete: [],
+      toSet: [['detail', { name: 'Detail', order: 1 }] as [string, StoredSheetMeta]],
+    }
+    expect(materializeLegacyDefaultSheet([], batch)).toEqual(batch)
+  })
+
+  it('does not preserve the implicit default tab when the last checkbox is deleted', () => {
+    expect(hasLegacyDefaultCheckboxRule(
+      new Map<string, unknown>([[key, oldRule]]).entries(),
+      { [key]: null },
+    )).toBe(false)
+  })
+
+  it('does not materialize default for an invalid checkbox-looking legacy entry', () => {
+    expect(hasLegacyDefaultCheckboxRule(
+      new Map<string, unknown>([['default!broken', {
+        uid: 'broken',
+        type: 'checkbox',
+        ranges: null,
+      }]]).entries(),
+      {},
+    )).toBe(false)
+  })
+
+  it('does not inspect orphaned default rules when an explicit workbook adds another tab', () => {
+    const doc = new Y.Doc()
+    doc.getMap<StoredSheetMeta>(SHEET_LIST_FIELD).set('live', { name: 'Live', order: 0 })
+    const validations = doc.getMap<StoredDataValidation>(SHEET_DATA_VALIDATIONS_FIELD)
+    const repeatedColumn = { startRow: 0, startColumn: 0, endRow: 999, endColumn: 0 }
+    for (const [index, suffix] of ['a', 'b', 'c'].entries()) {
+      validations.set(`default!${suffix}`, {
+        ...oldRule,
+        uid: suffix,
+        ranges: Array.from({ length: 1000 }, () => ({
+          ...repeatedColumn,
+          startColumn: index,
+          endColumn: index,
+        })),
+      })
+    }
+
+    expect(() => measureSheetAfterEdit(
+      Y.encodeStateAsUpdate(doc), {}, {}, {}, {}, {},
+      { added: { name: 'Added', order: 1 } }, {},
+    )).not.toThrow()
+  })
+
+  it('rejects allowBlank=false instead of silently changing the API request', () => {
+    expect(() => validateSheetDataValidation(key, { ...oldRule, allowBlank: false })).toThrow(
+      'checkbox allowBlank must be true',
+    )
+  })
+
+  it('accepts omitted allowBlank independent of optional-field insertion order', () => {
+    const withoutAllowBlank = {
+      uid: 'checkbox-optional',
+      type: 'checkbox' as const,
+      ranges: oldRule.ranges,
+      showDropDown: false,
+    }
+    expect(validateSheetDataValidationBatch(
+      new Map<string, unknown>().entries(),
+      { 'default!checkbox-optional': withoutAllowBlank },
+      new Set(['default']),
+    ).toSet[0]?.[1]).toMatchObject({ allowBlank: true, showDropDown: false })
+  })
+
+  it('caps the complete persisted checkbox candidate count, not only one PATCH batch', () => {
+    const second = { ...oldRule, uid: 'checkbox-2' }
+    expect(() => validateSheetDataValidationBatch(
+      new Map<string, unknown>([[key, oldRule]]).entries(),
+      { 'default!checkbox-2': second },
+      new Set(['default']),
+      new Set(),
+      { maxRules: 1, maxBytes: 10_000 },
+    )).toThrow('inspection budget')
+  })
+
+  it('caps aggregate persisted checkbox bytes including overlap losers', () => {
+    const loser = { ...oldRule, uid: 'checkbox-2', error: 'x'.repeat(200) }
+    expect(() => validateSheetDataValidations(
+      { [key]: oldRule, 'default!checkbox-2': loser },
+      new Set(['default']),
+      false,
+      { maxRules: 10, maxBytes: 100 },
+    )).toThrow('inspection budget')
+  })
+
+  it('ignores malformed persisted checkbox candidates but keeps direct validation strict', () => {
+    const malformed = { uid: 'broken', type: 'checkbox', ranges: null }
+    expect(validateSheetDataValidations({ 'default!broken': malformed })).toEqual({})
+    expect(() => validateSheetDataValidation('default!broken', malformed)).toThrow(SheetSnapshotInvalidError)
+    expect(() => validateSheetDataValidationBatch(
+      new Map([['default!broken', malformed]]).entries(),
+      {},
+      new Set(['default']),
+    )).not.toThrow()
+  })
+
+  it('does not expose an oversized invalid historical key as an unusable repair key', () => {
+    const oversizedKey = `default!${'x'.repeat(1024 * 1024)}`
+    let caught: unknown
+    try {
+      validateSheetDataValidations(
+        { [oversizedKey]: oldRule }, new Set(['default']), false, { maxRules: 1, maxBytes: 100 },
+      )
+    } catch (error) {
+      caught = error
+    }
+    expect(caught).toBeInstanceOf(SheetDataValidationInspectionBudgetError)
+    expect((caught as SheetDataValidationInspectionBudgetError).repairDataValidationKey).toBe('')
+  })
+
+  it('does not expose an oversized invalid key when a historical value cannot be JSON encoded', () => {
+    const oversizedKey = `default!${'x'.repeat(1024 * 1024)}`
+    const source = new Y.Doc()
+    source.getMap(SHEET_DATA_VALIDATIONS_FIELD).set(oversizedKey, { ...oldRule, legacy: 1n })
+    const restored = new Y.Doc()
+    Y.applyUpdate(restored, Y.encodeStateAsUpdate(source))
+    let caught: unknown
+    try {
+      validateSheetDataValidations(
+        restored.getMap(SHEET_DATA_VALIDATIONS_FIELD).toJSON(),
+        new Set(['default']),
+        false,
+        { maxRules: 1, maxBytes: 100 },
+      )
+    } catch (error) {
+      caught = error
+    }
+    expect(caught).toBeInstanceOf(SheetDataValidationInspectionBudgetError)
+    expect((caught as SheetDataValidationInspectionBudgetError).repairDataValidationKey).toBe('')
+  })
+
+  it('keeps a JSON-unencodable historical checkbox repair key actionable', () => {
+    const key = 'default!legacy-bigint'
+    const historical = { ...oldRule, uid: 'legacy-bigint', legacy: 1n }
+    let caught: unknown
+    try {
+      validateSheetDataValidations(
+        { [key]: historical }, new Set(['default']), false, { maxRules: 1, maxBytes: 100 },
+      )
+    } catch (error) {
+      caught = error
+    }
+    expect(caught).toBeInstanceOf(SheetDataValidationInspectionBudgetError)
+    expect((caught as SheetDataValidationInspectionBudgetError).repairDataValidationKey).toBe(key)
+
+    const batch = validateSheetDataValidationDeletionRepairBatch(
+      new Map<string, unknown>([[key, historical]]).entries(),
+      { [key]: null },
+    )
+    expect(batch).toMatchObject({ toDelete: [key], toSet: [] })
+    expect(batch.rawBytes).toBeLessThan(batch.previousRawBytes)
+  })
+
+  it('can delete an exact malformed backend-owned checkbox key but not a foreign entry', () => {
+    const malformedKey = 'malformed-checkbox-key'
+    const existing = new Map<string, unknown>([
+      [malformedKey, { uid: 'broken', type: 'checkbox', ranges: null }],
+      ['legacy-list-key', { type: 'list' }],
+    ])
+    expect(validateSheetDataValidationBatch(
+      existing.entries(),
+      { [malformedKey]: null },
+      new Set(['default']),
+    )).toEqual({ toDelete: [malformedKey], toSet: [] })
+    expect(() => validateSheetDataValidationBatch(
+      existing.entries(),
+      { 'legacy-list-key': null },
+      new Set(['default']),
+    )).toThrow('key is invalid')
+  })
+
+  it('validates checkbox API edits against the complete post-edit rule set', () => {
+    const existing = new Map<string, unknown>([[key, oldRule]])
+    const nextKey = 'default!checkbox-2'
+    const nextRule: StoredDataValidation = {
+      ...oldRule,
+      uid: 'checkbox-2',
+      ranges: [{ startRow: 4, startColumn: 2, endRow: 5, endColumn: 3 }],
+    }
+
+    expect(validateSheetDataValidationBatch(
+      existing.entries(),
+      { [nextKey]: nextRule },
+      new Set(['default']),
+    )).toEqual({
+      toDelete: [],
+      toSet: [[nextKey, nextRule]],
+    })
+  })
+
+  it('cascades existing checkbox rules when their sheet is deleted', () => {
+    const existing = new Map<string, unknown>([
+      [key, oldRule],
+      ['default!legacy-list', { ...oldRule, uid: 'legacy-list', type: 'list' }],
+    ])
+    const batch = validateSheetDataValidationBatch(
+      existing.entries(),
+      {},
+      new Set(),
+      new Set(['default']),
+    )
+
+    expect(batch).toEqual({ toDelete: [key], toSet: [] })
+  })
+
+  it('tolerates orphaned and overlapping stored checkbox rules during an unrelated API edit', () => {
+    const overlapKey = 'default!checkbox-2'
+    const orphanKey = 'deleted!checkbox-3'
+    const existing = new Map<string, unknown>([
+      [key, oldRule],
+      [overlapKey, {
+        ...oldRule,
+        uid: 'checkbox-2',
+        ranges: [{ startRow: 1, startColumn: 1, endRow: 2, endColumn: 2 }],
+      }],
+      [orphanKey, { ...oldRule, uid: 'checkbox-3' }],
+    ])
+
+    expect(validateSheetDataValidationBatch(existing.entries(), {}, new Set(['default']))).toEqual({
+      toDelete: [],
+      toSet: [],
+    })
+  })
+
+  it('still rejects a requested checkbox rule for an absent sheet', () => {
+    expect(() => validateSheetDataValidationBatch(
+      new Map<string, unknown>().entries(),
+      { 'deleted!checkbox-1': oldRule },
+      new Set(['default']),
+    )).toThrow('sheet does not exist')
+  })
+
+  it('rejects a requested lexical winner that would displace an existing effective rule', () => {
+    const existing = new Map<string, unknown>([[
+      'default!z',
+      {
+        ...oldRule,
+        uid: 'z',
+        ranges: [{ startRow: 0, startColumn: 0, endRow: 0, endColumn: 1 }],
+      },
+    ]])
+
+    expect(() => validateSheetDataValidationBatch(
+      existing.entries(),
+      {
+        'default!a': {
+          ...oldRule,
+          uid: 'a',
+          ranges: [{ startRow: 0, startColumn: 1, endRow: 0, endColumn: 2 }],
+        },
+      },
+      new Set(['default']),
+    )).toThrow('must not overlap')
+  })
+
+  it('measures a sheets-only delete after cascading checkbox rules', () => {
+    const doc = new Y.Doc()
+    registerDefaultSheet(doc)
+    doc.getMap<StoredDataValidation>(SHEET_DATA_VALIDATIONS_FIELD).set(key, oldRule)
+
+    expect(() => measureSheetAfterEdit(
+      Y.encodeStateAsUpdate(doc),
+      {},
+      {},
+      {},
+      {},
+      {},
+      { default: null },
+    )).not.toThrow()
+  })
+
+  it('rejects overlapping API rules and cannot delete a legacy non-checkbox rule', () => {
+    const existing = new Map<string, unknown>([
+      [key, oldRule],
+      ['default!legacy-list', { ...oldRule, uid: 'legacy-list', type: 'list' }],
+    ])
+    expect(() => validateSheetDataValidationBatch(
+      existing.entries(),
+      {
+        'default!checkbox-2': {
+          ...oldRule,
+          uid: 'checkbox-2',
+          ranges: [{ startRow: 1, startColumn: 1, endRow: 2, endColumn: 2 }],
+        },
+      },
+      new Set(['default']),
+    )).toThrow('must not overlap')
+    expect(() => validateSheetDataValidationBatch(
+      existing.entries(),
+      { 'default!legacy-list': null },
+      new Set(['default']),
+    )).toThrow('only checkbox rules can be deleted')
   })
 })
 

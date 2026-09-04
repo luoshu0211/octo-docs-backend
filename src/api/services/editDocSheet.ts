@@ -23,6 +23,7 @@
  * the cell contract check replaces those. Everything else is the doc path.
  */
 import { transaction, type Tx } from '../../db/pool.js'
+import * as Y from 'yjs'
 import { yjsDocumentRepo } from '../../db/repos/yjsDocumentRepo.js'
 import { docVersionRepo, KIND_RESTORE_MARKER } from '../../db/repos/docVersionRepo.js'
 import { docMemberRepo } from '../../db/repos/docMemberRepo.js'
@@ -36,12 +37,19 @@ import {
   validateSheetMergeBatch,
   validateSheetListBatch,
   measureSheetAfterEdit,
+  validateSheetDataValidationDeletionRepairBatch,
+  validateSheetDataValidations,
+  sheetLogicalIdsWithLegacyDefault,
+  SheetDataValidationInspectionBudgetError,
   SheetSnapshotInvalidError,
   ProtectedRangeError,
   type SheetCell,
   type StoredDrawing,
   type StoredHyperLink,
   type StoredSheetMeta,
+  type StoredDataValidation,
+  SHEET_DATA_VALIDATIONS_FIELD,
+  SHEET_LIST_FIELD,
 } from '../../agent/sheetConversion.js'
 import { SCHEMA_VERSION } from '../../schema/index.js'
 import { config } from '../../config/env.js'
@@ -67,6 +75,8 @@ export interface EditDocSheetInput {
   merges: Record<string, boolean | null>
   /** Keyed sheet tabs (logicalId -> {name,order}); null deletes a tab. */
   sheets: Record<string, StoredSheetMeta | null>
+  /** Keyed checkbox rules (`${logicalId}!${uid}`); null deletes a rule. */
+  dataValidations?: Record<string, StoredDataValidation | null>
   /** permission_epoch observed when the request was authorized (TOCTOU baseline). */
   authorizedEpoch: number
   /**
@@ -99,6 +109,9 @@ export type EditDocSheetResult =
       payloadBytes?: number
       docBytes?: number
       limit?: number
+      baseVersion?: string
+      repairDataValidationKey?: string
+      hint?: string
     }
 
 interface LockedMetaRow {
@@ -135,7 +148,12 @@ async function resolveWriterTx(tx: Tx, docId: string, uid: string, principalSpac
 }
 
 /** Map a thrown edit-core / guard error to its HTTP status + code. */
-function mapEditError(err: unknown): { status: number; error: string } | null {
+function mapEditError(err: unknown): {
+  status: number
+  error: string
+  repairDataValidationKey?: string
+  hint?: string
+} | null {
   if (err instanceof BaseVersionStaleError) return { status: 412, error: 'base_version_stale' }
   if (err instanceof SheetSnapshotInvalidError) return { status: 422, error: 'sheet_cell_invalid' }
   // Pre-mutation refusal (nothing applied / broadcast), so it belongs in this set: the caller's
@@ -144,9 +162,83 @@ function mapEditError(err: unknown): { status: number; error: string } | null {
   return null
 }
 
+function repairableInspectionKey(
+  err: unknown,
+  preEditState: Uint8Array,
+  dataValidations: Record<string, StoredDataValidation | null>,
+): string | undefined {
+  if (!(err instanceof SheetDataValidationInspectionBudgetError)) return undefined
+  const scratch = new Y.Doc()
+  Y.applyUpdate(scratch, preEditState)
+  const raw: Record<string, unknown> = Object.create(null)
+  const validationMap = scratch.getMap<StoredDataValidation>(SHEET_DATA_VALIDATIONS_FIELD)
+  for (const [storedKey, value] of validationMap.entries()) raw[storedKey] = value
+
+  // A repair key is actionable only when the persisted snapshot was already over budget. If this
+  // request introduced the overflow, the key where the post-edit scan stopped may name an unrelated
+  // healthy rule; suggesting its deletion would trade a rejected write for avoidable data loss.
+  let key: string
+  try {
+    validateSheetDataValidations(
+      raw,
+      sheetLogicalIdsWithLegacyDefault(scratch.getMap(SHEET_LIST_FIELD).keys()),
+    )
+    return undefined
+  } catch (preEditError) {
+    if (!(preEditError instanceof SheetDataValidationInspectionBudgetError)) return undefined
+    key = preEditError.repairDataValidationKey
+  }
+  // A non-null request value caused or replaced this candidate. It has not been persisted, so
+  // telling the caller to delete it would either be a no-op or remove the previous valid rule.
+  if (Object.prototype.hasOwnProperty.call(dataValidations, key) && dataValidations[key] !== null) {
+    return undefined
+  }
+  try {
+    const batch = validateSheetDataValidationDeletionRepairBatch(
+      validationMap.entries(),
+      { [key]: null },
+    )
+    return batch.rawBytes < batch.previousRawBytes ? key : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function mapEditErrorWithRepairContext(
+  err: unknown,
+  preEditState: Uint8Array,
+  dataValidations: Record<string, StoredDataValidation | null>,
+): ReturnType<typeof mapEditError> {
+  if (!(err instanceof SheetDataValidationInspectionBudgetError)) return mapEditError(err)
+  const repairDataValidationKey = repairableInspectionKey(err, preEditState, dataValidations)
+  if (!repairDataValidationKey) {
+    return {
+      status: 413,
+      error: 'sheet_too_large',
+      hint: 'reduce or split the checkbox validation changes, then retry',
+    }
+  }
+  return {
+    status: 413,
+    error: 'sheet_too_large',
+    repairDataValidationKey,
+    hint: 'delete the returned checkbox validation key with PATCH, then retry the write',
+  }
+}
+
 export async function editDocSheet(input: EditDocSheetInput): Promise<EditDocSheetResult> {
   // ── 1. Pre-flight (NO lock) ───────────────────────────────────────────────
   const { state: preEditState, baseSV } = await readLiveSheet(input.documentName)
+  const dataValidations = input.dataValidations ?? {}
+  const validationDeletionOnly =
+    Object.keys(dataValidations).length > 0 &&
+    Object.values(dataValidations).every((value) => value === null) &&
+    Object.keys(input.cells).length === 0 &&
+    Object.keys(input.dims).length === 0 &&
+    Object.keys(input.drawings).length === 0 &&
+    Object.keys(input.hyperlinks).length === 0 &&
+    Object.keys(input.merges).length === 0 &&
+    Object.keys(input.sheets).length === 0
 
   // cheap pre-compare: fail most GET<->PATCH conflicts before a snapshot row.
   if (!stateVectorsEqual(input.clientBaseVersion, baseSV)) {
@@ -155,6 +247,9 @@ export async function editDocSheet(input: EditDocSheetInput): Promise<EditDocShe
 
   // contract check: surface 422 sheet_cell_invalid fail-fast, before any lock or
   // live write, using the SAME validators the live mutation runs (cells + dims).
+  let docBytes: number
+  let payloadBytes: number | null
+  let validationRepairShrank: boolean
   try {
     validateSheetCellBatch(input.cells)
     validateSheetDimBatch(input.dims)
@@ -162,9 +257,32 @@ export async function editDocSheet(input: EditDocSheetInput): Promise<EditDocShe
     validateSheetHyperLinkBatch(input.hyperlinks)
     validateSheetMergeBatch(input.merges)
     validateSheetListBatch(input.sheets)
+    const measured = measureSheetAfterEdit(
+      preEditState,
+      input.cells,
+      input.dims,
+      input.drawings,
+      input.hyperlinks,
+      input.merges,
+      input.sheets,
+      dataValidations,
+      {
+        maxRules: config.sheetWrite.maxDataValidations,
+        maxBytes: config.sheetWrite.maxDataValidationBytes,
+      },
+    )
+    docBytes = measured.docBytes
+    payloadBytes = measured.payloadBytes
+    validationRepairShrank = measured.validationRepairShrank
   } catch (err) {
-    const mapped = mapEditError(err)
-    if (mapped) return { ok: false, ...mapped }
+    const mapped = mapEditErrorWithRepairContext(err, preEditState, dataValidations)
+    if (mapped) {
+      return {
+        ok: false,
+        ...mapped,
+        ...(mapped.repairDataValidationKey ? { baseVersion: encodeBaseVersion(baseSV) } : {}),
+      }
+    }
     throw err
   }
 
@@ -178,11 +296,14 @@ export async function editDocSheet(input: EditDocSheetInput): Promise<EditDocShe
   // chained PATCH→PATCH could grow the sheet past the read cap into a
   // write-but-not-readable state (GET permanently 413s). No lock is held yet, so a
   // rejection here leaves no snapshot row and no live side effect.
-  const { docBytes, payloadBytes } = measureSheetAfterEdit(preEditState, input.cells, input.dims, input.drawings, input.hyperlinks, input.merges, input.sheets)
   // Align the write cap to the read cap so a written sheet is always GET-readable.
   // Report payloadBytes/limit (the read-payload dimension) so the write-gate 413
   // carries the SAME observability field the read gate emits (docSheet.ts).
-  if (payloadBytes > config.sheetRead.maxCellBytes) {
+  const shrinkingValidationRepair = validationDeletionOnly && validationRepairShrank
+  if (payloadBytes === null && !shrinkingValidationRepair) {
+    return { ok: false, status: 422, error: 'sheet_cell_invalid' }
+  }
+  if (payloadBytes !== null && payloadBytes > config.sheetRead.maxCellBytes && !shrinkingValidationRepair) {
     return {
       ok: false,
       status: 413,
@@ -251,6 +372,7 @@ export async function editDocSheet(input: EditDocSheetInput): Promise<EditDocShe
       input.hyperlinks,
       input.merges,
       input.sheets,
+      dataValidations,
       txResult.isAdmin,
     )
     bytes = committed.bytes
@@ -272,7 +394,7 @@ export async function editDocSheet(input: EditDocSheetInput): Promise<EditDocShe
     // peers: the safety snapshot is then the ONLY undo record for a change peers
     // have seen, so it MUST be preserved and the request fails 500 — deleting it
     // would strip the sole restore point for a live, peer-visible edit.
-    const mapped = mapEditError(err)
+    const mapped = mapEditErrorWithRepairContext(err, preEditState, dataValidations)
     if (mapped) {
       // Best-effort compensating delete; a failure must not mask the edit error.
       try {
@@ -280,7 +402,13 @@ export async function editDocSheet(input: EditDocSheetInput): Promise<EditDocShe
       } catch {
         /* surface the original edit error below */
       }
-      return { ok: false, ...mapped }
+      return {
+        ok: false,
+        ...mapped,
+        ...(mapped.repairDataValidationKey
+          ? { baseVersion: encodeBaseVersion(input.clientBaseVersion) }
+          : {}),
+      }
     }
     // Unknown / store-time failure: keep the snapshot, surface as 500 (the route
     // maps a thrown error to internal_error).
