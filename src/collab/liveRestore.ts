@@ -32,6 +32,7 @@ import {
   decodeTargetSnapshot,
   reconcileFragment,
   reconcileSheetMap,
+  validateSheetMapReconcile,
   reconcileBoardMaps,
 } from './versionRestore.js'
 import { advanceEditVersion } from './liveDocWrite.js'
@@ -61,6 +62,10 @@ import type { Node as PMNode } from 'prosemirror-model'
  * clock, so the SV moves forward on a delete-only restore just like on a set.
  */
 export function reconcileRestoreOntoDoc(doc: Y.Doc, targetPMDoc: PMNode, targetState: Uint8Array): void {
+  // Yjs does not roll back a transaction callback that throws. Validate every
+  // sheet map and cross-map constraint before the fragment or any sheet content
+  // is mutated, so an invalid restore leaves the exact live state untouched.
+  validateSheetMapReconcile(doc, targetState)
   const fragment = doc.getXmlFragment(COLLAB_FIELD)
   reconcileFragment(targetPMDoc, fragment)
   // Spreadsheet cells + dims + drawings (floating images) live in their own

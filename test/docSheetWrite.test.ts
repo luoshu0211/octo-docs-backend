@@ -1,6 +1,14 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import * as Y from 'yjs'
-import { SHEET_YMAP_FIELD, SHEET_DIMS_FIELD, type SheetCell } from '../src/agent/sheetConversion.js'
+import {
+  SHEET_YMAP_FIELD,
+  SHEET_DIMS_FIELD,
+  SHEET_LIST_FIELD,
+  SHEET_DATA_VALIDATIONS_FIELD,
+  type SheetCell,
+  type StoredDataValidation,
+  type StoredSheetMeta,
+} from '../src/agent/sheetConversion.js'
 
 // Offline unit test (mirrors docContent.test.ts): mock the auth guard, the MySQL
 // pool, and the live-document boundary. editDocSheet's batch validation + the
@@ -58,6 +66,8 @@ const writerGuard = {
 function liveSheet(
   cells: Record<string, unknown> = {},
   dims: Record<string, number> = {},
+  withDefaultTab = false,
+  dataValidations: Record<string, StoredDataValidation> = {},
 ) {
   const doc = new Y.Doc()
   const cellMap = doc.getMap<unknown>(SHEET_YMAP_FIELD)
@@ -65,6 +75,12 @@ function liveSheet(
   doc.transact(() => {
     for (const [k, v] of Object.entries(cells)) cellMap.set(k, v)
     for (const [k, v] of Object.entries(dims)) dimMap.set(k, v)
+    if (withDefaultTab) {
+      doc.getMap<StoredSheetMeta>(SHEET_LIST_FIELD).set('default', { name: 'Sheet1', order: 0 })
+    }
+    for (const [k, v] of Object.entries(dataValidations)) {
+      doc.getMap<StoredDataValidation>(SHEET_DATA_VALIDATIONS_FIELD).set(k, v)
+    }
   })
   return { state: Y.encodeStateAsUpdate(doc), baseSV: Y.encodeStateVector(doc) }
 }
@@ -183,6 +199,27 @@ describe('request shape', () => {
     }
   })
 
+  it('413 too_many_data_validations when the checkbox-rule batch exceeds its cap', async () => {
+    const original = config.sheetWrite.maxDataValidations
+    config.sheetWrite.maxDataValidations = 2
+    try {
+      const res = mockRes()
+      const dataValidations = {
+        'default!checkbox-1': null,
+        'default!checkbox-2': null,
+        'default!checkbox-3': null,
+      }
+      await patchDocSheetHandler(req({ docId: 'd_1' }, {
+        body: { baseVersion: 'v', dataValidations },
+      }), res as never)
+      expect(res.statusCode).toBe(413)
+      expect(res.body).toEqual({ error: 'too_many_data_validations' })
+      expect(vi.mocked(readLiveSheet)).not.toHaveBeenCalled()
+    } finally {
+      config.sheetWrite.maxDataValidations = original
+    }
+  })
+
   it('413 cell_too_large when a single cell payload exceeds the cap', async () => {
     const original = config.sheetWrite.maxCellContentBytes
     config.sheetWrite.maxCellContentBytes = 20
@@ -244,6 +281,102 @@ describe('PATCH /sheet — batch write', () => {
 
     expect(res.statusCode).toBe(200)
     expect(vi.mocked(commitLiveSheetEdit).mock.calls[0]![3]).toEqual(cells)
+  })
+
+  it('creates a checkbox rule and forwards its normalized batch to the live commit', async () => {
+    const view = liveSheet({}, {}, true)
+    vi.mocked(readLiveSheet).mockResolvedValue(view)
+    vi.mocked(commitLiveSheetEdit).mockResolvedValue({ newSV: Y.encodeStateVector(new Y.Doc()), bytes: 10 })
+    vi.spyOn(docVersionRepo, 'createTx').mockResolvedValue(2)
+    mockTx(okMeta)
+
+    const dataValidations = {
+      'default!checkbox-a1': {
+        uid: 'checkbox-a1',
+        type: 'checkbox',
+        formula1: '1',
+        formula2: '0',
+        allowBlank: true,
+        ranges: [{ startRow: 0, startColumn: 0, endRow: 0, endColumn: 0 }],
+      },
+    }
+    const res = mockRes()
+    await patchDocSheetHandler(req({ docId: 'd_1' }, {
+      body: { baseVersion: encodeBaseVersion(view.baseSV), dataValidations },
+    }), res as never)
+
+    expect(res.statusCode).toBe(200)
+    expect(vi.mocked(commitLiveSheetEdit).mock.calls[0]![9]).toEqual(dataValidations)
+  })
+
+  it('rejects allowBlank=false instead of silently changing the requested checkbox rule', async () => {
+    const view = liveSheet({}, {}, true)
+    vi.mocked(readLiveSheet).mockResolvedValue(view)
+    mockTx(okMeta)
+
+    const res = mockRes()
+    await patchDocSheetHandler(req({ docId: 'd_1' }, {
+      body: {
+        baseVersion: encodeBaseVersion(view.baseSV),
+        dataValidations: {
+          'default!checkbox-a1': {
+            uid: 'checkbox-a1',
+            type: 'checkbox',
+            allowBlank: false,
+            ranges: [{ startRow: 0, startColumn: 0, endRow: 0, endColumn: 0 }],
+          },
+        },
+      },
+    }), res as never)
+
+    expect(res.statusCode).toBe(422)
+    expect(commitLiveSheetEdit).not.toHaveBeenCalled()
+  })
+
+  it('allows a cell edit when stored checkbox rules reference a deleted sheet', async () => {
+    const view = liveSheet({}, {}, true, {
+      'deleted!checkbox-a1': {
+        uid: 'checkbox-a1',
+        type: 'checkbox',
+        ranges: [{ startRow: 0, startColumn: 0, endRow: 0, endColumn: 0 }],
+      },
+    })
+    vi.mocked(readLiveSheet).mockResolvedValue(view)
+    vi.mocked(commitLiveSheetEdit).mockResolvedValue({ newSV: Y.encodeStateVector(new Y.Doc()), bytes: 10 })
+    vi.spyOn(docVersionRepo, 'createTx').mockResolvedValue(3)
+    mockTx(okMeta)
+
+    const res = mockRes()
+    await patchDocSheetHandler(req({ docId: 'd_1' }, {
+      body: bodyFor(view, { 'default!0:0': { v: 'still writable' } }),
+    }), res as never)
+
+    expect(res.statusCode).toBe(200)
+    expect(vi.mocked(commitLiveSheetEdit)).toHaveBeenCalledOnce()
+  })
+
+  it('rejects a non-checkbox validation before taking a snapshot or writing live state', async () => {
+    const view = liveSheet({}, {}, true)
+    vi.mocked(readLiveSheet).mockResolvedValue(view)
+    const createSpy = vi.spyOn(docVersionRepo, 'createTx')
+    const res = mockRes()
+    await patchDocSheetHandler(req({ docId: 'd_1' }, {
+      body: {
+        baseVersion: encodeBaseVersion(view.baseSV),
+        dataValidations: {
+          'default!list-a1': {
+            uid: 'list-a1',
+            type: 'list',
+            ranges: [{ startRow: 0, startColumn: 0, endRow: 0, endColumn: 0 }],
+          },
+        },
+      },
+    }), res as never)
+
+    expect(res.statusCode).toBe(422)
+    expect(res.body).toEqual({ error: 'sheet_cell_invalid' })
+    expect(createSpy).not.toHaveBeenCalled()
+    expect(vi.mocked(commitLiveSheetEdit)).not.toHaveBeenCalled()
   })
 })
 
@@ -397,6 +530,264 @@ describe('cumulative size gate', () => {
       // (GET /:docId/sheet) emits — write/read 413 bodies are consistent.
       expect(body.limit).toBe(20)
       expect(body.payloadBytes).toBeGreaterThan(20)
+      expect(createSpy).not.toHaveBeenCalled()
+      expect(vi.mocked(commitLiveSheetEdit)).not.toHaveBeenCalled()
+    } finally {
+      config.sheetRead.maxCellBytes = original
+    }
+  })
+
+  it('allows a real validation-only delete that shrinks an already oversized payload', async () => {
+    const key = 'default!checkbox-large-a'
+    const view = liveSheet({}, {}, true, {
+      [key]: {
+        uid: 'checkbox-large-a',
+        type: 'checkbox',
+        allowBlank: true,
+        error: 'x'.repeat(1_000),
+        ranges: [{ startRow: 0, startColumn: 0, endRow: 0, endColumn: 0 }],
+      },
+      'default!checkbox-large-b': {
+        uid: 'checkbox-large-b',
+        type: 'checkbox',
+        allowBlank: true,
+        error: 'y'.repeat(1_000),
+        ranges: [{ startRow: 1, startColumn: 0, endRow: 1, endColumn: 0 }],
+      },
+    })
+    vi.mocked(readLiveSheet).mockResolvedValue(view)
+    vi.mocked(commitLiveSheetEdit).mockResolvedValue({ newSV: Y.encodeStateVector(new Y.Doc()), bytes: 50 })
+    vi.spyOn(docVersionRepo, 'createTx').mockResolvedValue(9)
+    mockTx(okMeta)
+
+    const original = config.sheetRead.maxCellBytes
+    config.sheetRead.maxCellBytes = 400
+    try {
+      const res = mockRes()
+      await patchDocSheetHandler(req({ docId: 'd_1' }, { body: {
+        baseVersion: encodeBaseVersion(view.baseSV),
+        cells: {},
+        dataValidations: { [key]: null },
+      } }), res as never)
+
+      expect(res.statusCode).toBe(200)
+      expect(vi.mocked(commitLiveSheetEdit)).toHaveBeenCalledOnce()
+    } finally {
+      config.sheetRead.maxCellBytes = original
+    }
+  })
+
+  it('allows a validation-only repair even when one deletion leaves inspection over budget', async () => {
+    const repeatedColumn = { startRow: 0, startColumn: 0, endRow: 999, endColumn: 0 }
+    const validations: Record<string, StoredDataValidation> = {}
+    for (const [index, suffix] of ['a', 'b', 'c', 'd'].entries()) {
+      validations[`default!${suffix}`] = {
+        uid: suffix,
+        type: 'checkbox',
+        ranges: Array.from({ length: 1000 }, () => ({
+          ...repeatedColumn,
+          startColumn: index,
+          endColumn: index,
+        })),
+      }
+    }
+    const view = liveSheet({}, {}, true, validations)
+    vi.mocked(readLiveSheet).mockResolvedValue(view)
+    vi.mocked(commitLiveSheetEdit).mockResolvedValue({ newSV: Y.encodeStateVector(new Y.Doc()), bytes: 50 })
+    vi.spyOn(docVersionRepo, 'createTx').mockResolvedValue(9)
+    mockTx(okMeta)
+
+    const res = mockRes()
+    await patchDocSheetHandler(req({ docId: 'd_1' }, { body: {
+      baseVersion: encodeBaseVersion(view.baseSV),
+      cells: {},
+      dataValidations: { 'default!c': null },
+    } }), res as never)
+
+    expect(res.statusCode).toBe(200)
+    expect(vi.mocked(commitLiveSheetEdit)).toHaveBeenCalledOnce()
+  })
+
+  it('does not let a validation deletion mixed with a cell edit bypass inspection', async () => {
+    const repeatedColumn = { startRow: 0, startColumn: 0, endRow: 999, endColumn: 0 }
+    const validations: Record<string, StoredDataValidation> = {}
+    for (const [index, suffix] of ['a', 'b', 'c'].entries()) {
+      validations[`default!${suffix}`] = {
+        uid: suffix,
+        type: 'checkbox',
+        ranges: Array.from({ length: 1000 }, () => ({
+          ...repeatedColumn,
+          startColumn: index,
+          endColumn: index,
+        })),
+      }
+    }
+    const view = liveSheet({}, {}, true, validations)
+    vi.mocked(readLiveSheet).mockResolvedValue(view)
+    const createSpy = vi.spyOn(docVersionRepo, 'createTx')
+    mockTx(okMeta)
+
+    const res = mockRes()
+    await patchDocSheetHandler(req({ docId: 'd_1' }, { body: {
+      baseVersion: encodeBaseVersion(view.baseSV),
+      cells: { 'default!0:0': { v: 'mixed' } },
+      dataValidations: { 'default!c': null },
+    } }), res as never)
+
+    expect(res.statusCode).toBe(413)
+    expect(res.body).toEqual({
+      error: 'sheet_too_large',
+      baseVersion: encodeBaseVersion(view.baseSV),
+      repairDataValidationKey: 'default!c',
+      hint: 'delete the returned checkbox validation key with PATCH, then retry the write',
+    })
+    expect(createSpy).not.toHaveBeenCalled()
+    expect(vi.mocked(commitLiveSheetEdit)).not.toHaveBeenCalled()
+  })
+
+  it('does not offer a persisted-rule repair for request-induced inspection overflow', async () => {
+    const repeatedColumn = { startRow: 0, startColumn: 0, endRow: 999, endColumn: 0 }
+    const validations: Record<string, StoredDataValidation> = {}
+    for (const [index, suffix] of ['a', 'b'].entries()) {
+      validations[`default!${suffix}`] = {
+        uid: suffix,
+        type: 'checkbox',
+        ranges: Array.from({ length: 1000 }, () => ({
+          ...repeatedColumn,
+          startColumn: index,
+          endColumn: index,
+        })),
+      }
+    }
+    const view = liveSheet({}, {}, true, validations)
+    vi.mocked(readLiveSheet).mockResolvedValue(view)
+    const createSpy = vi.spyOn(docVersionRepo, 'createTx')
+    mockTx(okMeta)
+
+    const res = mockRes()
+    await patchDocSheetHandler(req({ docId: 'd_1' }, { body: {
+      baseVersion: encodeBaseVersion(view.baseSV),
+      cells: {},
+      dataValidations: {
+        'default!c': {
+          uid: 'c',
+          type: 'checkbox',
+          ranges: [repeatedColumn],
+        },
+      },
+    } }), res as never)
+
+    expect(res.statusCode).toBe(413)
+    expect(res.body).toEqual({
+      error: 'sheet_too_large',
+      hint: 'reduce or split the checkbox validation changes, then retry',
+    })
+    expect(createSpy).not.toHaveBeenCalled()
+    expect(vi.mocked(commitLiveSheetEdit)).not.toHaveBeenCalled()
+  })
+
+  it('does not blame an existing rule when a lexical-earlier request makes a healthy snapshot overflow', async () => {
+    const repeatedColumn = (column: number) => ({
+      startRow: 0,
+      startColumn: column,
+      endRow: 999,
+      endColumn: column,
+    })
+    const existing: Record<string, StoredDataValidation> = {}
+    for (const [column, uid] of ['b', 'c'].entries()) {
+      existing[`default!${uid}`] = {
+        uid,
+        type: 'checkbox',
+        ranges: Array.from({ length: 600 }, () => repeatedColumn(column + 1)),
+      }
+    }
+    const view = liveSheet({}, {}, true, existing)
+    vi.mocked(readLiveSheet).mockResolvedValue(view)
+    const createSpy = vi.spyOn(docVersionRepo, 'createTx')
+    mockTx(okMeta)
+
+    const res = mockRes()
+    await patchDocSheetHandler(req({ docId: 'd_1' }, { body: {
+      baseVersion: encodeBaseVersion(view.baseSV),
+      cells: {},
+      dataValidations: {
+        'default!a': {
+          uid: 'a',
+          type: 'checkbox',
+          ranges: Array.from({ length: 900 }, () => repeatedColumn(0)),
+        },
+      },
+    } }), res as never)
+
+    expect(res.statusCode).toBe(413)
+    expect(res.body).toEqual({
+      error: 'sheet_too_large',
+      hint: 'reduce or split the checkbox validation changes, then retry',
+    })
+    expect(createSpy).not.toHaveBeenCalled()
+    expect(vi.mocked(commitLiveSheetEdit)).not.toHaveBeenCalled()
+  })
+
+  it('rejects a no-op validation delete when the oversized payload does not shrink', async () => {
+    const view = liveSheet({}, {}, true, {
+      'default!checkbox-large': {
+        uid: 'checkbox-large',
+        type: 'checkbox',
+        allowBlank: true,
+        error: 'x'.repeat(1_000),
+        ranges: [{ startRow: 0, startColumn: 0, endRow: 0, endColumn: 0 }],
+      },
+    })
+    vi.mocked(readLiveSheet).mockResolvedValue(view)
+    const createSpy = vi.spyOn(docVersionRepo, 'createTx')
+    mockTx(okMeta)
+
+    const original = config.sheetRead.maxCellBytes
+    config.sheetRead.maxCellBytes = 400
+    try {
+      const res = mockRes()
+      await patchDocSheetHandler(req({ docId: 'd_1' }, { body: {
+        baseVersion: encodeBaseVersion(view.baseSV),
+        cells: {},
+        dataValidations: { 'default!missing': null },
+      } }), res as never)
+
+      expect(res.statusCode).toBe(413)
+      expect(createSpy).not.toHaveBeenCalled()
+      expect(vi.mocked(commitLiveSheetEdit)).not.toHaveBeenCalled()
+    } finally {
+      config.sheetRead.maxCellBytes = original
+    }
+  })
+
+  it.each([
+    ['an empty validation map', {} as Record<string, StoredDataValidation | null>, {}, 400],
+    ['a validation delete mixed with a cell edit', { 'default!checkbox-large': null }, { 'default!0:0': { v: 'changed' } }, 413],
+  ])('does not bypass the size gate for %s', async (_label, dataValidations, cells, expectedStatus) => {
+    const view = liveSheet({}, {}, true, {
+      'default!checkbox-large': {
+        uid: 'checkbox-large',
+        type: 'checkbox',
+        allowBlank: true,
+        error: 'x'.repeat(1_000),
+        ranges: [{ startRow: 0, startColumn: 0, endRow: 0, endColumn: 0 }],
+      },
+    })
+    vi.mocked(readLiveSheet).mockResolvedValue(view)
+    const createSpy = vi.spyOn(docVersionRepo, 'createTx')
+    mockTx(okMeta)
+
+    const original = config.sheetRead.maxCellBytes
+    config.sheetRead.maxCellBytes = 100
+    try {
+      const res = mockRes()
+      await patchDocSheetHandler(req({ docId: 'd_1' }, { body: {
+        baseVersion: encodeBaseVersion(view.baseSV),
+        cells,
+        dataValidations,
+      } }), res as never)
+
+      expect(res.statusCode).toBe(expectedStatus)
       expect(createSpy).not.toHaveBeenCalled()
       expect(vi.mocked(commitLiveSheetEdit)).not.toHaveBeenCalled()
     } finally {

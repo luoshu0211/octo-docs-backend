@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import * as Y from 'yjs'
-import { SHEET_YMAP_FIELD, SHEET_DIMS_FIELD, type SheetCell } from '../src/agent/sheetConversion.js'
+import { SHEET_YMAP_FIELD, SHEET_DIMS_FIELD, SHEET_LIST_FIELD, SHEET_DATA_VALIDATIONS_FIELD, type SheetCell, type StoredDataValidation, type StoredSheetMeta } from '../src/agent/sheetConversion.js'
 
 // Offline unit test (mirrors docContent.test.ts): mock the auth guard and the
 // live-document boundary. The route's decode + payload-guard runs for real
@@ -117,6 +117,56 @@ describe('GET /sheet — live cells + dims + base version', () => {
     expect(body.sheetDims).toEqual({})
   })
 
+  it('returns checkbox validation rules with the live sheet state', async () => {
+    const doc = new Y.Doc()
+    doc.getMap<StoredSheetMeta>(SHEET_LIST_FIELD).set('default', { name: 'Sheet1', order: 0 })
+    doc.getMap<StoredDataValidation>(SHEET_DATA_VALIDATIONS_FIELD).set('default!checkbox-a1', {
+      uid: 'checkbox-a1',
+      type: 'checkbox',
+      formula1: '1',
+      formula2: '0',
+      allowBlank: true,
+      ranges: [{ startRow: 0, startColumn: 0, endRow: 0, endColumn: 0 }],
+    })
+    const state = Y.encodeStateAsUpdate(doc)
+    const view = { state, baseSV: Y.encodeStateVector(doc) }
+    vi.mocked(readLiveSheet).mockResolvedValue(view)
+
+    const res = mockRes()
+    await getDocSheetHandler(req({ docId: 'd_1' }), res as never)
+
+    expect(res.statusCode).toBe(200)
+    expect((res.body as { sheetDataValidations: Record<string, StoredDataValidation> }).sheetDataValidations)
+      .toEqual({
+        'default!checkbox-a1': {
+          uid: 'checkbox-a1',
+          type: 'checkbox',
+          formula1: '1',
+          formula2: '0',
+          allowBlank: true,
+          ranges: [{ startRow: 0, startColumn: 0, endRow: 0, endColumn: 0 }],
+        },
+      })
+  })
+
+  it('ignores checkbox rules orphaned by a removed sheet', async () => {
+    const doc = new Y.Doc()
+    doc.getMap<StoredSheetMeta>(SHEET_LIST_FIELD).set('default', { name: 'Sheet1', order: 0 })
+    doc.getMap<StoredDataValidation>(SHEET_DATA_VALIDATIONS_FIELD).set('deleted!checkbox-a1', {
+      uid: 'checkbox-a1',
+      type: 'checkbox',
+      ranges: [{ startRow: 0, startColumn: 0, endRow: 0, endColumn: 0 }],
+    })
+    const state = Y.encodeStateAsUpdate(doc)
+    vi.mocked(readLiveSheet).mockResolvedValue({ state, baseSV: Y.encodeStateVector(doc) })
+
+    const res = mockRes()
+    await getDocSheetHandler(req({ docId: 'd_1' }), res as never)
+
+    expect(res.statusCode).toBe(200)
+    expect((res.body as { sheetDataValidations: Record<string, unknown> }).sheetDataValidations).toEqual({})
+  })
+
   it('fails closed with 409 when a cell violates the {v,f,s} contract', async () => {
     // A hostile cell carrying an unexpected field must not be serialized to the
     // client — decodeSheetSnapshot throws SheetSnapshotInvalidError -> 409.
@@ -182,6 +232,37 @@ describe('large-sheet read guard', () => {
     expect(body.error).toBe('sheet_too_large')
     expect(body.limit).toBe(200)
     expect(body.payloadBytes).toBeGreaterThan(200)
+  })
+
+  it('returns a repair key and base version when checkbox inspection exceeds its work budget', async () => {
+    const doc = new Y.Doc()
+    doc.getMap<StoredSheetMeta>(SHEET_LIST_FIELD).set('default', { name: 'Sheet1', order: 0 })
+    const repeatedColumn = { startRow: 0, startColumn: 0, endRow: 999, endColumn: 0 }
+    for (const [index, suffix] of ['a', 'b', 'c'].entries()) {
+      doc.getMap<StoredDataValidation>(SHEET_DATA_VALIDATIONS_FIELD).set(`default!${suffix}`, {
+        uid: suffix,
+        type: 'checkbox',
+        ranges: Array.from({ length: 1000 }, () => ({
+          ...repeatedColumn,
+          startColumn: index,
+          endColumn: index,
+        })),
+      })
+    }
+    const view = { state: Y.encodeStateAsUpdate(doc), baseSV: Y.encodeStateVector(doc) }
+    vi.mocked(readLiveSheet).mockResolvedValue(view)
+
+    const res = mockRes()
+    await getDocSheetHandler(req({ docId: 'd_1' }), res as never)
+
+    expect(res.statusCode).toBe(413)
+    expect(res.body).toEqual({
+      error: 'sheet_too_large',
+      baseVersion: encodeBaseVersion(view.baseSV),
+      repairDataValidationKey: 'default!c',
+      hint: 'delete the returned checkbox validation key with PATCH, then retry the read',
+    })
+    expect(vi.mocked(readLiveSheet)).toHaveBeenCalledOnce()
   })
 
   it('serves a sheet that sits just under the cap', async () => {
@@ -280,7 +361,7 @@ describe('paginated sheet read', () => {
   it('a large sheet is paginated instead of 413 (the read wall is lifted)', async () => {
     // Same oversized grid that the whole-sheet read rejects with 413 — under a
     // small cap, paginated mode serves it a page at a time with a 200.
-    config.sheetRead.maxCellBytes = 200
+    config.sheetRead.maxCellBytes = 300
     const cells: Record<string, SheetCell> = {}
     for (let r = 0; r < 40; r++) cells[`default!${r}:0`] = { v: `row-${r}-value` }
     vi.mocked(readLiveSheet).mockResolvedValue(liveSheet(cells))
@@ -344,7 +425,7 @@ describe('paginated sheet read', () => {
   it('first page counts sheetDims against the byte cap so cells+dims stay within it (P1-b)', async () => {
     // Small cap; a chunky dims map eats most of it. Before the fix the cells
     // budget ignored dims, so the first page (cells + dims) could exceed the cap.
-    config.sheetRead.maxCellBytes = 400
+    config.sheetRead.maxCellBytes = 500
     const dims: Record<string, number> = {}
     for (let c = 0; c < 20; c++) dims[`c${c}`] = 120 + c
     vi.mocked(readLiveSheet).mockResolvedValue(liveSheet(tenRowSheet(), dims))
@@ -358,15 +439,425 @@ describe('paginated sheet read', () => {
       sheetDims: Record<string, number>
       hasMore: boolean
     }
-    // The whole first-page body (cells + dims, the two grid fields the caller
-    // receives) must not exceed the per-page byte cap.
-    const firstPageBytes = Buffer.byteLength(
-      JSON.stringify({ sheetCells: body.sheetCells, sheetDims: body.sheetDims }),
-    )
+    // The complete first-page response (not only cells + dims) must stay within the cap.
+    const firstPageBytes = Buffer.byteLength(JSON.stringify(res.body))
     expect(firstPageBytes).toBeLessThanOrEqual(config.sheetRead.maxCellBytes)
     // Dims still returned on the first page, and the walk still makes progress.
     expect(body.sheetDims).toEqual(dims)
     expect(body.hasMore).toBe(true)
+  })
+
+  it('fits the complete first-page response under the cap without checkbox rules', async () => {
+    const cells = {
+      'default!0:0': { v: 'a'.repeat(100) },
+      'default!1:0': { v: 'b'.repeat(100) },
+      'default!2:0': { v: 'c'.repeat(100) },
+    }
+    const view = liveSheet(cells)
+    const baseVersion = encodeBaseVersion(view.baseSV)
+    const firstKey = 'default!0:0'
+    const oneCellPage = {
+      docId: 'd_1',
+      sheetCells: { [firstKey]: cells[firstKey] },
+      baseVersion,
+      hasMore: true,
+      nextCursor: encodeSheetCursor({ v: baseVersion, k: firstKey }),
+      sheetDims: {},
+      sheetHyperLinks: {},
+      sheetMerges: {},
+      sheetList: {},
+      sheetDataValidations: {},
+    }
+    config.sheetRead.maxCellBytes = Buffer.byteLength(JSON.stringify(oneCellPage))
+    expect(Buffer.byteLength(JSON.stringify({
+      ...oneCellPage,
+      sheetCells: {
+        [firstKey]: cells[firstKey],
+        'default!1:0': cells['default!1:0'],
+      },
+      nextCursor: encodeSheetCursor({ v: baseVersion, k: 'default!1:0' }),
+    }))).toBeGreaterThan(config.sheetRead.maxCellBytes)
+    vi.mocked(readLiveSheet).mockResolvedValue(view)
+
+    const res = mockRes()
+    await getDocSheetHandler(req({ docId: 'd_1' }, { limit: '3' }), res as never)
+
+    expect(res.statusCode).toBe(200)
+    expect(res.body).toEqual(oneCellPage)
+    expect(Buffer.byteLength(JSON.stringify(res.body))).toBeLessThanOrEqual(config.sheetRead.maxCellBytes)
+  })
+
+  it('fits the complete continuation-page response under the cap', async () => {
+    const cells = {
+      'default!0:0': { v: 'a'.repeat(100) },
+      'default!1:0': { v: 'b'.repeat(100) },
+      'default!2:0': { v: 'c'.repeat(100) },
+    }
+    const view = liveSheet(cells)
+    const baseVersion = encodeBaseVersion(view.baseSV)
+    const firstKey = 'default!0:0'
+    const secondKey = 'default!1:0'
+    const oneCellPage = {
+      docId: 'd_1',
+      sheetCells: { [secondKey]: cells[secondKey] },
+      baseVersion,
+      hasMore: true,
+      nextCursor: encodeSheetCursor({ v: baseVersion, k: secondKey }),
+    }
+    config.sheetRead.maxCellBytes = Buffer.byteLength(JSON.stringify(oneCellPage))
+    expect(Buffer.byteLength(JSON.stringify({
+      ...oneCellPage,
+      sheetCells: {
+        [secondKey]: cells[secondKey],
+        'default!2:0': cells['default!2:0'],
+      },
+      hasMore: false,
+      nextCursor: null,
+    }))).toBeGreaterThan(config.sheetRead.maxCellBytes)
+    vi.mocked(readLiveSheet).mockResolvedValue(view)
+
+    const res = mockRes()
+    await getDocSheetHandler(
+      req({ docId: 'd_1' }, { limit: '3', cursor: encodeSheetCursor({ v: baseVersion, k: firstKey }) }),
+      res as never,
+    )
+
+    expect(res.statusCode).toBe(200)
+    expect(res.body).toEqual(oneCellPage)
+    expect(Buffer.byteLength(JSON.stringify(res.body))).toBeLessThanOrEqual(config.sheetRead.maxCellBytes)
+  })
+
+  it('returns a repairable 413 when checkbox metadata makes the final first page exceed the cap', async () => {
+    config.sheetRead.maxCellBytes = 300
+    const doc = new Y.Doc()
+    doc.getMap<StoredSheetMeta>(SHEET_LIST_FIELD).set('default', { name: 'Sheet1', order: 0 })
+    doc.getMap<StoredDataValidation>(SHEET_DATA_VALIDATIONS_FIELD).set('default!checkbox-a1', {
+      uid: 'checkbox-a1',
+      type: 'checkbox',
+      allowBlank: true,
+      error: 'x'.repeat(250),
+      ranges: [{ startRow: 0, startColumn: 0, endRow: 0, endColumn: 0 }],
+    })
+    const view = { state: Y.encodeStateAsUpdate(doc), baseSV: Y.encodeStateVector(doc) }
+    vi.mocked(readLiveSheet).mockResolvedValue(view)
+
+    const res = mockRes()
+    await getDocSheetHandler(req({ docId: 'd_1' }, { limit: '100' }), res as never)
+
+    expect(res.statusCode).toBe(413)
+    expect(res.body).toMatchObject({
+      error: 'sheet_too_large',
+      limit: 300,
+      baseVersion: encodeBaseVersion(view.baseSV),
+      repairDataValidationKey: 'default!checkbox-a1',
+    })
+    expect((res.body as { payloadBytes: number }).payloadBytes).toBeGreaterThan(300)
+  })
+
+  it('does not offer checkbox repair when the first cell still cannot fit after deletion', async () => {
+    const doc = new Y.Doc()
+    const firstKey = 'default!0:0'
+    const cells = { [firstKey]: { v: 'x'.repeat(500) } }
+    const sheetList = { default: { name: 'Sheet1', order: 0 } }
+    const validationKey = 'default!checkbox-a1'
+    const rule: StoredDataValidation = {
+      uid: 'checkbox-a1',
+      type: 'checkbox',
+      allowBlank: true,
+      ranges: [{ startRow: 0, startColumn: 0, endRow: 0, endColumn: 0 }],
+    }
+    doc.getMap(SHEET_YMAP_FIELD).set(firstKey, cells[firstKey])
+    doc.getMap<StoredSheetMeta>(SHEET_LIST_FIELD).set('default', sheetList.default)
+    doc.getMap<StoredDataValidation>(SHEET_DATA_VALIDATIONS_FIELD).set(validationKey, rule)
+    const view = { state: Y.encodeStateAsUpdate(doc), baseSV: Y.encodeStateVector(doc) }
+    const baseVersion = encodeBaseVersion(view.baseSV)
+    const metadataWithoutValidations = {
+      docId: 'd_1',
+      sheetCells: {},
+      baseVersion,
+      hasMore: false,
+      nextCursor: null,
+      sheetDims: {},
+      sheetHyperLinks: {},
+      sheetMerges: {},
+      sheetList,
+      sheetDataValidations: {},
+    }
+    config.sheetRead.maxCellBytes = Buffer.byteLength(JSON.stringify(metadataWithoutValidations)) + 10
+    expect(Buffer.byteLength(JSON.stringify({
+      ...metadataWithoutValidations,
+      sheetDataValidations: { [validationKey]: rule },
+    }))).toBeGreaterThan(config.sheetRead.maxCellBytes)
+    expect(Buffer.byteLength(JSON.stringify({
+      ...metadataWithoutValidations,
+      sheetCells: cells,
+    }))).toBeGreaterThan(config.sheetRead.maxCellBytes)
+    vi.mocked(readLiveSheet).mockResolvedValue(view)
+
+    const res = mockRes()
+    await getDocSheetHandler(req({ docId: 'd_1' }, { limit: '1' }), res as never)
+
+    expect(res.statusCode).toBe(413)
+    expect(res.body).toMatchObject({
+      error: 'sheet_too_large',
+      hint: 'the next sheet cell exceeds the paginated read limit',
+    })
+    expect(res.body).not.toHaveProperty('repairDataValidationKey')
+    expect(res.body).not.toHaveProperty('baseVersion')
+  })
+
+  it('shrinks a checkbox first page before asking the caller to delete valid metadata', async () => {
+    config.sheetRead.maxCellBytes = 500
+    const doc = new Y.Doc()
+    for (let row = 0; row < 20; row++) {
+      doc.getMap<unknown>(SHEET_YMAP_FIELD).set(`default!${row}:0`, { v: `row-${row}` })
+    }
+    doc.getMap<StoredSheetMeta>(SHEET_LIST_FIELD).set('default', { name: 'Sheet1', order: 0 })
+    doc.getMap<StoredDataValidation>(SHEET_DATA_VALIDATIONS_FIELD).set('default!checkbox-a1', {
+      uid: 'checkbox-a1',
+      type: 'checkbox',
+      allowBlank: true,
+      ranges: [{ startRow: 0, startColumn: 0, endRow: 0, endColumn: 0 }],
+    })
+    vi.mocked(readLiveSheet).mockResolvedValue({
+      state: Y.encodeStateAsUpdate(doc),
+      baseSV: Y.encodeStateVector(doc),
+    })
+
+    const res = mockRes()
+    await getDocSheetHandler(req({ docId: 'd_1' }, { limit: '100' }), res as never)
+
+    expect(res.statusCode).toBe(200)
+    expect(Object.keys((res.body as { sheetCells: object }).sheetCells).length).toBeGreaterThan(0)
+    expect(Object.keys((res.body as { sheetCells: object }).sheetCells).length).toBeLessThan(20)
+    expect(res.body).toMatchObject({
+      hasMore: true,
+      nextCursor: expect.any(String),
+      sheetDataValidations: { 'default!checkbox-a1': expect.any(Object) },
+    })
+    expect(Buffer.byteLength(JSON.stringify(res.body))).toBeLessThanOrEqual(500)
+  })
+
+  it('does not offer checkbox deletion when other first-page metadata already exceeds the cap', async () => {
+    config.sheetRead.maxCellBytes = 300
+    const doc = new Y.Doc()
+    doc.getMap<StoredSheetMeta>(SHEET_LIST_FIELD).set('default', {
+      name: 'x'.repeat(400),
+      order: 0,
+    })
+    doc.getMap<StoredDataValidation>(SHEET_DATA_VALIDATIONS_FIELD).set('default!checkbox-a1', {
+      uid: 'checkbox-a1',
+      type: 'checkbox',
+      allowBlank: true,
+      ranges: [{ startRow: 0, startColumn: 0, endRow: 0, endColumn: 0 }],
+    })
+    vi.mocked(readLiveSheet).mockResolvedValue({
+      state: Y.encodeStateAsUpdate(doc),
+      baseSV: Y.encodeStateVector(doc),
+    })
+
+    const res = mockRes()
+    await getDocSheetHandler(req({ docId: 'd_1' }, { limit: '100' }), res as never)
+
+    expect(res.statusCode).toBe(413)
+    expect(res.body).toMatchObject({
+      error: 'sheet_too_large',
+      hint: 'sheet metadata exceeds the paginated read limit',
+    })
+    expect(res.body).not.toHaveProperty('repairDataValidationKey')
+    expect(res.body).not.toHaveProperty('baseVersion')
+  })
+
+  it('reports first-page metadata overflow when there are no checkbox rules or cells', async () => {
+    config.sheetRead.maxCellBytes = 300
+    const doc = new Y.Doc()
+    doc.getMap<StoredSheetMeta>(SHEET_LIST_FIELD).set('default', {
+      name: 'x'.repeat(400),
+      order: 0,
+    })
+    vi.mocked(readLiveSheet).mockResolvedValue({
+      state: Y.encodeStateAsUpdate(doc),
+      baseSV: Y.encodeStateVector(doc),
+    })
+
+    const res = mockRes()
+    await getDocSheetHandler(req({ docId: 'd_1' }, { limit: '100' }), res as never)
+
+    expect(res.statusCode).toBe(413)
+    expect(res.body).toMatchObject({
+      error: 'sheet_too_large',
+      hint: 'sheet metadata exceeds the paginated read limit',
+    })
+    expect(res.body).not.toHaveProperty('repairDataValidationKey')
+  })
+
+  it('offers checkbox repair when metadata blocks a one-cell terminal page with a long state vector', async () => {
+    const doc = new Y.Doc()
+    const firstKey = 'default!0:0'
+    const cells = { [firstKey]: { v: 'x'.repeat(500) } }
+    const sheetList = { default: { name: 'Sheet1', order: 0 } }
+    const validationKey = 'default!checkbox-a1'
+    const rule: StoredDataValidation = {
+      uid: 'checkbox-a1',
+      type: 'checkbox',
+      allowBlank: true,
+      ranges: [{ startRow: 0, startColumn: 0, endRow: 0, endColumn: 0 }],
+    }
+    for (let index = 0; index < 30; index++) {
+      const client = new Y.Doc()
+      client.getMap('state-vector-padding').set(String(index), index)
+      Y.applyUpdate(doc, Y.encodeStateAsUpdate(client))
+    }
+    for (const [key, cell] of Object.entries(cells)) doc.getMap(SHEET_YMAP_FIELD).set(key, cell)
+    doc.getMap<StoredSheetMeta>(SHEET_LIST_FIELD).set('default', sheetList.default)
+    doc.getMap<StoredDataValidation>(SHEET_DATA_VALIDATIONS_FIELD).set(validationKey, rule)
+    const view = { state: Y.encodeStateAsUpdate(doc), baseSV: Y.encodeStateVector(doc) }
+    const baseVersion = encodeBaseVersion(view.baseSV)
+    const minimalPageWithoutValidations = {
+      docId: 'd_1',
+      sheetCells: { [firstKey]: cells[firstKey] },
+      baseVersion,
+      hasMore: false,
+      nextCursor: null,
+      sheetDims: {},
+      sheetHyperLinks: {},
+      sheetMerges: {},
+      sheetList,
+      sheetDataValidations: {},
+    }
+    config.sheetRead.maxCellBytes = Buffer.byteLength(JSON.stringify(minimalPageWithoutValidations))
+    expect(Buffer.byteLength(JSON.stringify({
+      ...minimalPageWithoutValidations,
+      sheetCells: {},
+      sheetDataValidations: { [validationKey]: rule },
+    }))).toBeLessThanOrEqual(config.sheetRead.maxCellBytes)
+    vi.mocked(readLiveSheet).mockResolvedValue(view)
+
+    const res = mockRes()
+    await getDocSheetHandler(req({ docId: 'd_1' }, { limit: '1' }), res as never)
+
+    expect(res.statusCode).toBe(413)
+    expect(res.body).toMatchObject({
+      error: 'sheet_too_large',
+      baseVersion,
+      repairDataValidationKey: validationKey,
+    })
+  })
+
+  it('re-paginates without checkbox metadata before deciding whether repair can restore the page', async () => {
+    const doc = new Y.Doc()
+    const logicalId = 's'.repeat(64)
+    const firstKey = `${logicalId}!0:0`
+    const secondKey = `${logicalId}!1:0`
+    const cells = { [firstKey]: { v: 'a' }, [secondKey]: { v: 'b' } }
+    const sheetList = { [logicalId]: { name: 'Sheet1', order: 0 } }
+    const validationKey = `${logicalId}!c`
+    const rule: StoredDataValidation = {
+      uid: 'c',
+      type: 'checkbox',
+      allowBlank: true,
+      ranges: [{ startRow: 0, startColumn: 0, endRow: 0, endColumn: 0 }],
+    }
+    for (const [key, cell] of Object.entries(cells)) doc.getMap(SHEET_YMAP_FIELD).set(key, cell)
+    doc.getMap<StoredSheetMeta>(SHEET_LIST_FIELD).set(logicalId, sheetList[logicalId])
+    doc.getMap<StoredDataValidation>(SHEET_DATA_VALIDATIONS_FIELD).set(validationKey, rule)
+    const view = { state: Y.encodeStateAsUpdate(doc), baseSV: Y.encodeStateVector(doc) }
+    const baseVersion = encodeBaseVersion(view.baseSV)
+    const repairedTerminalPage = {
+      docId: 'd_1',
+      sheetCells: cells,
+      baseVersion,
+      hasMore: false,
+      nextCursor: null,
+      sheetDims: {},
+      sheetHyperLinks: {},
+      sheetMerges: {},
+      sheetList,
+      sheetDataValidations: {},
+    }
+    config.sheetRead.maxCellBytes = Buffer.byteLength(JSON.stringify(repairedTerminalPage))
+    const staleOneCellProbe = {
+      ...repairedTerminalPage,
+      sheetCells: { [firstKey]: cells[firstKey] },
+      hasMore: true,
+      nextCursor: encodeSheetCursor({ v: baseVersion, k: firstKey }),
+    }
+    expect(Buffer.byteLength(JSON.stringify(staleOneCellProbe))).toBeGreaterThan(
+      config.sheetRead.maxCellBytes,
+    )
+    vi.mocked(readLiveSheet).mockResolvedValue(view)
+
+    const res = mockRes()
+    await getDocSheetHandler(req({ docId: 'd_1' }, { limit: '2' }), res as never)
+
+    expect(res.statusCode).toBe(413)
+    expect(res.body).toMatchObject({
+      error: 'sheet_too_large',
+      baseVersion,
+      repairDataValidationKey: validationKey,
+    })
+  })
+
+  it('offers checkbox repair when only a smaller post-delete prefix fits', async () => {
+    const doc = new Y.Doc()
+    const cells = {
+      'default!0:0': { v: 'a'.repeat(100) },
+      'default!1:0': { v: 'b'.repeat(100) },
+      'default!2:0': { v: 'c'.repeat(100) },
+    }
+    const sheetList = { default: { name: 'Sheet1', order: 0 } }
+    const validationKey = 'default!checkbox-a1'
+    const rule: StoredDataValidation = {
+      uid: 'checkbox-a1',
+      type: 'checkbox',
+      allowBlank: true,
+      ranges: [{ startRow: 0, startColumn: 0, endRow: 0, endColumn: 0 }],
+    }
+    for (const [key, cell] of Object.entries(cells)) doc.getMap(SHEET_YMAP_FIELD).set(key, cell)
+    doc.getMap<StoredSheetMeta>(SHEET_LIST_FIELD).set('default', sheetList.default)
+    doc.getMap<StoredDataValidation>(SHEET_DATA_VALIDATIONS_FIELD).set(validationKey, rule)
+    const view = { state: Y.encodeStateAsUpdate(doc), baseSV: Y.encodeStateVector(doc) }
+    const baseVersion = encodeBaseVersion(view.baseSV)
+    const firstKey = 'default!0:0'
+    const oneCellPageWithoutValidations = {
+      docId: 'd_1',
+      sheetCells: { [firstKey]: cells[firstKey] },
+      baseVersion,
+      hasMore: true,
+      nextCursor: encodeSheetCursor({ v: baseVersion, k: firstKey }),
+      sheetDims: {},
+      sheetHyperLinks: {},
+      sheetMerges: {},
+      sheetList,
+      sheetDataValidations: {},
+    }
+    config.sheetRead.maxCellBytes = Buffer.byteLength(JSON.stringify(oneCellPageWithoutValidations))
+    expect(Buffer.byteLength(JSON.stringify({
+      ...oneCellPageWithoutValidations,
+      sheetCells: {
+        [firstKey]: cells[firstKey],
+        'default!1:0': cells['default!1:0'],
+      },
+      nextCursor: encodeSheetCursor({ v: baseVersion, k: 'default!1:0' }),
+    }))).toBeGreaterThan(config.sheetRead.maxCellBytes)
+    expect(Buffer.byteLength(JSON.stringify({
+      ...oneCellPageWithoutValidations,
+      sheetCells: {},
+      hasMore: false,
+      nextCursor: null,
+      sheetDataValidations: { [validationKey]: rule },
+    }))).toBeLessThanOrEqual(config.sheetRead.maxCellBytes)
+    vi.mocked(readLiveSheet).mockResolvedValue(view)
+
+    const res = mockRes()
+    await getDocSheetHandler(req({ docId: 'd_1' }, { limit: '3' }), res as never)
+
+    expect(res.statusCode).toBe(413)
+    expect(res.body).toMatchObject({
+      error: 'sheet_too_large',
+      baseVersion,
+      repairDataValidationKey: validationKey,
+    })
   })
 
   it('subsequent pages keep the full byte budget (dims omitted, not reserved)', async () => {
@@ -374,7 +865,7 @@ describe('paginated sheet read', () => {
     // their bytes — it gets the whole cap for cells. Use a sheet large enough that
     // the byte budget (not the cell supply) bounds BOTH pages, so the comparison
     // reflects the budget difference rather than the sheet running out.
-    config.sheetRead.maxCellBytes = 400
+    config.sheetRead.maxCellBytes = 500
     const cells: Record<string, SheetCell> = {}
     for (let r = 0; r < 40; r++) cells[`default!${r}:0`] = { v: `row-${r}` }
     const dims: Record<string, number> = {}

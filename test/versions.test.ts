@@ -63,6 +63,7 @@ import { buildSchema, COLLAB_FIELD, SCHEMA_VERSION } from '../src/schema/index.j
 import { WB_SCHEMA_VERSION } from '../src/whiteboard/schema/index.js'
 import { Node as PMNode } from 'prosemirror-model'
 import { prosemirrorToYDoc, prosemirrorToYXmlFragment, yDocToProsemirrorJSON } from 'y-prosemirror'
+import { SHEET_DATA_VALIDATIONS_FIELD, SHEET_LIST_FIELD } from '../src/agent/sheetConversion.js'
 
 const schema = buildSchema()
 
@@ -466,6 +467,73 @@ describe('getVersionStateHandler — decoded preview (A3)', () => {
     expect((body.doc as { type: string }).type).toBe('doc')
     expect(paragraphTexts(body.doc)).toEqual(['hello', 'world'])
     expect(body.docVersionSeq).toBe(5)
+
+    vi.mocked(docVersionRepo.getStateById).mockRestore()
+  })
+
+  it('includes checkbox validations in a sheet version preview', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(adminGuard)
+    const versionDoc = new Y.Doc()
+    Y.applyUpdate(versionDoc, stateFromPM({ type: 'doc', content: [para('sheet')] }))
+    versionDoc.getMap(SHEET_LIST_FIELD).set('default', { name: 'Sheet1', order: 0 })
+    versionDoc.getMap(SHEET_DATA_VALIDATIONS_FIELD).set('default!checkbox-1', {
+      uid: 'checkbox-1',
+      type: 'checkbox',
+      formula1: '1',
+      formula2: '0',
+      ranges: [{ startRow: 0, startColumn: 0, endRow: 0, endColumn: 0 }],
+    })
+    versionDoc.getMap(SHEET_DATA_VALIDATIONS_FIELD).set('default!decimal-1', {
+      uid: 'decimal-1',
+      type: 'decimal',
+      operator: 'equal',
+      formula1: '100',
+      ranges: [{ startRow: 8, startColumn: 3, endRow: 8, endColumn: 3 }],
+    })
+    versionDoc.getMap(SHEET_DATA_VALIDATIONS_FIELD).set('deleted!checkbox-2', {
+      uid: 'checkbox-2',
+      type: 'checkbox',
+      ranges: [{ startRow: 1, startColumn: 1, endRow: 1, endColumn: 1 }],
+    })
+    vi.spyOn(docVersionRepo, 'getStateById').mockResolvedValue({
+      version: versionRow() as never,
+      state: Y.encodeStateAsUpdate(versionDoc),
+    })
+
+    const res = mockRes()
+    await getVersionStateHandler(req({ docId: 'd_1', versionId: '5' }), res as never)
+
+    expect(res.statusCode).toBe(200)
+    expect((res.body as { sheetDataValidations: Record<string, unknown> }).sheetDataValidations).toEqual({
+      'default!checkbox-1': expect.objectContaining({ uid: 'checkbox-1', type: 'checkbox' }),
+    })
+    expect((res.body as { sheetList: Record<string, unknown> }).sheetList).toEqual({
+      default: { name: 'Sheet1', order: 0 },
+    })
+
+    vi.mocked(docVersionRepo.getStateById).mockRestore()
+  })
+
+  it('returns 409 sheet_snapshot_invalid for a malformed checkbox in version preview', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(adminGuard)
+    const versionDoc = new Y.Doc()
+    Y.applyUpdate(versionDoc, stateFromPM({ type: 'doc', content: [para('sheet')] }))
+    versionDoc.getMap(SHEET_LIST_FIELD).set('default', { name: 'Sheet1', order: 0 })
+    versionDoc.getMap(SHEET_DATA_VALIDATIONS_FIELD).set('default!broken', {
+      uid: 'broken',
+      type: 'checkbox',
+      ranges: null,
+    })
+    vi.spyOn(docVersionRepo, 'getStateById').mockResolvedValue({
+      version: versionRow() as never,
+      state: Y.encodeStateAsUpdate(versionDoc),
+    })
+
+    const res = mockRes()
+    await getVersionStateHandler(req({ docId: 'd_1', versionId: '5' }), res as never)
+
+    expect(res.statusCode).toBe(409)
+    expect((res.body as { error: string }).error).toBe('sheet_snapshot_invalid')
 
     vi.mocked(docVersionRepo.getStateById).mockRestore()
   })

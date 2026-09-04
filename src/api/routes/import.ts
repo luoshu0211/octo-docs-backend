@@ -40,8 +40,8 @@ import { resolveGitHubEmoji } from '../../import/markdown/emoji.js'
 import { parseXlsx, XlsxParseError } from '../../import/xlsx/parse.js'
 import { xlsxWorkbookToSheetBatch } from '../../import/xlsx/toSheetBatch.js'
 import { readLiveSheet } from '../../collab/liveSheetWrite.js'
-import { decodeSheetSnapshot, decodeSheetDimsSnapshot, decodeSheetDrawingsSnapshot, decodeSheetHyperLinksSnapshot, decodeSheetMergesSnapshot, decodeSheetListSnapshot } from '../../collab/versionRestore.js'
-import type { SheetCell, StoredDrawing, StoredHyperLink, StoredSheetMeta } from '../../agent/sheetConversion.js'
+import { decodeSheetSnapshot, decodeSheetDimsSnapshot, decodeSheetDrawingsSnapshot, decodeSheetHyperLinksSnapshot, decodeSheetMergesSnapshot, decodeSheetListSnapshot, decodeOwnedSheetDataValidationKeysSnapshot } from '../../collab/versionRestore.js'
+import type { SheetCell, StoredDrawing, StoredHyperLink, StoredSheetMeta, StoredDataValidation } from '../../agent/sheetConversion.js'
 import { editDocSheet } from '../services/editDocSheet.js'
 import { readLiveForEdit } from '../../collab/liveDocWrite.js'
 import { editDocBody } from '../services/editDocBody.js'
@@ -825,6 +825,7 @@ export async function importXlsxHandler(req: Request, res: Response): Promise<vo
     const existingHyperlinks = decodeSheetHyperLinksSnapshot(state)
     const existingMerges = decodeSheetMergesSnapshot(state)
     const existingSheets = decodeSheetListSnapshot(state)
+    const existingDataValidationKeys = decodeOwnedSheetDataValidationKeysSnapshot(state)
     const cells: Record<string, SheetCell | null> = {}
     for (const key of Object.keys(existingCells)) cells[key] = null
     Object.assign(cells, importedCells)
@@ -842,6 +843,8 @@ export async function importXlsxHandler(req: Request, res: Response): Promise<vo
     const sheets: Record<string, StoredSheetMeta | null> = {}
     for (const key of Object.keys(existingSheets)) sheets[key] = null
     sheets.default = { name: importedSheetName?.trim() || 'Sheet1', order: 0 }
+    const dataValidations: Record<string, StoredDataValidation | null> = Object.create(null)
+    for (const key of existingDataValidationKeys) dataValidations[key] = null
     const result = await editDocSheet({
       uid: req.uid,
       docId,
@@ -854,6 +857,7 @@ export async function importXlsxHandler(req: Request, res: Response): Promise<vo
       hyperlinks,
       merges,
       sheets,
+      dataValidations,
       authorizedEpoch: guard.meta.permission_epoch,
       isBot: req.botToken !== undefined,
       token: req.octoToken,
@@ -863,6 +867,9 @@ export async function importXlsxHandler(req: Request, res: Response): Promise<vo
       if (result.payloadBytes !== undefined) errBody.payloadBytes = result.payloadBytes
       if (result.docBytes !== undefined) errBody.docBytes = result.docBytes
       if (result.limit !== undefined) errBody.limit = result.limit
+      if (result.baseVersion !== undefined) errBody.baseVersion = result.baseVersion
+      if (result.repairDataValidationKey !== undefined) errBody.repairDataValidationKey = result.repairDataValidationKey
+      if (result.hint !== undefined) errBody.hint = result.hint
       res.status(result.status).json(errBody)
       return
     }
