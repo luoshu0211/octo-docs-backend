@@ -1,6 +1,16 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import * as Y from 'yjs'
-import { SHEET_YMAP_FIELD, SHEET_DIMS_FIELD, SHEET_LIST_FIELD, SHEET_DATA_VALIDATIONS_FIELD, type SheetCell, type StoredDataValidation, type StoredSheetMeta } from '../src/agent/sheetConversion.js'
+import {
+  SHEET_YMAP_FIELD,
+  SHEET_DIMS_FIELD,
+  SHEET_LIST_FIELD,
+  SHEET_FREEZE_FIELD,
+  SHEET_FILTERS_FIELD,
+  SHEET_DATA_VALIDATIONS_FIELD,
+  type SheetCell,
+  type StoredDataValidation,
+  type StoredSheetMeta,
+} from '../src/agent/sheetConversion.js'
 
 // Offline unit test (mirrors docContent.test.ts): mock the auth guard and the
 // live-document boundary. The route's decode + payload-guard runs for real
@@ -49,6 +59,11 @@ const sheetGuard = {
 function liveSheet(
   cells: Record<string, unknown> = {},
   dims: Record<string, number> = {},
+  resources: {
+    freeze?: Record<string, unknown>
+    filters?: Record<string, unknown>
+    dataValidations?: Record<string, unknown>
+  } = {},
 ) {
   const doc = new Y.Doc()
   const cellMap = doc.getMap<unknown>(SHEET_YMAP_FIELD)
@@ -56,6 +71,11 @@ function liveSheet(
   doc.transact(() => {
     for (const [k, v] of Object.entries(cells)) cellMap.set(k, v)
     for (const [k, v] of Object.entries(dims)) dimMap.set(k, v)
+    for (const [k, v] of Object.entries(resources.freeze ?? {})) doc.getMap(SHEET_FREEZE_FIELD).set(k, v)
+    for (const [k, v] of Object.entries(resources.filters ?? {})) doc.getMap(SHEET_FILTERS_FIELD).set(k, v)
+    for (const [k, v] of Object.entries(resources.dataValidations ?? {})) {
+      doc.getMap(SHEET_DATA_VALIDATIONS_FIELD).set(k, v)
+    }
   })
   return { state: Y.encodeStateAsUpdate(doc), baseSV: Y.encodeStateVector(doc) }
 }
@@ -112,9 +132,53 @@ describe('GET /sheet — live cells + dims + base version', () => {
     await getDocSheetHandler(req({ docId: 'd_1' }), res as never)
 
     expect(res.statusCode).toBe(200)
-    const body = res.body as { sheetCells: object; sheetDims: object }
+    const body = res.body as {
+      sheetCells: object
+      sheetDims: object
+      sheetFreeze: object
+      sheetFilters: object
+      sheetDataValidations: object
+    }
     expect(body.sheetCells).toEqual({})
     expect(body.sheetDims).toEqual({})
+    expect(body.sheetFreeze).toEqual({})
+    expect(body.sheetFilters).toEqual({})
+    expect(body.sheetDataValidations).toEqual({})
+  })
+
+  it('returns freeze, filter, and dropdown/data-validation resources', async () => {
+    const range = { startRow: 0, startColumn: 0, endRow: 9, endColumn: 1 }
+    vi.mocked(readLiveSheet).mockResolvedValue(liveSheet({}, {}, {
+      freeze: { default: { startRow: 1, startColumn: 0, xSplit: 0, ySplit: 1 } },
+      filters: { default: { ref: range, filterColumns: [{ colId: 1, filters: { filters: ['open'] } }] } },
+      dataValidations: {
+        'default!bot-status': {
+          uid: 'bot-status',
+          type: 'listMultiple',
+          formula1: '["待处理","处理中"]',
+          formula2: '#9ec5fe,#ffd8a8',
+          showDropDown: true,
+          renderMode: 2,
+          ranges: [range],
+        },
+      },
+    }))
+
+    const res = mockRes()
+    await getDocSheetHandler(req({ docId: 'd_1' }), res as never)
+
+    expect(res.statusCode).toBe(200)
+    const body = res.body as Record<string, unknown>
+    expect(body.sheetFreeze).toEqual({ default: { startRow: 1, startColumn: -1, xSplit: 0, ySplit: 1 } })
+    expect(body.sheetFilters).toEqual({
+      default: { ref: range, filterColumns: [{ colId: 1, filters: { filters: ['open'] } }] },
+    })
+    expect(body.sheetDataValidations).toEqual({
+      default: [{
+        uid: 'bot-status', type: 'listMultiple', formula1: '["待处理","处理中"]',
+        formula2: '#9ec5fe,#ffd8a8', showDropDown: true, renderMode: 2, ranges: [range],
+      }],
+    })
   })
 
   it('returns checkbox validation rules with the live sheet state', async () => {
@@ -136,16 +200,16 @@ describe('GET /sheet — live cells + dims + base version', () => {
     await getDocSheetHandler(req({ docId: 'd_1' }), res as never)
 
     expect(res.statusCode).toBe(200)
-    expect((res.body as { sheetDataValidations: Record<string, StoredDataValidation> }).sheetDataValidations)
+    expect((res.body as { sheetDataValidations: Record<string, StoredDataValidation[]> }).sheetDataValidations)
       .toEqual({
-        'default!checkbox-a1': {
+        default: [{
           uid: 'checkbox-a1',
           type: 'checkbox',
           formula1: '1',
           formula2: '0',
           allowBlank: true,
           ranges: [{ startRow: 0, startColumn: 0, endRow: 0, endColumn: 0 }],
-        },
+        }],
       })
   })
 
@@ -361,7 +425,7 @@ describe('paginated sheet read', () => {
   it('a large sheet is paginated instead of 413 (the read wall is lifted)', async () => {
     // Same oversized grid that the whole-sheet read rejects with 413 — under a
     // small cap, paginated mode serves it a page at a time with a 200.
-    config.sheetRead.maxCellBytes = 300
+    config.sheetRead.maxCellBytes = 400
     const cells: Record<string, SheetCell> = {}
     for (let r = 0; r < 40; r++) cells[`default!${r}:0`] = { v: `row-${r}-value` }
     vi.mocked(readLiveSheet).mockResolvedValue(liveSheet(cells))
@@ -447,6 +511,39 @@ describe('paginated sheet read', () => {
     expect(body.hasMore).toBe(true)
   })
 
+  it('returns 413 when first-page worksheet metadata alone exceeds the byte cap', async () => {
+    config.sheetRead.maxCellBytes = 200
+    vi.mocked(readLiveSheet).mockResolvedValue(liveSheet({}, {}, {
+      dataValidations: {
+        'default!large': {
+          uid: 'large',
+          type: 'list',
+          formula1: JSON.stringify(['x'.repeat(300)]),
+          ranges: [{ startRow: 0, startColumn: 0, endRow: 0, endColumn: 0 }],
+        },
+      },
+    }))
+
+    const res = mockRes()
+    await getDocSheetHandler(req({ docId: 'd_1' }, { limit: '10' }), res as never)
+
+    expect(res.statusCode).toBe(413)
+    expect(res.body).toMatchObject({ error: 'sheet_too_large', limit: 200 })
+  })
+
+  it('returns 413 rather than forcing one oversized cell into a paginated response', async () => {
+    config.sheetRead.maxCellBytes = 200
+    vi.mocked(readLiveSheet).mockResolvedValue(liveSheet({
+      'default!0:0': { v: 'x'.repeat(500) },
+    }))
+
+    const res = mockRes()
+    await getDocSheetHandler(req({ docId: 'd_1' }, { limit: '10' }), res as never)
+
+    expect(res.statusCode).toBe(413)
+    expect(res.body).toMatchObject({ error: 'sheet_too_large', limit: 200 })
+  })
+
   it('fits the complete first-page response under the cap without checkbox rules', async () => {
     const cells = {
       'default!0:0': { v: 'a'.repeat(100) },
@@ -466,6 +563,8 @@ describe('paginated sheet read', () => {
       sheetHyperLinks: {},
       sheetMerges: {},
       sheetList: {},
+      sheetFreeze: {},
+      sheetFilters: {},
       sheetDataValidations: {},
     }
     config.sheetRead.maxCellBytes = Buffer.byteLength(JSON.stringify(oneCellPage))
@@ -581,12 +680,14 @@ describe('paginated sheet read', () => {
       sheetHyperLinks: {},
       sheetMerges: {},
       sheetList,
+      sheetFreeze: {},
+      sheetFilters: {},
       sheetDataValidations: {},
     }
     config.sheetRead.maxCellBytes = Buffer.byteLength(JSON.stringify(metadataWithoutValidations)) + 10
     expect(Buffer.byteLength(JSON.stringify({
       ...metadataWithoutValidations,
-      sheetDataValidations: { [validationKey]: rule },
+      sheetDataValidations: { default: [rule] },
     }))).toBeGreaterThan(config.sheetRead.maxCellBytes)
     expect(Buffer.byteLength(JSON.stringify({
       ...metadataWithoutValidations,
@@ -633,7 +734,7 @@ describe('paginated sheet read', () => {
     expect(res.body).toMatchObject({
       hasMore: true,
       nextCursor: expect.any(String),
-      sheetDataValidations: { 'default!checkbox-a1': expect.any(Object) },
+      sheetDataValidations: { default: [expect.any(Object)] },
     })
     expect(Buffer.byteLength(JSON.stringify(res.body))).toBeLessThanOrEqual(500)
   })
@@ -723,13 +824,15 @@ describe('paginated sheet read', () => {
       sheetHyperLinks: {},
       sheetMerges: {},
       sheetList,
+      sheetFreeze: {},
+      sheetFilters: {},
       sheetDataValidations: {},
     }
     config.sheetRead.maxCellBytes = Buffer.byteLength(JSON.stringify(minimalPageWithoutValidations))
     expect(Buffer.byteLength(JSON.stringify({
       ...minimalPageWithoutValidations,
       sheetCells: {},
-      sheetDataValidations: { [validationKey]: rule },
+      sheetDataValidations: { default: [rule] },
     }))).toBeLessThanOrEqual(config.sheetRead.maxCellBytes)
     vi.mocked(readLiveSheet).mockResolvedValue(view)
 
@@ -773,6 +876,8 @@ describe('paginated sheet read', () => {
       sheetHyperLinks: {},
       sheetMerges: {},
       sheetList,
+      sheetFreeze: {},
+      sheetFilters: {},
       sheetDataValidations: {},
     }
     config.sheetRead.maxCellBytes = Buffer.byteLength(JSON.stringify(repairedTerminalPage))
@@ -829,6 +934,8 @@ describe('paginated sheet read', () => {
       sheetHyperLinks: {},
       sheetMerges: {},
       sheetList,
+      sheetFreeze: {},
+      sheetFilters: {},
       sheetDataValidations: {},
     }
     config.sheetRead.maxCellBytes = Buffer.byteLength(JSON.stringify(oneCellPageWithoutValidations))
@@ -845,7 +952,7 @@ describe('paginated sheet read', () => {
       sheetCells: {},
       hasMore: false,
       nextCursor: null,
-      sheetDataValidations: { [validationKey]: rule },
+      sheetDataValidations: { default: [rule] },
     }))).toBeLessThanOrEqual(config.sheetRead.maxCellBytes)
     vi.mocked(readLiveSheet).mockResolvedValue(view)
 

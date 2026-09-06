@@ -36,6 +36,8 @@ import {
   validateSheetHyperLinkBatch,
   validateSheetMergeBatch,
   validateSheetListBatch,
+  validateSheetFreezeBatch,
+  validateSheetFilterBatch,
   measureSheetAfterEdit,
   validateSheetDataValidationDeletionRepairBatch,
   validateSheetDataValidations,
@@ -47,7 +49,10 @@ import {
   type StoredDrawing,
   type StoredHyperLink,
   type StoredSheetMeta,
+  type StoredFreeze,
+  type StoredFilter,
   type StoredDataValidation,
+  type SheetDataValidationResourceChanges,
   SHEET_DATA_VALIDATIONS_FIELD,
   SHEET_LIST_FIELD,
 } from '../../agent/sheetConversion.js'
@@ -75,8 +80,12 @@ export interface EditDocSheetInput {
   merges: Record<string, boolean | null>
   /** Keyed sheet tabs (logicalId -> {name,order}); null deletes a tab. */
   sheets: Record<string, StoredSheetMeta | null>
-  /** Keyed checkbox rules (`${logicalId}!${uid}`); null deletes a rule. */
-  dataValidations?: Record<string, StoredDataValidation | null>
+  /** Keyed freeze-pane configs (logicalId -> four Univer counters); null unfreezes. */
+  freeze?: Record<string, StoredFreeze | null>
+  /** Keyed auto-filter snapshots (logicalId -> range + criteria); null removes. */
+  filters?: Record<string, StoredFilter | null>
+  /** Public replace-per-sheet rules; legacy flat checkbox keys remain repair-compatible. */
+  dataValidations?: SheetDataValidationResourceChanges
   /** permission_epoch observed when the request was authorized (TOCTOU baseline). */
   authorizedEpoch: number
   /**
@@ -165,7 +174,7 @@ function mapEditError(err: unknown): {
 function repairableInspectionKey(
   err: unknown,
   preEditState: Uint8Array,
-  dataValidations: Record<string, StoredDataValidation | null>,
+  dataValidations: SheetDataValidationResourceChanges,
 ): string | undefined {
   if (!(err instanceof SheetDataValidationInspectionBudgetError)) return undefined
   const scratch = new Y.Doc()
@@ -190,7 +199,14 @@ function repairableInspectionKey(
   }
   // A non-null request value caused or replaced this candidate. It has not been persisted, so
   // telling the caller to delete it would either be a no-op or remove the previous valid rule.
-  if (Object.prototype.hasOwnProperty.call(dataValidations, key) && dataValidations[key] !== null) {
+  const logicalId = key.includes('!') ? key.slice(0, key.indexOf('!')) : key
+  const directValue = dataValidations[key]
+  const groupedValue = dataValidations[logicalId]
+  if (
+    (Object.prototype.hasOwnProperty.call(dataValidations, key) && directValue !== null) ||
+    (Object.prototype.hasOwnProperty.call(dataValidations, logicalId) &&
+      groupedValue !== null && !(Array.isArray(groupedValue) && groupedValue.length === 0))
+  ) {
     return undefined
   }
   try {
@@ -207,7 +223,7 @@ function repairableInspectionKey(
 function mapEditErrorWithRepairContext(
   err: unknown,
   preEditState: Uint8Array,
-  dataValidations: Record<string, StoredDataValidation | null>,
+  dataValidations: SheetDataValidationResourceChanges,
 ): ReturnType<typeof mapEditError> {
   if (!(err instanceof SheetDataValidationInspectionBudgetError)) return mapEditError(err)
   const repairDataValidationKey = repairableInspectionKey(err, preEditState, dataValidations)
@@ -229,16 +245,20 @@ function mapEditErrorWithRepairContext(
 export async function editDocSheet(input: EditDocSheetInput): Promise<EditDocSheetResult> {
   // ── 1. Pre-flight (NO lock) ───────────────────────────────────────────────
   const { state: preEditState, baseSV } = await readLiveSheet(input.documentName)
+  const freeze = input.freeze ?? {}
+  const filters = input.filters ?? {}
   const dataValidations = input.dataValidations ?? {}
   const validationDeletionOnly =
     Object.keys(dataValidations).length > 0 &&
-    Object.values(dataValidations).every((value) => value === null) &&
+    Object.values(dataValidations).every((value) => value === null || (Array.isArray(value) && value.length === 0)) &&
     Object.keys(input.cells).length === 0 &&
     Object.keys(input.dims).length === 0 &&
     Object.keys(input.drawings).length === 0 &&
     Object.keys(input.hyperlinks).length === 0 &&
     Object.keys(input.merges).length === 0 &&
-    Object.keys(input.sheets).length === 0
+    Object.keys(input.sheets).length === 0 &&
+    Object.keys(freeze).length === 0 &&
+    Object.keys(filters).length === 0
 
   // cheap pre-compare: fail most GET<->PATCH conflicts before a snapshot row.
   if (!stateVectorsEqual(input.clientBaseVersion, baseSV)) {
@@ -257,6 +277,8 @@ export async function editDocSheet(input: EditDocSheetInput): Promise<EditDocShe
     validateSheetHyperLinkBatch(input.hyperlinks)
     validateSheetMergeBatch(input.merges)
     validateSheetListBatch(input.sheets)
+    validateSheetFreezeBatch(freeze)
+    validateSheetFilterBatch(filters)
     const measured = measureSheetAfterEdit(
       preEditState,
       input.cells,
@@ -265,6 +287,8 @@ export async function editDocSheet(input: EditDocSheetInput): Promise<EditDocShe
       input.hyperlinks,
       input.merges,
       input.sheets,
+      freeze,
+      filters,
       dataValidations,
       {
         maxRules: config.sheetWrite.maxDataValidations,
@@ -372,6 +396,8 @@ export async function editDocSheet(input: EditDocSheetInput): Promise<EditDocShe
       input.hyperlinks,
       input.merges,
       input.sheets,
+      freeze,
+      filters,
       dataValidations,
       txResult.isAdmin,
     )

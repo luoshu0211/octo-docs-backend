@@ -505,7 +505,23 @@ describe('getVersionStateHandler — decoded preview (A3)', () => {
 
     expect(res.statusCode).toBe(200)
     expect((res.body as { sheetDataValidations: Record<string, unknown> }).sheetDataValidations).toEqual({
-      'default!checkbox-1': expect.objectContaining({ uid: 'checkbox-1', type: 'checkbox' }),
+      default: [
+        {
+          uid: 'checkbox-1',
+          type: 'checkbox',
+          formula1: '1',
+          formula2: '0',
+          allowBlank: true,
+          ranges: [{ startRow: 0, startColumn: 0, endRow: 0, endColumn: 0 }],
+        },
+        {
+          uid: 'decimal-1',
+          type: 'decimal',
+          operator: 'equal',
+          formula1: '100',
+          ranges: [{ startRow: 8, startColumn: 3, endRow: 8, endColumn: 3 }],
+        },
+      ],
     })
     expect((res.body as { sheetList: Record<string, unknown> }).sheetList).toEqual({
       default: { name: 'Sheet1', order: 0 },

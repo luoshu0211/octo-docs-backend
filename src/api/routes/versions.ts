@@ -38,6 +38,8 @@ import {
   decodeSheetSnapshot,
   decodeSheetDimsSnapshot,
   decodeSheetListSnapshot,
+  decodeSheetFreezeSnapshot,
+  decodeSheetFiltersSnapshot,
   decodeSheetDataValidationsSnapshot,
   SchemaIncompatibleError,
   SheetSnapshotInvalidError,
@@ -271,6 +273,8 @@ export async function getVersionStateHandler(req: Request, res: Response): Promi
       // Checkbox validation rules are part of visible sheet state and must use the same
       // fail-closed decoder as restore, otherwise preview can accept a snapshot restore rejects.
       sheetDataValidations: decodeSheetDataValidationsSnapshot(found.state, true),
+      sheetFreeze: decodeSheetFreezeSnapshot(found.state),
+      sheetFilters: decodeSheetFiltersSnapshot(found.state),
       // The frontend needs the historical tab registry to apply the same valid-sheet filtering as
       // the live grid before diffing checkbox winners. Empty means the legacy implicit default tab.
       sheetList: decodeSheetListSnapshot(found.state),
