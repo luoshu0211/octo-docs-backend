@@ -16,7 +16,43 @@ import { prosemirrorToYXmlFragment, yDocToProsemirrorJSON } from 'y-prosemirror'
 import { Node as PMNode } from 'prosemirror-model'
 import { buildSchema, COLLAB_FIELD, SCHEMA_VERSION } from '../schema/index.js'
 import { HTML_DOC_TYPE, HTML_PPT_DOC_TYPE, type DocType } from '../db/docType.js'
-import { SHEET_YMAP_FIELD, SHEET_DIMS_FIELD, SHEET_DRAWINGS_FIELD, SHEET_HYPERLINKS_FIELD, SHEET_MERGES_FIELD, SHEET_LIST_FIELD, SHEET_DATA_VALIDATIONS_FIELD, SheetSnapshotInvalidError, validateSheetCells, validateSheetCell, validateSheetDims, validateSheetDim, validateSheetDrawing, validateSheetHyperLink, validateSheetHyperLinks, validateSheetMerge, validateSheetMerges, validateSheetListEntry, validateSheetList, validateSheetDataValidationCandidates, validateSheetDataValidations, sheetLogicalIdsWithLegacyDefault, type StoredDrawing, type StoredHyperLink, type StoredSheetMeta, type StoredDataValidation } from '../agent/sheetConversion.js'
+import {
+  SHEET_YMAP_FIELD,
+  SHEET_DIMS_FIELD,
+  SHEET_DRAWINGS_FIELD,
+  SHEET_HYPERLINKS_FIELD,
+  SHEET_MERGES_FIELD,
+  SHEET_LIST_FIELD,
+  SHEET_FREEZE_FIELD,
+  SHEET_FILTERS_FIELD,
+  SHEET_DATA_VALIDATIONS_FIELD,
+  SheetSnapshotInvalidError,
+  validateSheetCells,
+  validateSheetCell,
+  validateSheetDims,
+  validateSheetDim,
+  validateSheetDrawing,
+  validateSheetHyperLink,
+  validateSheetHyperLinks,
+  validateSheetMerge,
+  validateSheetMerges,
+  validateSheetListEntry,
+  validateSheetList,
+  validateSheetFreeze,
+  validateSheetFreezes,
+  validateSheetFilter,
+  validateSheetFilters,
+  validateSheetDataValidationCandidateEntries,
+  validateSheetDataValidationResources,
+  validateSheetDataValidations,
+  sheetLogicalIdsWithLegacyDefault,
+  type StoredDrawing,
+  type StoredHyperLink,
+  type StoredSheetMeta,
+  type StoredFreeze,
+  type StoredFilter,
+  type StoredDataValidationRule,
+} from '../agent/sheetConversion.js'
 import { WB_SCHEMA_VERSION } from '../whiteboard/schema/index.js'
 import { getElementsMap, getFilesMap, readEntry, readElements, type YElements } from '../whiteboard/ydoc.js'
 export { SheetSnapshotInvalidError }
@@ -124,7 +160,17 @@ export function assertNeverKind(kind: never): never {
 // SHEET_YMAP_FIELD is the single shared constant (defined in agent/sheetConversion.ts,
 // the cross-repo contract anchor). A text document never creates this map, so all
 // sheet-aware helpers below are strict no-ops for docs.
-export { SHEET_YMAP_FIELD, SHEET_DIMS_FIELD, SHEET_DRAWINGS_FIELD, SHEET_HYPERLINKS_FIELD, SHEET_MERGES_FIELD, SHEET_LIST_FIELD, SHEET_DATA_VALIDATIONS_FIELD }
+export {
+  SHEET_YMAP_FIELD,
+  SHEET_DIMS_FIELD,
+  SHEET_DRAWINGS_FIELD,
+  SHEET_HYPERLINKS_FIELD,
+  SHEET_MERGES_FIELD,
+  SHEET_LIST_FIELD,
+  SHEET_FREEZE_FIELD,
+  SHEET_FILTERS_FIELD,
+  SHEET_DATA_VALIDATIONS_FIELD,
+}
 
 /**
  * Read the spreadsheet cells out of a snapshot's binary state. Returns a plain
@@ -226,11 +272,31 @@ export function decodeSheetListSnapshot(targetState: Uint8Array): Record<string,
   return validateSheetList(raw)
 }
 
-/** Decode and validate the persisted checkbox rules owned by this backend surface. */
+/** Read the compact per-sheet freeze-pane records from a snapshot. */
+export function decodeSheetFreezeSnapshot(targetState: Uint8Array): Record<string, StoredFreeze> {
+  const doc = new Y.Doc()
+  Y.applyUpdate(doc, targetState)
+  const source = doc.getMap(SHEET_FREEZE_FIELD)
+  const raw: Record<string, unknown> = Object.create(null)
+  for (const [key, value] of source.entries()) raw[key] = value
+  return validateSheetFreezes(raw)
+}
+
+/** Read the compact per-sheet auto-filter range and criteria snapshots. */
+export function decodeSheetFiltersSnapshot(targetState: Uint8Array): Record<string, StoredFilter> {
+  const doc = new Y.Doc()
+  Y.applyUpdate(doc, targetState)
+  const source = doc.getMap(SHEET_FILTERS_FIELD)
+  const raw: Record<string, unknown> = Object.create(null)
+  for (const [key, value] of source.entries()) raw[key] = value
+  return validateSheetFilters(raw)
+}
+
+/** Decode all persisted validation kinds and expose the replace-per-sheet REST shape. */
 export function decodeSheetDataValidationsSnapshot(
   targetState: Uint8Array,
   strictCheckboxCandidates = false,
-): Record<string, StoredDataValidation> {
+): Record<string, StoredDataValidationRule[]> {
   const doc = new Y.Doc()
   Y.applyUpdate(doc, targetState)
   const validations = doc.getMap(SHEET_DATA_VALIDATIONS_FIELD)
@@ -240,7 +306,7 @@ export function decodeSheetDataValidationsSnapshot(
   const allowedLogicalIds = sheetLogicalIdsWithLegacyDefault(Object.keys(validateSheetList(rawSheets)))
   const raw: Record<string, unknown> = Object.create(null)
   for (const [key, value] of validations.entries()) raw[key] = value
-  return validateSheetDataValidations(raw, allowedLogicalIds, strictCheckboxCandidates)
+  return validateSheetDataValidationResources(raw, allowedLogicalIds, strictCheckboxCandidates)
 }
 
 /** List every backend-owned checkbox key, including malformed/overlap-loser state, for replace flows. */
@@ -293,6 +359,10 @@ function processSheetMapReconcile(liveDoc: Y.Doc, targetState: Uint8Array, apply
   const liveMerges = liveDoc.getMap(SHEET_MERGES_FIELD)
   const targetSheets = targetYDoc.getMap(SHEET_LIST_FIELD)
   const liveSheets = liveDoc.getMap(SHEET_LIST_FIELD)
+  const targetFreeze = targetYDoc.getMap(SHEET_FREEZE_FIELD)
+  const liveFreeze = liveDoc.getMap(SHEET_FREEZE_FIELD)
+  const targetFilters = targetYDoc.getMap(SHEET_FILTERS_FIELD)
+  const liveFilters = liveDoc.getMap(SHEET_FILTERS_FIELD)
   const targetValidations = targetYDoc.getMap(SHEET_DATA_VALIDATIONS_FIELD)
   const liveValidations = liveDoc.getMap(SHEET_DATA_VALIDATIONS_FIELD)
   if (
@@ -302,12 +372,14 @@ function processSheetMapReconcile(liveDoc: Y.Doc, targetState: Uint8Array, apply
     targetHyper.size === 0 && liveHyper.size === 0 &&
     targetMerges.size === 0 && liveMerges.size === 0 &&
     targetSheets.size === 0 && liveSheets.size === 0 &&
+    targetFreeze.size === 0 && liveFreeze.size === 0 &&
+    targetFilters.size === 0 && liveFilters.size === 0 &&
     targetValidations.size === 0 && liveValidations.size === 0
   ) {
     return false // pure text doc — untouched
   }
-  // Validate the ENTIRE target of ALL SEVEN maps first (fail-closed) so a bad
-  // cell / dimension / drawing / hyperlink / merge / tab / validation aborts before we mutate
+  // Validate the ENTIRE target of ALL NINE maps first (fail-closed) so a bad
+  // cell / dimension / drawing / hyperlink / merge / tab / freeze / filter / validation aborts before we mutate
   // anything — no partial, half-restored state. Every map is built with a null
   // prototype so a reserved key (e.g. `__proto__`) is an ordinary own property,
   // never a prototype-mutating trap, and membership below uses Object.hasOwn.
@@ -323,10 +395,14 @@ function processSheetMapReconcile(liveDoc: Y.Doc, targetState: Uint8Array, apply
   for (const [key, val] of targetMerges.entries()) validatedMerges[key] = validateSheetMerge(key, val)
   const validatedSheets: Record<string, StoredSheetMeta> = Object.create(null)
   for (const [key, val] of targetSheets.entries()) validatedSheets[key] = validateSheetListEntry(key, val)
+  const validatedFreeze: Record<string, StoredFreeze> = Object.create(null)
+  for (const [key, val] of targetFreeze.entries()) validatedFreeze[key] = validateSheetFreeze(key, val)
+  const validatedFilters: Record<string, StoredFilter> = Object.create(null)
+  for (const [key, val] of targetFilters.entries()) validatedFilters[key] = validateSheetFilter(key, val)
   const rawValidations: Record<string, unknown> = Object.create(null)
   for (const [key, val] of targetValidations.entries()) rawValidations[key] = val
   const allowedValidationLogicalIds = sheetLogicalIdsWithLegacyDefault(Object.keys(validatedSheets))
-  const validatedValidationCandidates = validateSheetDataValidationCandidates(
+  const validatedValidationCandidates = validateSheetDataValidationCandidateEntries(
     rawValidations,
     allowedValidationLogicalIds,
     true,
@@ -334,31 +410,6 @@ function processSheetMapReconcile(liveDoc: Y.Doc, targetState: Uint8Array, apply
   // Also exercise deterministic winner selection before mutation. Restore persists every valid
   // candidate (including overlap losers), while read paths expose only the effective winners.
   validateSheetDataValidations(rawValidations, allowedValidationLogicalIds, true)
-  // This backend owns checkbox persistence only. Refuse to overwrite a live
-  // foreign validation that happens to reuse a target checkbox key; otherwise
-  // restoring checkbox state would silently destroy data owned by another
-  // validation implementation.
-  for (const key of Object.keys(validatedValidationCandidates)) {
-    const liveValue = liveValidations.get(key)
-    if (
-      liveValue !== undefined &&
-      (liveValue === null || typeof liveValue !== 'object' || Array.isArray(liveValue) ||
-        (liveValue as unknown as Record<string, unknown>).type !== 'checkbox')
-    ) {
-      throw new SheetSnapshotInvalidError(`data validation ${key}: cannot replace a non-checkbox rule`)
-    }
-  }
-  for (const [key, targetValue] of targetValidations.entries()) {
-    const targetIsCheckbox = targetValue !== null && typeof targetValue === 'object' && !Array.isArray(targetValue) &&
-      (targetValue as Record<string, unknown>).type === 'checkbox'
-    if (targetIsCheckbox) continue
-    const liveValue = liveValidations.get(key)
-    const liveIsCheckbox = liveValue !== null && typeof liveValue === 'object' && !Array.isArray(liveValue) &&
-      (liveValue as unknown as Record<string, unknown>).type === 'checkbox'
-    if (liveIsCheckbox) {
-      throw new SheetSnapshotInvalidError(`data validation ${key}: cannot replace a checkbox with a non-checkbox rule`)
-    }
-  }
   if (!apply) return true
   // Cells: make live equal target (delete live-only, set/overwrite target).
   for (const key of [...liveSheet.keys()]) {
@@ -407,15 +458,19 @@ function processSheetMapReconcile(liveDoc: Y.Doc, targetState: Uint8Array, apply
   for (const [key, val] of Object.entries(validatedSheets)) {
     liveSheets.set(key, val)
   }
-  // Checkbox validations: reconcile only the rule type this backend owns.
-  // Legacy list/decimal/etc. entries stay untouched instead of disappearing
-  // merely because the checkbox decoder intentionally filtered them out.
-  for (const [key, value] of [...liveValidations.entries()]) {
-    const isCheckbox = value !== null && typeof value === 'object' && !Array.isArray(value) &&
-      (value as unknown as Record<string, unknown>).type === 'checkbox'
-    if (isCheckbox && !Object.hasOwn(validatedValidationCandidates, key)) {
-      liveValidations.delete(key)
-    }
+  for (const key of [...liveFreeze.keys()]) {
+    if (!Object.hasOwn(validatedFreeze, key)) liveFreeze.delete(key)
+  }
+  for (const [key, val] of Object.entries(validatedFreeze)) liveFreeze.set(key, val)
+  for (const key of [...liveFilters.keys()]) {
+    if (!Object.hasOwn(validatedFilters, key)) liveFilters.delete(key)
+  }
+  for (const [key, val] of Object.entries(validatedFilters)) liveFilters.set(key, val)
+  // The unified validation map owns dropdowns and checkboxes. Reconcile every
+  // validated per-rule entry; checkbox candidates retain !124's strict restore
+  // validation and deterministic overlap checks above.
+  for (const key of [...liveValidations.keys()]) {
+    if (!Object.hasOwn(validatedValidationCandidates, key)) liveValidations.delete(key)
   }
   for (const [key, val] of Object.entries(validatedValidationCandidates)) {
     liveValidations.set(key, val)

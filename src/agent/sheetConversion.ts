@@ -70,13 +70,43 @@ export const SHEET_MERGES_FIELD = 'sheetMerges'
  */
 export const SHEET_LIST_FIELD = 'sheetList'
 
-/** Checkbox rules keyed `${logicalId}!${uid}` (matches the Docs frontend binding). */
+/**
+ * Compact worksheet resources introduced by the P0 spreadsheet controls. These
+ * names are a cross-repository contract with octo-docs-module MR !70. Freeze
+ * and filters are stored once per logical sheet; validation rules are keyed
+ * `${logicalId}!${uid}` so independent peer edits converge per rule.
+ */
+export const SHEET_FREEZE_FIELD = 'sheetFreeze'
+export const SHEET_FILTERS_FIELD = 'sheetFilters'
 export const SHEET_DATA_VALIDATIONS_FIELD = 'sheetDataValidations'
 
-export interface StoredDataValidation {
+export interface StoredSheetRange {
+  startRow: number
+  startColumn: number
+  endRow: number
+  endColumn: number
+}
+
+export interface StoredFreeze {
+  startRow: number
+  startColumn: number
+  xSplit: number
+  ySplit: number
+}
+
+export interface StoredFilterColumn extends Record<string, unknown> {
+  colId: number
+}
+
+export interface StoredFilter {
+  ref: StoredSheetRange
+  filterColumns?: StoredFilterColumn[]
+}
+
+export interface StoredDataValidation extends Record<string, unknown> {
   uid: string
   type: string
-  ranges: Array<{ startRow: number; startColumn: number; endRow: number; endColumn: number }>
+  ranges: StoredSheetRange[]
   formula1?: string
   formula2?: string
   error?: string
@@ -93,6 +123,9 @@ export interface StoredDataValidation {
   renderMode?: number
   bizInfo?: { showTime?: boolean }
 }
+
+/** Public REST name retained from MR !123; all validation kinds share this shape. */
+export type StoredDataValidationRule = StoredDataValidation
 
 const DATA_VALIDATION_KEY_RE = /^[^!\p{Cc}]{1,64}![^!\p{Cc}]{1,256}$/u
 const DATA_VALIDATION_OPERATORS = new Set([
@@ -477,14 +510,25 @@ function dataValidationRulesEqual(
 
 /** Validate a checkbox edit against the complete post-edit rule set. */
 export function validateSheetDataValidationBatch(
-  existing: Iterable<[string, unknown]>,
-  changes: Record<string, StoredDataValidation | null>,
-  allowedLogicalIds: ReadonlySet<string>,
+  existing: Iterable<[string, unknown]> | SheetDataValidationResourceChanges,
+  changes?: Record<string, StoredDataValidation | null>,
+  allowedLogicalIds: ReadonlySet<string> = new Set(),
   deletedLogicalIds: ReadonlySet<string> = new Set(),
   storageLimits: SheetDataValidationStorageLimits = configuredSheetDataValidationStorageLimits(),
 ): SheetDataValidationBatch {
+  if (changes === undefined) {
+    const resourceChanges = existing as SheetDataValidationResourceChanges
+    const logicalIds = new Set(Object.keys(resourceChanges).map((key) => (
+      key.includes('!') ? key.slice(0, key.indexOf('!')) : key
+    )))
+    const batch = validateSheetDataValidationResourceBatch([], resourceChanges, logicalIds, new Set(), storageLimits)
+    return {
+      toDelete: Object.keys(resourceChanges).filter((key) => !key.includes('!')),
+      toSet: batch.toSet,
+    }
+  }
   const stored: Record<string, unknown> = Object.create(null)
-  for (const [key, value] of existing) stored[key] = value
+  for (const [key, value] of existing as Iterable<[string, unknown]>) stored[key] = value
   const currentLogicalIds = new Set([...allowedLogicalIds, ...deletedLogicalIds])
   const effectiveBefore = validateSheetDataValidations(stored, currentLogicalIds, false, storageLimits)
   // Keep the raw map for post-edit normalization. Historical overlapping losers remain stored but
@@ -819,6 +863,8 @@ export function assertSheetWriteAllowed(
   sheets: Record<string, StoredSheetMeta | null> = {},
   /** Checkbox data-validation set/delete batch, keyed `${logicalId}!${uid}`. */
   dataValidations: Record<string, StoredDataValidation | null> = {},
+  /** Freeze/filter/grouped-validation changes conservatively address a whole sheet. */
+  resourceSheets: string[] = [],
 ): void {
   if (isAdmin) return
   const keys = Object.keys(cells)
@@ -826,7 +872,10 @@ export function assertSheetWriteAllowed(
   const mergeKeys = Object.keys(merges)
   const sheetKeys = Object.keys(sheets)
   const validationKeys = Object.keys(dataValidations)
-  if (keys.length === 0 && dimKeys.length === 0 && mergeKeys.length === 0 && sheetKeys.length === 0 && validationKeys.length === 0) return
+  if (
+    keys.length === 0 && dimKeys.length === 0 && mergeKeys.length === 0 &&
+    sheetKeys.length === 0 && validationKeys.length === 0 && resourceSheets.length === 0
+  ) return
   const rules = doc.getMap<StoredProtectionRule>(SHEET_PROTECTION_FIELD)
   if (rules.size === 0) return
   const grants = doc.getMap<{ allow?: unknown }>(SHEET_PROTECTION_GRANTS_FIELD)
@@ -1071,6 +1120,17 @@ export function assertSheetWriteAllowed(
   // the protected rectangle along with everything else. There is no coordinate to intersect, hence
   // no rect loop here: `whole` OR a non-empty `rects` both mean "this sheet carries protection".
   for (const key of sheetKeys) {
+    const entry = bySheet.get(key)
+    if (!entry && !docWideBlocked) continue
+    let blocked = docWideBlocked
+    if (!blocked && entry) {
+      blocked = wholeSheetBlocked(entry)
+        || entry.rects.some(({ permissionId }) => !permitted(permissionId))
+    }
+    if (blocked) refused.push(key)
+  }
+
+  for (const key of resourceSheets) {
     const entry = bySheet.get(key)
     if (!entry && !docWideBlocked) continue
     let blocked = docWideBlocked
@@ -1859,6 +1919,499 @@ export function validateSheetList(sheets: Record<string, unknown>): Record<strin
   return out
 }
 
+// The current web workbook is deliberately bounded to 1000x100. Keeping the
+// resource ranges inside that same grid prevents a bot from persisting rules the
+// browser can never display or repair.
+const SHEET_MAX_ROWS = 1000
+const SHEET_MAX_COLUMNS = 100
+const MAX_RESOURCE_DEPTH = 20
+
+function validateResourceLogicalId(key: unknown, label: string): string {
+  if (typeof key !== 'string' || !LIST_KEY_RE.test(key) || RESERVED_LOGICAL_IDS.has(key)) {
+    throw new SheetSnapshotInvalidError(`${label} key must be a valid logicalId: ${String(key).slice(0, 64)}`)
+  }
+  return key
+}
+
+/** Clone a JSON-compatible plugin payload while rejecting values Yjs/JSON cannot
+ * round-trip faithfully (undefined, functions, symbols, bigint, NaN/Infinity). */
+function cloneResourceJson(value: unknown, label: string, depth = 0): unknown {
+  if (depth > MAX_RESOURCE_DEPTH) {
+    throw new SheetSnapshotInvalidError(`${label}: nested value is too deep`)
+  }
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return value
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw new SheetSnapshotInvalidError(`${label}: number must be finite`)
+    return value
+  }
+  if (Array.isArray(value)) {
+    return value.map((entry, index) => cloneResourceJson(entry, `${label}[${index}]`, depth + 1))
+  }
+  if (typeof value !== 'object') {
+    throw new SheetSnapshotInvalidError(`${label}: value is not JSON-compatible`)
+  }
+  const out: Record<string, unknown> = Object.create(null)
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    if (key === '__proto__' || key === 'prototype' || key === 'constructor') {
+      throw new SheetSnapshotInvalidError(`${label}: reserved field '${key}' is not allowed`)
+    }
+    out[key] = cloneResourceJson(entry, `${label}.${key}`, depth + 1)
+  }
+  return out
+}
+
+export function validateSheetRange(value: unknown, label = 'range'): StoredSheetRange {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new SheetSnapshotInvalidError(`${label}: value is not a plain object`)
+  }
+  const rec = value as Record<string, unknown>
+  const { startRow, startColumn, endRow, endColumn } = rec
+  if (![startRow, startColumn, endRow, endColumn].every(Number.isInteger)) {
+    throw new SheetSnapshotInvalidError(`${label}: bounds must be integers`)
+  }
+  const sr = startRow as number
+  const sc = startColumn as number
+  const er = endRow as number
+  const ec = endColumn as number
+  if (sr < 0 || sc < 0 || er < sr || ec < sc || er >= SHEET_MAX_ROWS || ec >= SHEET_MAX_COLUMNS) {
+    throw new SheetSnapshotInvalidError(`${label}: bounds are outside the 1000x100 grid`)
+  }
+  return { startRow: sr, startColumn: sc, endRow: er, endColumn: ec }
+}
+
+export function validateSheetFreeze(key: unknown, value: unknown): StoredFreeze {
+  const logicalId = validateResourceLogicalId(key, 'sheetFreeze')
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new SheetSnapshotInvalidError(`sheetFreeze ${logicalId}: value is not a plain object`)
+  }
+  const rec = value as Record<string, unknown>
+  for (const field of Object.keys(rec)) {
+    if (field !== 'startRow' && field !== 'startColumn' && field !== 'xSplit' && field !== 'ySplit') {
+      throw new SheetSnapshotInvalidError(`sheetFreeze ${logicalId}: unexpected field '${field}'`)
+    }
+  }
+  const values = [rec.startRow, rec.startColumn, rec.xSplit, rec.ySplit]
+  if (!values.every(Number.isInteger)) {
+    throw new SheetSnapshotInvalidError(`sheetFreeze ${logicalId}: all fields must be integers`)
+  }
+  const xSplit = rec.xSplit as number
+  const ySplit = rec.ySplit as number
+  const startRow = rec.startRow as number
+  const startColumn = rec.startColumn as number
+  if (xSplit < 0 || xSplit >= SHEET_MAX_COLUMNS || ySplit < 0 || ySplit >= SHEET_MAX_ROWS) {
+    throw new SheetSnapshotInvalidError(`sheetFreeze ${logicalId}: split is outside the 1000x100 grid`)
+  }
+  if (ySplit > 0 && (startRow < ySplit || startRow >= SHEET_MAX_ROWS)) {
+    throw new SheetSnapshotInvalidError(`sheetFreeze ${logicalId}: startRow must be at or after ySplit`)
+  }
+  if (xSplit > 0 && (startColumn < xSplit || startColumn >= SHEET_MAX_COLUMNS)) {
+    throw new SheetSnapshotInvalidError(`sheetFreeze ${logicalId}: startColumn must be at or after xSplit`)
+  }
+  if (ySplit === 0 && startRow !== -1 && startRow !== 0) {
+    throw new SheetSnapshotInvalidError(`sheetFreeze ${logicalId}: unfrozen row axis must use -1 or 0`)
+  }
+  if (xSplit === 0 && startColumn !== -1 && startColumn !== 0) {
+    throw new SheetSnapshotInvalidError(`sheetFreeze ${logicalId}: unfrozen column axis must use -1 or 0`)
+  }
+  return {
+    startRow: ySplit === 0 ? -1 : startRow,
+    startColumn: xSplit === 0 ? -1 : startColumn,
+    xSplit,
+    ySplit,
+  }
+}
+
+export function validateSheetFilter(key: unknown, value: unknown): StoredFilter {
+  const logicalId = validateResourceLogicalId(key, 'sheetFilters')
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new SheetSnapshotInvalidError(`sheetFilters ${logicalId}: value is not a plain object`)
+  }
+  const rec = value as Record<string, unknown>
+  const ref = validateSheetRange(rec.ref, `sheetFilters ${logicalId}.ref`)
+  const out: StoredFilter = { ref }
+  if (rec.filterColumns !== undefined) {
+    if (!Array.isArray(rec.filterColumns)) {
+      throw new SheetSnapshotInvalidError(`sheetFilters ${logicalId}.filterColumns must be an array`)
+    }
+    const columns: StoredFilterColumn[] = []
+    for (let i = 0; i < rec.filterColumns.length; i += 1) {
+      const cloned = cloneResourceJson(rec.filterColumns[i], `sheetFilters ${logicalId}.filterColumns[${i}]`)
+      if (cloned === null || typeof cloned !== 'object' || Array.isArray(cloned)) {
+        throw new SheetSnapshotInvalidError(`sheetFilters ${logicalId}.filterColumns[${i}] is not an object`)
+      }
+      const colId = (cloned as Record<string, unknown>).colId
+      if (!Number.isInteger(colId) || (colId as number) < ref.startColumn || (colId as number) > ref.endColumn) {
+        throw new SheetSnapshotInvalidError(`sheetFilters ${logicalId}.filterColumns[${i}].colId is outside ref`)
+      }
+      columns.push(cloned as StoredFilterColumn)
+    }
+    if (columns.length > 0) out.filterColumns = columns
+  }
+  return out
+}
+
+export function parseSheetDataValidationKey(key: unknown): { logicalId: string; uid: string } {
+  if (typeof key !== 'string') {
+    throw new SheetSnapshotInvalidError(`sheetDataValidations key is invalid: ${String(key).slice(0, 64)}`)
+  }
+  const bang = key.indexOf('!')
+  if (bang <= 0 || bang !== key.lastIndexOf('!')) {
+    throw new SheetSnapshotInvalidError(`sheetDataValidations key must be logicalId!uid: ${key.slice(0, 64)}`)
+  }
+  const logicalId = validateResourceLogicalId(key.slice(0, bang), 'sheetDataValidations')
+  const uid = key.slice(bang + 1)
+  if (uid.length === 0 || uid.length > 128 || /\p{Cc}/u.test(uid)) {
+    throw new SheetSnapshotInvalidError(`sheetDataValidations ${logicalId}: uid in key is invalid`)
+  }
+  return { logicalId, uid }
+}
+
+/** Validate one rule of any Univer validation kind. Checkbox rules additionally
+ * pass the hardened validator merged from !124. */
+export function validateSheetDataValidationRule(
+  logicalId: string,
+  value: unknown,
+  index: number,
+): StoredDataValidationRule {
+  const cloned = cloneResourceJson(value, `sheetDataValidations ${logicalId}[${index}]`)
+  if (cloned === null || typeof cloned !== 'object' || Array.isArray(cloned)) {
+    throw new SheetSnapshotInvalidError(`sheetDataValidations ${logicalId}[${index}] is not an object`)
+  }
+  const rec = cloned as Record<string, unknown>
+  if (
+    typeof rec.uid !== 'string' || rec.uid.length === 0 || rec.uid.length > 128 ||
+    rec.uid.includes('!') || /\p{Cc}/u.test(rec.uid)
+  ) {
+    throw new SheetSnapshotInvalidError(`sheetDataValidations ${logicalId}[${index}].uid is invalid`)
+  }
+  if (typeof rec.type !== 'string' || rec.type.length === 0) {
+    throw new SheetSnapshotInvalidError(`sheetDataValidations ${logicalId}[${index}].type is invalid`)
+  }
+  if (!Array.isArray(rec.ranges) || rec.ranges.length === 0) {
+    throw new SheetSnapshotInvalidError(`sheetDataValidations ${logicalId}[${index}].ranges must not be empty`)
+  }
+  const ranges = rec.ranges.map((range, rangeIndex) =>
+    validateSheetRange(range, `sheetDataValidations ${logicalId}[${index}].ranges[${rangeIndex}]`),
+  )
+  delete rec.unitId
+  delete rec.subUnitId
+  if (rec.type === 'list' || rec.type === 'listMultiple') delete rec.operator
+  const rule = { ...rec, uid: rec.uid, type: rec.type, ranges } as StoredDataValidationRule
+  return rule.type === 'checkbox'
+    ? validateSheetDataValidation(`${logicalId}!${rule.uid}`, rule)
+    : rule
+}
+
+export interface SheetResourceBatch<T> {
+  toDelete: string[]
+  toSet: Array<[string, T]>
+}
+
+export type SheetDataValidationResourceChanges = Record<
+  string,
+  StoredDataValidationRule | StoredDataValidationRule[] | null
+>
+
+export function validateSheetFreezeBatch(
+  freeze: Record<string, StoredFreeze | null>,
+): SheetResourceBatch<StoredFreeze> {
+  const toDelete: string[] = []
+  const toSet: Array<[string, StoredFreeze]> = []
+  for (const [key, value] of Object.entries(freeze)) {
+    if (value === null) toDelete.push(validateResourceLogicalId(key, 'sheetFreeze'))
+    else toSet.push([key, validateSheetFreeze(key, value)])
+  }
+  return { toDelete, toSet }
+}
+
+export function validateSheetFilterBatch(
+  filters: Record<string, StoredFilter | null>,
+): SheetResourceBatch<StoredFilter> {
+  const toDelete: string[] = []
+  const toSet: Array<[string, StoredFilter]> = []
+  for (const [key, value] of Object.entries(filters)) {
+    if (value === null) toDelete.push(validateResourceLogicalId(key, 'sheetFilters'))
+    else toSet.push([key, validateSheetFilter(key, value)])
+  }
+  return { toDelete, toSet }
+}
+
+/** Validate every stored rule without resolving checkbox overlaps. Restore uses
+ * this candidate view so a currently-hidden loser can become effective later. */
+export function validateSheetDataValidationCandidateEntries(
+  raw: Record<string, unknown>,
+  allowedLogicalIds?: ReadonlySet<string>,
+  strictCheckboxCandidates = false,
+  storageLimits: SheetDataValidationStorageLimits = configuredSheetDataValidationStorageLimits(),
+): Record<string, StoredDataValidationRule> {
+  const checkboxRules = validateSheetDataValidationCandidates(
+    raw,
+    allowedLogicalIds,
+    strictCheckboxCandidates,
+    storageLimits,
+  )
+  const out: Record<string, StoredDataValidationRule> = Object.create(null)
+  for (const key of Object.keys(raw).sort()) {
+    const value = raw[key]
+    const checkboxCandidate = value !== null && typeof value === 'object' && !Array.isArray(value) &&
+      (value as Record<string, unknown>).type === 'checkbox'
+    if (checkboxCandidate) {
+      if (checkboxRules[key]) out[key] = checkboxRules[key]!
+      continue
+    }
+    const { logicalId, uid } = parseSheetDataValidationKey(key)
+    if (allowedLogicalIds && !allowedLogicalIds.has(logicalId)) continue
+    const rule = validateSheetDataValidationRule(logicalId, value, 0)
+    if (rule.uid !== uid) {
+      throw new SheetSnapshotInvalidError(`sheetDataValidations ${key}: uid must match its key`)
+    }
+    out[key] = rule
+  }
+  return out
+}
+
+/** Validate all effective rule kinds in the internal per-rule Y.Map. Checkbox
+ * candidates retain !124's deterministic overlap, budget and orphan rules. */
+export function validateSheetDataValidationEntries(
+  raw: Record<string, unknown>,
+  allowedLogicalIds?: ReadonlySet<string>,
+  strictCheckboxCandidates = false,
+  storageLimits: SheetDataValidationStorageLimits = configuredSheetDataValidationStorageLimits(),
+): Record<string, StoredDataValidationRule> {
+  const candidates = validateSheetDataValidationCandidateEntries(
+    raw,
+    allowedLogicalIds,
+    strictCheckboxCandidates,
+    storageLimits,
+  )
+  const effectiveCheckboxes = validateSheetDataValidations(
+    raw,
+    allowedLogicalIds,
+    strictCheckboxCandidates,
+    storageLimits,
+  )
+  for (const [key, rule] of Object.entries(candidates)) {
+    if (rule.type === 'checkbox' && !effectiveCheckboxes[key]) delete candidates[key]
+  }
+  return candidates
+}
+
+/** Public REST/read shape: group internal `${logicalId}!${uid}` entries by sheet. */
+export function validateSheetDataValidationResources(
+  raw: Record<string, unknown>,
+  allowedLogicalIds?: ReadonlySet<string>,
+  strictCheckboxCandidates = false,
+  storageLimits: SheetDataValidationStorageLimits = configuredSheetDataValidationStorageLimits(),
+): Record<string, StoredDataValidationRule[]> {
+  const entries = validateSheetDataValidationEntries(raw, allowedLogicalIds, strictCheckboxCandidates, storageLimits)
+  const out: Record<string, StoredDataValidationRule[]> = Object.create(null)
+  for (const [key, rule] of Object.entries(entries)) {
+    const { logicalId } = parseSheetDataValidationKey(key)
+    const rules = out[logicalId] ?? []
+    rules.push(rule)
+    out[logicalId] = rules
+  }
+  return out
+}
+
+/** Translate the public replace-per-sheet contract into internal per-rule edits.
+ * The legacy flat checkbox-only form remains accepted for precise repair calls. */
+export function validateSheetDataValidationResourceBatch(
+  existing: Iterable<[string, unknown]>,
+  changes: SheetDataValidationResourceChanges,
+  allowedLogicalIds: ReadonlySet<string>,
+  deletedLogicalIds: ReadonlySet<string> = new Set(),
+  storageLimits: SheetDataValidationStorageLimits = configuredSheetDataValidationStorageLimits(),
+): SheetDataValidationBatch {
+  const items = Object.entries(changes)
+  const hasFlatKeys = items.some(([key]) => key.includes('!'))
+  const hasGroupedKeys = items.some(([key]) => !key.includes('!'))
+  if (hasFlatKeys && hasGroupedKeys) {
+    throw new SheetSnapshotInvalidError('data validations cannot mix per-sheet and per-rule keys')
+  }
+  if (hasFlatKeys) {
+    for (const [key, value] of items) {
+      if (value !== null && Array.isArray(value)) {
+        throw new SheetSnapshotInvalidError(`data validation ${key}: legacy per-rule value must be an object or null`)
+      }
+      if (value !== null && (value as StoredDataValidationRule).type !== 'checkbox') {
+        throw new SheetSnapshotInvalidError(`data validation ${key}: legacy per-rule writes support checkbox only`)
+      }
+    }
+    return validateSheetDataValidationBatch(
+      existing,
+      changes as Record<string, StoredDataValidation | null>,
+      allowedLogicalIds,
+      deletedLogicalIds,
+      storageLimits,
+    )
+  }
+
+  const stored: Record<string, unknown> = Object.create(null)
+  for (const [key, value] of existing) stored[key] = value
+  const next: Record<string, unknown> = Object.assign(Object.create(null), stored)
+  const affectedLogicalIds = new Set<string>(deletedLogicalIds)
+  const requested: Array<[string, StoredDataValidationRule]> = []
+
+  for (const [key, value] of items) {
+    const logicalId = validateResourceLogicalId(key, 'sheetDataValidations')
+    affectedLogicalIds.add(logicalId)
+    if (value !== null && !Array.isArray(value)) {
+      throw new SheetSnapshotInvalidError(`sheetDataValidations ${logicalId}: value must be an array or null`)
+    }
+    if (value !== null && !allowedLogicalIds.has(logicalId)) {
+      throw new SheetSnapshotInvalidError(`sheetDataValidations ${logicalId}: sheet does not exist`)
+    }
+    if (Array.isArray(value)) {
+      const seen = new Set<string>()
+      value.forEach((candidate, index) => {
+        const rule = validateSheetDataValidationRule(logicalId, candidate, index)
+        if (seen.has(rule.uid)) {
+          throw new SheetSnapshotInvalidError(`sheetDataValidations ${logicalId}: duplicate uid '${rule.uid}'`)
+        }
+        seen.add(rule.uid)
+        requested.push([`${logicalId}!${rule.uid}`, rule])
+      })
+    }
+  }
+
+  const toDelete: string[] = []
+  for (const key of Object.keys(stored)) {
+    const bang = key.indexOf('!')
+    const logicalId = bang > 0 ? key.slice(0, bang) : ''
+    if (!affectedLogicalIds.has(logicalId)) continue
+    delete next[key]
+    toDelete.push(key)
+  }
+  for (const [key, rule] of requested) next[key] = rule
+
+  const validated = validateSheetDataValidationEntries(next, allowedLogicalIds, false, storageLimits)
+  for (const [key, rule] of requested) {
+    if (!dataValidationRulesEqual(validated[key], rule)) {
+      throw new SheetSnapshotInvalidError('data validations must not overlap or exceed the sheet budget')
+    }
+  }
+  return { toDelete, toSet: requested }
+}
+
+/** Narrow recovery path for an already-over-budget checkbox map. Only deletions
+ * are accepted; grouped keys delete the complete validation set for that sheet. */
+export function validateSheetDataValidationResourceDeletionRepairBatch(
+  existing: Iterable<[string, unknown]>,
+  changes: SheetDataValidationResourceChanges,
+): SheetDataValidationDeletionRepairBatch {
+  const items = Object.entries(changes)
+  if (items.some(([, value]) => value !== null && !(Array.isArray(value) && value.length === 0))) {
+    throw new SheetSnapshotInvalidError('data validation repair accepts deletions only')
+  }
+  const hasFlatKeys = items.some(([key]) => key.includes('!'))
+  const hasGroupedKeys = items.some(([key]) => !key.includes('!'))
+  if (hasFlatKeys && hasGroupedKeys) {
+    throw new SheetSnapshotInvalidError('data validations cannot mix per-sheet and per-rule keys')
+  }
+  if (hasFlatKeys) {
+    return validateSheetDataValidationDeletionRepairBatch(
+      existing,
+      changes as Record<string, StoredDataValidation | null>,
+    )
+  }
+
+  const stored = Array.from(existing)
+  const logicalIds = new Set(items.map(([key]) => validateResourceLogicalId(key, 'sheetDataValidations')))
+  const toDelete = stored
+    .map(([key]) => key)
+    .filter((key) => {
+      const bang = key.indexOf('!')
+      return bang > 0 && logicalIds.has(key.slice(0, bang))
+    })
+  const deleted = new Set(toDelete)
+  const previousUsage = measureSheetDataValidationStorage(stored)
+  const nextUsage = measureSheetDataValidationStorage(stored.filter(([key]) => !deleted.has(key)))
+  return {
+    toDelete,
+    toSet: [],
+    previousRawBytes: previousUsage.bytes,
+    rawBytes: nextUsage.bytes,
+  }
+}
+
+export function applySheetFreezeToYMap(
+  ymap: Y.Map<StoredFreeze>,
+  freeze: Record<string, StoredFreeze | null>,
+): void {
+  const { toDelete, toSet } = validateSheetFreezeBatch(freeze)
+  for (const key of toDelete) ymap.delete(key)
+  for (const [key, value] of toSet) ymap.set(key, value)
+}
+
+export function applySheetFiltersToYMap(
+  ymap: Y.Map<StoredFilter>,
+  filters: Record<string, StoredFilter | null>,
+): void {
+  const { toDelete, toSet } = validateSheetFilterBatch(filters)
+  for (const key of toDelete) ymap.delete(key)
+  for (const [key, value] of toSet) ymap.set(key, value)
+}
+
+export function applySheetDataValidationsToYMap(
+  ymap: Y.Map<StoredDataValidationRule>,
+  validations: SheetDataValidationResourceChanges,
+): void {
+  const logicalIds = new Set<string>()
+  for (const key of ymap.keys()) {
+    const bang = key.indexOf('!')
+    if (bang > 0) logicalIds.add(key.slice(0, bang))
+  }
+  for (const key of Object.keys(validations)) {
+    logicalIds.add(key.includes('!') ? key.slice(0, key.indexOf('!')) : key)
+  }
+  if (logicalIds.size === 0) logicalIds.add('default')
+  const { toDelete, toSet } = validateSheetDataValidationResourceBatch(
+    ymap.entries(), validations, logicalIds,
+  )
+  for (const key of toDelete) ymap.delete(key)
+  for (const [key, value] of toSet) ymap.set(key, value)
+}
+
+export function validateSheetFreezes(raw: Record<string, unknown>): Record<string, StoredFreeze> {
+  const out: Record<string, StoredFreeze> = Object.create(null)
+  for (const [key, value] of Object.entries(raw)) out[key] = validateSheetFreeze(key, value)
+  return out
+}
+
+export function validateSheetFilters(raw: Record<string, unknown>): Record<string, StoredFilter> {
+  const out: Record<string, StoredFilter> = Object.create(null)
+  for (const [key, value] of Object.entries(raw)) out[key] = validateSheetFilter(key, value)
+  return out
+}
+
+export function hasLegacyDefaultDataValidationRule(
+  existing: Iterable<[string, unknown]>,
+  changes: SheetDataValidationResourceChanges,
+): boolean {
+  const raw: Record<string, unknown> = Object.create(null)
+  for (const [key, value] of existing) {
+    if (key.startsWith('default!')) raw[key] = value
+  }
+  if (Object.hasOwn(changes, 'default')) {
+    for (const key of Object.keys(raw)) delete raw[key]
+    const value = changes.default
+    if (Array.isArray(value)) {
+      value.forEach((candidate, index) => {
+        const rule = validateSheetDataValidationRule('default', candidate, index)
+        raw[`default!${rule.uid}`] = rule
+      })
+    }
+  } else {
+    for (const [key, value] of Object.entries(changes)) {
+      if (!key.startsWith('default!')) continue
+      if (value === null) delete raw[key]
+      else if (!Array.isArray(value)) raw[key] = value
+    }
+  }
+  return Object.keys(validateSheetDataValidationEntries(raw, new Set(['default']))).length > 0
+}
+
 /**
  * Measure the sheet AFTER applying an edit batch, the two ways its downstream
  * caps are enforced, so the write path can reject an oversized result in its
@@ -1894,7 +2447,9 @@ export function measureSheetAfterEdit(
   hyperlinks: Record<string, StoredHyperLink | null> = {},
   merges: Record<string, boolean | null> = {},
   sheets: Record<string, StoredSheetMeta | null> = {},
-  dataValidations: Record<string, StoredDataValidation | null> = {},
+  freeze: Record<string, StoredFreeze | null> = {},
+  filters: Record<string, StoredFilter | null> = {},
+  dataValidations: SheetDataValidationResourceChanges = {},
   dataValidationStorageLimits: SheetDataValidationStorageLimits = configuredSheetDataValidationStorageLimits(),
 ): {
   docBytes: number
@@ -1902,6 +2457,18 @@ export function measureSheetAfterEdit(
   previousPayloadBytes: number | null
   validationRepairShrank: boolean
 } {
+  // Compatibility with !124's short-lived positional signature, where the
+  // seventh optional map was flat checkbox changes and the next value was its
+  // storage-limit override. The public P0 signature uses freeze/filters first.
+  if (Object.keys(freeze).some((key) => key.includes('!'))) {
+    dataValidations = freeze as unknown as SheetDataValidationResourceChanges
+    const legacyLimits = filters as unknown as Partial<SheetDataValidationStorageLimits>
+    if (typeof legacyLimits.maxRules === 'number' && typeof legacyLimits.maxBytes === 'number') {
+      dataValidationStorageLimits = legacyLimits as SheetDataValidationStorageLimits
+    }
+    freeze = {}
+    filters = {}
+  }
   const scratch = new Y.Doc()
   Y.applyUpdate(scratch, preEditState)
   const ymap = scratch.getMap<SheetCell>(SHEET_YMAP_FIELD)
@@ -1910,12 +2477,15 @@ export function measureSheetAfterEdit(
   const linkMap = scratch.getMap<StoredHyperLink>(SHEET_HYPERLINKS_FIELD)
   const mergeMap = scratch.getMap<boolean>(SHEET_MERGES_FIELD)
   const listMap = scratch.getMap<StoredSheetMeta>(SHEET_LIST_FIELD)
+  const freezeMap = scratch.getMap<StoredFreeze>(SHEET_FREEZE_FIELD)
+  const filterMap = scratch.getMap<StoredFilter>(SHEET_FILTERS_FIELD)
   const validationMap = scratch.getMap<StoredDataValidation>(SHEET_DATA_VALIDATIONS_FIELD)
   const validationDeletionOnly = Object.keys(dataValidations).length > 0 &&
-    Object.values(dataValidations).every((value) => value === null) &&
+    Object.values(dataValidations).every((value) => value === null || (Array.isArray(value) && value.length === 0)) &&
     Object.keys(cells).length === 0 && Object.keys(dims).length === 0 &&
     Object.keys(drawings).length === 0 && Object.keys(hyperlinks).length === 0 &&
-    Object.keys(merges).length === 0 && Object.keys(sheets).length === 0
+    Object.keys(merges).length === 0 && Object.keys(sheets).length === 0 &&
+    Object.keys(freeze).length === 0 && Object.keys(filters).length === 0
   let previousPayloadBytes: number | null = null
   try {
     previousPayloadBytes = measureSheetReadPayloadBytes(scratch)
@@ -1928,18 +2498,20 @@ export function measureSheetAfterEdit(
     requestedListBatch,
     listMap.size === 0 &&
       requestedListBatch.toSet.length > 0 &&
-      hasLegacyDefaultCheckboxRule(validationMap.entries(), dataValidations),
+      hasLegacyDefaultDataValidationRule(validationMap.entries(), dataValidations),
   )
   const nextLogicalIds = sheetLogicalIdsWithLegacyDefault(listMap.keys())
   for (const key of listBatch.toDelete) nextLogicalIds.delete(key)
   for (const [key] of listBatch.toSet) nextLogicalIds.add(key)
   const repairBatch = validationDeletionOnly
-    ? validateSheetDataValidationDeletionRepairBatch(validationMap.entries(), dataValidations)
+    ? validateSheetDataValidationResourceDeletionRepairBatch(validationMap.entries(), dataValidations)
     : null
-  const validationBatch = repairBatch ?? validateSheetDataValidationBatch(
+  const validationBatch = repairBatch ?? validateSheetDataValidationResourceBatch(
     validationMap.entries(), dataValidations, nextLogicalIds, new Set(listBatch.toDelete),
     dataValidationStorageLimits,
   )
+  const freezeBatch = validateSheetFreezeBatch(freeze)
+  const filterBatch = validateSheetFilterBatch(filters)
   // Apply the batch exactly as the live commit will (validate-all-then-apply), so
   // the measured post-edit doc matches what commitLiveSheetEdit would persist.
   scratch.transact(() => {
@@ -1950,6 +2522,10 @@ export function measureSheetAfterEdit(
     applySheetMergesToYMap(mergeMap, merges)
     for (const key of listBatch.toDelete) listMap.delete(key)
     for (const [key, meta] of listBatch.toSet) listMap.set(key, meta)
+    for (const key of freezeBatch.toDelete) freezeMap.delete(key)
+    for (const [key, value] of freezeBatch.toSet) freezeMap.set(key, value)
+    for (const key of filterBatch.toDelete) filterMap.delete(key)
+    for (const [key, value] of filterBatch.toSet) filterMap.set(key, value)
     for (const key of validationBatch.toDelete) validationMap.delete(key)
     for (const [key, rule] of validationBatch.toSet) validationMap.set(key, rule)
   })
@@ -1986,6 +2562,10 @@ function measureSheetReadPayloadBytes(doc: Y.Doc): number {
   for (const [key, val] of doc.getMap(SHEET_MERGES_FIELD).entries()) rawMerges[key] = val
   const rawSheets: Record<string, unknown> = {}
   for (const [key, val] of doc.getMap(SHEET_LIST_FIELD).entries()) rawSheets[key] = val
+  const rawFreeze: Record<string, unknown> = {}
+  for (const [key, val] of doc.getMap(SHEET_FREEZE_FIELD).entries()) rawFreeze[key] = val
+  const rawFilters: Record<string, unknown> = {}
+  for (const [key, val] of doc.getMap(SHEET_FILTERS_FIELD).entries()) rawFilters[key] = val
   const rawValidations: Record<string, unknown> = {}
   for (const [key, val] of doc.getMap(SHEET_DATA_VALIDATIONS_FIELD).entries()) rawValidations[key] = val
   const sheetCells = validateSheetCells(rawCells)
@@ -1993,9 +2573,20 @@ function measureSheetReadPayloadBytes(doc: Y.Doc): number {
   const sheetHyperLinks = validateSheetHyperLinks(rawLinks)
   const sheetMerges = validateSheetMerges(rawMerges)
   const sheetList = validateSheetList(rawSheets)
-  const sheetDataValidations = validateSheetDataValidations(
+  const sheetFreeze = validateSheetFreezes(rawFreeze)
+  const sheetFilters = validateSheetFilters(rawFilters)
+  const sheetDataValidations = validateSheetDataValidationResources(
     rawValidations,
     sheetLogicalIdsWithLegacyDefault(Object.keys(sheetList)),
   )
-  return Buffer.byteLength(JSON.stringify({ sheetCells, sheetDims, sheetHyperLinks, sheetMerges, sheetList, sheetDataValidations }))
+  return Buffer.byteLength(JSON.stringify({
+    sheetCells,
+    sheetDims,
+    sheetHyperLinks,
+    sheetMerges,
+    sheetList,
+    sheetFreeze,
+    sheetFilters,
+    sheetDataValidations,
+  }))
 }

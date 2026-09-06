@@ -306,7 +306,62 @@ describe('PATCH /sheet — batch write', () => {
     }), res as never)
 
     expect(res.statusCode).toBe(200)
-    expect(vi.mocked(commitLiveSheetEdit).mock.calls[0]![9]).toEqual(dataValidations)
+    expect(vi.mocked(commitLiveSheetEdit).mock.calls[0]![11]).toEqual(dataValidations)
+  })
+
+  it('accepts a resources-only batch and forwards freeze, filters, and dropdown rules atomically', async () => {
+    const view = liveSheet()
+    vi.mocked(readLiveSheet).mockResolvedValue(view)
+    vi.mocked(commitLiveSheetEdit).mockResolvedValue({ newSV: Y.encodeStateVector(new Y.Doc()), bytes: 64 })
+    vi.spyOn(docVersionRepo, 'createTx').mockResolvedValue(2)
+    mockTx(okMeta)
+
+    const range = { startRow: 0, startColumn: 0, endRow: 10, endColumn: 1 }
+    const freeze = { default: { startRow: 1, startColumn: -1, xSplit: 0, ySplit: 1 } }
+    const filters = { default: { ref: range, filterColumns: [{ colId: 1, filters: { filters: ['open'] } }] } }
+    const dataValidations = {
+      default: [{
+        uid: 'bot-status',
+        type: 'listMultiple',
+        formula1: '["待处理","处理中"]',
+        formula2: '#9ec5fe,#ffd8a8',
+        showDropDown: true,
+        renderMode: 2,
+        ranges: [range],
+      }],
+    }
+    const res = mockRes()
+    await patchDocSheetHandler(req({ docId: 'd_1' }, { body: {
+      baseVersion: encodeBaseVersion(view.baseSV),
+      freeze,
+      filters,
+      dataValidations,
+    } }), res as never)
+
+    expect(res.statusCode).toBe(200)
+    const call = vi.mocked(commitLiveSheetEdit).mock.calls[0]!
+    expect(call[3]).toEqual({})
+    expect(call[9]).toEqual(freeze)
+    expect(call[10]).toEqual(filters)
+    expect(call[11]).toEqual(dataValidations)
+  })
+
+  it('rejects malformed P0 resource ranges before taking a safety snapshot', async () => {
+    const view = liveSheet()
+    vi.mocked(readLiveSheet).mockResolvedValue(view)
+    const createSpy = vi.spyOn(docVersionRepo, 'createTx')
+    const res = mockRes()
+    await patchDocSheetHandler(req({ docId: 'd_1' }, { body: {
+      baseVersion: encodeBaseVersion(view.baseSV),
+      filters: {
+        default: { ref: { startRow: 0, startColumn: 0, endRow: 1000, endColumn: 1 } },
+      },
+    } }), res as never)
+
+    expect(res.statusCode).toBe(422)
+    expect(res.body).toEqual({ error: 'sheet_cell_invalid' })
+    expect(createSpy).not.toHaveBeenCalled()
+    expect(vi.mocked(commitLiveSheetEdit)).not.toHaveBeenCalled()
   })
 
   it('rejects allowBlank=false instead of silently changing the requested checkbox rule', async () => {

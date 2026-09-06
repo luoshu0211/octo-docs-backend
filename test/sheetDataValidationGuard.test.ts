@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest'
 import * as Y from 'yjs'
 import {
   SHEET_DATA_VALIDATIONS_FIELD,
+  SHEET_FILTERS_FIELD,
+  SHEET_FREEZE_FIELD,
   SHEET_LIST_FIELD,
   SHEET_YMAP_FIELD,
   validateSheetDataValidations,
@@ -21,6 +23,16 @@ function checkbox(uid: string, extra: Partial<StoredDataValidation> = {}): Store
   }
 }
 
+function dropdown(uid: string, type: 'list' | 'listMultiple' = 'list') {
+  return {
+    uid,
+    type,
+    formula1: '["待处理","已完成"]',
+    showDropDown: true,
+    ranges: [{ startRow: 0, startColumn: 0, endRow: 10, endColumn: 0 }],
+  }
+}
+
 function guardedDoc(customLimits = limits): {
   doc: Y.Doc
   validations: Y.Map<unknown>
@@ -37,6 +49,19 @@ describe('sheetDataValidationGuard', () => {
     const { validations, dispose } = guardedDoc()
     validations.set('default!a', checkbox('a'))
     expect(validations.get('default!a')).toEqual(checkbox('a'))
+    dispose()
+  })
+
+  it('keeps valid collaborative single-select and multi-select rules', () => {
+    const { doc, validations, dispose } = guardedDoc({ maxRules: 10, maxBytes: 20_000 })
+    doc.transact(() => {
+      validations.set('default!single', dropdown('single'))
+      validations.set('default!multiple', dropdown('multiple', 'listMultiple'))
+    }, { source: 'connection' })
+    expect(validations.toJSON()).toEqual({
+      'default!single': dropdown('single'),
+      'default!multiple': dropdown('multiple', 'listMultiple'),
+    })
     dispose()
   })
 
@@ -70,12 +95,24 @@ describe('sheetDataValidationGuard', () => {
     dispose()
   })
 
-  it('reverts changing an existing checkbox into a foreign validation type', () => {
+  it('reverts a client changing an existing rule to another validation type', () => {
     const { validations, dispose } = guardedDoc()
     const original = checkbox('a')
     validations.set('default!a', original)
-    validations.set('default!a', { uid: 'a', type: 'list', ranges: [] })
+    validations.set('default!a', dropdown('a'))
     expect(validations.get('default!a')).toEqual(original)
+    dispose()
+  })
+
+  it('allows a validated server transaction to replace a rule type', () => {
+    const { doc, validations, dispose } = guardedDoc()
+    const original = checkbox('a')
+    validations.set('default!a', original)
+    doc.transact(() => validations.set('default!a', dropdown('a')), {
+      source: 'local',
+      context: { user: { id: 'u_1' } },
+    })
+    expect(validations.get('default!a')).toEqual(dropdown('a'))
     dispose()
   })
 
@@ -151,6 +188,54 @@ describe('sheetDataValidationGuard', () => {
     }, 'client')
     expect(validations.has('default!broken')).toBe(false)
     expect(cells.has('default!7:0')).toBe(false)
+    dispose()
+  })
+
+  it('keeps valid collaborative freeze and filter writes', () => {
+    const { doc, dispose } = guardedDoc()
+    const freeze = doc.getMap(SHEET_FREEZE_FIELD)
+    const filters = doc.getMap(SHEET_FILTERS_FIELD)
+    freeze.set('default', { startRow: 1, startColumn: -1, xSplit: 0, ySplit: 1 })
+    filters.set('default', {
+      ref: { startRow: 0, startColumn: 0, endRow: 10, endColumn: 1 },
+      filterColumns: [{ colId: 1, filters: { filters: ['待处理'] } }],
+    })
+    expect(freeze.has('default')).toBe(true)
+    expect(filters.has('default')).toBe(true)
+    dispose()
+  })
+
+  it('atomically reverts malformed freeze writes and sibling filter/cell writes', () => {
+    const { doc, dispose } = guardedDoc()
+    const freeze = doc.getMap(SHEET_FREEZE_FIELD)
+    const filters = doc.getMap(SHEET_FILTERS_FIELD)
+    const cells = doc.getMap(SHEET_YMAP_FIELD)
+    doc.transact(() => {
+      freeze.set('default', { startRow: 1, startColumn: -1, xSplit: 0, ySplit: 'bad' })
+      filters.set('default', {
+        ref: { startRow: 0, startColumn: 0, endRow: 10, endColumn: 1 },
+      })
+      cells.set('default!0:0', { v: 'must roll back' })
+    }, { source: 'connection' })
+    expect(freeze.size).toBe(0)
+    expect(filters.size).toBe(0)
+    expect(cells.size).toBe(0)
+    dispose()
+  })
+
+  it('reverts malformed and orphaned filter writes', () => {
+    const { doc, dispose } = guardedDoc()
+    const filters = doc.getMap(SHEET_FILTERS_FIELD)
+    doc.transact(() => {
+      filters.set('default', {
+        ref: { startRow: 0, startColumn: 0, endRow: 10, endColumn: 1 },
+        filterColumns: [{ colId: 2 }],
+      })
+      filters.set('missing', {
+        ref: { startRow: 0, startColumn: 0, endRow: 1, endColumn: 1 },
+      })
+    }, { source: 'connection' })
+    expect(filters.size).toBe(0)
     dispose()
   })
 

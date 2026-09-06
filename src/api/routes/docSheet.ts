@@ -26,8 +26,28 @@ import { requireDocRole } from '../guard.js'
 import { readLiveSheet } from '../../collab/liveSheetWrite.js'
 import { editDocSheet } from '../services/editDocSheet.js'
 import { encodeBaseVersion, parseBaseVersion } from '../../collab/docBodyEdit.js'
-import { decodeSheetSnapshot, decodeSheetDimsSnapshot, decodeSheetHyperLinksSnapshot, decodeSheetMergesSnapshot, decodeSheetListSnapshot, decodeSheetDataValidationsSnapshot } from '../../collab/versionRestore.js'
-import { SheetDataValidationInspectionBudgetError, SheetSnapshotInvalidError, type SheetCell, type StoredDrawing, type StoredHyperLink, type StoredSheetMeta, type StoredDataValidation } from '../../agent/sheetConversion.js'
+import {
+  decodeSheetSnapshot,
+  decodeSheetDimsSnapshot,
+  decodeSheetHyperLinksSnapshot,
+  decodeSheetMergesSnapshot,
+  decodeSheetListSnapshot,
+  decodeSheetFreezeSnapshot,
+  decodeSheetFiltersSnapshot,
+  decodeSheetDataValidationsSnapshot,
+} from '../../collab/versionRestore.js'
+import {
+  SheetDataValidationInspectionBudgetError,
+  SheetSnapshotInvalidError,
+  type SheetCell,
+  type StoredDrawing,
+  type StoredHyperLink,
+  type StoredSheetMeta,
+  type StoredFreeze,
+  type StoredFilter,
+  type StoredDataValidationRule,
+  type SheetDataValidationResourceChanges,
+} from '../../agent/sheetConversion.js'
 import {
   decodeSheetCursor,
   encodeSheetCursor,
@@ -108,7 +128,9 @@ export async function getDocSheetHandler(req: Request, res: Response): Promise<v
     const sheetHyperLinks = decodeSheetHyperLinksSnapshot(state) as Record<string, StoredHyperLink>
     const sheetMerges = decodeSheetMergesSnapshot(state) as Record<string, boolean>
     const sheetList = decodeSheetListSnapshot(state) as Record<string, StoredSheetMeta>
-    const sheetDataValidations = decodeSheetDataValidationsSnapshot(state) as Record<string, StoredDataValidation>
+    const sheetFreeze = decodeSheetFreezeSnapshot(state)
+    const sheetFilters = decodeSheetFiltersSnapshot(state)
+    const sheetDataValidations = decodeSheetDataValidationsSnapshot(state)
 
     if (paginated) {
       await respondPaginatedSheet(res, {
@@ -118,6 +140,8 @@ export async function getDocSheetHandler(req: Request, res: Response): Promise<v
         sheetHyperLinks,
         sheetMerges,
         sheetList,
+        sheetFreeze,
+        sheetFilters,
         sheetDataValidations,
         baseVersion,
         limitRaw,
@@ -139,7 +163,16 @@ export async function getDocSheetHandler(req: Request, res: Response): Promise<v
     // dimension (maxDocBytes / doc_too_large) — lets a caller see at a glance which
     // dimension tripped and how far it sits from the cap. See README "Sheet size
     // dimensions" for why the two dimensions differ.
-    const payloadBytes = Buffer.byteLength(JSON.stringify({ sheetCells, sheetDims, sheetHyperLinks, sheetMerges, sheetList, sheetDataValidations }))
+    const payloadBytes = Buffer.byteLength(JSON.stringify({
+      sheetCells,
+      sheetDims,
+      sheetHyperLinks,
+      sheetMerges,
+      sheetList,
+      sheetFreeze,
+      sheetFilters,
+      sheetDataValidations,
+    }))
     if (payloadBytes > config.sheetRead.maxCellBytes) {
       res.status(413).json({
         error: 'sheet_too_large',
@@ -157,6 +190,8 @@ export async function getDocSheetHandler(req: Request, res: Response): Promise<v
       sheetHyperLinks,
       sheetMerges,
       sheetList,
+      sheetFreeze,
+      sheetFilters,
       sheetDataValidations,
       // The live state vector, base64. Carried so a later write can guard on it
       // for optimistic concurrency (Stage2); this read does not reuse a historic
@@ -205,7 +240,9 @@ function firstPageCellBudget(
   sheetHyperLinks: Record<string, StoredHyperLink>,
   sheetMerges: Record<string, boolean>,
   sheetList: Record<string, StoredSheetMeta>,
-  sheetDataValidations: Record<string, StoredDataValidation>,
+  sheetFreeze: Record<string, StoredFreeze>,
+  sheetFilters: Record<string, StoredFilter>,
+  sheetDataValidations: Record<string, StoredDataValidationRule[]>,
 ): number {
   if (!isFirstPage) return config.sheetRead.maxCellBytes
   const envelopeBytes = Buffer.byteLength(JSON.stringify({
@@ -214,6 +251,8 @@ function firstPageCellBudget(
     sheetHyperLinks,
     sheetMerges,
     sheetList,
+    sheetFreeze,
+    sheetFilters,
     sheetDataValidations,
   }))
   return Math.max(0, config.sheetRead.maxCellBytes - envelopeBytes)
@@ -282,7 +321,9 @@ async function respondPaginatedSheet(
     sheetHyperLinks: Record<string, StoredHyperLink>
     sheetMerges: Record<string, boolean>
     sheetList: Record<string, StoredSheetMeta>
-    sheetDataValidations: Record<string, StoredDataValidation>
+    sheetFreeze: Record<string, StoredFreeze>
+    sheetFilters: Record<string, StoredFilter>
+    sheetDataValidations: Record<string, StoredDataValidationRule[]>
     baseVersion: string
     limitRaw: string | undefined
     cursorRaw: string | undefined
@@ -327,6 +368,8 @@ async function respondPaginatedSheet(
       args.sheetHyperLinks,
       args.sheetMerges,
       args.sheetList,
+      args.sheetFreeze,
+      args.sheetFilters,
       args.sheetDataValidations,
     ),
   )
@@ -349,9 +392,13 @@ async function respondPaginatedSheet(
   if (isFirstPage) body.sheetMerges = args.sheetMerges
   // Sheet-tab registry describes the whole doc; return once, on the first page.
   if (isFirstPage) body.sheetList = args.sheetList
-  // Checkbox validation rules describe the whole grid; return once, on page one.
+  if (isFirstPage) body.sheetFreeze = args.sheetFreeze
+  if (isFirstPage) body.sheetFilters = args.sheetFilters
+  // Validation rules describe the whole grid; return once, on page one.
   if (isFirstPage) body.sheetDataValidations = args.sheetDataValidations
-  const validationKeys = Object.keys(args.sheetDataValidations)
+  const validationKeys = Object.entries(args.sheetDataValidations).flatMap(([logicalId, rules]) =>
+    rules.map((rule) => `${logicalId}!${rule.uid}`),
+  )
   let metadataWithoutValidationBytes: number | undefined
   if (isFirstPage) {
     const metadataWithoutValidations = {
@@ -382,6 +429,8 @@ async function respondPaginatedSheet(
         args.sheetHyperLinks,
         args.sheetMerges,
         args.sheetList,
+        args.sheetFreeze,
+        args.sheetFilters,
         {},
       ),
     )
@@ -594,21 +643,42 @@ function checkSheetsBounds(
   return null
 }
 
-/** A checkbox-rule batch: `{ "${logicalId}!${uid}": rule | null }`. */
+function validateObjectResourceShape<T extends object>(
+  value: unknown,
+): value is Record<string, T | null> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  return Object.values(value as Record<string, unknown>).every(
+    (entry) => entry === null || (typeof entry === 'object' && !Array.isArray(entry)),
+  )
+}
+
+/** Public shape is `{ logicalId: rule[] | null }`; a flat checkbox object is
+ * accepted only as a backwards-compatible repair/write form. */
 function validateDataValidationsShape(
   dataValidations: unknown,
-): dataValidations is Record<string, StoredDataValidation | null> {
+): dataValidations is SheetDataValidationResourceChanges {
   if (!dataValidations || typeof dataValidations !== 'object' || Array.isArray(dataValidations)) return false
   return Object.values(dataValidations as Record<string, unknown>).every(
-    (value) => value === null || (typeof value === 'object' && !Array.isArray(value)),
+    (value) => value === null || Array.isArray(value) || typeof value === 'object',
   )
 }
 
 function checkDataValidationsBounds(
-  dataValidations: Record<string, StoredDataValidation | null>,
+  dataValidations: SheetDataValidationResourceChanges,
 ): { status: number; error: string } | null {
-  if (Object.keys(dataValidations).length > config.sheetWrite.maxDataValidations) {
+  const ruleCount = Object.values(dataValidations).reduce(
+    (count, value) => count + (Array.isArray(value) ? value.length : 1),
+    0,
+  )
+  if (ruleCount > config.sheetWrite.maxDataValidations) {
     return { status: 413, error: 'too_many_data_validations' }
+  }
+  return null
+}
+
+function checkResourceBounds(value: Record<string, unknown>): { status: number; error: string } | null {
+  if (Object.keys(value).length > config.sheetWrite.maxCells) {
+    return { status: 413, error: 'too_many_sheet_resources' }
   }
   return null
 }
@@ -640,6 +710,8 @@ export async function patchDocSheetHandler(req: Request, res: Response): Promise
   const hyperlinks = body.hyperlinks === undefined ? {} : body.hyperlinks
   const merges = body.merges === undefined ? {} : body.merges
   const sheets = body.sheets === undefined ? {} : body.sheets
+  const freeze = body.freeze === undefined ? {} : body.freeze
+  const filters = body.filters === undefined ? {} : body.filters
   const dataValidations = body.dataValidations === undefined ? {} : body.dataValidations
   if (
     !validateCellsShape(cells) ||
@@ -648,6 +720,8 @@ export async function patchDocSheetHandler(req: Request, res: Response): Promise
     !validateHyperlinksShape(hyperlinks) ||
     !validateMergesShape(merges) ||
     !validateSheetsShape(sheets) ||
+    !validateObjectResourceShape<StoredFreeze>(freeze) ||
+    !validateObjectResourceShape<StoredFilter>(filters) ||
     !validateDataValidationsShape(dataValidations)
   ) {
     res.status(400).json({ error: 'invalid_body' })
@@ -663,6 +737,8 @@ export async function patchDocSheetHandler(req: Request, res: Response): Promise
     Object.keys(hyperlinks).length === 0 &&
     Object.keys(merges).length === 0 &&
     Object.keys(sheets).length === 0 &&
+    Object.keys(freeze).length === 0 &&
+    Object.keys(filters).length === 0 &&
     Object.keys(dataValidations).length === 0
   ) {
     res.status(400).json({ error: 'invalid_body' })
@@ -676,6 +752,8 @@ export async function patchDocSheetHandler(req: Request, res: Response): Promise
     checkHyperlinksBounds(hyperlinks) ??
     checkMergesBounds(merges) ??
     checkSheetsBounds(sheets) ??
+    checkResourceBounds(freeze) ??
+    checkResourceBounds(filters) ??
     checkDataValidationsBounds(dataValidations)
   if (bounds) {
     res.status(bounds.status).json({ error: bounds.error })
@@ -695,6 +773,8 @@ export async function patchDocSheetHandler(req: Request, res: Response): Promise
       hyperlinks,
       merges,
       sheets,
+      freeze,
+      filters,
       dataValidations,
       authorizedEpoch: guard.meta.permission_epoch,
       isBot: req.botToken !== undefined,

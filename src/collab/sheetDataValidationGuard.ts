@@ -4,6 +4,8 @@ import {
   SHEET_DATA_VALIDATIONS_FIELD,
   SHEET_DIMS_FIELD,
   SHEET_DRAWINGS_FIELD,
+  SHEET_FILTERS_FIELD,
+  SHEET_FREEZE_FIELD,
   SHEET_HYPERLINKS_FIELD,
   SHEET_LIST_FIELD,
   SHEET_MERGES_FIELD,
@@ -12,8 +14,11 @@ import {
   SHEET_YMAP_FIELD,
   sheetLogicalIdsWithLegacyDefault,
   measureSheetDataValidationStorage,
-  validateSheetDataValidation,
+  parseSheetDataValidationKey,
+  validateSheetDataValidationRule,
   validateSheetDataValidations,
+  validateSheetFilter,
+  validateSheetFreeze,
   type SheetDataValidationStorageLimits,
 } from '../agent/sheetConversion.js'
 
@@ -38,6 +43,8 @@ const SHEET_ATOMIC_ROOT_MAP_FIELDS = [
   SHEET_PROTECTION_GRANTS_FIELD,
   'sheetPermissionPoints',
   'sheetCommentAnchors',
+  SHEET_FREEZE_FIELD,
+  SHEET_FILTERS_FIELD,
   SHEET_DATA_VALIDATIONS_FIELD,
 ] as const
 
@@ -49,29 +56,83 @@ function logicalIds(doc: Y.Doc): Set<string> {
   return sheetLogicalIdsWithLegacyDefault(doc.getMap(SHEET_LIST_FIELD).keys())
 }
 
-function changedValuesAreValidCheckboxes(
+function isServerAuthoritativeOrigin(origin: unknown): boolean {
+  if (origin === null || typeof origin !== 'object' || !('source' in origin)) return false
+  const source = (origin as { source?: unknown }).source
+  // DirectConnection transactions are local. Their Redis replay has only the redis source tag,
+  // so both forms must retain restore/REST type replacements that were validated before mutation.
+  return source === 'local' || source === 'redis'
+}
+
+function changedValuesAreValidRules(
+  map: Y.Map<unknown>,
+  changes: ReadonlyMap<string, KeyChange>,
+  allowedLogicalIds: ReadonlySet<string>,
+  allowTypeReplacement: boolean,
+): boolean {
+  for (const [key, change] of changes) {
+    if (change.action === 'delete') continue
+    const value = map.get(key)
+    try {
+      const { logicalId, uid } = parseSheetDataValidationKey(key)
+      if (!allowedLogicalIds.has(logicalId)) return false
+      const rule = validateSheetDataValidationRule(logicalId, value, 0)
+      if (rule.uid !== uid) return false
+      if (!allowTypeReplacement && change.action === 'update') {
+        const oldType = change.oldValue !== null && typeof change.oldValue === 'object' &&
+          !Array.isArray(change.oldValue)
+          ? (change.oldValue as Record<string, unknown>).type
+          : undefined
+        if (typeof oldType === 'string' && oldType !== rule.type) return false
+      }
+    } catch {
+      return false
+    }
+  }
+  return true
+}
+
+function changedFreezeValuesAreValid(
   map: Y.Map<unknown>,
   changes: ReadonlyMap<string, KeyChange>,
   allowedLogicalIds: ReadonlySet<string>,
 ): boolean {
   for (const [key, change] of changes) {
     if (change.action === 'delete') continue
-    const value = map.get(key)
-    if (
-      value === null ||
-      typeof value !== 'object' ||
-      Array.isArray(value) ||
-      (value as Record<string, unknown>).type !== 'checkbox'
-    ) return false
     try {
-      validateSheetDataValidation(key, value)
+      if (!allowedLogicalIds.has(key)) return false
+      validateSheetFreeze(key, map.get(key))
     } catch {
       return false
     }
-    const separator = key.indexOf('!')
-    if (separator <= 0 || !allowedLogicalIds.has(key.slice(0, separator))) return false
   }
   return true
+}
+
+function changedFilterValuesAreValid(
+  map: Y.Map<unknown>,
+  changes: ReadonlyMap<string, KeyChange>,
+  allowedLogicalIds: ReadonlySet<string>,
+): boolean {
+  for (const [key, change] of changes) {
+    if (change.action === 'delete') continue
+    try {
+      if (!allowedLogicalIds.has(key)) return false
+      validateSheetFilter(key, map.get(key))
+    } catch {
+      return false
+    }
+  }
+  return true
+}
+
+function changesForMap(transaction: Y.Transaction, map: Y.Map<unknown>): Map<string, KeyChange> {
+  const changes = new Map<string, KeyChange>()
+  for (const event of transactionEvents(transaction, map)) {
+    if (!(event instanceof Y.YMapEvent) || event.target !== map) continue
+    for (const [key, change] of event.changes.keys) changes.set(key, change as KeyChange)
+  }
+  return changes
 }
 
 function restoreChangedValues(
@@ -166,14 +227,15 @@ function affectedSheetSnapshot(
 }
 
 /**
- * Guard the checkbox-owned Y.Map against unvalidated WebSocket writes.
+ * Guard backend-owned worksheet resource maps against unvalidated WebSocket writes.
  *
  * Hocuspocus applies a Yjs frame before an observer can inspect it, so rejection is represented by
  * one synchronous compensating transaction. The repair is value-idempotent across Redis relays.
- * Deletes survive a rejected mixed transaction so legacy state remains repairable. Adds/updates
- * must be valid checkboxes, may not grow an already-over-limit snapshot, and only rescan affected
- * sheets for convergence work. Foreign validation types already present when the document loads
- * are preserved, but clients cannot add them or turn a checkbox into one to bypass the limits.
+ * Validation deletions survive a rejected mixed transaction so legacy state remains repairable.
+ * Adds/updates must be valid rules for a live sheet, freeze/filter entries must pass the same strict
+ * validators as REST, and a client cannot replace an existing rule with another validation type.
+ * Server-authoritative REST/restore transactions and their Redis replay may perform that deliberate
+ * type replacement because both paths validate the complete target before mutation.
  */
 export function attachSheetDataValidationGuard(
   doc: Y.Doc,
@@ -184,26 +246,36 @@ export function attachSheetDataValidationGuard(
   // cannot leave sibling cell/dimension/protection writes partially applied.
   const atomicRootMaps = SHEET_ATOMIC_ROOT_MAP_FIELDS.map((field) => doc.getMap<unknown>(field))
   const map = doc.getMap<unknown>(SHEET_DATA_VALIDATIONS_FIELD)
+  const freezeMap = doc.getMap<unknown>(SHEET_FREEZE_FIELD)
+  const filterMap = doc.getMap<unknown>(SHEET_FILTERS_FIELD)
   const observer = (transaction: Y.Transaction): void => {
     if (transaction.origin === SHEET_DATA_VALIDATION_GUARD_ORIGIN) return
-    const changes = new Map<string, KeyChange>()
-    for (const event of transactionEvents(
-      transaction,
-      map,
-    )) {
-      if (!(event instanceof Y.YMapEvent) || event.target !== map) continue
-      for (const [key, change] of event.changes.keys) changes.set(key, change as KeyChange)
-    }
-    if (changes.size === 0) return
+    const changes = changesForMap(transaction, map)
+    const freezeChanges = changesForMap(transaction, freezeMap)
+    const filterChanges = changesForMap(transaction, filterMap)
+    if (changes.size === 0 && freezeChanges.size === 0 && filterChanges.size === 0) return
     const allowedLogicalIds = logicalIds(doc)
     try {
-      if (!changedValuesAreValidCheckboxes(map, changes, allowedLogicalIds)) throw new Error('invalid checkbox write')
-      const beforeUsage = measureSheetDataValidationStorage(snapshotBefore(map, changes))
-      const afterUsage = measureSheetDataValidationStorage(map.entries())
-      if (!withinStorageLimits(afterUsage, limits) && !nonGrowingStorageRepair(beforeUsage, afterUsage)) {
-        throw new Error('checkbox storage limit exceeded')
+      if (!changedValuesAreValidRules(
+        map,
+        changes,
+        allowedLogicalIds,
+        isServerAuthoritativeOrigin(transaction.origin),
+      )) throw new Error('invalid data-validation write')
+      if (!changedFreezeValuesAreValid(freezeMap, freezeChanges, allowedLogicalIds)) {
+        throw new Error('invalid freeze write')
       }
-      affectedSheetSnapshot(map, changes, allowedLogicalIds)
+      if (!changedFilterValuesAreValid(filterMap, filterChanges, allowedLogicalIds)) {
+        throw new Error('invalid filter write')
+      }
+      if (changes.size > 0) {
+        const beforeUsage = measureSheetDataValidationStorage(snapshotBefore(map, changes))
+        const afterUsage = measureSheetDataValidationStorage(map.entries())
+        if (!withinStorageLimits(afterUsage, limits) && !nonGrowingStorageRepair(beforeUsage, afterUsage)) {
+          throw new Error('data-validation storage limit exceeded')
+        }
+        affectedSheetSnapshot(map, changes, allowedLogicalIds)
+      }
     } catch {
       restoreChangedValues(doc, map, changes, transaction, atomicRootMaps)
     }

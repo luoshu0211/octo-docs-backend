@@ -388,7 +388,7 @@ describe('versionRestore — sheet data validations', () => {
     const doc = new Y.Doc()
     registerDefaultSheet(doc)
     doc.getMap<StoredDataValidation>(SHEET_DATA_VALIDATIONS_FIELD).set(key, oldRule)
-    expect(decodeSheetDataValidationsSnapshot(Y.encodeStateAsUpdate(doc))).toEqual({ [key]: oldRule })
+    expect(decodeSheetDataValidationsSnapshot(Y.encodeStateAsUpdate(doc))).toEqual({ default: [oldRule] })
     expect(validateSheetDataValidation(key, oldRule)).toEqual(oldRule)
   })
 
@@ -429,7 +429,7 @@ describe('versionRestore — sheet data validations', () => {
     expect(map.has('default!live-only')).toBe(false)
   })
 
-  it('preserves legacy non-checkbox validations while reconciling checkbox rules', () => {
+  it('restores all validation kinds and removes live-only rules', () => {
     const legacyKey = 'default!legacy-list'
     const legacyRule = {
       uid: 'legacy-list',
@@ -450,7 +450,7 @@ describe('versionRestore — sheet data validations', () => {
     live.transact(() => reconcileSheetMap(live, Y.encodeStateAsUpdate(target)))
 
     expect(map.get(legacyKey)).toEqual(legacyRule)
-    expect(map.get('default!live-only-list')).toEqual({ ...legacyRule, uid: 'live-only-list' })
+    expect(map.has('default!live-only-list')).toBe(false)
     expect(map.get(key)).toEqual(oldRule)
   })
 
@@ -465,7 +465,7 @@ describe('versionRestore — sheet data validations', () => {
       targetRule: { ...oldRule, type: 'list' },
       liveRule: oldRule,
     },
-  ])('fails closed before mutation for $name', ({ targetRule, liveRule }) => {
+  ])('restores the target rule across a type change for $name', ({ targetRule, liveRule }) => {
     const cellKey = sheetCellKey('default', 0, 0)
     const target = new Y.Doc()
     registerDefaultSheet(target)
@@ -476,11 +476,9 @@ describe('versionRestore — sheet data validations', () => {
     live.getMap<SheetCell>(SHEET_YMAP_FIELD).set(cellKey, { v: 'live' })
     live.getMap(SHEET_DATA_VALIDATIONS_FIELD).set(key, liveRule)
 
-    expect(() => live.transact(() => reconcileSheetMap(live, Y.encodeStateAsUpdate(target)))).toThrow(
-      SheetSnapshotInvalidError,
-    )
-    expect(live.getMap<SheetCell>(SHEET_YMAP_FIELD).get(cellKey)).toEqual({ v: 'live' })
-    expect(live.getMap(SHEET_DATA_VALIDATIONS_FIELD).get(key)).toEqual(liveRule)
+    expect(() => live.transact(() => reconcileSheetMap(live, Y.encodeStateAsUpdate(target)))).not.toThrow()
+    expect(live.getMap<SheetCell>(SHEET_YMAP_FIELD).get(cellKey)).toEqual({ v: 'target' })
+    expect(live.getMap(SHEET_DATA_VALIDATIONS_FIELD).get(key)).toEqual(targetRule)
   })
 
   it.each([
@@ -494,22 +492,20 @@ describe('versionRestore — sheet data validations', () => {
       targetRule: { ...oldRule, type: 'list' },
       liveRule: oldRule,
     },
-  ])('keeps the complete live state unchanged through reconcileRestoreOntoDoc for $name', ({ targetRule, liveRule }) => {
+  ])('reconciles the complete live state through reconcileRestoreOntoDoc for $name', ({ targetRule, liveRule }) => {
     const target = new Y.Doc()
     registerDefaultSheet(target)
     target.getMap(SHEET_DATA_VALIDATIONS_FIELD).set(key, targetRule)
     const live = new Y.Doc()
     registerDefaultSheet(live)
     live.getMap(SHEET_DATA_VALIDATIONS_FIELD).set(key, liveRule)
-    const before = Y.encodeStateAsUpdate(live)
-
     expect(() => live.transact(() => reconcileRestoreOntoDoc(
       live,
       decodeTargetSnapshot(Y.encodeStateAsUpdate(target)),
       Y.encodeStateAsUpdate(target),
-    ))).toThrow(SheetSnapshotInvalidError)
+    ))).not.toThrow()
 
-    expect(Y.encodeStateAsUpdate(live)).toEqual(before)
+    expect(live.getMap(SHEET_DATA_VALIDATIONS_FIELD).get(key)).toEqual(targetRule)
   })
 
   it('fails closed before changing cells when a target rule is malformed', () => {
@@ -552,7 +548,7 @@ describe('versionRestore — sheet data validations', () => {
         ranges: [{ startRow: 1, startColumn: 1, endRow: 2, endColumn: 2 }],
       },
     })
-    expect(decodeSheetDataValidationsSnapshot(Y.encodeStateAsUpdate(live))).toEqual({ [key]: oldRule })
+    expect(decodeSheetDataValidationsSnapshot(Y.encodeStateAsUpdate(live))).toEqual({ default: [oldRule] })
   })
 
   it('validates a legal full-sheet singleton rule without quadratic range comparisons', () => {
