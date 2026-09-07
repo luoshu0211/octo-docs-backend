@@ -685,6 +685,7 @@ export async function listRecentHandler(req: Request, res: Response) {
       docId: d.doc_id,
       title: d.title,
       ownerId: d.owner_id,
+      isExternal: d.space_id !== spaceId,
       docType: d.doc_type,
       ...(d.octo_doc_slug ? { octoDocSlug: d.octo_doc_slug } : {}),
       role,

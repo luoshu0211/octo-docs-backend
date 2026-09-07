@@ -12,8 +12,10 @@ import {
   ProtectedRangeError,
   SHEET_PROTECTION_FIELD,
   SHEET_PROTECTION_GRANTS_FIELD,
+  SHEET_DATA_VALIDATIONS_FIELD,
   sheetCellKey,
   type SheetCell,
+  type StoredDataValidation,
 } from '../src/agent/sheetConversion.js'
 
 /** A doc carrying one protected RANGE rule over C5:D6 on the `default` sheet. */
@@ -704,5 +706,139 @@ describe('assertSheetWriteAllowed — sheets (tab delete / rename / reorder)', (
     expect(() =>
       assertSheetWriteAllowed(doc, noCells, 'bot-1', false, {}, {}, { default: null }),
     ).not.toThrow()
+  })
+})
+
+describe('assertSheetWriteAllowed — checkbox validations', () => {
+  const inside: StoredDataValidation = {
+    uid: 'checkbox-c5',
+    type: 'checkbox',
+    ranges: [{ startRow: 4, startColumn: 2, endRow: 4, endColumn: 2 }],
+  }
+  const outside: StoredDataValidation = {
+    uid: 'checkbox-a1',
+    type: 'checkbox',
+    ranges: [{ startRow: 0, startColumn: 0, endRow: 0, endColumn: 0 }],
+  }
+
+  it('rejects creating a checkbox that intersects a protected range', () => {
+    const doc = docWithRangeRule({ allow: [] })
+    expect(() => assertSheetWriteAllowed(
+      doc,
+      {},
+      'bot-1',
+      false,
+      {},
+      {},
+      {},
+      { 'default!checkbox-c5': inside },
+    )).toThrow(ProtectedRangeError)
+  })
+
+  it('uses the current authoritative range when deleting a checkbox rule', () => {
+    const doc = docWithRangeRule({ allow: [] })
+    doc.getMap<StoredDataValidation>(SHEET_DATA_VALIDATIONS_FIELD).set('default!checkbox-c5', inside)
+    expect(() => assertSheetWriteAllowed(
+      doc,
+      {},
+      'bot-1',
+      false,
+      {},
+      {},
+      {},
+      { 'default!checkbox-c5': null },
+    )).toThrow(ProtectedRangeError)
+  })
+
+  it('uses both old and new ranges when moving a checkbox rule', () => {
+    const doc = docWithRangeRule({ allow: [] })
+    doc.getMap<StoredDataValidation>(SHEET_DATA_VALIDATIONS_FIELD).set('default!checkbox-c5', inside)
+    expect(() => assertSheetWriteAllowed(
+      doc,
+      {},
+      'bot-1',
+      false,
+      {},
+      {},
+      {},
+      { 'default!checkbox-c5': { ...outside, uid: 'checkbox-c5' } },
+    )).toThrow(ProtectedRangeError)
+  })
+
+  it('protects a historical overlap loser that becomes effective when its winner moves', () => {
+    const doc = new Y.Doc()
+    doc.getMap(SHEET_PROTECTION_FIELD).set('default!r:r1', {
+      kind: 'r',
+      id: 'r1',
+      permissionId: 'perm-1',
+      ranges: [{ startRow: 0, startColumn: 2, endRow: 0, endColumn: 2 }],
+    })
+    doc.getMap(SHEET_PROTECTION_GRANTS_FIELD).set('perm-1', { allow: [] })
+    const validations = doc.getMap<StoredDataValidation>(SHEET_DATA_VALIDATIONS_FIELD)
+    validations.set('default!a', {
+      uid: 'a',
+      type: 'checkbox',
+      ranges: [{ startRow: 0, startColumn: 0, endRow: 0, endColumn: 1 }],
+    })
+    validations.set('default!z', {
+      uid: 'z',
+      type: 'checkbox',
+      ranges: [{ startRow: 0, startColumn: 1, endRow: 0, endColumn: 2 }],
+    })
+
+    expect(() => assertSheetWriteAllowed(
+      doc,
+      {},
+      'bot-1',
+      false,
+      {},
+      {},
+      {},
+      {
+        'default!a': {
+          uid: 'a',
+          type: 'checkbox',
+          ranges: [{ startRow: 0, startColumn: 0, endRow: 0, endColumn: 0 }],
+        },
+      },
+    )).toThrow(ProtectedRangeError)
+  })
+
+  it('allows a checkbox outside the protected range', () => {
+    const doc = docWithRangeRule({ allow: [] })
+    expect(() => assertSheetWriteAllowed(
+      doc,
+      {},
+      'bot-1',
+      false,
+      {},
+      {},
+      {},
+      { 'default!checkbox-a1': outside },
+    )).not.toThrow()
+  })
+
+  it('fails closed for a non-admin repair when the effective checkbox set exceeds inspection budget', () => {
+    const doc = docWithRangeRule({ allow: [] })
+    const validations = doc.getMap<StoredDataValidation>(SHEET_DATA_VALIDATIONS_FIELD)
+    const repeatedColumn = { startRow: 0, startColumn: 0, endRow: 999, endColumn: 0 }
+    for (const [index, suffix] of ['a', 'b', 'c'].entries()) {
+      validations.set(`default!${suffix}`, {
+        uid: suffix,
+        type: 'checkbox',
+        ranges: Array.from({ length: 1000 }, () => ({
+          ...repeatedColumn,
+          startColumn: index,
+          endColumn: index,
+        })),
+      })
+    }
+
+    expect(() => assertSheetWriteAllowed(
+      doc, {}, 'bot-1', false, {}, {}, {}, { 'default!c': null },
+    )).toThrow(ProtectedRangeError)
+    expect(() => assertSheetWriteAllowed(
+      doc, {}, 'admin', true, {}, {}, {}, { 'default!c': null },
+    )).not.toThrow()
   })
 })

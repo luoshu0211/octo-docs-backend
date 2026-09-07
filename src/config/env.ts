@@ -787,6 +787,14 @@ export const config = {
     // realistic single edit, low enough that a scripted client cannot fan out
     // unbounded validate/set work under the 1mb body cap.
     maxCells: num('SHEET_WRITE_MAX_CELLS', 5000),
+    // Checkbox rules per PATCH batch. Kept separate from maxCells so the route's
+    // diagnostics and future tuning describe the resource actually being bounded.
+    // The same value caps the complete persisted checkbox candidate set.
+    maxDataValidations: num('SHEET_WRITE_MAX_DATA_VALIDATIONS', 5000),
+    // Aggregate serialized bytes of persisted checkbox candidates. Unlike the
+    // document-wide binary cap, this bounds the validation map before overlap
+    // resolution so hidden losers and malformed checkbox-shaped entries count.
+    maxDataValidationBytes: num('SHEET_WRITE_MAX_DATA_VALIDATION_BYTES', 1024 * 1024),
     // Upper bound on a single cell's serialized {v,f,s} payload — keeps one cell
     // (chiefly its opaque style object) from carrying most of the 1mb body.
     maxCellContentBytes: num('SHEET_WRITE_MAX_CELL_CONTENT_BYTES', 64 * 1024),

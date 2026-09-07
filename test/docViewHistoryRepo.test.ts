@@ -192,6 +192,14 @@ describe('docViewHistoryRepo.listRecent — query-time filter + keyset paging', 
     expect(countSql).toContain('COUNT(*)')
   })
 
+  it('selects the document home Space so clients can distinguish cross-Space rows', async () => {
+    mockQuery.mockResolvedValueOnce([{ cnt: 0 }] as never)
+    mockQuery.mockResolvedValueOnce([] as never)
+    await docViewHistoryRepo.listRecent({ uid: 'u_1', spaceId: 's1', principalSpaceId: 's1', pageSize: 20 })
+    const itemsSql = mockQuery.mock.calls.at(-1)![0] as string
+    expect(itemsSql).toContain('m.space_id')
+  })
+
   it('CROSS-SPACE ISOLATION: the share branch is same-space-guarded and never leaks another space (member)', async () => {
     mockQuery.mockResolvedValueOnce([{ cnt: 0 }] as never) // count
     mockQuery.mockResolvedValueOnce([] as never) // items

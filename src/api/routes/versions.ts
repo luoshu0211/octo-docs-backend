@@ -37,6 +37,10 @@ import {
   decodeBoardSnapshot,
   decodeSheetSnapshot,
   decodeSheetDimsSnapshot,
+  decodeSheetListSnapshot,
+  decodeSheetFreezeSnapshot,
+  decodeSheetFiltersSnapshot,
+  decodeSheetDataValidationsSnapshot,
   SchemaIncompatibleError,
   SheetSnapshotInvalidError,
   BoardSnapshotInvalidError,
@@ -266,6 +270,14 @@ export async function getVersionStateHandler(req: Request, res: Response): Promi
       // synced grid maps are surfaced so the version panel can faithfully render
       // a historical sheet's layout, not just its cell contents.
       sheetDims: decodeSheetDimsSnapshot(found.state),
+      // Checkbox validation rules are part of visible sheet state and must use the same
+      // fail-closed decoder as restore, otherwise preview can accept a snapshot restore rejects.
+      sheetDataValidations: decodeSheetDataValidationsSnapshot(found.state, true),
+      sheetFreeze: decodeSheetFreezeSnapshot(found.state),
+      sheetFilters: decodeSheetFiltersSnapshot(found.state),
+      // The frontend needs the historical tab registry to apply the same valid-sheet filtering as
+      // the live grid before diffing checkbox winners. Empty means the legacy implicit default tab.
+      sheetList: decodeSheetListSnapshot(found.state),
       schemaVersion: found.version.schemaVersion,
       docVersionSeq: versionId,
     })

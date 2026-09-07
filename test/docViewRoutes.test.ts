@@ -102,10 +102,10 @@ describe('GET /docs/recent — listRecentHandler', () => {
       total: 2,
       nextCursor: 'CURSOR',
       items: [
-        { doc_id: 'd_1', title: 'A', owner_id: 'u_o', doc_type: 'doc', role: 2,
+        { doc_id: 'd_1', title: 'A', owner_id: 'u_o', space_id: 's_external', doc_type: 'doc', role: 2,
           updated_at: new Date('2026-07-10T00:00:00.000Z'), updated_by: 'u_e1',
           viewed_at: new Date('2026-07-15T06:00:00.000Z') },
-        { doc_id: 'd_2', title: 'B', owner_id: 'u_1', doc_type: 'board', role: 3,
+        { doc_id: 'd_2', title: 'B', owner_id: 'u_1', space_id: 's1', doc_type: 'board', role: 3,
           updated_at: new Date('2026-07-11T00:00:00.000Z'), updated_by: 'u_e2',
           viewed_at: new Date('2026-07-15T05:00:00.000Z') },
       ],
@@ -123,6 +123,8 @@ describe('GET /docs/recent — listRecentHandler', () => {
     expect(body.items[0]!.role).toBe('writer')
     expect(body.items[1]!.role).toBe('admin')
     expect(body.items[0]!.viewedAt).toBe('2026-07-15T06:00:00.000Z')
+    expect(body.items[0]!.isExternal).toBe(true)
+    expect(body.items[1]!.isExternal).toBe(false)
     // repo received the normalized inputs.
     const arg = vi.mocked(docViewHistoryRepo.listRecent).mock.calls[0]![0]
     expect(arg.creators).toEqual(['u_o'])

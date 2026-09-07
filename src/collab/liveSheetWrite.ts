@@ -15,10 +15,43 @@
 import type { Document } from '@hocuspocus/server'
 import * as Y from 'yjs'
 import { getCollabServer } from './server.js'
-import { validateSheetCellBatch, validateSheetDimBatch, validateSheetDrawingBatch, validateSheetHyperLinkBatch, validateSheetMergeBatch, validateSheetListBatch, assertSheetWriteAllowed, SHEET_YMAP_FIELD, SHEET_DIMS_FIELD, SHEET_DRAWINGS_FIELD, SHEET_HYPERLINKS_FIELD, SHEET_MERGES_FIELD, SHEET_LIST_FIELD, type SheetCell, type StoredDrawing, type StoredHyperLink, type StoredSheetMeta } from '../agent/sheetConversion.js'
+import {
+  validateSheetCellBatch,
+  validateSheetDimBatch,
+  validateSheetDrawingBatch,
+  validateSheetHyperLinkBatch,
+  validateSheetMergeBatch,
+  validateSheetListBatch,
+  validateSheetFreezeBatch,
+  validateSheetFilterBatch,
+  materializeLegacyDefaultSheet,
+  hasLegacyDefaultDataValidationRule,
+  validateSheetDataValidationResourceBatch,
+  validateSheetDataValidationResourceDeletionRepairBatch,
+  sheetLogicalIdsWithLegacyDefault,
+  assertSheetWriteAllowed,
+  SHEET_YMAP_FIELD,
+  SHEET_DIMS_FIELD,
+  SHEET_DRAWINGS_FIELD,
+  SHEET_HYPERLINKS_FIELD,
+  SHEET_MERGES_FIELD,
+  SHEET_LIST_FIELD,
+  SHEET_FREEZE_FIELD,
+  SHEET_FILTERS_FIELD,
+  SHEET_DATA_VALIDATIONS_FIELD,
+  type SheetCell,
+  type StoredDrawing,
+  type StoredHyperLink,
+  type StoredSheetMeta,
+  type StoredFreeze,
+  type StoredFilter,
+  type StoredDataValidation,
+  type SheetDataValidationResourceChanges,
+} from '../agent/sheetConversion.js'
 import { advanceEditVersion } from './liveDocWrite.js'
 import { stateVectorsEqual, BaseVersionStaleError } from './docBodyEdit.js'
 import { persistedByteLength } from './persistedEncoding.js'
+import { config } from '../config/env.js'
 
 /**
  * Read the live sheet document for a content read (mirrors readLiveForEdit).
@@ -88,6 +121,9 @@ export async function commitLiveSheetEdit(
   hyperlinks: Record<string, StoredHyperLink | null> = {},
   merges: Record<string, boolean | null> = {},
   sheets: Record<string, StoredSheetMeta | null> = {},
+  freeze: Record<string, StoredFreeze | null> = {},
+  filters: Record<string, StoredFilter | null> | boolean = {},
+  dataValidations: SheetDataValidationResourceChanges = {},
   /**
    * Whether the caller resolved `uid` as a doc admin, under the SAME doc_meta
    * lock that authorized the write. Defaults to false so an uninformed caller
@@ -95,6 +131,15 @@ export async function commitLiveSheetEdit(
    */
   isAdmin = false,
 ): Promise<{ newSV: Uint8Array; bytes: number }> {
+  // Compatibility with !124's short-lived positional signature, where the
+  // argument now named `freeze` carried flat checkbox changes and `filters`
+  // carried isAdmin. The public route uses the grouped signature below.
+  if (typeof filters === 'boolean') {
+    isAdmin = filters
+    dataValidations = freeze as unknown as SheetDataValidationResourceChanges
+    freeze = {}
+    filters = {}
+  }
   const server = getCollabServer()
   const connection = await server.hocuspocus.openDirectConnection(documentName, { user: { id: uid } })
   let newSV!: Uint8Array
@@ -107,17 +152,75 @@ export async function commitLiveSheetEdit(
       if (!stateVectorsEqual(clientBaseVersion, currentSV)) {
         throw new BaseVersionStaleError()
       }
+      // Prepare the effective sheet-list batch before authorization. Legacy V1 checkbox state can
+      // implicitly materialize `default`; the guard must see that server-added write too, not only
+      // the caller's literal `sheets` payload.
+      const listMap = doc.getMap<StoredSheetMeta>(SHEET_LIST_FIELD)
+      const validationMap = doc.getMap<StoredDataValidation>(SHEET_DATA_VALIDATIONS_FIELD)
+      const validationDeletionOnly = Object.keys(dataValidations).length > 0 &&
+        Object.values(dataValidations).every((value) => value === null || (Array.isArray(value) && value.length === 0)) &&
+        Object.keys(cells).length === 0 && Object.keys(dims).length === 0 &&
+        Object.keys(drawings).length === 0 && Object.keys(hyperlinks).length === 0 &&
+        Object.keys(merges).length === 0 && Object.keys(sheets).length === 0 &&
+        Object.keys(freeze).length === 0 && Object.keys(filters).length === 0
+      const requestedListBatch = validateSheetListBatch(sheets)
+      const listBatch = materializeLegacyDefaultSheet(
+        listMap.keys(),
+        requestedListBatch,
+        listMap.size === 0 &&
+          requestedListBatch.toSet.length > 0 &&
+          hasLegacyDefaultDataValidationRule(validationMap.entries(), dataValidations),
+      )
+      const protectedSheetChanges: Record<string, StoredSheetMeta | null> = Object.create(null)
+      for (const key of listBatch.toDelete) protectedSheetChanges[key] = null
+      for (const [key, meta] of listBatch.toSet) protectedSheetChanges[key] = meta
+
+      const nextLogicalIds = sheetLogicalIdsWithLegacyDefault(listMap.keys())
+      for (const key of listBatch.toDelete) nextLogicalIds.delete(key)
+      for (const [key] of listBatch.toSet) nextLogicalIds.add(key)
+      const validationBatch = validationDeletionOnly
+        ? validateSheetDataValidationResourceDeletionRepairBatch(validationMap.entries(), dataValidations)
+        : validateSheetDataValidationResourceBatch(
+          validationMap.entries(), dataValidations, nextLogicalIds, new Set(listBatch.toDelete),
+          {
+            maxRules: config.sheetWrite.maxDataValidations,
+            maxBytes: config.sheetWrite.maxDataValidationBytes,
+          },
+        )
+      const protectedCheckboxChanges: Record<string, StoredDataValidation | null> = Object.create(null)
+      for (const key of validationBatch.toDelete) {
+        const current = validationMap.get(key)
+        if (current?.type === 'checkbox') protectedCheckboxChanges[key] = null
+      }
+      for (const [key, rule] of validationBatch.toSet) {
+        if (rule.type === 'checkbox') protectedCheckboxChanges[key] = rule
+      }
+      const resourceSheets = new Set([...Object.keys(freeze), ...Object.keys(filters)])
+      for (const key of Object.keys(dataValidations)) {
+        if (!key.includes('!')) resourceSheets.add(key)
+      }
+
       // (1b) PROTECTION guard — still before any mutation. Reads the protection
       //      rules + grant lists off the SAME live doc, so a non-admin writing
       //      into a protected range is rejected with nothing applied and nothing
       //      broadcast (same fail-closed shape as the stale-version guard above).
       //      openDirectConnection bypasses onAuthenticate, so this is the only
       //      place the bot/REST path can be held to the protection contract.
-      //      `sheets` is passed too: the route allows sheets-only PATCHes, and a
+      //      the effective sheet batch is passed too: the route allows sheets-only PATCHes, and a
       //      tab delete destroys every protected cell on that tab, so omitting it
       //      left a strictly-worse bypass than the cell write this guard refuses.
-      assertSheetWriteAllowed(doc, cells, uid, isAdmin, dims, merges, sheets)
-      // (2) The single, last content mutation. Validate ALL SIX batches FIRST
+      assertSheetWriteAllowed(
+        doc,
+        cells,
+        uid,
+        isAdmin,
+        dims,
+        merges,
+        protectedSheetChanges,
+        protectedCheckboxChanges,
+        [...resourceSheets],
+      )
+      // (2) The single, last content mutation. Validate ALL NINE batches FIRST
       //     (validate* return the split batches without mutating), THEN apply —
       //     so a bad dim/drawing can't leave cells half-applied. Yjs does NOT roll
       //     back a thrown transact callback and disconnect flushes onStore, so a
@@ -130,7 +233,8 @@ export async function commitLiveSheetEdit(
       const drawingBatch = validateSheetDrawingBatch(drawings)
       const linkBatch = validateSheetHyperLinkBatch(hyperlinks)
       const mergeBatch = validateSheetMergeBatch(merges)
-      const listBatch = validateSheetListBatch(sheets)
+      const freezeBatch = validateSheetFreezeBatch(freeze)
+      const filterBatch = validateSheetFilterBatch(filters)
       const ymap = doc.getMap<SheetCell>(SHEET_YMAP_FIELD)
       for (const key of cellBatch.toDelete) ymap.delete(key)
       for (const [key, cell] of cellBatch.toSet) ymap.set(key, cell)
@@ -146,9 +250,16 @@ export async function commitLiveSheetEdit(
       const mergeMap = doc.getMap<boolean>(SHEET_MERGES_FIELD)
       for (const key of mergeBatch.toDelete) mergeMap.delete(key)
       for (const [key, v] of mergeBatch.toSet) mergeMap.set(key, v)
-      const listMap = doc.getMap<StoredSheetMeta>(SHEET_LIST_FIELD)
       for (const key of listBatch.toDelete) listMap.delete(key)
       for (const [key, meta] of listBatch.toSet) listMap.set(key, meta)
+      const freezeMap = doc.getMap<StoredFreeze>(SHEET_FREEZE_FIELD)
+      for (const key of freezeBatch.toDelete) freezeMap.delete(key)
+      for (const [key, value] of freezeBatch.toSet) freezeMap.set(key, value)
+      const filterMap = doc.getMap<StoredFilter>(SHEET_FILTERS_FIELD)
+      for (const key of filterBatch.toDelete) filterMap.delete(key)
+      for (const [key, value] of filterBatch.toSet) filterMap.set(key, value)
+      for (const key of validationBatch.toDelete) validationMap.delete(key)
+      for (const [key, rule] of validationBatch.toSet) validationMap.set(key, rule)
       // (3) Advance the edit-version counter so a delete-only batch also moves
       //     the state vector forward; the token is read AFTER this bump.
       advanceEditVersion(doc)

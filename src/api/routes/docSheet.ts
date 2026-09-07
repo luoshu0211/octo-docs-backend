@@ -26,8 +26,28 @@ import { requireDocRole } from '../guard.js'
 import { readLiveSheet } from '../../collab/liveSheetWrite.js'
 import { editDocSheet } from '../services/editDocSheet.js'
 import { encodeBaseVersion, parseBaseVersion } from '../../collab/docBodyEdit.js'
-import { decodeSheetSnapshot, decodeSheetDimsSnapshot, decodeSheetHyperLinksSnapshot, decodeSheetMergesSnapshot, decodeSheetListSnapshot } from '../../collab/versionRestore.js'
-import { SheetSnapshotInvalidError, type SheetCell, type StoredDrawing, type StoredHyperLink, type StoredSheetMeta } from '../../agent/sheetConversion.js'
+import {
+  decodeSheetSnapshot,
+  decodeSheetDimsSnapshot,
+  decodeSheetHyperLinksSnapshot,
+  decodeSheetMergesSnapshot,
+  decodeSheetListSnapshot,
+  decodeSheetFreezeSnapshot,
+  decodeSheetFiltersSnapshot,
+  decodeSheetDataValidationsSnapshot,
+} from '../../collab/versionRestore.js'
+import {
+  SheetDataValidationInspectionBudgetError,
+  SheetSnapshotInvalidError,
+  type SheetCell,
+  type StoredDrawing,
+  type StoredHyperLink,
+  type StoredSheetMeta,
+  type StoredFreeze,
+  type StoredFilter,
+  type StoredDataValidationRule,
+  type SheetDataValidationResourceChanges,
+} from '../../agent/sheetConversion.js'
 import {
   decodeSheetCursor,
   encodeSheetCursor,
@@ -95,17 +115,22 @@ export async function getDocSheetHandler(req: Request, res: Response): Promise<v
   // small sheets are unaffected. Either param switches on paginated mode.
   const paginated = limitRaw !== undefined || cursorRaw !== undefined
 
+  let readBaseVersion: string | undefined
   try {
     // Read the live authoritative state + its state vector, then decode with the
     // SAME validated primitives the version-restore preview uses (decodeSheet*),
     // so the read path and the preview path never drift on the {v,f,s} contract.
     const { state, baseSV } = await readLiveSheet(guard.meta.document_name)
+    const baseVersion = encodeBaseVersion(baseSV)
+    readBaseVersion = baseVersion
     const sheetCells = decodeSheetSnapshot(state) as Record<string, SheetCell>
     const sheetDims = decodeSheetDimsSnapshot(state)
     const sheetHyperLinks = decodeSheetHyperLinksSnapshot(state) as Record<string, StoredHyperLink>
     const sheetMerges = decodeSheetMergesSnapshot(state) as Record<string, boolean>
     const sheetList = decodeSheetListSnapshot(state) as Record<string, StoredSheetMeta>
-    const baseVersion = encodeBaseVersion(baseSV)
+    const sheetFreeze = decodeSheetFreezeSnapshot(state)
+    const sheetFilters = decodeSheetFiltersSnapshot(state)
+    const sheetDataValidations = decodeSheetDataValidationsSnapshot(state)
 
     if (paginated) {
       await respondPaginatedSheet(res, {
@@ -115,6 +140,9 @@ export async function getDocSheetHandler(req: Request, res: Response): Promise<v
         sheetHyperLinks,
         sheetMerges,
         sheetList,
+        sheetFreeze,
+        sheetFilters,
+        sheetDataValidations,
         baseVersion,
         limitRaw,
         cursorRaw,
@@ -135,7 +163,16 @@ export async function getDocSheetHandler(req: Request, res: Response): Promise<v
     // dimension (maxDocBytes / doc_too_large) — lets a caller see at a glance which
     // dimension tripped and how far it sits from the cap. See README "Sheet size
     // dimensions" for why the two dimensions differ.
-    const payloadBytes = Buffer.byteLength(JSON.stringify({ sheetCells, sheetDims, sheetHyperLinks, sheetMerges, sheetList }))
+    const payloadBytes = Buffer.byteLength(JSON.stringify({
+      sheetCells,
+      sheetDims,
+      sheetHyperLinks,
+      sheetMerges,
+      sheetList,
+      sheetFreeze,
+      sheetFilters,
+      sheetDataValidations,
+    }))
     if (payloadBytes > config.sheetRead.maxCellBytes) {
       res.status(413).json({
         error: 'sheet_too_large',
@@ -153,12 +190,35 @@ export async function getDocSheetHandler(req: Request, res: Response): Promise<v
       sheetHyperLinks,
       sheetMerges,
       sheetList,
+      sheetFreeze,
+      sheetFilters,
+      sheetDataValidations,
       // The live state vector, base64. Carried so a later write can guard on it
       // for optimistic concurrency (Stage2); this read does not reuse a historic
       // versions snapshot.
       baseVersion,
     })
   } catch (err) {
+    if (err instanceof SheetDataValidationInspectionBudgetError) {
+      // Do not return a partial winner set: the aggregate inspection stopped at the budget wall.
+      // The state vector and one exact raw-map key are enough for an authorized writer to perform
+      // a strictly shrinking deletion and retry until the sheet becomes normally readable.
+      if (readBaseVersion === undefined) {
+        res.status(500).json({ error: 'internal_error' })
+        return
+      }
+      res.status(413).json({
+        error: 'sheet_too_large',
+        baseVersion: readBaseVersion,
+        ...(err.repairDataValidationKey
+          ? {
+              repairDataValidationKey: err.repairDataValidationKey,
+              hint: 'delete the returned checkbox validation key with PATCH, then retry the read',
+            }
+          : { hint: 'remove malformed checkbox metadata, then retry the read' }),
+      })
+      return
+    }
     if (err instanceof SheetSnapshotInvalidError) {
       // A cell or dimension violated the {v,f,s} / c<idx>|r<idx> contract —
       // fail-closed rather than serializing arbitrary writer-controlled data.
@@ -170,21 +230,9 @@ export async function getDocSheetHandler(req: Request, res: Response): Promise<v
 }
 
 /**
- * Byte budget for a page's CELLS. maxCellBytes caps the grid payload — the same
- * `{ sheetCells, sheetDims }` object the whole-sheet read measures for its 413
- * (see getDocSheetHandler). The first page also carries sheetDims (returned once,
- * on page one), so budgeting only the cells against maxCellBytes let the first
- * page's cells + dims together exceed the cap — the per-page byte wall was
- * silently punched through whenever a sheet had non-trivial column/row overrides.
- *
- * Reserve everything in the grid payload EXCEPT the cells — the serialized dims
- * plus the fixed `{ "sheetCells": …, "sheetDims": … }` framing — so the whole
- * first page's grid payload (cells + dims) stays within maxCellBytes. Later pages
- * omit dims and get the full budget.
- *
- * Floored at 0: paginateSheetCells always emits at least its first cell (progress
- * guarantee), so even a pathologically large dims map still makes forward
- * progress rather than returning an empty, non-advancing page.
+ * Byte budget for a page's cells. The first page also carries the whole-grid
+ * maps, including checkbox validations, so reserve their serialized bytes.
+ * Later pages omit them and retain the full cell budget.
  */
 function firstPageCellBudget(
   isFirstPage: boolean,
@@ -192,13 +240,62 @@ function firstPageCellBudget(
   sheetHyperLinks: Record<string, StoredHyperLink>,
   sheetMerges: Record<string, boolean>,
   sheetList: Record<string, StoredSheetMeta>,
+  sheetFreeze: Record<string, StoredFreeze>,
+  sheetFilters: Record<string, StoredFilter>,
+  sheetDataValidations: Record<string, StoredDataValidationRule[]>,
 ): number {
   if (!isFirstPage) return config.sheetRead.maxCellBytes
-  // Envelope = the grid payload with an empty cell map: dims + hyperlinks + merges
-  // + sheetList plus the object framing that will wrap the cells. Reserving it keeps
-  // cells + all whole-grid maps ≤ the cap on the first page.
-  const envelopeBytes = Buffer.byteLength(JSON.stringify({ sheetCells: {}, sheetDims, sheetHyperLinks, sheetMerges, sheetList }))
+  const envelopeBytes = Buffer.byteLength(JSON.stringify({
+    sheetCells: {},
+    sheetDims,
+    sheetHyperLinks,
+    sheetMerges,
+    sheetList,
+    sheetFreeze,
+    sheetFilters,
+    sheetDataValidations,
+  }))
   return Math.max(0, config.sheetRead.maxCellBytes - envelopeBytes)
+}
+
+/** Fit the complete response envelope, including a continuation cursor, to the read cap. */
+function fitPaginatedSheetBody(
+  body: Record<string, unknown>,
+  cells: Record<string, SheetCell>,
+  baseVersion: string,
+): Record<string, unknown> | null {
+  if (Buffer.byteLength(JSON.stringify(body)) <= config.sheetRead.maxCellBytes) return body
+
+  // The cell paginator reserves whole-grid maps but not the response framing. Find the largest
+  // fitting prefix in one linear pass, measuring every cell and cursor once.
+  const framedBytes = Buffer.byteLength(JSON.stringify({
+    ...body,
+    sheetCells: {},
+    hasMore: true,
+    nextCursor: '',
+  }))
+  const emptyCursorJsonBytes = Buffer.byteLength(JSON.stringify({ v: baseVersion, k: '' }))
+  const pageKeys = Object.keys(cells)
+  let cellBytes = 0
+  let fittingCount = 0
+  for (const [index, key] of pageKeys.entries()) {
+    const keyJson = JSON.stringify(key)
+    const cellJson = JSON.stringify(cells[key])
+    cellBytes += (index === 0 ? 0 : 1) + Buffer.byteLength(keyJson) + 1 + Buffer.byteLength(cellJson)
+    const cursorJsonBytes = emptyCursorJsonBytes - 2 + Buffer.byteLength(keyJson)
+    const cursorBytes = Math.floor((cursorJsonBytes * 4 + 2) / 3)
+    if (framedBytes + cellBytes + cursorBytes <= config.sheetRead.maxCellBytes) fittingCount = index + 1
+  }
+  if (fittingCount === 0) return null
+
+  const fittingKeys = pageKeys.slice(0, fittingCount)
+  const lastKey = fittingKeys.at(-1)!
+  return {
+    ...body,
+    sheetCells: Object.fromEntries(fittingKeys.map((key) => [key, cells[key]!])),
+    hasMore: true,
+    nextCursor: encodeSheetCursor({ v: baseVersion, k: lastKey }),
+  }
 }
 
 /**
@@ -224,6 +321,9 @@ async function respondPaginatedSheet(
     sheetHyperLinks: Record<string, StoredHyperLink>
     sheetMerges: Record<string, boolean>
     sheetList: Record<string, StoredSheetMeta>
+    sheetFreeze: Record<string, StoredFreeze>
+    sheetFilters: Record<string, StoredFilter>
+    sheetDataValidations: Record<string, StoredDataValidationRule[]>
     baseVersion: string
     limitRaw: string | undefined
     cursorRaw: string | undefined
@@ -262,13 +362,21 @@ async function respondPaginatedSheet(
     args.sheetCells,
     afterKey,
     parsedLimit.limit,
-    firstPageCellBudget(isFirstPage, args.sheetDims, args.sheetHyperLinks, args.sheetMerges, args.sheetList),
+    firstPageCellBudget(
+      isFirstPage,
+      args.sheetDims,
+      args.sheetHyperLinks,
+      args.sheetMerges,
+      args.sheetList,
+      args.sheetFreeze,
+      args.sheetFilters,
+      args.sheetDataValidations,
+    ),
   )
   const nextCursor =
     page.hasMore && page.lastKey !== null
       ? encodeSheetCursor({ v: args.baseVersion, k: page.lastKey })
       : null
-
   const body: Record<string, unknown> = {
     docId: args.docId,
     sheetCells: page.cells,
@@ -284,7 +392,77 @@ async function respondPaginatedSheet(
   if (isFirstPage) body.sheetMerges = args.sheetMerges
   // Sheet-tab registry describes the whole doc; return once, on the first page.
   if (isFirstPage) body.sheetList = args.sheetList
-  res.status(200).json(body)
+  if (isFirstPage) body.sheetFreeze = args.sheetFreeze
+  if (isFirstPage) body.sheetFilters = args.sheetFilters
+  // Validation rules describe the whole grid; return once, on page one.
+  if (isFirstPage) body.sheetDataValidations = args.sheetDataValidations
+  const validationKeys = Object.entries(args.sheetDataValidations).flatMap(([logicalId, rules]) =>
+    rules.map((rule) => `${logicalId}!${rule.uid}`),
+  )
+  let metadataWithoutValidationBytes: number | undefined
+  if (isFirstPage) {
+    const metadataWithoutValidations = {
+      ...body,
+      sheetCells: {},
+      hasMore: false,
+      nextCursor: null,
+      sheetDataValidations: {},
+    }
+    metadataWithoutValidationBytes = Buffer.byteLength(JSON.stringify(metadataWithoutValidations))
+  }
+
+  const fittedBody = fitPaginatedSheetBody(body, page.cells, args.baseVersion)
+  if (fittedBody !== null) {
+    res.status(200).json(fittedBody)
+    return
+  }
+
+  let repairDataValidationKey: string | undefined
+  if (isFirstPage && validationKeys.length > 0) {
+    const repairedPage = paginateSheetCells(
+      args.sheetCells,
+      afterKey,
+      parsedLimit.limit,
+      firstPageCellBudget(
+        isFirstPage,
+        args.sheetDims,
+        args.sheetHyperLinks,
+        args.sheetMerges,
+        args.sheetList,
+        args.sheetFreeze,
+        args.sheetFilters,
+        {},
+      ),
+    )
+    const repairedNextCursor = repairedPage.hasMore && repairedPage.lastKey !== null
+      ? encodeSheetCursor({ v: args.baseVersion, k: repairedPage.lastKey })
+      : null
+    const pageWithoutValidations = {
+      ...body,
+      sheetCells: repairedPage.cells,
+      hasMore: repairedPage.hasMore,
+      nextCursor: repairedNextCursor,
+      sheetDataValidations: {},
+    }
+    if (fitPaginatedSheetBody(pageWithoutValidations, repairedPage.cells, args.baseVersion) !== null) {
+      repairDataValidationKey = validationKeys.sort().at(-1)!
+    }
+  }
+  res.status(413).json({
+    error: 'sheet_too_large',
+    payloadBytes: Buffer.byteLength(JSON.stringify(body)),
+    limit: config.sheetRead.maxCellBytes,
+    ...(repairDataValidationKey ? {
+      baseVersion: args.baseVersion,
+      repairDataValidationKey,
+      hint: 'delete the returned checkbox validation key with PATCH, then retry the read',
+    } : {
+      hint: metadataWithoutValidationBytes !== undefined &&
+        metadataWithoutValidationBytes > config.sheetRead.maxCellBytes
+        ? 'sheet metadata exceeds the paginated read limit'
+        : 'the next sheet cell exceeds the paginated read limit',
+    }),
+  })
 }
 
 /** Extract the base-version token from the If-Match header or the body mirror. */
@@ -465,6 +643,46 @@ function checkSheetsBounds(
   return null
 }
 
+function validateObjectResourceShape<T extends object>(
+  value: unknown,
+): value is Record<string, T | null> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  return Object.values(value as Record<string, unknown>).every(
+    (entry) => entry === null || (typeof entry === 'object' && !Array.isArray(entry)),
+  )
+}
+
+/** Public shape is `{ logicalId: rule[] | null }`; a flat checkbox object is
+ * accepted only as a backwards-compatible repair/write form. */
+function validateDataValidationsShape(
+  dataValidations: unknown,
+): dataValidations is SheetDataValidationResourceChanges {
+  if (!dataValidations || typeof dataValidations !== 'object' || Array.isArray(dataValidations)) return false
+  return Object.values(dataValidations as Record<string, unknown>).every(
+    (value) => value === null || Array.isArray(value) || typeof value === 'object',
+  )
+}
+
+function checkDataValidationsBounds(
+  dataValidations: SheetDataValidationResourceChanges,
+): { status: number; error: string } | null {
+  const ruleCount = Object.values(dataValidations).reduce(
+    (count, value) => count + (Array.isArray(value) ? value.length : 1),
+    0,
+  )
+  if (ruleCount > config.sheetWrite.maxDataValidations) {
+    return { status: 413, error: 'too_many_data_validations' }
+  }
+  return null
+}
+
+function checkResourceBounds(value: Record<string, unknown>): { status: number; error: string } | null {
+  if (Object.keys(value).length > config.sheetWrite.maxCells) {
+    return { status: 413, error: 'too_many_sheet_resources' }
+  }
+  return null
+}
+
 // ── PATCH /:docId/sheet — batch cell edit (writer) ────────────────────────────
 docSheetRouter.patch('/:docId/sheet', patchDocSheetHandler)
 
@@ -492,13 +710,19 @@ export async function patchDocSheetHandler(req: Request, res: Response): Promise
   const hyperlinks = body.hyperlinks === undefined ? {} : body.hyperlinks
   const merges = body.merges === undefined ? {} : body.merges
   const sheets = body.sheets === undefined ? {} : body.sheets
+  const freeze = body.freeze === undefined ? {} : body.freeze
+  const filters = body.filters === undefined ? {} : body.filters
+  const dataValidations = body.dataValidations === undefined ? {} : body.dataValidations
   if (
     !validateCellsShape(cells) ||
     !validateDimsShape(dims) ||
     !validateDrawingsShape(drawings) ||
     !validateHyperlinksShape(hyperlinks) ||
     !validateMergesShape(merges) ||
-    !validateSheetsShape(sheets)
+    !validateSheetsShape(sheets) ||
+    !validateObjectResourceShape<StoredFreeze>(freeze) ||
+    !validateObjectResourceShape<StoredFilter>(filters) ||
+    !validateDataValidationsShape(dataValidations)
   ) {
     res.status(400).json({ error: 'invalid_body' })
     return
@@ -512,7 +736,10 @@ export async function patchDocSheetHandler(req: Request, res: Response): Promise
     Object.keys(drawings).length === 0 &&
     Object.keys(hyperlinks).length === 0 &&
     Object.keys(merges).length === 0 &&
-    Object.keys(sheets).length === 0
+    Object.keys(sheets).length === 0 &&
+    Object.keys(freeze).length === 0 &&
+    Object.keys(filters).length === 0 &&
+    Object.keys(dataValidations).length === 0
   ) {
     res.status(400).json({ error: 'invalid_body' })
     return
@@ -524,7 +751,10 @@ export async function patchDocSheetHandler(req: Request, res: Response): Promise
     checkDrawingsBounds(drawings) ??
     checkHyperlinksBounds(hyperlinks) ??
     checkMergesBounds(merges) ??
-    checkSheetsBounds(sheets)
+    checkSheetsBounds(sheets) ??
+    checkResourceBounds(freeze) ??
+    checkResourceBounds(filters) ??
+    checkDataValidationsBounds(dataValidations)
   if (bounds) {
     res.status(bounds.status).json({ error: bounds.error })
     return
@@ -543,6 +773,9 @@ export async function patchDocSheetHandler(req: Request, res: Response): Promise
       hyperlinks,
       merges,
       sheets,
+      freeze,
+      filters,
+      dataValidations,
       authorizedEpoch: guard.meta.permission_epoch,
       isBot: req.botToken !== undefined,
       token: req.octoToken,
@@ -563,6 +796,9 @@ export async function patchDocSheetHandler(req: Request, res: Response): Promise
     if (result.payloadBytes !== undefined) errBody.payloadBytes = result.payloadBytes
     if (result.docBytes !== undefined) errBody.docBytes = result.docBytes
     if (result.limit !== undefined) errBody.limit = result.limit
+    if (result.baseVersion !== undefined) errBody.baseVersion = result.baseVersion
+    if (result.repairDataValidationKey !== undefined) errBody.repairDataValidationKey = result.repairDataValidationKey
+    if (result.hint !== undefined) errBody.hint = result.hint
     res.status(result.status).json(errBody)
   } catch {
     res.status(500).json({ error: 'internal_error' })
