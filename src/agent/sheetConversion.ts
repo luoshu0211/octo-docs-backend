@@ -101,6 +101,7 @@ export interface StoredFilterColumn extends Record<string, unknown> {
 export interface StoredFilter {
   ref: StoredSheetRange
   filterColumns?: StoredFilterColumn[]
+  enabledColumns?: number[]
 }
 
 export interface StoredDataValidation extends Record<string, unknown> {
@@ -2046,6 +2047,29 @@ export function validateSheetFilter(key: unknown, value: unknown): StoredFilter 
       columns.push(cloned as StoredFilterColumn)
     }
     if (columns.length > 0) out.filterColumns = columns
+  }
+  if (rec.enabledColumns !== undefined) {
+    if (!Array.isArray(rec.enabledColumns) || rec.enabledColumns.length === 0) {
+      throw new SheetSnapshotInvalidError(`sheetFilters ${logicalId}.enabledColumns must be a non-empty array`)
+    }
+    const columns = new Set<number>()
+    for (let i = 0; i < rec.enabledColumns.length; i += 1) {
+      const column = rec.enabledColumns[i]
+      if (!Number.isInteger(column)) {
+        throw new SheetSnapshotInvalidError(`sheetFilters ${logicalId}.enabledColumns[${i}] must be an integer`)
+      }
+      if ((column as number) < ref.startColumn || (column as number) > ref.endColumn) {
+        throw new SheetSnapshotInvalidError(`sheetFilters ${logicalId}.enabledColumns[${i}] is outside ref`)
+      }
+      columns.add(column as number)
+    }
+    out.enabledColumns = [...columns].sort((a, b) => a - b)
+    const enabled = new Set(out.enabledColumns)
+    if (out.filterColumns?.some((column) => !enabled.has(column.colId))) {
+      throw new SheetSnapshotInvalidError(
+        `sheetFilters ${logicalId}.filterColumns colId must also appear in enabledColumns`,
+      )
+    }
   }
   return out
 }

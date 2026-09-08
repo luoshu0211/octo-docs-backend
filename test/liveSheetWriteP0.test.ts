@@ -43,7 +43,11 @@ import {
 const range = { startRow: 0, startColumn: 0, endRow: 20, endColumn: 1 }
 const freeze = { default: { startRow: 1, startColumn: 1, xSplit: 1, ySplit: 1 } }
 const filters = {
-  default: { ref: range, filterColumns: [{ colId: 1, filters: { filters: ['待处理'] } }] },
+  default: {
+    ref: range,
+    filterColumns: [{ colId: 1, filters: { filters: ['待处理'] } }],
+    enabledColumns: [0, 1],
+  },
 }
 const dataValidations = {
   default: [

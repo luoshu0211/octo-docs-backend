@@ -26,7 +26,11 @@ import {
 const range = { startRow: 0, startColumn: 0, endRow: 9, endColumn: 1 }
 const freeze = { default: { startRow: 1, startColumn: -1, xSplit: 0, ySplit: 1 } }
 const filters = {
-  default: { ref: range, filterColumns: [{ colId: 1, filters: { blank: false, filters: ['open'] } }] },
+  default: {
+    ref: range,
+    filterColumns: [{ colId: 1, filters: { blank: false, filters: ['open'] } }],
+    enabledColumns: [0, 1],
+  },
 }
 const validations = {
   default: [{
@@ -144,6 +148,35 @@ describe('P0 worksheet resource contract', () => {
     })).toThrow(SheetSnapshotInvalidError)
   })
 
+  it('normalizes explicit filter columns and rejects malformed sparse column sets', () => {
+    expect(validateSheetFilterBatch({
+      default: {
+        ref: { ...range, endColumn: 12 },
+        enabledColumns: [12, 6, 12],
+      },
+    }).toSet).toEqual([['default', {
+      ref: { ...range, endColumn: 12 },
+      enabledColumns: [6, 12],
+    }]])
+
+    for (const enabledColumns of [[], [6.5], [13]]) {
+      expect(() => validateSheetFilterBatch({
+        default: {
+          ref: { ...range, endColumn: 12 },
+          enabledColumns,
+        },
+      })).toThrow(SheetSnapshotInvalidError)
+    }
+
+    expect(() => validateSheetFilterBatch({
+      default: {
+        ref: { ...range, endColumn: 12 },
+        filterColumns: [{ colId: 7, filters: { filters: ['hidden'] } }],
+        enabledColumns: [6, 12],
+      },
+    })).toThrow('filterColumns colId must also appear in enabledColumns')
+  })
+
   it('counts compact resources in both persisted and read-payload size gates', () => {
     const empty = Y.encodeStateAsUpdate(new Y.Doc())
     const baseline = measureSheetAfterEdit(empty, {})
@@ -169,6 +202,7 @@ describe('P0 worksheet resource contract', () => {
     expect([...live.getMap(SHEET_FREEZE_FIELD).keys()]).toEqual(['default'])
     expect([...live.getMap(SHEET_FILTERS_FIELD).keys()]).toEqual(['default'])
     expect([...live.getMap(SHEET_DATA_VALIDATIONS_FIELD).keys()]).toEqual(['default!bot-status'])
+    expect(decodeSheetFiltersSnapshot(Y.encodeStateAsUpdate(live))).toEqual(filters)
     expect(decodeSheetDataValidationsSnapshot(Y.encodeStateAsUpdate(live)).default?.[0]).not.toHaveProperty('operator')
   })
 })
