@@ -150,7 +150,13 @@ describe('GET /sheet — live cells + dims + base version', () => {
     const range = { startRow: 0, startColumn: 0, endRow: 9, endColumn: 1 }
     vi.mocked(readLiveSheet).mockResolvedValue(liveSheet({}, {}, {
       freeze: { default: { startRow: 1, startColumn: 0, xSplit: 0, ySplit: 1 } },
-      filters: { default: { ref: range, filterColumns: [{ colId: 1, filters: { filters: ['open'] } }] } },
+      filters: {
+        default: {
+          ref: range,
+          filterColumns: [{ colId: 1, filters: { filters: ['open'] } }],
+          enabledColumns: [0, 1],
+        },
+      },
       dataValidations: {
         'default!bot-status': {
           uid: 'bot-status',
@@ -171,7 +177,11 @@ describe('GET /sheet — live cells + dims + base version', () => {
     const body = res.body as Record<string, unknown>
     expect(body.sheetFreeze).toEqual({ default: { startRow: 1, startColumn: -1, xSplit: 0, ySplit: 1 } })
     expect(body.sheetFilters).toEqual({
-      default: { ref: range, filterColumns: [{ colId: 1, filters: { filters: ['open'] } }] },
+      default: {
+        ref: range,
+        filterColumns: [{ colId: 1, filters: { filters: ['open'] } }],
+        enabledColumns: [0, 1],
+      },
     })
     expect(body.sheetDataValidations).toEqual({
       default: [{

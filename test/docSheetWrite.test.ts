@@ -318,7 +318,13 @@ describe('PATCH /sheet — batch write', () => {
 
     const range = { startRow: 0, startColumn: 0, endRow: 10, endColumn: 1 }
     const freeze = { default: { startRow: 1, startColumn: -1, xSplit: 0, ySplit: 1 } }
-    const filters = { default: { ref: range, filterColumns: [{ colId: 1, filters: { filters: ['open'] } }] } }
+    const filters = {
+      default: {
+        ref: range,
+        filterColumns: [{ colId: 1, filters: { filters: ['open'] } }],
+        enabledColumns: [0, 1],
+      },
+    }
     const dataValidations = {
       default: [{
         uid: 'bot-status',
