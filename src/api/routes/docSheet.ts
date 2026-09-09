@@ -621,7 +621,7 @@ function checkMergesBounds(
 }
 
 /**
- * A sheets-edit batch: `{ logicalId: {name,order} | null }` (null = delete a tab).
+ * A sheets-edit batch: `{ logicalId: {name,order,rowCount?,columnCount?} | null }`.
  * Shape-only: a non-object or array batch is a 400; each value must be null or a
  * plain object. Contract validation (logicalId key shape, name/order types) is
  * deferred to validateSheetListBatch in the service → 422.

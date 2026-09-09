@@ -24,7 +24,7 @@ import {
   validateSheetListBatch,
   validateSheetFreezeBatch,
   validateSheetFilterBatch,
-  materializeLegacyDefaultSheet,
+  prepareSheetListBatchForWrite,
   hasLegacyDefaultDataValidationRule,
   validateSheetDataValidationResourceBatch,
   validateSheetDataValidationResourceDeletionRepairBatch,
@@ -164,9 +164,10 @@ export async function commitLiveSheetEdit(
         Object.keys(merges).length === 0 && Object.keys(sheets).length === 0 &&
         Object.keys(freeze).length === 0 && Object.keys(filters).length === 0
       const requestedListBatch = validateSheetListBatch(sheets)
-      const listBatch = materializeLegacyDefaultSheet(
-        listMap.keys(),
+      const listBatch = prepareSheetListBatchForWrite(
+        listMap.entries(),
         requestedListBatch,
+        cells,
         listMap.size === 0 &&
           requestedListBatch.toSet.length > 0 &&
           hasLegacyDefaultDataValidationRule(validationMap.entries(), dataValidations),

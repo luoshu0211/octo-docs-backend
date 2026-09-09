@@ -78,7 +78,7 @@ export interface EditDocSheetInput {
   hyperlinks: Record<string, StoredHyperLink | null>
   /** Keyed merges (`${logicalId}:sr:sc:er:ec` -> true); null un-merges. */
   merges: Record<string, boolean | null>
-  /** Keyed sheet tabs (logicalId -> {name,order}); null deletes a tab. */
+  /** Keyed sheet tabs (logicalId -> {name,order,rowCount?,columnCount?}); null deletes a tab. */
   sheets: Record<string, StoredSheetMeta | null>
   /** Keyed freeze-pane configs (logicalId -> four Univer counters); null unfreezes. */
   freeze?: Record<string, StoredFreeze | null>
