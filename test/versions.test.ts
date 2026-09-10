@@ -43,7 +43,6 @@ import {
   KIND_RESTORE_MARKER,
 } from '../src/db/repos/docVersionRepo.js'
 import { restoreVersion } from '../src/api/services/restoreVersion.js'
-import * as restoreVersionModule from '../src/api/services/restoreVersion.js'
 import { readLiveDocState } from '../src/collab/liveDocRead.js'
 import { applyRestoreToLiveDoc, applyBoardRestoreToLiveDoc } from '../src/collab/liveRestore.js'
 import { query, transaction } from '../src/db/pool.js'
@@ -525,6 +524,39 @@ describe('getVersionStateHandler — decoded preview (A3)', () => {
     })
     expect((res.body as { sheetList: Record<string, unknown> }).sheetList).toEqual({
       default: { name: 'Sheet1', order: 0 },
+    })
+
+    vi.mocked(docVersionRepo.getStateById).mockRestore()
+  })
+
+  it('omits undefined optional validation fields in a sheet version preview', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(adminGuard)
+    const versionDoc = new Y.Doc()
+    Y.applyUpdate(versionDoc, stateFromPM({ type: 'doc', content: [para('sheet')] }))
+    versionDoc.getMap(SHEET_LIST_FIELD).set('default', { name: 'Sheet1', order: 0 })
+    versionDoc.getMap(SHEET_DATA_VALIDATIONS_FIELD).set('default!decimal-1', {
+      uid: 'decimal-1',
+      type: 'decimal',
+      formula1: '1',
+      formula2: undefined,
+      ranges: [{ startRow: 0, startColumn: 0, endRow: 0, endColumn: 0 }],
+    })
+    vi.spyOn(docVersionRepo, 'getStateById').mockResolvedValue({
+      version: versionRow() as never,
+      state: Y.encodeStateAsUpdate(versionDoc),
+    })
+
+    const res = mockRes()
+    await getVersionStateHandler(req({ docId: 'd_1', versionId: '5' }), res as never)
+
+    expect(res.statusCode).toBe(200)
+    expect((res.body as { sheetDataValidations: Record<string, unknown> }).sheetDataValidations).toEqual({
+      default: [{
+        uid: 'decimal-1',
+        type: 'decimal',
+        formula1: '1',
+        ranges: [{ startRow: 0, startColumn: 0, endRow: 0, endColumn: 0 }],
+      }],
     })
 
     vi.mocked(docVersionRepo.getStateById).mockRestore()
@@ -1564,71 +1596,27 @@ describe('XIN-656 restore leg — safety snapshot sources the live scene', () =>
   })
 })
 
-// ── html_ppt wrong-kind rejection on the Yjs version routes (§1.3) ────────────
-//
-// A `html_ppt` doc's versions are BentoDoc / rendered-HTML blobs in `ppt_version`,
-// NOT Yjs `doc_version` rows. The three Yjs handlers (create / state / restore)
-// must reject a `html_ppt` doc with 422 `unsupported_document_type` BEFORE any
-// decode/live path runs, so a BentoDoc blob can never reach
-// readLiveDocState / docVersionRepo.getStateById / the restoreVersion service.
-describe('version routes — html_ppt wrong-kind guard (422 unsupported_document_type)', () => {
-  // Guard for a html_ppt doc; the only field the guards read before the
-  // wrong-kind check is doc_type, but keep the doc identity fields for parity.
-  const pptGuard = {
-    meta: { doc_id: 'd_1', document_name: 'octo:s1:f_default:ppt:d_1', doc_type: 'html_ppt', permission_epoch: 7 },
-    role: 'admin',
-  } as never
+describe('common PPT version routes', () => {
+  const pptGuard = { meta: { doc_id: 'd_1', document_name: 'octo:s1:f_default:ppt:d_1',
+    doc_type: 'html_ppt', permission_epoch: 7 }, role: 'admin' } as never
 
-  it('createVersionHandler rejects html_ppt with 422 and never reads the live doc', async () => {
-    vi.mocked(requireDocRole).mockResolvedValue(pptGuard)
+  it('requires verified principal Space before snapshot or restore', async () => {
     vi.mocked(readLiveDocState).mockClear()
-    const createSpy = vi.spyOn(docVersionRepo, 'create')
-
-    const res = mockRes()
-    await createVersionHandler(req({ docId: 'd_1' }, { body: { label: 'x' } }), res as never)
-
-    expect(res.statusCode).toBe(422)
-    expect(res.body).toEqual({ error: 'unsupported_document_type' })
-    // No snapshot decode path: neither the live-doc read nor the row insert ran.
+    vi.mocked(requireDocRole).mockResolvedValue(pptGuard)
+    await expect(createVersionHandler(req({ docId: 'd_1' }, { body: { baseRevision: 0 } }), mockRes() as never))
+      .rejects.toMatchObject({ code: 'FORBIDDEN' })
+    await expect(restoreVersionHandler(req({ docId: 'd_1', versionId: '5' }, { body: { baseRevision: 0 } }), mockRes() as never))
+      .rejects.toMatchObject({ code: 'FORBIDDEN' })
     expect(readLiveDocState).not.toHaveBeenCalled()
-    expect(createSpy).not.toHaveBeenCalled()
-
-    createSpy.mockRestore()
   })
-
-  it('getVersionStateHandler rejects html_ppt with 422 and never loads a version row', async () => {
+  it('returns not found for missing PPT state without opening a Yjs document', async () => {
     vi.mocked(requireDocRole).mockResolvedValue(pptGuard)
-    const getStateSpy = vi.spyOn(docVersionRepo, 'getStateById')
-
-    const res = mockRes()
-    await getVersionStateHandler(req({ docId: 'd_1', versionId: '5' }), res as never)
-
-    expect(res.statusCode).toBe(422)
-    expect(res.body).toEqual({ error: 'unsupported_document_type' })
-    // No decode path: the version row is never fetched, so no blob is decoded.
-    expect(getStateSpy).not.toHaveBeenCalled()
-
-    getStateSpy.mockRestore()
-  })
-
-  it('restoreVersionHandler rejects html_ppt with 422 and never enters the restore service', async () => {
-    vi.mocked(requireDocRole).mockResolvedValue(pptGuard)
-    const restoreSpy = vi.spyOn(restoreVersionModule, 'restoreVersion')
-    const getStateSpy = vi.spyOn(docVersionRepo, 'getStateById')
-
-    const res = mockRes()
-    await restoreVersionHandler(req({ docId: 'd_1', versionId: '5' }), res as never)
-
-    expect(res.statusCode).toBe(422)
-    expect(res.body).toEqual({ error: 'unsupported_document_type' })
-    // No decode/reconcile path: the restore service (and its transaction + row
-    // read) is never invoked, so the BentoDoc blob is never forward-reconciled.
-    expect(restoreSpy).not.toHaveBeenCalled()
-    expect(getStateSpy).not.toHaveBeenCalled()
-    expect(transaction).not.toHaveBeenCalled()
-
-    restoreSpy.mockRestore()
-    getStateSpy.mockRestore()
+    const spy = vi.spyOn(docVersionRepo, 'getStateById')
+    const response = mockRes()
+    await getVersionStateHandler(req({ docId: 'd_1', versionId: '5' }), response as never)
+    expect(response.statusCode).toBe(404)
+    expect(spy).not.toHaveBeenCalled()
+    spy.mockRestore()
   })
 })
 
@@ -1642,13 +1630,13 @@ describe('version routes — html_ppt 422 on list / rename / delete (P2-2)', () 
     role: 'admin',
   } as never
 
-  it('listVersionsHandler rejects html_ppt with 422 and never queries doc_version rows', async () => {
+  it('lists PPT metadata using its storage adapter without querying Yjs rows', async () => {
     vi.mocked(requireDocRole).mockResolvedValue(pptGuard)
     const listSpy = vi.spyOn(docVersionRepo, 'listByDoc')
     const res = mockRes()
     await listVersionsHandler(req({ docId: 'd_1' }), res as never)
-    expect(res.statusCode).toBe(422)
-    expect(res.body).toEqual({ error: 'unsupported_document_type' })
+    expect(res.statusCode).toBe(200)
+    expect(res.body).toMatchObject({ items: [], nextCursor: null })
     expect(listSpy).not.toHaveBeenCalled()
     listSpy.mockRestore()
   })

@@ -172,10 +172,10 @@ export function requireSafeSigningSecret(secret: string): string {
 
 /**
  * Resolve the public, browser-reachable collab WS URL that collab-token responses
- * hand back as `collabWsUrl` (§4.4). The Hocuspocus WS server lives on its own
- * origin (default :1234) with nginx NOT reverse-proxying it, so this MUST be an
- * absolute `ws://`/`wss://` URL — a relative path would resolve against the REST
- * API origin and never reach the WS port.
+ * hand back as `collabWsUrl` (§4.4). This MUST be an absolute `ws://`/`wss://`
+ * URL, normally the shared gateway's /docs-collab route to Hocuspocus :1234.
+ * That gateway also routes /api/v1/ppt/collab to Docs HTTP :3000. Direct-port
+ * Hocuspocus deployments require a separate PPT_RELAY_PUBLIC_WS_URL override.
  *
  * Production fail-fast (mirrors requireSafeSigningSecret's production-gated
  * contract): the compat window is over — the frontend has dropped its build-time
@@ -241,14 +241,32 @@ export function resolveCardDisplayTimeZone(raw: string): string {
   return value
 }
 
-/**
- * Master on/off switch for the R4-B1 PPT collab relay (default OFF), read ONCE
- * here so it can gate both the `relay.enabled` value AND the production
- * validation of the relay's own env (e.g. PPT_RELAY_PUBLIC_WS_URL) — a disabled
- * relay must be truly inert at boot, never fail startup for a knob it will not
- * consult (XIN-1825 P1-2). `strictBool` so an operator typo fails startup loudly.
- */
-const PPT_RELAY_ENABLED = strictBool('PPT_RELAY_ENABLED', false)
+/** Reuse the trusted collaboration origin; never derive service URLs from Host. */
+export function pptPublicWsUrl(shared: string, override = ''): string {
+  const value = override.trim() || shared.trim()
+  if (!value) return resolveCollabPublicWsUrl('', 'COLLAB_TOKEN_PUBLIC_WS_URL')
+  let url: URL
+  try { url = new URL(value) } catch { throw new Error('Invalid collaboration public URL') }
+  if (!['ws:', 'wss:'].includes(url.protocol) || url.username || url.password || url.hash || url.search) {
+    throw new Error('Collaboration public URL must be ws/wss without credentials, query or fragment')
+  }
+  if (!override.trim()) url.pathname = '/api/v1/ppt/collab'
+  return override.trim() || url.toString()
+}
+
+function collaborationWebOrigin(): string {
+  const raw = str('COLLAB_TOKEN_PUBLIC_WS_URL', '').trim()
+  if (!raw) return ''
+  try {
+    const url = new URL(raw)
+    if (!['ws:', 'wss:'].includes(url.protocol) || url.username || url.password) return ''
+    url.protocol = url.protocol === 'wss:' ? 'https:' : 'http:'
+    return url.origin
+  } catch { return '' }
+}
+
+// Optional operational rollback only. No PPT-specific activation configuration.
+const PPT_RELAY_ENABLED = strictBool('PPT_RELAY_ENABLED', true)
 
 export const config = {
   hostname: str('HOSTNAME', 'octo-docs-local'),
@@ -408,8 +426,8 @@ export const config = {
     // COLLAB_TOKEN_SECRET is read verbatim (dev default outside prod). A
     // production strength gate (non-dev-default + a minimum byte length) is a
     // SERVICE-WIDE config hardening that fails startup for every document type,
-    // so it does not belong on this default-off PPT feature branch; it is split
-    // out into a standalone config PR a deploy owner reviews (XIN-1825 P1-1).
+    // so it is tracked separately from PPT integration in a standalone config
+    // PR for deployment-owner review (XIN-1825 P1-1).
     secret: str('COLLAB_TOKEN_SECRET', DEV_SIGNING_SECRET),
     ttlSeconds: num('COLLAB_TOKEN_TTL_SECONDS', 300),
     // Two-stage rollout switch for the home-Space proof claim. New issuers stamp
@@ -423,7 +441,7 @@ export const config = {
     ),
     // Public, browser-reachable collab WS origin surfaced to clients as
     // `collabWsUrl` in the collab-token response (§4.4). Absolute ws://|wss://
-    // only (WS runs on its own :1234 origin, not reverse-proxied). REQUIRED in
+    // only; normally the gateway's /docs-collab route to :1234. REQUIRED in
     // production: unset/malformed is fatal (fail-fast, refuses to start). Soft
     // (warn => omit) outside production only — see resolveCollabPublicWsUrl.
     publicWsUrl: resolveCollabPublicWsUrl(str('COLLAB_TOKEN_PUBLIC_WS_URL', '')),
@@ -452,7 +470,7 @@ export const config = {
   // octo-web from, e.g. `http://192.168.214.189:3010`. Empty (default) safely
   // degrades to origin-relative `/d/<docId>`.
   // See src/util/docShareLink.ts.
-  webOrigin: str('OCTO_WEB_ORIGIN', ''),
+  webOrigin: str('OCTO_WEB_ORIGIN', '') || collaborationWebOrigin(),
 
   htmlRegistration: {
     // Dedicated service credential; browser session tokens never authorize this entry.
@@ -982,16 +1000,7 @@ export const config = {
     // the Hocuspocus server and NOT a new deployable. These knobs cover the
     // collab-token/ticket issuance and the relay's protocol/limit envelope.
     relay: {
-      // Master on/off switch for the R4-B1 collab relay (default OFF). When false
-      // (the default) the WS relay is NOT attached to the HTTP server and the
-      // collab-token issuance route is NOT mounted, so the `/api/v1/ppt/collab`
-      // endpoint is entirely absent — Half A is inert dead code until Half B lands
-      // the op-metadata trust boundary (server-minted actor binding + per-actor `s`
-      // continuity). This is the single control that keeps the relay's deferred
-      // trust boundary from being reachable in production before it exists (Half A
-      // still enforces the server-only room-relative clock bound; the actor/uid and
-      // per-actor sequence gates are Half B). `strictBool` so an operator typo fails
-      // startup loudly rather than silently turning the endpoint on.
+      // Available with the service; existing authentication and ACLs still apply.
       enabled: PPT_RELAY_ENABLED,
       // Bento CRDT sync protocol version the relay speaks (`SYNC_V`). A frame
       // whose `pv` is missing or != this is refused with `protocol-version`
@@ -1002,17 +1011,12 @@ export const config = {
       // credential carried in `Sec-WebSocket-Protocol` (never a long-lived token
       // in the URL); short so a leaked/replayed ticket is useless quickly.
       ticketTtlSeconds: numMin('PPT_RELAY_TICKET_TTL_SECONDS', 30, 1),
-      // Public, browser-reachable relay WS origin surfaced to clients as
-      // `pptWsUrl` in the collab-token response (§7.1). Absolute ws://|wss://
-      // only; REQUIRED in production (unset/malformed is fatal — see
-      // resolveCollabPublicWsUrl) ONLY when the relay is enabled. When the relay
-      // is OFF (the default) its validation is SKIPPED so the disabled default is
-      // truly inert and cannot fail startup for a URL it will never surface
-      // (XIN-1825 P1-2); the raw value is carried through unvalidated but is never
-      // consulted while `enabled` is false.
+      // The existing trusted collaboration origin supplies the PPT endpoint.
+      // The override is optional with the shared gateway, but required for PPT
+      // when the collaboration origin exposes only direct-port Hocuspocus.
       publicWsUrl: PPT_RELAY_ENABLED
-        ? resolveCollabPublicWsUrl(str('PPT_RELAY_PUBLIC_WS_URL', ''), 'PPT_RELAY_PUBLIC_WS_URL')
-        : str('PPT_RELAY_PUBLIC_WS_URL', '').trim(),
+        ? pptPublicWsUrl(str('COLLAB_TOKEN_PUBLIC_WS_URL', ''), str('PPT_RELAY_PUBLIC_WS_URL', ''))
+        : '',
       // Bento default relay limits (§7.3). Starting values ported from Bento's
       // upstream sync worker; load-test before production. Enforced as hard
       // refusals: `too-large` (permanent), `rate-limited` (retryable),

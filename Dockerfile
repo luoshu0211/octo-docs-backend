@@ -57,10 +57,11 @@ RUN npm ci
 COPY tsconfig.json ./
 COPY src ./src
 COPY migrations ./migrations
+COPY assets/ppt ./assets/ppt
 RUN npm run build
 
 ENV NODE_ENV=production
-# 3000 = public REST API, 1234 = Hocuspocus collab WS, 9090 = optional
+# 3000 = public HTTP API + PPT collab WS, 1234 = Hocuspocus Yjs WS, 9090 = optional
 # internal-only API (bound only when INTERNAL_HTTP_PORT is set; serves
 # /internal/html). EXPOSE is documentation/intra-network only — never publish
 # 9090 to the host (caveat: `docker run -P` publishes EVERY EXPOSEd port to an

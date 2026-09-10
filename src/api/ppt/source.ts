@@ -1,3 +1,5 @@
+import { pptMediaIds } from '../../ppt/media.js'
+import { renderPptHtml } from '../../ppt/render.js'
 /**
  * PPT source/bootstrap route: `GET /api/v1/ppt/docs/:docId/source` (R3-B1).
  *
@@ -9,9 +11,9 @@
  * routes (R3-F1) depend on. It finalizes, for `html_ppt` decks:
  *
  *   1. ACCESS POLICY (§4 / §12 / PPT-SOURCE-001..003, PPT-UI-002/003):
- *      reader/commenter may load ONLY `published`; `draft`/`live` require
- *      writer/admin. A reader/commenter asking for draft/live gets `403 FORBIDDEN`
- *      — the negative control this round must prove.
+ *      reader/commenter may load published and live content, matching other
+ *      document types. Recovery drafts require writer/admin; current-Space
+ *      membership and document permission are checked on every read.
  *   2. CACHE POLICY (§4 / PPT-SOURCE-004, PPT-UI-004):
  *      a published version's bento/html source is served `private, no-cache`
  *      with a content-hash ETag, so the server re-authorizes every use and
@@ -46,15 +48,10 @@ import { PptApiError, sendPptData } from './envelope.js'
 import { pptAuthMiddleware, pptSpaceContextMiddleware } from './auth.js'
 import { loadPptDocForRead } from './pptDocGuard.js'
 
-/**
- * Minimum role per source mode (§4 / §12 reader-live row). commenter (rank 20)
- * ranks BELOW writer (30), so a commenter — like a reader — fails the writer
- * floor on draft/live and is denied, while both pass the reader floor on
- * published. This one table IS the published-only-for-reader/commenter rule.
- */
+/** Current content is reader-visible, like Docs/Board/Sheet. Recovery drafts remain writer-only. */
 const MODE_MIN_ROLE: Record<PptSourceMode, Role> = {
   published: 'reader',
-  live: 'writer',
+  live: 'reader',
   draft: 'writer',
 }
 
@@ -234,8 +231,8 @@ export function makePptSourceHandler(provider: PptSourceProvider) {
   return async function getPptSourceHandler(req: Request, res: Response): Promise<void> {
     const uid = req.uid!
     const spaceId = req.spaceId!
-    const docId = req.params.docId ?? ''
-    if (docId === '') {
+    const requestedDocId = req.params.docId ?? ''
+    if (requestedDocId === '') {
       throw new PptApiError('VALIDATION_ERROR', 'docId is required', { details: { field: 'docId' } })
     }
 
@@ -243,16 +240,11 @@ export function makePptSourceHandler(provider: PptSourceProvider) {
     const format = parseFormat(req.query.format)
     const version = parseVersion(req.query.version, mode)
 
-    // Load doc + resolve effective role (throws enveloped NOT_FOUND / CONFLICT /
-    // UNSUPPORTED_DOCUMENT_TYPE). Role may be 'none'; the mode floor below rejects it.
-    // This is a LIVE REST route (served regardless of the relay flag), so it uses the
-    // 'propagate' membership-error mode: an identity-service outage surfaces as a 5xx,
-    // never a silent 403/404 for a legitimate `anyone_in_space` reader (XIN-1835 spec
-    // deviation — the fail-closed swallow is scoped to the relay ticket path only).
-    const { meta, role } = await loadPptDocForRead(uid, spaceId, docId, { token: req.octoToken, membershipErrorMode: 'propagate' })
+    // Resolve the same current-Space-qualified ACL/share model as Docs.
+    const { meta, role } = await loadPptDocForRead(uid, spaceId, requestedDocId, { token: req.octoToken })
+    const docId = meta.doc_id
 
-    // ACCESS POLICY — the headline guarantee. reader/commenter fail the writer
-    // floor on draft/live => 403; everyone with read access passes on published.
+    // Read permission does not imply permission to edit or replace a recovery draft.
     if (!roleAtLeast(role, MODE_MIN_ROLE[mode])) {
       throw new PptApiError('FORBIDDEN', `insufficient role to read ${mode} source`)
     }
@@ -277,6 +269,11 @@ export function makePptSourceHandler(provider: PptSourceProvider) {
       // — with the same cache policy as the other formats for this mode.
       if (!content.html) {
         throw new PptApiError('NOT_FOUND', 'no rendered HTML available for this source')
+      }
+      if (pptMediaIds(content.deck).length) {
+        content.html = await renderPptHtml(content.deck,docId)
+        const again = await loadPptDocForRead(uid,spaceId,docId,{token:req.octoToken})
+        if(Number(again.meta.permission_epoch)!==Number(meta.permission_epoch)) throw new PptApiError('FORBIDDEN','permissions changed')
       }
       applyCacheHeaders(res, mode, format, content)
       res.setHeader('Content-Type', 'text/html; charset=utf-8')

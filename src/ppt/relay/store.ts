@@ -45,6 +45,10 @@ export interface FrameIdentity {
   payloadHash: string | null
 }
 
+export class RoomCapacityError extends Error {
+  constructor() { super('room frame budget exhausted'); this.name = 'RoomCapacityError' }
+}
+
 export class DuplicateFramePayloadError extends Error {
   readonly duplicatePayloadMismatch = true as const
   constructor(frameId: string) {
@@ -179,6 +183,8 @@ export interface RelaySnapshot {
 }
 
 export interface SaveSnapshotInput {
+  /** Reject a reduction whose base snapshot changed on another replica. */
+  expectedSnapshotVersion?: number
   docId: string
   coveredSeq: number
   doc: BentoDoc
@@ -441,6 +447,9 @@ export class InMemoryPptRelayStore implements PptRelayStore {
   async saveSnapshot(input: SaveSnapshotInput): Promise<SaveSnapshotResult> {
     const r = this.room(input.docId)
     const cur = r.snapshot
+    if (input.expectedSnapshotVersion !== undefined && input.expectedSnapshotVersion !== (cur?.snapshotVersion ?? 0)) {
+      throw new RetryableStorageError('snapshot base changed; reduce again')
+    }
     // Mirror the DB store's atomic covered-guard: only advance the version and
     // replace the doc + state when the incoming coverage does not regress (P0-3).
     if (!cur || input.coveredSeq >= cur.coveredSeq) {

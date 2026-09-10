@@ -1,3 +1,4 @@
+vi.mock('../src/db/repos/docMemberRepo.js', () => ({ docMemberRepo: { upsertDirectTx: vi.fn(async () => {}) } }))
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 
 // Offline unit test: mock the auth guard and the MySQL pool. The route handler
@@ -8,10 +9,12 @@ vi.mock('../src/api/guard.js', () => ({
 }))
 vi.mock('../src/db/pool.js', () => ({
   query: vi.fn(async () => []),
-  transaction: vi.fn(),
+  transaction: vi.fn(async fn => fn({})),
 }))
 vi.mock('../src/db/repos/docMetaRepo.js', () => ({
   docMetaRepo: {
+    createTx: vi.fn(async (_tx, input) => docMetaRepo.create(input)),
+    getByDocIdTx: vi.fn(async (_tx, id) => docMetaRepo.getByDocId(id)),
     create: vi.fn(async () => undefined),
     getByDocId: vi.fn(async () => null),
     listForUser: vi.fn(async () => ({ total: 0, items: [] })),

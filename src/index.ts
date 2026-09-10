@@ -6,18 +6,12 @@
  * (§4.5 step 3) to refresh the per-node epoch watermark, and a SIGTERM graceful
  * shutdown that flushes documents and releases locks (§9.4).
  *
- * NOTE: In production the Hocuspocus WS and the REST Meta API can be separate
- * deployables. The REST Meta API is stateless for its request/response endpoints,
- * but the PPT relay attached to it (below) keeps a PROCESS-LOCAL room registry
- * (live sockets, per-room seq/budget state) and a Redis-backed single-use ticket
- * store. For THIS round the committed topology is SINGLE-REPLICA: deploy exactly
- * one REST/PPT-relay replica per environment (see DEPLOYMENT.md). The earlier
- * docId-affinity routing note is retracted — horizontal REST scaling can be
- * revisited only after the relay grows an explicit shared transport or affinity
- * design; until then a second replica would split a deck's room state and is not
- * supported. The two listeners are colocated here for a runnable scaffold.
+ * Both protocols share the existing MySQL and Redis infrastructure. PPT nodes
+ * use Redis invalidations plus durable replay and expiring shared awareness;
+ * no document affinity or single-replica deployment is required.
  */
 import { Redis } from 'ioredis'
+import { pptRoomChannel, receivePptRoomEvent, startPptRoomPublishing } from './ppt/clusterEvents.js'
 import { startNodeHeartbeat, withdrawNode } from './collab/compactionCluster.js'
 import {
   startOverCapHeartbeat,
@@ -96,21 +90,23 @@ async function main(): Promise<void> {
   // where an invalidation arriving between subscribe and relay-construction would
   // throw a ReferenceError (XIN-1693 P2-g). It is ATTACHED to the REST HTTP server
   // further below, once that server exists — and ONLY when `config.ppt.relay.enabled`
-  // is true (default false). While disabled the relay is constructed but never
+  // is true (default true). While disabled the relay is constructed but never
   // attached, so `applyEpochBump` is a cheap no-op on empty rooms and the
-  // `/api/v1/ppt/collab` upgrade path is absent (XIN-1821: Half A ships inert until
-  // the Half B op-metadata trust boundary lands; see docs/DEPLOYMENT.md).
+  // `/api/v1/ppt/collab` upgrade path is absent. See the multi-replica
+  // rollout procedure in docs/DEPLOYMENT.md.
   const pptRelay = createPptRelay()
+  const stopPptPublishing = startPptRoomPublishing()
 
   // Subscribe to epoch invalidation events (§4.5 step 3). On an event we drop
   // caches and refresh the local watermark. Acting on individual live
   // connections (close 4403 / flip readOnly) is the next layer; the
   // beforeHandleMessage per-principal recheck (§4.5 step 4) is the backstop.
   const sub = new Redis({ host: config.redis.host, port: config.redis.port })
-  await sub.subscribe(epochInvalidateChannel(), commentEventsChannel())
+  await sub.subscribe(epochInvalidateChannel(), commentEventsChannel(), pptRoomChannel())
   sub.on('message', (channel: string, message: string) => {
     if (channel === epochInvalidateChannel()) void handleInvalidate(message)
     else if (channel === commentEventsChannel()) broadcastCommentMutation(message)
+    else if (channel === pptRoomChannel()) receivePptRoomEvent(message)
   })
 
   async function handleInvalidate(message: string): Promise<void> {
@@ -234,26 +230,14 @@ async function main(): Promise<void> {
     )
   }
 
-  // R4-B1: the Bento-frame PPT relay is hosted INSIDE B — attached to the REST
-  // HTTP server on the `/api/v1/ppt/collab` upgrade path (owner-locked "no second
-  // service"), NOT the Hocuspocus server above and NOT a new deployable. The relay
-  // itself was constructed earlier (before the epoch subscriber that references
-  // it); here we only bind it to the now-listening HTTP server.
-  // R4-B1: the Bento-frame PPT relay is hosted INSIDE B — attached to the REST
-  // HTTP server on the `/api/v1/ppt/collab` upgrade path (owner-locked "no second
-  // service"), NOT the Hocuspocus server above and NOT a new deployable. The relay
-  // itself was constructed earlier (before the epoch subscriber that references
-  // it); here we only bind it to the now-listening HTTP server — and ONLY when the
-  // relay is enabled. Default OFF (XIN-1821): Half A carries no reachable op-metadata
-  // trust boundary yet, so the endpoint stays absent until an operator opts in via
-  // `PPT_RELAY_ENABLED=true` (Half B pairs the boundary with R4-F1).
+  // PPT uses the existing HTTP listener and shared Redis/MySQL infrastructure.
   if (config.ppt.relay.enabled) {
     pptRelay.attach(httpServer)
     // eslint-disable-next-line no-console
     console.log('[octo-docs] PPT relay attached on /api/v1/ppt/collab')
   } else {
     // eslint-disable-next-line no-console
-    console.log('[octo-docs] PPT relay DISABLED (PPT_RELAY_ENABLED not set); /api/v1/ppt/collab is not mounted')
+    console.log('[octo-docs] PPT relay DISABLED (PPT_RELAY_ENABLED=false); /api/v1/ppt/collab is not mounted')
   }
 
   // §9.4 graceful shutdown: flush docs, then release locks, then close infra.
@@ -279,6 +263,7 @@ async function main(): Promise<void> {
       await flushUnrestoredRetries()
       // TODO(§5.3 / §9.4): releaseAllDocumentLocks() so a takeover node can
       // become primary writer immediately without waiting for the lock TTL.
+      stopPptPublishing()
       pptRelay.close()
       httpServer.close()
       internalServer?.close()

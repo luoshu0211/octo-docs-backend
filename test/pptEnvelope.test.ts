@@ -185,18 +185,14 @@ describe('PPT envelope is scoped to /api/v1/ppt (integration)', () => {
     expect(await res.json()).toEqual({ error: { code: 'NOT_FOUND', message: 'resource not found' } })
   })
 
-  it('the collab-token route is NOT mounted while the relay is disabled (XIN-1821 default-off gate)', async () => {
-    // With `PPT_RELAY_ENABLED` false (the default, unset in tests), createPptRouter does
-    // not mount the collab-token issuance route, so the endpoint resolves to the enveloped
-    // NOT_FOUND — Half A issues no relay ticket for an endpoint that is not attached, and
-    // the deferred op-metadata trust boundary is never reachable in production.
+  it('the enabled collab-token route still requires authentication', async () => {
     const res = await fetch(`${base}/api/v1/ppt/docs/collab-token`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: '{}',
     })
-    expect(res.status).toBe(404)
-    expect(await res.json()).toEqual({ error: { code: 'NOT_FOUND', message: 'resource not found' } })
+    expect(res.status).toBe(401)
+    expect(await res.json()).toMatchObject({ error: { code: 'AUTH_REQUIRED' } })
   })
 
   it('a malformed JSON body on /api/v1/ppt returns the C-style VALIDATION_ERROR envelope, not the global invalid_body', async () => {
