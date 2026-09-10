@@ -2063,7 +2063,7 @@ export function validateSheetList(sheets: Record<string, unknown>): Record<strin
 // bot cannot create rules that the browser can never display or repair.
 const MAX_RESOURCE_DEPTH = 20
 
-function validateResourceLogicalId(key: unknown, label: string): string {
+export function validateResourceLogicalId(key: unknown, label: string): string {
   if (typeof key !== 'string' || !LIST_KEY_RE.test(key) || RESERVED_LOGICAL_IDS.has(key)) {
     throw new SheetSnapshotInvalidError(`${label} key must be a valid logicalId: ${String(key).slice(0, 64)}`)
   }
