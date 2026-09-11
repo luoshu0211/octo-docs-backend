@@ -214,6 +214,7 @@ export function createApp(
   }
 
   const jsonBodyParser = express.json({ limit: '1mb' })
+  const sheetWriteJsonBodyParser = express.json({ limit: config.sheetWrite.maxRequestBytes })
   app.use((req, res, next) => {
     // The Excalidraw importer needs the exact application/json bytes so it can
     // reject malformed UTF-8/JSON and enforce its own byte boundary before
@@ -232,6 +233,15 @@ export function createApp(
     // body is parsed by the global parser here, and the leak persists on exactly
     // the routes the router serves.
     if (/^\/api\/v1\/ppt(\/|$)/i.test(req.path)) return next()
+    // A styled Sheet PATCH can legitimately exceed the service-wide 1 MiB JSON
+    // budget. Give only the two Sheet write surfaces their own finite parser cap;
+    // every other JSON route retains the historical 1 MiB cap.
+    if (
+      req.method === 'PATCH' &&
+      /^\/(?:api\/v1\/docs|v1\/bot\/docs)\/[^/]+\/sheet\/?$/i.test(req.path)
+    ) {
+      return sheetWriteJsonBodyParser(req, res, next)
+    }
     return jsonBodyParser(req, res, next)
   })
 
@@ -408,8 +418,8 @@ export function createApp(
       // route handler runs, so the sheet write path never reaches its own
       // sheet-specific bounds. Align the error code with the endpoint the client
       // hit: the sheet content surface (GET/PATCH /:docId/sheet) reports
-      // sheet_too_large — matching its in-handler read guard and issue #69's 1MB
-      // sheet contract — while every other route keeps doc_too_large.
+      // sheet_too_large — matching its in-handler read guard and configured
+      // Sheet request cap — while every other route keeps doc_too_large.
       const code = req.path.endsWith('/sheet') ? 'sheet_too_large' : 'doc_too_large'
       res.status(413).json({ error: code })
       return

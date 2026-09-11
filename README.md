@@ -216,6 +216,8 @@ apparent "dead zone" myth, so they are documented together here.
 
 | Dimension | What it measures | How | Cap (env) | Where enforced |
 | --- | --- | --- | --- | --- |
+| **Write request** | One `PATCH /:docId/sheet` JSON body | Raw HTTP request bytes | `SHEET_WRITE_MAX_REQUEST_BYTES` (default **3 MiB**) | Route-selected `express.json` parser → **413 `sheet_too_large`** |
+| **Write entries** | Operations in each Sheet PATCH resource map | Number of object entries; cell sets and deletes both count | `SHEET_WRITE_MAX_CELLS` (default **20,000**) | Route gate `docSheet.ts` → **413 `too_many_cells`** or the resource-specific equivalent |
 | **Read payload** | The JSON body a `GET /:docId/sheet` returns | UTF-8 bytes of the decoded cells and whole-grid maps, including checkbox validations | `SHEET_READ_MAX_CELL_BYTES` (default **1 MB**) → `config.sheetRead.maxCellBytes` | Read gate `docSheet.ts` → **413 `sheet_too_large`**; write gate `editDocSheet.ts` measures it the SAME way and pre-rejects a write that would exceed it |
 | **Storage** | The persisted Y.Doc binary update | `Y.encodeStateAsUpdate(doc).length` | `MAX_DOC_BYTES` (default **10 MB**) → `config.maxDocBytes` | `persistence.store`; write gate `editDocSheet.ts` → **413 `doc_too_large`** |
 

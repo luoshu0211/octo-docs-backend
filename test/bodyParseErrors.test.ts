@@ -35,7 +35,7 @@ describe('body-parser error mapping (§③)', () => {
     expect(await res.json()).toEqual({ error: 'invalid_body' })
   })
 
-  it('body over the 1mb limit → 413 doc_too_large (not 500)', async () => {
+  it('body over the global 1mb limit → 413 doc_too_large (not 500)', async () => {
     // ~6 MiB JSON body, well over express.json's 1mb cap.
     const huge = JSON.stringify({ ops: 'x'.repeat(6 * 1024 * 1024) })
     const res = await fetch(`${base}/v1/bot/docs/d_1/content`, {
@@ -47,11 +47,32 @@ describe('body-parser error mapping (§③)', () => {
     expect(await res.json()).toEqual({ error: 'doc_too_large' })
   })
 
+  it('allows a 2 MiB Sheet PATCH without widening the global JSON cap', async () => {
+    const medium = JSON.stringify({ cells: { 'default!0:0': { v: 'x'.repeat(2 * 1024 * 1024) } } })
+
+    const sheetRes = await fetch(`${base}/v1/bot/docs/d_1/sheet`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer x' },
+      body: medium,
+    })
+    // The Sheet-specific 3 MiB parser admitted the body, so bogus auth is now
+    // the first failing gate. A global 1 MiB parser would have returned 413.
+    expect(sheetRes.status).toBe(401)
+
+    const contentRes = await fetch(`${base}/v1/bot/docs/d_1/content`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer x' },
+      body: medium,
+    })
+    expect(contentRes.status).toBe(413)
+    expect(await contentRes.json()).toEqual({ error: 'doc_too_large' })
+  })
+
   it('oversized body on the sheet endpoint → 413 sheet_too_large (not doc_too_large)', async () => {
     // The parse-time 413 fires before the route handler, so the sheet write path
     // never reaches its own bounds. The central handler must still report the
-    // sheet-specific code so the /:docId/sheet 1MB rejection matches the read
-    // guard's sheet_too_large (issue #69 sheet contract), not doc_too_large.
+    // sheet-specific code so the /:docId/sheet request-cap rejection matches the
+    // read guard's sheet_too_large contract, not doc_too_large.
     const huge = JSON.stringify({ cells: { 'default!0:0': { v: 'x'.repeat(6 * 1024 * 1024) } } })
     const res = await fetch(`${base}/v1/bot/docs/d_1/sheet`, {
       method: 'PATCH',
