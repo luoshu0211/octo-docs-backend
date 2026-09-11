@@ -11,6 +11,8 @@
  *   GET   /:docId/sheet   reader  — read the LIVE cells + dims + base version
  *   PATCH /:docId/sheet   writer  — batch cell set/delete under a strict
  *                                   If-Match(SV) optimistic-concurrency guard
+ *   POST  /:docId/sheet/replace writer — server-side atomic replace-all under
+ *                                        the same If-Match + writer gates
  *
  * The routes are mounted on BOTH the human /api/v1/docs chain and the bot
  * /v1/bot/docs chain (see app.ts), so each reads req.uid / req.spaceId from
@@ -25,6 +27,7 @@ import { Router, type Router as ExpressRouter, type Request, type Response } fro
 import { requireDocRole } from '../guard.js'
 import { readLiveSheet } from '../../collab/liveSheetWrite.js'
 import { editDocSheet } from '../services/editDocSheet.js'
+import { replaceDocSheet, type SheetFindBy } from '../services/replaceDocSheet.js'
 import { encodeBaseVersion, parseBaseVersion } from '../../collab/docBodyEdit.js'
 import {
   decodeSheetSnapshot,
@@ -47,6 +50,8 @@ import {
   type StoredFilter,
   type StoredDataValidationRule,
   type SheetDataValidationResourceChanges,
+  validateResourceLogicalId,
+  validateSheetRange,
 } from '../../agent/sheetConversion.js'
 import {
   decodeSheetCursor,
@@ -681,6 +686,110 @@ function checkResourceBounds(value: Record<string, unknown>): { status: number; 
     return { status: 413, error: 'too_many_sheet_resources' }
   }
   return null
+}
+
+interface SheetReplaceBody {
+  findString: string
+  replaceString: string
+  findBy: SheetFindBy
+  caseSensitive: boolean
+  matchesTheWholeCell: boolean
+  logicalId?: string
+  range?: ReturnType<typeof validateSheetRange>
+}
+
+function parseSheetReplaceBody(value: unknown): SheetReplaceBody | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const body = value as Record<string, unknown>
+  if (typeof body.findString !== 'string' || typeof body.replaceString !== 'string') return null
+  const findString = body.findString.trim()
+  if (findString === '') return null
+
+  const findBy = body.findBy ?? 'value'
+  const caseSensitive = body.caseSensitive ?? false
+  const matchesTheWholeCell = body.matchesTheWholeCell ?? false
+  if (findBy !== 'value' && findBy !== 'formula') return null
+  if (typeof caseSensitive !== 'boolean' || typeof matchesTheWholeCell !== 'boolean') return null
+  if (body.range !== undefined && body.logicalId === undefined) return null
+
+  try {
+    const logicalId = body.logicalId === undefined
+      ? undefined
+      : validateResourceLogicalId(body.logicalId, 'replace logicalId')
+    const range = body.range === undefined
+      ? undefined
+      : validateSheetRange(body.range, 'replace range')
+    return {
+      findString,
+      replaceString: body.replaceString,
+      findBy,
+      caseSensitive,
+      matchesTheWholeCell,
+      logicalId,
+      range,
+    }
+  } catch (err) {
+    if (err instanceof SheetSnapshotInvalidError) return null
+    throw err
+  }
+}
+
+// ── POST /:docId/sheet/replace — atomic server-side replace-all (writer) ─────
+docSheetRouter.post('/:docId/sheet/replace', replaceDocSheetHandler)
+
+export async function replaceDocSheetHandler(req: Request, res: Response): Promise<void> {
+  const guard = await requireDocRole(req, res, req.params.docId!, 'writer')
+  if (!guard) return
+  if (!requireSheetDocType(res, guard.meta.doc_type)) return
+
+  const baseVersionRaw = readBaseVersion(req)
+  const body = parseSheetReplaceBody(req.body)
+  if (baseVersionRaw === null || body === null) {
+    res.status(400).json({ error: 'invalid_body' })
+    return
+  }
+
+  try {
+    const result = await replaceDocSheet({
+      uid: req.uid!,
+      docId: guard.meta.doc_id,
+      documentName: guard.meta.document_name,
+      principalSpaceId: req.principalSpaceId!,
+      clientBaseVersion: parseBaseVersion(baseVersionRaw),
+      ...body,
+      authorizedEpoch: guard.meta.permission_epoch,
+      isBot: req.botToken !== undefined,
+      token: req.octoToken,
+    })
+    if (result.ok) {
+      res.status(200).json({
+        docId: guard.meta.doc_id,
+        matchedCells: result.matchedCells,
+        replacedCells: result.replacedCells,
+        replacements: result.replacements,
+        baseVersion: result.baseVersion,
+        ...('bytes' in result ? {
+          bytes: result.bytes,
+          newDocVersionSeq: result.newDocVersionSeq,
+        } : {}),
+      })
+      return
+    }
+    const errorBody: Record<string, unknown> = { error: result.error }
+    if (result.payloadBytes !== undefined) errorBody.payloadBytes = result.payloadBytes
+    if (result.docBytes !== undefined) errorBody.docBytes = result.docBytes
+    if (result.limit !== undefined) errorBody.limit = result.limit
+    if (result.baseVersion !== undefined) errorBody.baseVersion = result.baseVersion
+    if (result.repairDataValidationKey !== undefined) errorBody.repairDataValidationKey = result.repairDataValidationKey
+    if (result.hint !== undefined) errorBody.hint = result.hint
+    res.status(result.status).json(errorBody)
+  } catch (err) {
+    if (err instanceof SheetSnapshotInvalidError) {
+      res.status(409).json({ error: 'sheet_snapshot_invalid' })
+      return
+    }
+    res.status(500).json({ error: 'internal_error' })
+  }
 }
 
 // ── PATCH /:docId/sheet — batch cell edit (writer) ────────────────────────────
