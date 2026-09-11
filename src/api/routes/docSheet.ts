@@ -500,12 +500,12 @@ function validateCellsShape(cells: unknown): cells is Record<string, SheetCell |
 /**
  * Request-shape bounds enforced BEFORE the no-lock batch validation (DoS gate),
  * mirroring docContent's checkOpsBounds. validateCellsShape only checks the
- * container; this caps magnitude so a ≤1mb body cannot force unbounded
+ * container; this caps magnitude so a byte-bounded body cannot force unbounded
  * validate/set work:
  *   - cell count            → 413 too_many_cells
  *   - single cell payload   → 413 cell_too_large
- * Byte-size is measured on the already-parsed (≤1mb) body, so the check itself
- * is bounded. Returns the error to send, or null when within bounds.
+ * Byte-size is measured on the already-parsed, route-capped body, so the check
+ * itself is bounded. Returns the error to send, or null when within bounds.
  */
 function checkCellsBounds(
   cells: Record<string, SheetCell | null>,

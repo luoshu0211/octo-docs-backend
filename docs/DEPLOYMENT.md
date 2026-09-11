@@ -318,6 +318,8 @@ vars (those without a fallback) **fail fast at boot** — that is intentional.
 | `OCTO_DOCS_HTML_REGISTRATION_TOKEN` | yes for docs-html; empty disables access | Dedicated shared token. It must exactly match the token docs-html sends as `X-Internal-Token` to `POST /internal/html/register`. This rate-limited internal boundary authenticates docs-html, not the end user: docs-html authenticates the user and delegates that identity in `owner`; docs-backend enforces owner/space/slug scoping. Never expose this route to browsers or reuse a browser/session token. |
 | `CARD_DISPLAY_TIME_ZONE` | no (`Asia/Shanghai`) | IANA zone used to render timestamps into user-visible card copy (e.g. the access-decision time). Pinned explicitly rather than following the container's `TZ`, which the image does not set (compose defaults it to UTC) — otherwise zh-CN card copy would show a time hours off. **Validated at startup:** an unrecognised zone (`Asia/Shangai`, `UTC+8`, …) fails the process at boot rather than throwing later on the decision path. |
 | `MAX_DOC_BYTES` | no (`10485760`) | single-doc Yjs state hard cap (~10MB) |
+| `SHEET_WRITE_MAX_REQUEST_BYTES` | no (`3145728`) | JSON body cap for `PATCH .../:docId/sheet` only; other JSON routes remain capped at 1 MiB |
+| `SHEET_WRITE_MAX_CELLS` | no (`20000`) | maximum entries in each Sheet PATCH resource map, including set and delete operations |
 
 > **⚠️ The `MYSQL_PASSWORD` / 504 trap.** When promoting config from a
 > known-good container, **dump the full environment of that container and edit

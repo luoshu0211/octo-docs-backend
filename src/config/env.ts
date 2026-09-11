@@ -799,12 +799,16 @@ export const config = {
   // that fail fast at the route gate, BEFORE the no-lock batch validation and
   // the live write, so an oversized cell batch is rejected without spending that
   // work. Mirrors docBodyEdit's bounds for the flat-cell write surface; the
-  // global express.json 1mb cap and the post-write maxDocBytes gate remain.
+  // route-scoped JSON cap and the post-write maxDocBytes gate remain independent.
   sheetWrite: {
+    // Sheet PATCH bodies legitimately carry dense per-cell styles. Keep their
+    // parser budget separate from the global 1 MiB JSON cap used by every other
+    // REST route, while retaining an explicit finite byte boundary.
+    maxRequestBytes: numMin('SHEET_WRITE_MAX_REQUEST_BYTES', 3 * 1024 * 1024, 1),
     // Upper bound on cells per PATCH batch (set + delete combined). Well above a
     // realistic single edit, low enough that a scripted client cannot fan out
-    // unbounded validate/set work under the 1mb body cap.
-    maxCells: num('SHEET_WRITE_MAX_CELLS', 5000),
+    // unbounded validate/set work under the route-scoped body cap.
+    maxCells: num('SHEET_WRITE_MAX_CELLS', 20000),
     // Checkbox rules per PATCH batch. Kept separate from maxCells so the route's
     // diagnostics and future tuning describe the resource actually being bounded.
     // The same value caps the complete persisted checkbox candidate set.
@@ -814,7 +818,7 @@ export const config = {
     // resolution so hidden losers and malformed checkbox-shaped entries count.
     maxDataValidationBytes: num('SHEET_WRITE_MAX_DATA_VALIDATION_BYTES', 1024 * 1024),
     // Upper bound on a single cell's serialized {v,f,s} payload — keeps one cell
-    // (chiefly its opaque style object) from carrying most of the 1mb body.
+    // (chiefly its opaque style object) from carrying most of the request body.
     maxCellContentBytes: num('SHEET_WRITE_MAX_CELL_CONTENT_BYTES', 64 * 1024),
   },
 
