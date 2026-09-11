@@ -5,6 +5,8 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, vi } 
 import type { AddressInfo } from 'node:net'
 import type { Server } from 'node:http'
 import express, { Router, json, type Express } from 'express'
+vi.mock('../src/ppt/currentSource.js', () => ({ readCurrentPpt: vi.fn(async () => null) }))
+vi.mock('../src/ppt/versions.js', () => ({ getPptVersion: vi.fn(async () => null) }))
 
 /**
  * R3-B1 integration tests for `GET /api/v1/ppt/docs/:docId/source`.
@@ -39,7 +41,7 @@ let currentMemberRole: 'reader' | 'commenter' | 'writer' | 'admin' | undefined
 vi.mock('../src/db/repos/docMetaRepo.js', () => ({
   DocOwnershipError: class DocOwnershipError extends Error {},
   docMetaRepo: {
-    getByDocId: vi.fn(async (docId: string) => (currentMeta && currentMeta.doc_id === docId ? currentMeta : null)),
+    getByDocId: vi.fn(async (docId: string) => (currentMeta && currentMeta.doc_id.toLowerCase() === docId.toLowerCase() ? currentMeta : null)),
   },
 }))
 vi.mock('../src/db/repos/docMemberRepo.js', () => ({
@@ -220,11 +222,11 @@ describe('PPT-SOURCE access policy (negative control)', () => {
     expect(body.error.code).toBe('FORBIDDEN')
   })
 
-  it('reader CANNOT load live — 403 FORBIDDEN', async () => {
+  it('reader can read current live content without edit capability', async () => {
     asRole('u_reader', 'reader')
-    const res = await get(base, 'd_ppt1', { mode: 'live', format: 'bento' })
-    expect(res.status).toBe(403)
-    expect(((await res.json()) as { error: { code: string } }).error.code).toBe('FORBIDDEN')
+    const res = await get(base, 'd_ppt1', { mode: 'live', format: 'bootstrap' })
+    expect(res.status).toBe(200)
+    expect(await res.json()).toMatchObject({ data: { editable: false, mode: 'live' } })
   })
 
   it('commenter CANNOT load draft — 403 FORBIDDEN', async () => {
@@ -234,11 +236,11 @@ describe('PPT-SOURCE access policy (negative control)', () => {
     expect(((await res.json()) as { error: { code: string } }).error.code).toBe('FORBIDDEN')
   })
 
-  it('commenter CANNOT load live — 403 FORBIDDEN', async () => {
+  it('commenter can read current live content without edit capability', async () => {
     asRole('u_commenter', 'commenter')
-    const res = await get(base, 'd_ppt1', { mode: 'live', format: 'bento' })
-    expect(res.status).toBe(403)
-    expect(((await res.json()) as { error: { code: string } }).error.code).toBe('FORBIDDEN')
+    const res = await get(base, 'd_ppt1', { mode: 'live', format: 'bootstrap' })
+    expect(res.status).toBe(200)
+    expect(await res.json()).toMatchObject({ data: { editable: false, mode: 'live' } })
   })
 
   it('reader IS allowed onto the published path (404 no-version, NOT 403)', async () => {
@@ -691,11 +693,11 @@ describe('PPT source guard & validation', () => {
     expect(res.status).toBe(404)
   })
 
-  it('cross-space doc => 404 (never 403, no existence leak)', async () => {
+  it('owner in another current Space receives no implicit owner grant', async () => {
     asRole('u_owner', undefined)
     const res = await get(base, 'd_ppt1', { mode: 'published', space: 's_other' })
-    expect(res.status).toBe(404)
-    expect(((await res.json()) as { error: { code: string } }).error.code).toBe('NOT_FOUND')
+    expect(res.status).toBe(403)
+    expect(((await res.json()) as { error: { code: string } }).error.code).toBe('FORBIDDEN')
   })
 
   it('archived doc => 409 CONFLICT', async () => {
@@ -738,4 +740,15 @@ describe('PPT source guard & validation', () => {
     expect(res.status).toBe(400)
     expect(((await res.json()) as { error: { code: string } }).error.code).toBe('VALIDATION_ERROR')
   })
+})
+
+it('reads source under the canonical ID when the URL uses a case alias', async () => {
+  seedDoc(); currentMemberRole = 'writer'
+  const { base, close } = await listen(makeApp())
+  try {
+    const canonical = await get(base, 'd_ppt1', { mode: 'draft' })
+    const alias = await get(base, 'D_PPT1', { mode: 'draft' })
+    expect(alias.status).toBe(200)
+    expect((await alias.json()).data).toEqual((await canonical.json()).data)
+  } finally { await close() }
 })

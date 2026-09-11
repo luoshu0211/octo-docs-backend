@@ -33,10 +33,13 @@ import { pptCollabFrameRepo } from '../../db/repos/pptCollabFrameRepo.js'
 import { pptCollabOpRepo } from '../../db/repos/pptCollabOpRepo.js'
 import { pptLiveSnapshotRepo } from '../../db/repos/pptLiveSnapshotRepo.js'
 import { pptRelaySeqRepo } from '../../db/repos/pptRelaySeqRepo.js'
+import { SyncState, type Op, type SyncStateJSON } from '../sync/slidesSync.js'
+import type { BentoDoc } from '../bentoDoc.js'
 import {
   canonicalPayloadHash,
   DuplicateFramePayloadError,
   RetryableStorageError,
+  RoomCapacityError,
   withStoreRetry,
   type AppendOpResult,
   type FrameIdentity,
@@ -59,7 +62,52 @@ function isDuplicateKeyError(err: unknown): boolean {
   )
 }
 
+export const MAX_PPT_SESSION_ACTORS = 4096
+
 export class DbPptRelayStore implements PptRelayStore {
+  constructor(private readonly enforceActorSequence = false) {}
+
+  /** Current reads under the room counter lock, after dedup resolution. */
+  private async validateSequence(tx: Tx, docId: string, incomingSeq: number, frameJson: string): Promise<void> {
+    const { ops } = JSON.parse(frameJson) as { ops: Op[] }
+    const actor = ops[0]?.a
+    if (!actor) throw new Error('missing actor')
+    const [watermark] = await tx.query<{ last_s: number }>(
+      'SELECT last_s FROM ppt_collab_actor_seq WHERE doc_id = ? AND actor = ? FOR UPDATE', [docId, actor])
+    const changesTitle = ops.some(op => op.op === 'set' && !op.el && !op.sl && op.k === 'title')
+    let last = Number(watermark?.last_s ?? 0)
+    let doc: BentoDoc | undefined
+    let state: SyncState | undefined
+    // Seed old sessions once from their durable snapshot/tail. Ordinary later
+    // frames use a scalar watermark, not an ever-growing full-tail replay.
+    // Title updates still need the actual LWW winner, not merely the wire value.
+    if (!watermark || changesTitle) {
+      const [row] = await tx.query<{ covered_seq: number; doc_json: string; state_json: string }>(
+        'SELECT covered_seq, doc_json, state_json FROM ppt_live_snapshot WHERE doc_id = ? FOR UPDATE', [docId])
+      if (!row?.state_json) throw new Error('live snapshot required')
+      doc = typeof row.doc_json === 'string' ? JSON.parse(row.doc_json) : row.doc_json
+      const json: SyncStateJSON = typeof row.state_json === 'string' ? JSON.parse(row.state_json) : row.state_json
+      state = SyncState.fromJSON('@relay', json)
+      const tail = await tx.query<{ frame_json: string }>(
+        'SELECT frame_json FROM ppt_collab_op WHERE doc_id = ? AND seq > ? AND seq < ? ORDER BY seq FOR UPDATE', [docId, row.covered_seq, incomingSeq])
+      for (const item of tail) {
+        const frame = typeof item.frame_json === 'string' ? JSON.parse(item.frame_json) : item.frame_json
+        state.apply(doc!, frame.ops)
+      }
+      // Retiring causal history without a protocol epoch is unsafe. Bound new
+      // session admission instead; existing actors can reconnect at the limit.
+      if (!watermark && state.vv[actor] === undefined && Object.keys(state.vv).length >= MAX_PPT_SESSION_ACTORS) throw new Error('PPT session actor limit reached')
+      last = Math.max(last, state.vv[actor] ?? 0)
+    }
+    for (const op of ops) if (op.a !== actor || op.s !== ++last) throw new Error('actor sequence must be contiguous')
+    if (changesTitle) {
+      state!.apply(doc!, ops)
+      if (typeof doc!.title !== 'string' || !doc!.title.trim() || doc!.title.length > 512) throw new Error('invalid title')
+      await tx.execute('UPDATE doc_meta SET title = ?, updated_at = CURRENT_TIMESTAMP(3) WHERE doc_id = ?', [doc!.title.trim(), docId])
+    }
+    await tx.execute('INSERT INTO ppt_collab_actor_seq (doc_id, actor, last_s) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE last_s = VALUES(last_s)', [docId, actor, last])
+  }
+
   async appendOp(docId: string, frameId: string, frame: unknown): Promise<AppendOpResult> {
     const frameJson = JSON.stringify(frame)
     const frameBytes = Buffer.byteLength(frameJson, 'utf8')
@@ -136,6 +184,18 @@ export class DbPptRelayStore implements PptRelayStore {
           }
         }
         throw err
+      }
+      // Includes the new op row: validate against only the prior tail by removing
+      // it from the query boundary below. All effects roll back on failure.
+      if (this.enforceActorSequence) {
+        await this.validateSequence(tx, docId, seq, frameJson)
+        // The counter row already serializes writers. Use a current read, not
+        // the dedup lookup's earlier REPEATABLE READ snapshot, for the fleet cap.
+        const [size] = await tx.query<{ total: number | string }>(
+          'SELECT COALESCE(SUM(frame_bytes), 0) AS total FROM ppt_collab_op WHERE doc_id = ? FOR UPDATE', [docId])
+        if (Number(size?.total ?? 0) > config.ppt.relay.maxRoomFrameBytes) {
+          throw new RoomCapacityError()
+        }
       }
       return { seq, duplicate: false, frameBytes }
     })
@@ -229,6 +289,15 @@ export class DbPptRelayStore implements PptRelayStore {
 
   async saveSnapshot(input: SaveSnapshotInput): Promise<SaveSnapshotResult> {
     return withStoreRetry('saveSnapshot', () => transaction(async (tx) => {
+      if (input.expectedSnapshotVersion !== undefined) {
+        await tx.execute('INSERT IGNORE INTO ppt_collab_seq (doc_id, last_seq) VALUES (?, 0)', [input.docId])
+        await tx.query('SELECT last_seq FROM ppt_collab_seq WHERE doc_id = ? FOR UPDATE', [input.docId])
+        const [current] = await tx.query<{ snapshot_version: number }>(
+          'SELECT snapshot_version FROM ppt_live_snapshot WHERE doc_id = ? FOR UPDATE', [input.docId])
+        if (Number(current?.snapshot_version ?? 0) !== input.expectedSnapshotVersion) {
+          throw new RetryableStorageError('snapshot base changed; reduce again')
+        }
+      }
       const { snapshotVersion, coveredSeq } = await pptLiveSnapshotRepo.upsertAdvanceTx(
         tx,
         input.docId,

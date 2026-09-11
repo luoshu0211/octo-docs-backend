@@ -1,3 +1,8 @@
+import { randomUUID } from 'node:crypto'
+import { connectionRegistry } from '../../permission/connectionRegistry.js'
+import type { Role } from '../../permission/role.js'
+import { nodeId } from '../../collab/compactionCluster.js'
+import { pptPersistenceFailure, type PptPersistenceFailure } from './persistenceFailure.js'
 /**
  * The Bento-frame WebSocket relay, hosted INSIDE B (§7.3).
  *
@@ -33,6 +38,7 @@ import { WebSocketServer, WebSocket } from 'ws'
 import { config } from '../../config/env.js'
 import { roleAtLeast, roleRank, type ResolvedRole } from '../../permission/role.js'
 import { type BentoDoc } from '../bentoDoc.js'
+import { inPptRoom, pptRoomEvents } from '../roomCoordinator.js'
 import {
   parseClientFrame,
   opsAreValid,
@@ -52,6 +58,7 @@ import {
   isDuplicateFramePayloadError,
   isRetryableStorageError,
   RetryableStorageError,
+  RoomCapacityError,
   type PptRelayStore,
   type ReplayCursor,
 } from './store.js'
@@ -102,6 +109,8 @@ export interface RelayLimits {
   sendDrainTimeoutMs: number
   /** Periodic per-connection read-auth refresh interval. */
   authRefreshMs: number
+  /** Two missed transport heartbeats retire a half-open connection. */
+  heartbeatIntervalMs: number
   /** Short TTL for doc-status read-path cache. */
   docStatusCacheTtlMs: number
   /**
@@ -170,6 +179,7 @@ function defaultLimits(): RelayLimits {
     sendHighWaterBytes: r.sendHighWaterBytes,
     sendDrainTimeoutMs: r.sendDrainTimeoutMs,
     authRefreshMs: r.authRefreshMs,
+    heartbeatIntervalMs: 15000,
     docStatusCacheTtlMs: r.docStatusCacheTtlMs,
     reauthGraceMs: r.reauthGraceMs,
     maxInboundQueue: r.maxInboundQueue,
@@ -223,6 +233,10 @@ export interface RoleResolutionContext {
 }
 
 export interface PptRelayDeps {
+  /** Production uses shared invalidation and durable catch-up across replicas. */
+  clustered?: boolean
+  /** Production draft rooms require server-bound actors; legacy fixtures opt out. */
+  requireBoundActors?: boolean
   /** Durable op/snapshot store. */
   store: PptRelayStore
   /** Verify the ticket string -> claims (throws on invalid/expired). */
@@ -252,6 +266,7 @@ export interface PptRelayDeps {
    * default records the drop so it is never silent.
    */
   onAgedOpDrop?: AgedOpDropHandler
+  onPersistenceFailure?: (failure: PptPersistenceFailure) => void
   protocolVersion?: number
   limits?: Partial<RelayLimits>
 }
@@ -264,6 +279,12 @@ interface ConnAuthState {
 }
 
 interface Conn {
+  connectionId: string
+  heartbeatTimer?: ReturnType<typeof setInterval>
+  presenceSubscribed: boolean
+  presenceReady: boolean
+  actor?: string
+  initialSnapshotSent?: boolean
   socket: WebSocket
   uid: string
   docId: string
@@ -561,6 +582,8 @@ export class PptRelay {
   private readonly pv: number
   private readonly limits: RelayLimits
   private readonly rooms = new Map<string, Set<Conn>>()
+  private readonly presencePending = new Set<string>()
+  private readonly presenceDirty = new Set<string>()
   /** Cumulative persisted frame bytes per room (room-full guard). */
   private readonly roomBytes = new Map<string, number>()
   /** Rooms whose {@link roomBytes} has been seeded from durable state. */
@@ -574,10 +597,8 @@ export class PptRelay {
    * absorbs the gap between the seeded clock and any un-serialized offline work. An
    * incoming `l` / text seed `sd[0]` above `value + OP_CLOCK_SLACK` is refused, so an
    * admitted value can never leap the clock to a ceiling that permanently invalidates
-   * every legitimate successor. This is the ONLY op-metadata trust retained in Half A —
-   * it needs nothing from the client half (it applied to EVERY connection pre-split,
-   * outside the actor-bound branch); the actor↔uid binding and per-actor `s` gate stay
-   * deferred to Half B.
+   * every legitimate successor. This clock bound applies to every connection. Production additionally enforces
+   * signed actor identity here and durable sequence continuity in DbPptRelayStore.
    */
   private readonly roomLamport = new Map<string, number>()
   /** Rooms whose {@link roomLamport} has been seeded from durable snapshot state. */
@@ -592,7 +613,61 @@ export class PptRelay {
    * room-budget read/modify so concurrent frames cannot both pass the cap and
    * lose an increment (the non-blocking `ensureRoomBudget` race).
    */
-  private readonly roomChains = new Map<string, Promise<void>>()
+  private readonly onExternalCompaction = (docId: string): void => {
+    // Compaction runs on our room chain, so no append can race this invalidation.
+    this.roomBytes.delete(docId)
+    this.roomBytesSeeded.delete(docId)
+    this.snapshotFrameCounts.delete(docId)
+  }
+  private readonly onExternalEdit = (docId: string, frame: ServerFrame): void => {
+    // REST commits on the same room chain. Push the normal op, preserving every
+    // peer's pending edits; disconnected clients recover via durable replay.
+    this.roomLamportSeeded.delete(docId)
+    this.roomBytesSeeded.delete(docId)
+    if (this.deps.clustered) this.onClusterRefresh(docId)
+    else for (const conn of this.rooms.get(docId) ?? []) void this.deliver(conn, frame)
+  }
+  private clusterTimer?: ReturnType<typeof setInterval>
+  private clusterSweepPending = false
+  private closed = false
+  private readonly onRemotePresence = (docId: string, frame: ServerFrame): void => {
+    for (const conn of this.rooms.get(docId) ?? []) void this.deliver(conn, frame)
+  }
+  private readonly onClusterRefresh = (docId: string): void => {
+    this.roomBytesSeeded.delete(docId)
+    this.roomLamportSeeded.delete(docId)
+    for (const conn of this.rooms.get(docId) ?? []) {
+      // Never start an unsolicited initial replay: the client must first opt in
+      // through hello. Existing replay coalescing and read gates apply here too.
+      if (conn.presenceReady && this.canPushRead(conn)) this.requestReplay(conn, conn.deliveredThrough, false)
+    }
+    this.schedulePresence(docId)
+  }
+
+  /** Lost notifications and rolling restarts recover via the existing replay
+   * protocol. One bounded sweep; no per-frame Redis delivery is authoritative. */
+  private async reconcileCluster(): Promise<void> {
+    if (this.clusterSweepPending || this.closed) return
+    this.clusterSweepPending = true
+    try {
+      const rooms = [...this.rooms.keys()]
+      let next = 0
+      await Promise.all(Array.from({ length: Math.min(4, rooms.length) }, async () => {
+        while (next < rooms.length && !this.closed) {
+          const docId = rooms[next++]!
+          try {
+            const highWater = await this.store.currentSeq(docId)
+            for (const conn of this.rooms.get(docId) ?? []) {
+              if (conn.presenceReady && this.canPushRead(conn) && highWater > conn.deliveredThrough) {
+                this.requestReplay(conn, conn.deliveredThrough, false)
+              }
+            }
+            this.schedulePresence(docId)
+          } catch { /* A later sweep retries; never advance a failed read's cursor. */ }
+        }
+      }))
+    } finally { this.clusterSweepPending = false }
+  }
   private readonly replaySemaphore: Semaphore
   private readonly docStatusCache = new Map<string, { status: 'live' | 'deleted'; expiresAt: number }>()
   /** Server-side snapshotter (snapshot advancement + op-log prune, XIN-1759 Part B). */
@@ -605,8 +680,17 @@ export class PptRelay {
    * already queued so an append burst cannot fan out into N concurrent reductions.
    */
   private readonly snapshotPending = new Set<string>()
+  private readonly snapshotFrameCounts = new Map<string, number>()
 
-  constructor(deps: PptRelayDeps) {
+  constructor(private readonly deps: PptRelayDeps) {
+    pptRoomEvents.on('changed', this.onExternalEdit)
+    pptRoomEvents.on('compacted', this.onExternalCompaction)
+    if (deps.clustered) {
+      pptRoomEvents.on('refresh', this.onClusterRefresh)
+      pptRoomEvents.on('remote-presence', this.onRemotePresence)
+      this.clusterTimer = setInterval(() => { void this.reconcileCluster() }, 2000)
+      this.clusterTimer.unref()
+    }
     this.store = deps.store
     this.verifyTicket = deps.verifyTicket ?? verifyPptRelayTicket
     this.ticketStore = deps.ticketStore ?? new InMemoryTicketStore()
@@ -719,6 +803,10 @@ export class PptRelay {
       socket.close(CLOSE_UNAUTHORIZED, 'invalid ticket')
       return
     }
+    if (this.deps.requireBoundActors && !claims.actor) {
+      socket.close(CLOSE_UNAUTHORIZED, 'bound actor required; obtain a new ticket')
+      return
+    }
     // Single-use: a replayed ticket (same jti) is rejected even if still valid.
     // A store error (e.g. Redis down for RedisTicketStore) must fail CLOSED and
     // close the just-upgraded socket rather than rejecting `onConnection` and
@@ -801,6 +889,10 @@ export class PptRelay {
     if (earlyClosed || socket.readyState !== WebSocket.OPEN) return
 
     conn = {
+      connectionId: randomUUID(),
+      presenceSubscribed: false,
+      presenceReady: false,
+      actor: claims.actor,
       socket,
       uid: claims.uid,
       docId: claims.docId,
@@ -833,6 +925,7 @@ export class PptRelay {
       drainChain: Promise.resolve(),
     }
     this.addToRoom(conn)
+    this.armHeartbeat(conn)
     this.armAuthRefresh(conn)
     this.armShareExpiry(conn, claims.exp)
     // Drain frames buffered before auth completed, in receipt order. No `await`
@@ -884,6 +977,8 @@ export class PptRelay {
   }
 
   private removeFromRoom(conn: Conn): void {
+    if (conn.heartbeatTimer) clearInterval(conn.heartbeatTimer)
+    conn.heartbeatTimer = undefined
     if (conn.authTimer) clearTimeout(conn.authTimer)
     conn.authTimer = undefined
     if (conn.shareExpiryTimer) clearTimeout(conn.shareExpiryTimer)
@@ -892,12 +987,18 @@ export class PptRelay {
     conn.reauthGraceTimer = undefined
     const room = this.rooms.get(conn.docId)
     if (!room) return
-    room.delete(conn)
+    const removed = room.delete(conn)
+    if (removed && this.deps.clustered) {
+      void connectionRegistry.unregister(conn.documentName, conn.connectionId)
+      pptRoomEvents.emit('presence', conn.docId, { ctl: 'presence', uid: conn.uid, presence: undefined })
+    }
+    if (removed && conn.presenceReady) this.schedulePresence(conn.docId)
     if (room.size === 0) {
       this.rooms.delete(conn.docId)
       // Drop the process-local budget for an empty room; it re-seeds from durable
       // state when the room is next joined, so this only bounds memory.
       this.roomBytes.delete(conn.docId)
+      this.snapshotFrameCounts.delete(conn.docId)
       this.roomBytesSeeded.delete(conn.docId)
       // Same for the room's live Lamport clock — it re-seeds from the durable
       // snapshot + un-snapshotted tail on the next join (XIN-1789 P1-2/P1-3).
@@ -911,12 +1012,86 @@ export class PptRelay {
   }
 
   private broadcast(conn: Conn, frame: ServerFrame): void {
+    if (this.deps.clustered && frame.ctl === 'presence') pptRoomEvents.emit('presence', conn.docId, frame)
     const room = this.rooms.get(conn.docId)
     if (!room) return
     for (const peer of room) {
       if (peer === conn) continue // sender never echoes its own op
       void this.deliver(peer, frame)
     }
+  }
+
+  private armHeartbeat(conn: Conn): void {
+    let alive = true
+    conn.socket.on('pong', () => { alive = true })
+    conn.heartbeatTimer = setInterval(() => {
+      if (conn.socket.readyState !== WebSocket.OPEN || !alive) {
+        conn.socket.terminate()
+        this.removeFromRoom(conn)
+        return
+      }
+      alive = false
+      try { conn.socket.ping() } catch { conn.socket.terminate(); this.removeFromRoom(conn) }
+    }, Math.max(50, this.limits.heartbeatIntervalMs))
+    conn.heartbeatTimer.unref()
+  }
+
+  /** Volatile roster, deduped by user like Docs awareness. No client identity or persistence. */
+  private schedulePresence(docId: string): void {
+    if (this.presencePending.has(docId)) { this.presenceDirty.add(docId); return }
+    this.presencePending.add(docId)
+    queueMicrotask(() => {
+      void this.sendPresence(docId).catch(() => {}).finally(() => {
+        this.presencePending.delete(docId)
+        if (this.presenceDirty.delete(docId)) this.schedulePresence(docId)
+      })
+    })
+  }
+
+  private async sendPresence(docId: string): Promise<void> {
+    const room = this.rooms.get(docId)
+    if (!room || (!this.deps.clustered && ![...room].some(peer => peer.presenceSubscribed && peer.presenceReady))) return
+    // Run auth checks outside outbound chains: a failed check may enqueue/await a close.
+    await Promise.all([...room].filter(peer => peer.presenceReady && this.canPushRead(peer))
+      .map(peer => this.refreshReadAuth(peer, 'online-users')))
+    const sharedUsers = new Map<string, { uid: string; name?: string }>()
+    if (this.deps.clustered) {
+      await Promise.all([...room].map(async peer => {
+        if (!peer.presenceReady || !this.canPushRead(peer)) {
+          await connectionRegistry.unregister(peer.documentName, peer.connectionId)
+          return
+        }
+        await connectionRegistry.register({ documentName: peer.documentName, uid: peer.uid,
+          node: nodeId(), connectionId: peer.connectionId, role: peer.role as Role,
+          permission_epoch: peer.roleEpoch, name: peer.name, expiresAt: Date.now() + 10_000 })
+        if (!this.rooms.get(docId)?.has(peer) || !this.canPushRead(peer)) {
+          await connectionRegistry.unregister(peer.documentName, peer.connectionId)
+        }
+      }))
+      const first = room.values().next().value as Conn | undefined
+      if (first) for (const entry of await connectionRegistry.list(first.documentName)) {
+        // Do not show stale authority after an epoch bump. Every owning node
+        // refreshes its entry only after its ordinary read-permission check.
+        if (entry.expiresAt && entry.permission_epoch === first.roleEpoch && roleAtLeast(entry.role, 'reader')) {
+          sharedUsers.set(entry.uid, { uid: entry.uid, name: entry.name })
+        }
+      }
+    }
+    const sends: Promise<void>[] = []
+    for (const peer of this.rooms.get(docId) ?? []) {
+      if (!peer.presenceSubscribed || !peer.presenceReady || !this.canPushRead(peer)) continue
+      // Recompute at send time: a queued roster must not retain departed/revoked users.
+      sends.push(this.gatedSend(peer, () => {
+        const users = new Map(sharedUsers)
+        for (const online of this.rooms.get(docId) ?? []) {
+          if (!online.presenceReady || !this.canPushRead(online)) continue
+          users.set(online.uid, { uid: online.uid, ...(online.name ? { name: online.name.slice(0, 256) } : {}) })
+        }
+        const sorted = [...users.values()].sort((a, b) => a.uid === peer.uid ? -1 : b.uid === peer.uid ? 1 : a.uid.localeCompare(b.uid))
+        return { ctl: 'peers', users: sorted.slice(0, 100), total: sorted.length }
+      }))
+    }
+    await Promise.all(sends)
   }
 
   private enqueueOutbound(conn: Conn, task: () => Promise<void> | void): Promise<void> {
@@ -996,6 +1171,10 @@ export class PptRelay {
     // `applyEpochBump`). A benign close (`bye`, resync, shutdown) also bumps it — moot,
     // since the socket is going away and no live-auth rebuild follows those paths.
     conn.authGeneration++
+    if (conn.presenceReady) {
+      conn.presenceReady = false
+      this.schedulePresence(conn.docId)
+    }
     return this.enqueueOutbound(conn, () => {
       conn.socket.close(code, reason)
       this.removeFromRoom(conn)
@@ -1220,7 +1399,7 @@ export class PptRelay {
    * unbounded backlog (XIN-1693 P1-3). Bounded by the drain timeout so a
    * wedged client cannot stall replay forever; on a closed socket it is a no-op.
    */
-  private async gatedSend(conn: Conn, frame: ServerFrame): Promise<void> {
+  private async gatedSend(conn: Conn, frame: ServerFrame | (() => ServerFrame)): Promise<void> {
     await this.enqueueOutbound(conn, async () => {
       if (!this.canPushRead(conn)) {
         const terminal = conn.auth.terminalClose
@@ -1250,7 +1429,7 @@ export class PptRelay {
         this.removeFromRoom(conn)
         return
       }
-      send(socket, frame)
+      send(socket, typeof frame === 'function' ? frame() : frame)
     })
   }
 
@@ -1263,8 +1442,7 @@ export class PptRelay {
    * set of rooms with in-flight mutations.
    */
   private runSerialized(docId: string, task: () => Promise<void>): Promise<void> {
-    const prev = this.roomChains.get(docId) ?? Promise.resolve()
-    const run = prev.then(task, task).catch((err) => {
+    return inPptRoom(docId, task).catch((err) => {
       // A handler owns its own client-facing error surfacing (via `refuse`); this
       // tail only guards the CHAIN so one frame's failure cannot stall the room's
       // queue. A throw reaching here is unexpected — log it rather than silently
@@ -1272,11 +1450,6 @@ export class PptRelay {
       // eslint-disable-next-line no-console
       console.warn('[ppt-relay] serialized frame handler threw:', err)
     })
-    this.roomChains.set(docId, run)
-    void run.then(() => {
-      if (this.roomChains.get(docId) === run) this.roomChains.delete(docId)
-    })
-    return run
   }
 
   private refuse(
@@ -1350,6 +1523,7 @@ export class PptRelay {
       case 'hello':
         if (this.enforceEphemeralLimits(conn, rawBytes)) return
         if (!(await this.refreshReadAuth(conn, 'hello'))) return
+        conn.presenceSubscribed = frame.presence === true
         this.requestReplay(conn, typeof frame.since === 'number' ? frame.since : 0, /* ready */ true)
         return
       case 'need':
@@ -1491,6 +1665,7 @@ export class PptRelay {
     // value refuses on resume rather than writing against the just-frozen socket.
     conn.authGeneration++
     conn.auth = { readAllowed: conn.auth.readAllowed, invalidated: false, pendingReauth: true }
+    this.schedulePresence(conn.docId)
     this.armReauthGrace(conn)
   }
 
@@ -1548,6 +1723,7 @@ export class PptRelay {
     // user, Space, or doc.
     if (
       claims.uid !== conn.uid
+      || claims.actor !== conn.actor
       || claims.principal_space_id !== conn.principalSpaceId
       || claims.docId !== conn.docId
       || claims.documentName !== conn.documentName
@@ -1618,6 +1794,7 @@ export class PptRelay {
       conn.reauthGraceTimer = undefined
     }
     conn.role = role
+    conn.name = claims.name
     conn.roleEpoch = liveEpoch
     conn.spaceMember = freshSpaceMember
     // Bump the reauth generation so any share-expiry callback still awaiting its
@@ -1630,6 +1807,7 @@ export class PptRelay {
     }
     this.armShareExpiry(conn, claims.exp)
     conn.auth = { readAllowed: roleAtLeast(role, 'reader'), invalidated: false }
+    this.schedulePresence(conn.docId)
     if (conn.caughtUp) await this.drainLiveBuffer(conn)
   }
 
@@ -1843,9 +2021,10 @@ export class PptRelay {
         // Only send the snapshot to a peer behind it; an already-synced peer is not
         // forced to reapply it (PPT-COLLAB-003). Send BOTH doc and state so a late
         // joiner can deterministically apply the ops that follow (XIN-1759 Part B).
-        if (snapshot && effectiveSince < snapshot.coveredSeq) {
+        if (snapshot && (effectiveSince < snapshot.coveredSeq || (conn.actor && !conn.initialSnapshotSent))) {
           if (!this.canPushRead(conn)) return false
           await this.gatedSend(conn, { ctl: 'snapshot', snapshotVersion: snapshot.snapshotVersion, doc: snapshot.doc, state: snapshot.state })
+          conn.initialSnapshotSent = true
           fromSeq = snapshot.coveredSeq
           readySeq = snapshot.coveredSeq
           // A snapshot covers all real ops through its coveredSeq; gaps in that
@@ -1894,6 +2073,8 @@ export class PptRelay {
             epoch,
             role: conn.role,
           })
+          conn.presenceReady = this.canPushRead(conn)
+          this.schedulePresence(conn.docId)
         }
         return true
       } catch (err) {
@@ -2185,7 +2366,7 @@ export class PptRelay {
    * succeed (XIN-1693 P2-c).
    */
   private async ensureRoomBudget(docId: string): Promise<number> {
-    if (!this.roomBytesSeeded.has(docId)) {
+    if (this.deps.clustered || !this.roomBytesSeeded.has(docId)) {
       try {
         const durable = await this.store.roomBytes(docId)
         // Do not clobber bytes counted by frames that landed during the seed read.
@@ -2220,12 +2401,11 @@ export class PptRelay {
    * the caller in {@link handleOps} runs it BEHIND the per-connection rate gate, so a
    * cheap flood of new frames can neither drive an unbounded read nor bypass the limiter.
    *
-   * NOTE (Half A scope): this seeds/tracks ONLY the room clock. The per-actor `s`
-   * high-water and the server-minted actor binding are NOT reconstructed here — that
-   * trust boundary is deferred to Half B (it depends on the client-sent `clientSessionId`).
+   * Actor identity is checked at admission; per-actor sequence continuity is
+   * maintained by DbPptRelayStore, independently of this room clock cache.
    */
   private async ensureRoomLamport(docId: string): Promise<number> {
-    if (!this.roomLamportSeeded.has(docId)) {
+    if (this.deps.clustered || !this.roomLamportSeeded.has(docId)) {
       let seed = 0
       const foldFrame = (frame: unknown): void => {
         const ops = Array.isArray((frame as { ops?: unknown })?.ops) ? (frame as { ops: unknown[] }).ops : []
@@ -2376,17 +2556,15 @@ export class PptRelay {
       this.refuse(conn, 'too-large', { k, frameId, message: 'op count exceeds per-frame limit' })
       return
     }
-    // Structural single-actor check (XIN-1772 P0-2): every op in a frame is authored
-    // by ONE actor. `opsAreValid` has already charset-restricted each `op.a` (no
-    // client can mint the reserved `@relay` reducer actor) and rejected reserved-key
-    // ids/keys (XIN-1821 P0-4). Binding that actor to the CONNECTION (server-minted
-    // actor↔uid) and the per-actor `s`-continuity gate are DEFERRED to Half B (they
-    // depend on the client-sent `clientSessionId`); Half A keeps only this shape-level
-    // check plus the server-only room-relative clock bound enforced below. The relay is
-    // gated OFF by default (XIN-1821) so the deferred actor impersonation (P0-1) is
-    // unreachable in production until Half B lands.
-    const frameOps = frame.ops as Array<{ a?: unknown }>
+    // Every batch has one actor, bound to this authenticated session in production.
+    // The DB append validates contiguous actor sequences under the room lock,
+    // after resolving duplicates, so reconnect/lost-ack resends remain idempotent.
+    const frameOps = frame.ops as Array<{ a?: unknown; op?: unknown; sl?: unknown; el?: unknown; k?: unknown }>
     const frameActor = frameOps[0]!.a
+    if (conn.actor && frameActor !== conn.actor) {
+      this.refuse(conn, 'protocol-version', { k, frameId, message: 'actor does not match authenticated session' })
+      return
+    }
     if (typeof frameActor !== 'string' || !frameOps.every((op) => op.a === frameActor)) {
       this.refuse(conn, 'protocol-version', { k, frameId, message: 'all ops in a frame must share one actor' })
       return
@@ -2504,15 +2682,9 @@ export class PptRelay {
     // contract), so gating here — the first point a NEW mutation is known — sheds a
     // flood before it can persist, mirroring the inbound-queue shed.
     //
-    // NOTE (Half A, XIN-1821): the op-metadata trust boundary is SPLIT. The server-only
-    // RELATIVE room-clock bound on `l`/`sd[0]` IS enforced here (below) — it needs
-    // nothing from the client half and closes P0-2 (a wire-legal Lamport value above the
-    // room clock permanently bricks the deck) and P0-3 (an unbounded `txt` seed `sd[0]`
-    // freezes an element's text). The server-minted actor↔uid binding and the per-actor
-    // `s`-continuity gate remain DEFERRED to Half B (paired with R4-F1): they depend on
-    // the client sending `clientSessionId`, and while deferred the relay is gated OFF by
-    // default (`PPT_RELAY_ENABLED`, see src/index.ts / src/api/ppt/envelope.ts) so the
-    // remaining P0-1 (actor impersonation) is UNREACHABLE in production.
+    // Signed actor identity and durable sequence validation complement the
+    // relative room-clock bound on l/sd[0]. Deploy matching clients and migrations
+    // using the coordinated multi-replica rollout in docs/DEPLOYMENT.md.
     if (known === null) {
       const retryInMs = this.rateLimited(conn.frameTimes)
       if (retryInMs !== null) {
@@ -2549,6 +2721,11 @@ export class PptRelay {
     const guardCode = await this.guardMutation(conn, typeof frame.epoch === 'number' ? frame.epoch : -1, rawBytes, this.limits.maxFrameBytes)
     if (guardCode) {
       this.refuse(conn, guardCode, { k, frameId })
+      return
+    }
+    // Renaming is an admin capability in the shared Docs metadata model.
+    if (conn.role !== 'admin' && frameOps.some(op => op.op === 'set' && !op.sl && !op.el && op.k === 'title')) {
+      this.refuse(conn, 'forbidden-role', { k, frameId })
       return
     }
     // Room-full: a room whose durable frame bytes would exceed the cap refuses
@@ -2609,10 +2786,19 @@ export class PptRelay {
     let seq: number
     let duplicate: boolean
     try {
-      const res = await this.store.appendOp(conn.docId, frameId, frame)
+      let res
+      try { res = await this.store.appendOp(conn.docId, frameId, frame) } catch (error) {
+        if (!(error instanceof RoomCapacityError)) throw error
+        await this.snapshotNow(conn.docId, true)
+        res = await this.store.appendOp(conn.docId, frameId, frame)
+      }
       seq = res.seq
       duplicate = res.duplicate
     } catch (err) {
+      if (err instanceof RoomCapacityError) {
+        this.refuse(conn, 'room-full', { k, frameId })
+        return
+      }
       if (isDuplicateFramePayloadError(err)) {
         this.refuse(conn, 'protocol-version', { k, frameId, message: 'frameId payload mismatch' })
         return
@@ -2621,6 +2807,9 @@ export class PptRelay {
       // `storage-retry` (retryable) so the client re-sends; anything else is a
       // permanent `storage-failed` (XIN-1693 P1-5).
       const code = isRetryableStorageError(err) ? 'storage-retry' : 'storage-failed'
+      if (code === 'storage-failed') {
+        try { this.deps.onPersistenceFailure?.(pptPersistenceFailure(conn.docId, err)) } catch { /* Observability must not prevent refusal. */ }
+      }
       this.refuse(conn, code, { k, frameId, message: 'durable persistence failed' })
       return
     }
@@ -2671,10 +2860,13 @@ export class PptRelay {
     // A delivery-stable, still-pushable author HAS received every lower real op in
     // room order before its own ack, so advancing then is correct and lets it
     // snapshot its own latest write.
-    if (this.canAdvanceDeliveredThroughFromAuthor(conn, duplicate)) this.markDeliveredThrough(conn, seq)
+    if (!this.deps.clustered && this.canAdvanceDeliveredThroughFromAuthor(conn, duplicate)) this.markDeliveredThrough(conn, seq)
     void this.sendCommittedAck(conn, { ctl: 'ack', k: frame.k ?? 0, q: seq, snapshotVersion })
     // Broadcast to peers only for a first-seen frame (no echo, no double-apply).
-    if (!duplicate) this.broadcast(conn, { ctl: 'op', q: seq, frame })
+    if (!duplicate) {
+      if (this.deps.clustered) pptRoomEvents.emit('changed', conn.docId, { ctl: 'op', q: seq, frame })
+      else this.broadcast(conn, { ctl: 'op', q: seq, frame })
+    }
     // Soft snapshot trigger (XIN-1759 Part B): a first-seen append grew the room, so
     // compact opportunistically if it crossed the soft byte threshold. Queued on the
     // room chain (at most one pending per room); fire-and-forget compaction.
@@ -2720,6 +2912,7 @@ export class PptRelay {
       const used = this.roomBytes.get(docId) ?? 0
       this.roomBytes.set(docId, Math.max(0, used - res.freedBytes))
     }
+    if (res) this.snapshotFrameCounts.delete(docId)
     return res
   }
 
@@ -2731,8 +2924,10 @@ export class PptRelay {
    * snapshots on the next trigger (or the forced path before `room-full`).
    */
   private maybeSoftSnapshot(docId: string): void {
+    const frames = (this.snapshotFrameCounts.get(docId) ?? 0) + 1
+    this.snapshotFrameCounts.set(docId, frames)
     if (this.snapshotPending.has(docId)) return
-    if ((this.roomBytes.get(docId) ?? 0) < this.limits.snapshotSoftThresholdBytes) return
+    if (frames < 256 && (this.roomBytes.get(docId) ?? 0) < this.limits.snapshotSoftThresholdBytes) return
     this.snapshotPending.add(docId)
     void this.runSerialized(docId, async () => {
       try {
@@ -2880,6 +3075,7 @@ export class PptRelay {
         // its own connect-time authority stands, this bump does not own it.
         if (gen === undefined || conn.authGeneration !== gen) continue
         conn.auth = { readAllowed: roleAtLeast(conn.role, 'reader'), invalidated: false }
+        this.schedulePresence(conn.docId)
         if (downgraded) void this.gatedSend(conn, { ctl: 'role-changed', role: conn.role, epoch: newEpoch })
         if (roleAtLeast(conn.role, 'reader') && conn.caughtUp) void this.drainLiveBuffer(conn)
       }
@@ -2902,6 +3098,12 @@ export class PptRelay {
   }
 
   close(): void {
+    this.closed = true
+    if (this.clusterTimer) clearInterval(this.clusterTimer)
+    pptRoomEvents.off('refresh', this.onClusterRefresh)
+    pptRoomEvents.off('remote-presence', this.onRemotePresence)
+    pptRoomEvents.off('changed', this.onExternalEdit)
+    pptRoomEvents.off('compacted', this.onExternalCompaction)
     for (const room of this.rooms.values()) {
       for (const conn of [...room]) void this.closeConn(conn, 1001, 'relay shutting down')
     }

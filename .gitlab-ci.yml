@@ -42,6 +42,37 @@ build:
     - npm test
     - npm run build
 
+ppt_cluster_integration:
+  stage: build
+  tags:
+    - tke-deepmining-runner
+  image: $NODE_IMAGE
+  services:
+    - name: mysql:8.0
+      alias: mysql
+      command: ["--max-allowed-packet=67108864"]
+    - name: redis:7-alpine
+      alias: redis
+  variables:
+    # Disposable CI service credentials, never production credentials.
+    MYSQL_HOST: mysql
+    MYSQL_PORT: "3306"
+    MYSQL_DATABASE: ppt_case_test_cluster
+    MYSQL_USER: ppt_ci
+    MYSQL_PASSWORD: ppt-ci-only
+    MYSQL_ROOT_PASSWORD: ppt-ci-root-only
+    REDIS_HOST: redis
+    REDIS_PORT: "6379"
+    REDIS_PREFIX: ppt-ci-cluster
+    PPT_CANONICAL_MYSQL_TEST: "1"
+    PPT_CLUSTER_MYSQL_TEST: "1"
+  before_script:
+    - npm config set registry "$NPM_REGISTRY"
+  script:
+    - npm ci
+    - node scripts/waitForPptTestServices.mjs
+    - npm test -- test/pptCanonicalId.mysql.test.ts
+
 .package: &package
   stage: package
   tags:

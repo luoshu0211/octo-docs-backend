@@ -26,7 +26,7 @@
  */
 import { Router, type Router as ExpressRouter, type Request, type Response } from 'express'
 import { requireDocRole } from '../guard.js'
-import { docVersionRepo, KIND_NAMED } from '../../db/repos/docVersionRepo.js'
+import { KIND_NAMED } from '../../db/repos/docVersionRepo.js'
 import { readLiveDocState } from '../../collab/liveDocRead.js'
 import { restoreVersion } from '../services/restoreVersion.js'
 import {
@@ -46,7 +46,13 @@ import {
   BoardSnapshotInvalidError,
 } from '../../collab/versionRestore.js'
 
+import { versionStorage } from '../services/versionStorage.js'
+import { pptPrincipalFromGuard } from '../services/commentStorage.js'
+import { changePptVersion, getPptVersion, validateVersionAction } from '../../ppt/versions.js'
+import { documentAsync, documentErrorHandler } from '../services/documentRoute.js'
+
 export const versionsRouter: ExpressRouter = Router()
+versionsRouter.use((_req, res, next) => { res.setHeader('Cache-Control', 'private, no-store'); next() })
 
 const MAX_NAME_LEN = 256
 
@@ -100,18 +106,12 @@ function parseVersionId(raw: string | undefined): number | null {
 }
 
 // ── GET /:docId/versions — list (reader) ──────────────────────────────────────
-versionsRouter.get('/:docId/versions', listVersionsHandler)
+versionsRouter.get('/:docId/versions', documentAsync(listVersionsHandler))
 
 export async function listVersionsHandler(req: Request, res: Response): Promise<void> {
   const guard = await requireDocRole(req, res, req.params.docId!, 'reader')
   if (!guard) return
-  if (contentKindFromDocType(guard.meta.doc_type) === 'ppt') {
-    // html_ppt has no Yjs `doc_version` rows (§1.3); answer wrong-kind uniformly
-    // with the other Yjs version handlers rather than an empty 200 list.
-    res.status(422).json({ error: 'unsupported_document_type' })
-    return
-  }
-
+  const store = versionStorage(guard.meta)
   const cursorRaw = req.query.cursor
   const cursor = typeof cursorRaw === 'string' && cursorRaw !== '' ? Number(cursorRaw) : undefined
   const limitRaw = req.query.limit
@@ -134,37 +134,44 @@ export async function listVersionsHandler(req: Request, res: Response): Promise<
   }
 
   const docId = guard.meta.doc_id
-  const { items, nextCursor } = await docVersionRepo.listByDoc(docId, {
+  const { items, nextCursor } = await store.listByDoc(docId, {
     cursor: Number.isFinite(cursor) ? cursor : undefined,
     limit: Number.isFinite(limit) ? limit : undefined,
     kind,
     includeAuto,
   })
-  const counts = await docVersionRepo.countsByKind(docId)
+  const counts = await store.countsByKind(docId)
+  if (guard.meta.doc_type === 'html_ppt') {
+    const current = await requireDocRole(req, res, docId, 'reader')
+    if (!current) return
+    if (current.meta.permission_epoch !== guard.meta.permission_epoch) {
+      res.status(403).json({ error: 'forbidden' }); return
+    }
+  }
   res.status(200).json({ items: items.map(toItem), nextCursor, counts })
 }
 
 // ── POST /:docId/versions — named snapshot of the live state (writer) ─────────
-versionsRouter.post('/:docId/versions', createVersionHandler)
+versionsRouter.post('/:docId/versions', documentAsync(createVersionHandler))
 
 export async function createVersionHandler(req: Request, res: Response): Promise<void> {
   const guard = await requireDocRole(req, res, req.params.docId!, 'writer')
   if (!guard) return
+  const store = versionStorage(guard.meta)
   const kind = contentKindFromDocType(guard.meta.doc_type)
-  if (kind === 'ppt') {
-    // html_ppt versions are BentoDoc / rendered-HTML blobs in `ppt_version`, not
-    // Yjs `doc_version` rows. The legacy Yjs version endpoints must reject them
-    // rather than snapshot the (non-existent) live Yjs state (§1.3).
-    res.status(422).json({ error: 'unsupported_document_type' })
-    return
-  }
-
   // Wire contract: the frontend sends the label as `label`. Accept the legacy
   // `name` as a fallback so older clients keep working.
   const { label, name } = req.body ?? {}
   const rawLabel = label ?? name
   if (rawLabel !== undefined && (typeof rawLabel !== 'string' || rawLabel.length > MAX_NAME_LEN)) {
     res.status(400).json({ error: 'invalid_name' })
+    return
+  }
+
+  if (kind === 'ppt') {
+    const result = await changePptVersion(pptPrincipalFromGuard(req, guard), 'create',
+      validateVersionAction({ ...req.body, label: rawLabel }), req.header('Idempotency-Key') ?? '')
+    res.status(201).json({ docVersionSeq: result.versionSeq })
     return
   }
 
@@ -179,7 +186,7 @@ export async function createVersionHandler(req: Request, res: Response): Promise
   // the column stays NOT NULL.
   const state = await readLiveDocState(documentName)
 
-  const id = await docVersionRepo.create({
+  const id = await store.create({
     docId: guard.meta.doc_id,
     documentName,
     kind: KIND_NAMED,
@@ -194,26 +201,31 @@ export async function createVersionHandler(req: Request, res: Response): Promise
 }
 
 // ── GET /:docId/versions/:versionId/state — decoded PM JSON (reader) ───────────
-versionsRouter.get('/:docId/versions/:versionId/state', getVersionStateHandler)
+versionsRouter.get('/:docId/versions/:versionId/state', documentAsync(getVersionStateHandler))
 
 export async function getVersionStateHandler(req: Request, res: Response): Promise<void> {
   const guard = await requireDocRole(req, res, req.params.docId!, 'reader')
   if (!guard) return
+  const store = versionStorage(guard.meta)
   const kind = contentKindFromDocType(guard.meta.doc_type)
-  if (kind === 'ppt') {
-    // html_ppt has no Yjs version state to decode here (§1.3) — reject rather
-    // than feed a BentoDoc blob to the ProseMirror/Excalidraw decoders.
-    res.status(422).json({ error: 'unsupported_document_type' })
-    return
-  }
-
   const versionId = parseVersionId(req.params.versionId)
   if (versionId === null) {
     res.status(400).json({ error: 'invalid_version_id' })
     return
   }
 
-  const found = await docVersionRepo.getStateById(versionId)
+  if (kind === 'ppt') {
+    const version = await getPptVersion(guard.meta.doc_id, versionId)
+    if (!version) { res.status(404).json({ error: 'not_found' }); return }
+    const again = await requireDocRole(req, res, guard.meta.doc_id, 'reader')
+    if (!again) return
+    if (again.meta.permission_epoch !== guard.meta.permission_epoch) { res.status(403).json({ error: 'forbidden' }); return }
+    res.setHeader('Cache-Control', 'private, no-store')
+    res.json({ kind: 'ppt', deck: version.deck, docVersionSeq: versionId, schemaVersion: 1 })
+    return
+  }
+
+  const found = await store.getStateById(versionId)
   // Hide cross-doc references behind 404 (do not leak existence to other docs).
   if (!found || found.version.docId !== guard.meta.doc_id) {
     res.status(404).json({ error: 'not_found' })
@@ -297,11 +309,12 @@ export async function getVersionStateHandler(req: Request, res: Response): Promi
 }
 
 // ── PATCH /:docId/versions/:versionId — rename (writer) ───────────────────────
-versionsRouter.patch('/:docId/versions/:versionId', renameVersionHandler)
+versionsRouter.patch('/:docId/versions/:versionId', documentAsync(renameVersionHandler))
 
 export async function renameVersionHandler(req: Request, res: Response): Promise<void> {
   const guard = await requireDocRole(req, res, req.params.docId!, 'writer')
   if (!guard) return
+  const store = versionStorage(guard.meta)
   if (contentKindFromDocType(guard.meta.doc_type) === 'ppt') {
     res.status(422).json({ error: 'unsupported_document_type' })
     return
@@ -321,21 +334,22 @@ export async function renameVersionHandler(req: Request, res: Response): Promise
     return
   }
 
-  const existing = await docVersionRepo.getById(versionId)
+  const existing = await store.getById(versionId)
   if (!existing || existing.docId !== guard.meta.doc_id) {
     res.status(404).json({ error: 'not_found' })
     return
   }
-  await docVersionRepo.rename(versionId, rawLabel)
+  await store.rename(versionId, rawLabel)
   res.status(200).json({ docVersionSeq: versionId })
 }
 
 // ── DELETE /:docId/versions/:versionId — delete (admin) ───────────────────────
-versionsRouter.delete('/:docId/versions/:versionId', deleteVersionHandler)
+versionsRouter.delete('/:docId/versions/:versionId', documentAsync(deleteVersionHandler))
 
 export async function deleteVersionHandler(req: Request, res: Response): Promise<void> {
   const guard = await requireDocRole(req, res, req.params.docId!, 'admin')
   if (!guard) return
+  const store = versionStorage(guard.meta)
   if (contentKindFromDocType(guard.meta.doc_type) === 'ppt') {
     res.status(422).json({ error: 'unsupported_document_type' })
     return
@@ -346,17 +360,17 @@ export async function deleteVersionHandler(req: Request, res: Response): Promise
     res.status(400).json({ error: 'invalid_version_id' })
     return
   }
-  const existing = await docVersionRepo.getById(versionId)
+  const existing = await store.getById(versionId)
   if (!existing || existing.docId !== guard.meta.doc_id) {
     res.status(404).json({ error: 'not_found' })
     return
   }
-  await docVersionRepo.deleteById(versionId)
+  await store.deleteById(versionId)
   res.status(200).json({ docVersionSeq: versionId })
 }
 
 // ── POST /:docId/versions/:versionId/restore — restore (admin) ────────────────
-versionsRouter.post('/:docId/versions/:versionId/restore', restoreVersionHandler)
+versionsRouter.post('/:docId/versions/:versionId/restore', documentAsync(restoreVersionHandler))
 
 export async function restoreVersionHandler(req: Request, res: Response): Promise<void> {
   const docId = req.params.docId!
@@ -365,16 +379,16 @@ export async function restoreVersionHandler(req: Request, res: Response): Promis
   const guard = await requireDocRole(req, res, docId, 'admin')
   if (!guard) return
   const kind = contentKindFromDocType(guard.meta.doc_type)
-  if (kind === 'ppt') {
-    // html_ppt restore goes through the PPT `ppt_version` path (§8), never the
-    // Yjs forward-reconcile here — reject before touching the live Yjs doc.
-    res.status(422).json({ error: 'unsupported_document_type' })
-    return
-  }
-
   const versionId = parseVersionId(req.params.versionId)
   if (versionId === null) {
     res.status(400).json({ error: 'invalid_version_id' })
+    return
+  }
+
+  if (kind === 'ppt') {
+    const result = await changePptVersion(pptPrincipalFromGuard(req, guard), 'restore',
+      validateVersionAction({ ...req.body, versionSeq: versionId }, true), req.header('Idempotency-Key') ?? '')
+    res.json({ restoredFrom: result.restoredVersionSeq, newDocVersionSeq: result.safetyVersionSeq })
     return
   }
 
@@ -404,3 +418,5 @@ export async function restoreVersionHandler(req: Request, res: Response): Promis
   }
   res.status(result.status).json({ error: result.error })
 }
+
+versionsRouter.use(documentErrorHandler)

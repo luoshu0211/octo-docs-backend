@@ -23,7 +23,7 @@
  * collab token carries.)
  */
 import jwt from 'jsonwebtoken'
-import { randomUUID } from 'node:crypto'
+import { createHmac, randomUUID } from 'node:crypto'
 import { config } from '../config/env.js'
 import { getRedis, rkey } from '../db/redis.js'
 import { parseDocumentName } from '../permission/documentName.js'
@@ -41,6 +41,8 @@ export const PPT_RELAY_TICKET_AUD = 'ppt-relay-ticket'
  * every mutating frame.
  */
 export interface PptCollabClaims {
+  actor?: string
+  clientSessionId?: string
   uid: string
   docId: string
   documentName: string
@@ -56,14 +58,17 @@ export interface PptCollabClaims {
    * caller's octo session token on the socket. Fail-closed: absent => false.
    */
   space_member?: boolean
-  /** Temporary hotfix proof: issuance verified the Human current Space equals the deck home Space. */
+  /** Whether the verified current Space is also the deck home Space. */
   home_space_verified?: boolean
+  current_space_verified?: boolean
   /** JWT expiry seconds since epoch, present on verified JWTs. */
   exp?: number
 }
 
 /** Enveloped `data` payload of a successful `collab-token` issuance (§7.1). */
 export interface PptCollabTokenResult {
+  actor?: string
+  clientSessionId?: string
   /** Short-lived relay token (JWT, `aud:'ppt-relay'`). */
   token: string
   /** Single-use handshake ticket (JWT, `aud:'ppt-relay-ticket'`). */
@@ -94,6 +99,7 @@ export interface PptCollabTokenResult {
 }
 
 export interface IssuePptCollabInput {
+  clientSessionId?: string
   uid: string
   docId: string
   documentName: string
@@ -104,8 +110,9 @@ export interface IssuePptCollabInput {
   name?: string
   /** Caller's space-membership at issuance (fold-in for share-derived re-resolve). */
   spaceMember?: boolean
-  /** Required proof produced only after the temporary Human home-Space gate succeeds. */
-  homeSpaceVerified: true
+  homeSpaceVerified: boolean
+  /** Required proof of the exact principal Space, including cross-Space grants. */
+  currentSpaceVerified: boolean
 }
 
 /**
@@ -115,8 +122,15 @@ export interface IssuePptCollabInput {
  * few seconds between issuance and connect).
  */
 export function issuePptCollabToken(input: IssuePptCollabInput): PptCollabTokenResult {
+  if (input.currentSpaceVerified !== true || !input.principalSpaceId) throw new Error('verified current-space proof required')
+  const binding = input.clientSessionId ? {
+    clientSessionId: input.clientSessionId,
+    actor: 'octo-' + createHmac('sha256', config.collabToken.secret)
+      .update(JSON.stringify(['ppt-actor-v1', input.docId, input.principalSpaceId, input.uid, input.clientSessionId])).digest('hex').slice(0, 48),
+  } : {}
   const name = typeof input.name === 'string' && input.name !== '' ? input.name : undefined
   const claims = {
+    ...binding,
     uid: input.uid,
     docId: input.docId,
     documentName: input.documentName,
@@ -126,6 +140,7 @@ export function issuePptCollabToken(input: IssuePptCollabInput): PptCollabTokenR
     ...(name !== undefined ? { name } : {}),
     ...(input.spaceMember !== undefined ? { space_member: input.spaceMember } : {}),
     home_space_verified: input.homeSpaceVerified,
+    current_space_verified: input.currentSpaceVerified,
   }
 
   const tokenTtl = config.collabToken.ttlSeconds
@@ -144,6 +159,7 @@ export function issuePptCollabToken(input: IssuePptCollabInput): PptCollabTokenR
 
   const now = Math.floor(Date.now() / 1000)
   const result: PptCollabTokenResult = {
+    ...binding,
     token,
     ticket,
     expiresAt: new Date((now + tokenTtl) * 1000).toISOString(),
@@ -175,6 +191,7 @@ function parseClaims(decoded: unknown): PptCollabClaims & { jti?: string } {
     jti,
     space_member: spaceMember,
     home_space_verified: homeSpaceVerified,
+    current_space_verified: currentSpaceVerified,
     exp,
   } = d
   if (
@@ -186,26 +203,26 @@ function parseClaims(decoded: unknown): PptCollabClaims & { jti?: string } {
   ) {
     throw new Error('invalid ppt collab token claims')
   }
-  let effectivePrincipalSpaceId = principalSpaceId
-  if (effectivePrincipalSpaceId === undefined) {
-    // Rollout compatibility for an already-issued same-Space PPT credential. PPT access is still
-    // home-Space-only, so the canonical signed documentName is the only safe value to recover.
-    // Never emit an empty principal Space: every live role recheck is Space-qualified.
-    try {
-      const parsed = parseDocumentName(documentName)
-      if (parsed.kind !== 'ppt') throw new Error('not a ppt document name')
-      effectivePrincipalSpaceId = parsed.space
-    } catch {
-      throw new Error('invalid ppt collab token claims')
-    }
+  // As with Docs, an old compatibility switch cannot substitute the home Space
+  // for the authenticated current principal. Both connect and reauth parse here.
+  if (currentSpaceVerified !== true || typeof principalSpaceId !== 'string' || !principalSpaceId) {
+    throw new Error('ppt credential missing verified current-space proof')
+  }
+  const parsed = parseDocumentName(documentName)
+  if (parsed.kind !== 'ppt' || parsed.doc !== docId ||
+      (spaceMember === true && parsed.space !== principalSpaceId)) {
+    throw new Error('invalid ppt collab token claims')
   }
   return {
     uid,
+    ...(typeof d.actor === 'string' && /^octo-[a-f0-9]{48}$/.test(d.actor) && typeof d.clientSessionId === 'string'
+      ? { actor: d.actor, clientSessionId: d.clientSessionId } : {}),
     docId,
     documentName,
     role,
     permission_epoch: epoch,
-    principal_space_id: effectivePrincipalSpaceId,
+    principal_space_id: principalSpaceId,
+    current_space_verified: true,
     ...(typeof name === 'string' && name !== '' ? { name } : {}),
     ...(typeof spaceMember === 'boolean' ? { space_member: spaceMember } : {}),
     ...(homeSpaceVerified === true ? { home_space_verified: true } : {}),
@@ -221,13 +238,6 @@ export function verifyPptRelayToken(token: string): PptCollabClaims {
     audience: PPT_RELAY_AUD,
   })
   const claims = parseClaims(decoded)
-  if (claims.home_space_verified !== true) {
-    if (!config.collabToken.allowLegacyWithoutHomeSpaceProof) {
-      throw new Error('ppt relay token missing verified home-space proof')
-    }
-    // eslint-disable-next-line no-console
-    console.warn('[octo-docs] legacy_home_space_token_accepted', { credentialKind: 'ppt_relay' })
-  }
   return claims
 }
 
@@ -244,13 +254,6 @@ export function verifyPptRelayTicket(ticket: string): PptCollabClaims & { jti: s
   const claims = parseClaims(decoded)
   if (typeof claims.jti !== 'string' || claims.jti === '') {
     throw new Error('ppt relay ticket missing jti')
-  }
-  if (claims.home_space_verified !== true) {
-    if (!config.collabToken.allowLegacyWithoutHomeSpaceProof) {
-      throw new Error('ppt relay ticket missing verified home-space proof')
-    }
-    // eslint-disable-next-line no-console
-    console.warn('[octo-docs] legacy_home_space_token_accepted', { credentialKind: 'ppt_ticket' })
   }
   return claims as PptCollabClaims & { jti: string }
 }

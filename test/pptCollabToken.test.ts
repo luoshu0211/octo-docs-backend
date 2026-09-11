@@ -31,11 +31,13 @@ interface FakeMeta {
 }
 let currentMeta: FakeMeta | null = null
 let currentMemberRole: 'reader' | 'commenter' | 'writer' | 'admin' | undefined
+const handoff = vi.hoisted(() => vi.fn(async () => undefined))
+vi.mock('../src/ppt/collabSession.js', () => ({ preparePptCollab: handoff }))
 
 vi.mock('../src/db/repos/docMetaRepo.js', () => ({
   DocOwnershipError: class DocOwnershipError extends Error {},
   docMetaRepo: {
-    getByDocId: vi.fn(async (docId: string) => (currentMeta && currentMeta.doc_id === docId ? currentMeta : null)),
+    getByDocId: vi.fn(async (docId: string) => (currentMeta && currentMeta.doc_id.toLowerCase() === docId.toLowerCase() ? currentMeta : null)),
     getByDocumentName: vi.fn(async (name: string) =>
       currentMeta && currentMeta.document_name === name ? currentMeta : null,
     ),
@@ -116,7 +118,7 @@ function post(base: string, body: unknown, opts: { token?: string; space?: strin
       token: opts.token ?? 'user-tok',
       'X-Space-Id': opts.space ?? 's_1',
     },
-    body: JSON.stringify(body),
+    body: JSON.stringify(body && typeof body === 'object' && !Array.isArray(body) ? {clientSessionId:'11111111-1111-4111-8111-111111111111',...body}:body),
   })
 }
 
@@ -153,6 +155,26 @@ beforeEach(() => {
 })
 
 describe('POST /api/v1/ppt/docs/collab-token (§7.1)', () => {
+  it('hands off writer drafts and signs a stable principal-qualified actor', async () => {
+    seedDoc(); currentMemberRole = 'writer'
+    const { base, close } = await listen(makeApp())
+    try {
+      const request = { docId: 'd_ppt1', clientSessionId: '11111111-1111-4111-8111-111111111111' }
+      const first = await (await post(base, request)).json()
+      const second = await (await post(base, request)).json()
+      expect(first.data.actor).toMatch(/^octo-[a-f0-9]{48}$/)
+      expect(second.data.actor).toBe(first.data.actor)
+      expect(second.data.ticket).not.toBe(first.data.ticket)
+      expect(verifyPptRelayTicket(first.data.ticket).actor).toBe(first.data.actor)
+      expect(handoff).toHaveBeenCalledWith('d_ppt1', 5)
+      const other = await (await post(base, { ...request, clientSessionId: '22222222-2222-4222-8222-222222222222' })).json()
+      expect(other.data.actor).not.toBe(first.data.actor)
+      currentMemberRole = 'reader'
+      expect((await post(base, request)).status).toBe(200)
+      expect((await post(base, { ...request, clientSessionId: 'spoof' })).status).toBe(400)
+      expect((await post(base, { ...request, clientSessionId: undefined })).status).toBe(400)
+    } finally { await close() }
+  })
   it('PPT-TOKEN-001: issues token/ticket with role/epoch/pptWsUrl/documentName/snapshotVersion/name', async () => {
     seedDoc()
     currentMemberRole = 'writer'
@@ -181,9 +203,10 @@ describe('POST /api/v1/ppt/docs/collab-token (§7.1)', () => {
       expect(tik.docId).toBe('d_ppt1')
       expect(tik.jti.length).toBeGreaterThan(0)
 
-      // Half A issues no server-minted actor and no per-actor `s` hint (that op-metadata
-      // trust boundary moved to Half B): the response carries neither field.
-      expect(d.actor).toBeUndefined()
+      // Both credentials bind the same server-minted actor to the session.
+      expect(d.actor).toEqual(expect.any(String))
+      expect(tok.actor).toBe(d.actor)
+      expect(tik.actor).toBe(d.actor)
       expect(d.nextS).toBeUndefined()
     } finally {
       await close()
@@ -226,7 +249,7 @@ describe('POST /api/v1/ppt/docs/collab-token (§7.1)', () => {
       const { base, close } = await listen(makeApp())
       try {
         const res = await post(base, { docId: 'd_ppt1' })
-        expect(res.status).toBe(404)
+        expect(res.status).toBe(403)
         expect(isSpaceMember).toHaveBeenCalledWith('u_writer', 's_1', 'user-tok')
       } finally {
         await close()
@@ -259,13 +282,15 @@ describe('POST /api/v1/ppt/docs/collab-token (§7.1)', () => {
       }
     })
 
-    it('cross-space doc → 404 NOT_FOUND (existence never leaks)', async () => {
-      seedDoc({ space_id: 's_other' })
+    it('cross-space direct writer gets the exact principal, without home-Space share eligibility', async () => {
+      seedDoc({ space_id: 's_other', document_name: 'octo:s_other:f_default:ppt:d_ppt1' })
       currentMemberRole = 'writer'
       const { base, close } = await listen(makeApp())
       try {
         const res = await post(base, { docId: 'd_ppt1' }, { space: 's_1' })
-        expect(res.status).toBe(404)
+        expect(res.status).toBe(200)
+        const body = await res.json()
+        expect(verifyPptRelayTicket(body.data.ticket)).toMatchObject({ principal_space_id: 's_1', space_member: false, current_space_verified: true })
       } finally {
         await close()
       }
@@ -337,4 +362,20 @@ describe('POST /api/v1/ppt/docs/collab-token (§7.1)', () => {
       }
     })
   })
+})
+
+// The metadata lookup mirrors MySQL's case-insensitive identity table; the
+// resulting room/actor claims must retain the stored spelling.
+it('uses the canonical ID for alias issuance and reconnect actors', async () => {
+  seedDoc(); currentMemberRole = 'writer'
+  const { base, close } = await listen(makeApp())
+  try {
+    const canonical = await (await post(base, { docId: 'd_ppt1' })).json()
+    const alias = await (await post(base, { docId: 'D_PPT1' })).json()
+    expect(alias.data.actor).toBe(canonical.data.actor)
+    expect(verifyPptRelayTicket(alias.data.ticket).docId).toBe('d_ppt1')
+    expect(verifyPptRelayToken(alias.data.token).docId).toBe('d_ppt1')
+    expect(alias.data.snapshotVersion).toBe(7)
+    expect(handoff).not.toHaveBeenCalledWith('D_PPT1', expect.anything())
+  } finally { await close() }
 })

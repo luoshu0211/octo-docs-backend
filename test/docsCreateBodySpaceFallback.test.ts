@@ -1,3 +1,5 @@
+vi.mock('../src/db/repos/docMemberRepo.js', () => ({ docMemberRepo: { upsertDirectTx: vi.fn(async () => {}) } }))
+vi.mock('../src/db/pool.js', () => ({ query: vi.fn(async () => []), transaction: vi.fn(async fn => fn({})) }))
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 
 // P3 close-out: the create handler must source the space *solely* from the
@@ -8,6 +10,8 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 // docsSpaceIsolation.test.ts / membersRoutes.test.ts).
 vi.mock('../src/db/repos/docMetaRepo.js', () => ({
   docMetaRepo: {
+    createTx: vi.fn(async (_tx, input) => docMetaRepo.create(input)),
+    getByDocIdTx: vi.fn(async (_tx, id) => docMetaRepo.getByDocId(id)),
     listForUser: vi.fn(async () => ({ total: 0, items: [] })),
     create: vi.fn(async () => {}),
     getByDocId: vi.fn(async () => ({ title: 'T', created_at: new Date(0) })),

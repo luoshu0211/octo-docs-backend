@@ -1,3 +1,4 @@
+import { isReplyRoot } from '../../comments/policy.js'
 /**
  * doc_comment repository (feature #3 — inline comments).
  *
@@ -18,6 +19,9 @@ export interface DocComment {
   parentId: number | null
   authorUid: string
   body: string
+  authorSpaceId?: string
+  revision?: number
+  anchor?: import('../../ppt/comments.js').PptCommentAnchor | null
   anchorStart: Buffer | null
   anchorEnd: Buffer | null
   anchorText: string
@@ -86,6 +90,7 @@ interface DocCommentMarkerRow {
 }
 
 export interface CreateCommentInput {
+  anchor?: import('../../ppt/comments.js').PptCommentAnchor
   docId: string
   documentName: string
   parentId: number | null
@@ -133,13 +138,13 @@ export const docCommentRepo = {
 
   async createReplyIfRoot(input: Omit<CreateCommentInput, 'anchorStart' | 'anchorEnd' | 'anchorText'>): Promise<number | null> {
     return transaction(async (tx) => {
-      const roots = await tx.query<{ id: number | string }>(
-        `SELECT id FROM doc_comment
+      const roots = await tx.query<{ id: number | string; parent_id: number | null; deleted: number }>(
+        `SELECT id, parent_id, deleted FROM doc_comment
           WHERE id = ? AND doc_id = ? AND parent_id IS NULL AND deleted = 0
           FOR UPDATE`,
         [input.parentId, input.docId],
       )
-      if (!roots[0]) return null
+      if (!isReplyRoot(roots[0] ? { parentId: roots[0].parent_id ?? null, deleted: !!roots[0].deleted } : null)) return null
       await tx.query(
         `INSERT INTO doc_comment
            (doc_id, document_name, parent_id, author_uid, body, anchor_start, anchor_end, anchor_text)

@@ -2071,7 +2071,8 @@ export function validateResourceLogicalId(key: unknown, label: string): string {
 }
 
 /** Clone a JSON-compatible plugin payload while rejecting values Yjs/JSON cannot
- * round-trip faithfully (undefined, functions, symbols, bigint, NaN/Infinity). */
+ * round-trip faithfully. Optional object properties with `undefined` are omitted,
+ * matching JSON.stringify; unsupported array entries and scalar values still fail. */
 function cloneResourceJson(value: unknown, label: string, depth = 0): unknown {
   if (depth > MAX_RESOURCE_DEPTH) {
     throw new SheetSnapshotInvalidError(`${label}: nested value is too deep`)
@@ -2092,6 +2093,7 @@ function cloneResourceJson(value: unknown, label: string, depth = 0): unknown {
     if (key === '__proto__' || key === 'prototype' || key === 'constructor') {
       throw new SheetSnapshotInvalidError(`${label}: reserved field '${key}' is not allowed`)
     }
+    if (entry === undefined) continue
     out[key] = cloneResourceJson(entry, `${label}.${key}`, depth + 1)
   }
   return out

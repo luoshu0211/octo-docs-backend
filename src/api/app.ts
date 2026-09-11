@@ -94,6 +94,7 @@ import { exportRouter } from './routes/export.js'
 import { boardExportRouter } from './routes/boardExport.js'
 import { importRouter } from './routes/import.js'
 import { createPptRouter, pptErrorHandler } from './ppt/envelope.js'
+import { createBotPptRouter } from './ppt/live.js'
 import { sanitizeUrlForLog } from './accessLog.js'
 
 /** Which audience's routes a given listener serves. See the module comment. */
@@ -330,6 +331,7 @@ export function createApp(
   // mount), mounted ahead of verifyBot so the authorizing bot routes are covered.
   botApi.use(createRateLimiter(opts.rateLimit))
   botApi.use(verifyBotMiddleware)
+  botApi.use(createBotPptRouter())
   botApi.use(botAcceptInviteRouter) // POST /v1/bot/docs/invites/:inviteToken/accept (docs #61)
   botApi.use(docsRouter)
   botApi.use(membersRouter)

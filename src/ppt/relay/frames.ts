@@ -88,6 +88,8 @@ export interface HelloFrame {
   pv: number
   /** Last room sequence the client already has; replay resumes after it. */
   since?: number
+  /** Opt in to server-authenticated online-user snapshots. */
+  presence?: boolean
 }
 export interface NeedFrame {
   t: 'need'
@@ -221,6 +223,12 @@ export interface PresenceBroadcastCtl {
   presence?: unknown
 }
 
+export interface OnlineUsersCtl {
+  ctl: 'peers'
+  users: Array<{ uid: string; name?: string }>
+  total: number
+}
+
 export type ServerFrame =
   | ReadyCtl
   | AckCtl
@@ -229,6 +237,7 @@ export type ServerFrame =
   | SnapshotReplayCtl
   | OpReplayCtl
   | PresenceBroadcastCtl
+  | OnlineUsersCtl
 
 /**
  * Parse + shape-validate a raw client frame. Returns the typed frame, or a
@@ -276,6 +285,9 @@ export function parseClientFrame(raw: unknown, expectedPv: number): FrameParseRe
   }
   switch (t as ClientFrameType) {
     case 'hello':
+      if (f.presence !== undefined && typeof f.presence !== 'boolean') {
+        return { ok: false, code: 'protocol-version', k, frameId, message: 'presence must be a boolean' }
+      }
       if (f.since !== undefined && !isSafeSeq(f.since)) {
         return { ok: false, code: 'protocol-version', k, frameId, message: 'since must be a non-negative integer' }
       }
@@ -355,8 +367,8 @@ export const ACTOR_ID_PATTERN = /^[a-z0-9-]{1,64}$/
  * cap alone was insufficient: a wire-legal value FAR below this ceiling but far ABOVE
  * the room's live clock still pins the Lamport clock (`lamport = max(lamport, op.l)`)
  * and invalidates every legitimate successor. The per-actor `s`-continuity gate and
- * the server-minted actor binding remain deferred to Half B (they depend on the client
- * sending `clientSessionId`). 2^45 (≈3.5e13) leaves an astronomically large runway for
+ * the server-minted actor binding are enforced by the production relay/store
+ * using the required `clientSessionId`. 2^45 (≈3.5e13) leaves an astronomically large runway for
  * the coarse bound while the relative bound does the real work.
  */
 export const MAX_OP_CLOCK = 2 ** 45
@@ -572,10 +584,8 @@ export function isBentoOp(op: unknown): boolean {
   // is the relay's RELATIVE room-clock check in `handleOps` (`> roomLamport +
   // OP_CLOCK_SLACK` refused), which prevents a wire-legal value above the room's live
   // clock from poisoning the Lamport clock (XIN-1821 P0-2/P0-3, server-only bound
-  // retained in Half A). The per-actor `s`-continuity gate that would stop a
-  // non-contiguous `s` from manufacturing an unfillable gap is DEFERRED to Half B (it
-  // needs the client-sent `clientSessionId`); Half A relies on the snapshot aged-op
-  // reclaim path for a stuck gap instead.
+  // retained in the server). Production DbPptRelayStore also enforces per-actor
+  // sequence continuity under the room counter lock, after dedup resolution.
   if (!isValidActorId(o.a) || !isBoundedOpClock(o.s) || !isBoundedOpClock(o.l)) return false
   switch (o.op) {
     case 'set':

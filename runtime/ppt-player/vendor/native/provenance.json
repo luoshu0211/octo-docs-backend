@@ -1,0 +1,14 @@
+{
+  "source": "https://github.com/nyblnet/bento",
+  "commit": "01000838496ec863ba1035eae12a8a4943020cdc",
+  "upstreamSha256": {
+    "code.ts": "c151e66a0db630c7f8d172bbc7bf685434557b30be1a9325567faf068bb99127",
+    "diff.ts": "031a99cdfe96c23b7dfac5f5657d9f64b9e91f9e8c394b28a728db56bef70785",
+    "tokenize.ts": "c9492366e8378aff98f29948c3982b435d7fe94909a35e488f3f2e0b4b9b9ab2"
+  },
+  "adaptations": [
+    "local import paths and type-only model shim",
+    "render wrapper normalizes legacy long language names",
+    "properties use native methods and existing host localization"
+  ]
+}

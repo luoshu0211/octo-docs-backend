@@ -98,7 +98,7 @@ beforeEach(() => {
 
 describe('rename -> search reindex signal (§3.3a)', () => {
   it('enqueues a doc-index signal keyed by documentName after a rename', async () => {
-    vi.mocked(requireDocRole).mockResolvedValue({ role: 'admin' } as never)
+    vi.mocked(requireDocRole).mockResolvedValue({ role: 'admin', meta: { doc_type: 'doc' } } as never)
     vi.mocked(docMetaRepo.resolveDocumentName).mockResolvedValue('octo:s1:f_default:d_1')
 
     const res = mockRes()
@@ -113,7 +113,7 @@ describe('rename -> search reindex signal (§3.3a)', () => {
 
   it('does NOT enqueue when search indexing is disabled', async () => {
     ;(config as unknown as { search: { indexEnabled: boolean } }).search.indexEnabled = false
-    vi.mocked(requireDocRole).mockResolvedValue({ role: 'admin' } as never)
+    vi.mocked(requireDocRole).mockResolvedValue({ role: 'admin', meta: { doc_type: 'doc' } } as never)
 
     const res = mockRes()
     await callRenameByDocId(req('d_1', 'New Title'), res)
@@ -124,7 +124,7 @@ describe('rename -> search reindex signal (§3.3a)', () => {
   })
 
   it('DOES enqueue for an html doc — body resolved from octo-docs-html S3 by the indexer', async () => {
-    vi.mocked(requireDocRole).mockResolvedValue({ role: 'admin' } as never)
+    vi.mocked(requireDocRole).mockResolvedValue({ role: 'admin', meta: { doc_type: 'html' } } as never)
     // 5-seg html key -> isSearchIndexedDoc now returns true; rename should enqueue.
     vi.mocked(docMetaRepo.resolveDocumentName).mockResolvedValue('octo:s1:f_default:html:d_1')
 

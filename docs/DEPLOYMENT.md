@@ -12,20 +12,83 @@ optionally a **third** for the internal service-to-service surface:
 | Listener | Default port | Purpose |
 | --- | --- | --- |
 | Hocuspocus collaborative WS | `1234` (`HOCUSPOCUS_PORT`) | real-time Yjs sync |
-| REST metadata API | `3000` (`HTTP_PORT`) | docs CRUD, collab-token, invites, attachments |
+| HTTP API and PPT WS | `3000` (`HTTP_PORT`) | docs CRUD, collab-token, invites, attachments, PPT relay upgrades |
 | Internal REST API (optional) | `9090` (`INTERNAL_HTTP_PORT`, **off** unless set) | in-network callers only: `/internal/html` (the html service's doc registration) |
 
-> **PPT relay topology for this round is single-replica.** The listeners are
-> colocated in one process (`src/index.ts`), and the Bento PPT collaboration relay
-> attached to the REST server on `/api/v1/ppt/collab` keeps a process-local room
-> registry (live sockets, replay state, per-room sequence and byte-budget state).
-> Do not run multiple REST/PPT-relay replicas for the same environment in this
-> round. Horizontal REST scaling can be revisited only after the relay has an
-> explicit shared transport or affinity design; until then, deploy exactly one
-> backend replica for PPT collaboration. The Hocuspocus nodes are stateful and
-> documentName-affinity routed. The optional internal listener below is a second
-> port of the *same* process, not a separate deployable — it does not change this
-> replica count.
+### PPT on the existing deployment
+
+PPT runs on the existing HTTP listener at `/api/v1/ppt/collab`. Keep the normal
+**two replicas and RollingUpdate**. No sticky sessions or single-node topology
+renderer is required. Existing Redis provides change notifications and expiring
+online-user entries; MySQL remains authoritative. Missed notifications recover
+through bounded periodic replay. Snapshot writes compare the reduction's base
+version under the database room lock before publishing or pruning.
+
+Reuse `MYSQL_*`, `REDIS_*`, `COLLAB_TOKEN_PUBLIC_WS_URL`, attachment storage,
+`OCTO_SERVER_BASE_URL`, and the existing Docs Bot mention token. The PPT public
+WebSocket URL derives from the trusted collaboration URL's origin with path
+`/api/v1/ppt/collab`. The web origin similarly defaults to its HTTP(S) origin.
+`PPT_RELAY_PUBLIC_WS_URL` and `OCTO_WEB_ORIGIN` are overrides only when the public
+origins differ. This derivation assumes the shared Web gateway routes
+`/docs-collab` to Hocuspocus `1234` and `/api/v1/ppt/collab` to Docs HTTP `3000`.
+For direct-port Hocuspocus deployments, **set `PPT_RELAY_PUBLIC_WS_URL` explicitly**
+to the browser-reachable Docs HTTP WebSocket endpoint: deriving a PPT path on
+Hocuspocus `1234` cannot reach the relay. For example, local direct-port URLs are
+`COLLAB_TOKEN_PUBLIC_WS_URL=ws://localhost:1234` and
+`PPT_RELAY_PUBLIC_WS_URL=ws://localhost:3000/api/v1/ppt/collab`.
+Set `OCTO_WEB_ORIGIN` to the actual Web origin when it differs from the shared
+collaboration origin. URL validation does not check gateway reachability.
+The relay defaults on; `PPT_RELAY_ENABLED=false` remains an
+optional operational rollback, not an activation prerequisite.
+
+Deployment sequence:
+
+1. Upgrade and verify every relevant PPT-aware OpenClaw plugin and CLI consumer.
+   Deploy the matching **Octo Server** with `OCTO_DOCS_BOT_MENTION_PPT_ENABLED`
+   unset or false. Wait until every old Server instance has been replaced before
+   deploying the Docs PPT producer: older shared-gate servers do not enforce this
+   switch, even when an environment value is set on them.
+2. Run the existing migration runner, including PPT actor watermarks, HTML
+   capacity and common version labels. Preserve every document and volume.
+3. Deploy the reviewed cluster-capable backend through the ordinary rolling
+   deployment. For the first activation, wait for every old backend pod to leave
+   before exposing PPT: older binaries do not participate in cluster events.
+4. Route `/api/v1/ppt/` to Docs HTTP port 3000 and enable WebSocket Upgrade on
+   `/api/v1/ppt/collab`. Route `/docs-collab` upgrades to Hocuspocus port 1234
+   for the Yjs protocol; PPT upgrades must not be sent to that listener.
+5. After consumer verification, enable `OCTO_DOCS_BOT_MENTION_PPT_ENABLED=true`
+   on **Octo Server** and roll all Server instances. Build and deploy Web with
+   **`VITE_DOCS_PPT_ENTRY=true`**. No separate SOURCE or CREATE
+   build switch is needed. Bot mentions use the existing server
+   `OCTO_DOCS_BOT_MENTION_ENABLED`, allowlists and shared token. PPT additionally
+   requires `OCTO_DOCS_BOT_MENTION_PPT_ENABLED=true` on **Octo Server**, not on the
+   Docs backend. This switch defaults off; missing or invalid values reject new
+   PPT tasks even when the shared allowlist contains `*`. Legacy/HTML mentions
+   and direct PPT create/edit/export remain
+   unaffected. Disabling it stops new PPT tasks, but does not cancel accepted ones;
+   accepted requests retain their existing idempotent replay behavior.
+6. Verify clients on different pods, REST Bot edits, restore, permission changes,
+   reconnect and node replacement. Disabling the entry alone is not a backend
+   security boundary; every API and socket still enforces its existing ACL.
+
+Rollback only to a compatible actor-watermark/cluster-aware binary. Before
+rolling back further, disable PPT writes and drain PPT connections on all pods;
+keep the migrated schema and stored data intact.
+
+The `ppt_version.html` field is LONGTEXT, with a 32 MiB UTF-8 rendered-version
+limit and 160 MiB export limit (including embedded media). Snapshot columns keep
+their existing independent limits. REST compaction and WS compaction share
+configuration and the structured aged-op-drop operational callback below.
+Creating a version also checks the connection's `@@max_allowed_packet`, counting both
+HTML and deck JSON with 64 KiB protocol headroom; smaller database limits return
+413 before a version or receipt is committed. MySQL 8's usual 64 MiB packet limit
+fits the application ceiling.
+
+Each document admits at most 4096 causal actors. Existing actors can reconnect
+at that limit; new sessions are refused without writes. Safe actor retirement
+requires a future protocol epoch and is not attempted by pruning. REST/Bot edits
+reuse one reserved server actor per document, replaying under a neutral actor
+before restoring its sequence, so repeated requests do not grow this count.
 
 ### Internal/public surface split (`INTERNAL_HTTP_PORT`)
 
@@ -192,8 +255,9 @@ Notes:
   HMAC-signed URLs with no external storage backend — fine for dev/staging.
   Production attachment delivery needs a real S3-compatible backend
   (MinIO or COS), selected with `ATTACHMENT_DRIVER=s3` (see §3.3).
-- Exposed ports: **WS `1234`** and **REST `3000`**. Publish both, or front them
-  with a gateway that routes WS upgrades to `1234` and REST to `3000`. If you
+- Exposed ports: **Hocuspocus WS `1234`** and **HTTP/PPT WS `3000`**. Publish both
+  with explicit public URLs, or use a gateway routing `/docs-collab` upgrades to
+  `1234` and REST plus `/api/v1/ppt/collab` upgrades to `3000`. If you
   enable `INTERNAL_HTTP_PORT`, that port is **in-network only** — do not publish
   it and do not proxy it (see §0).
 
@@ -212,7 +276,7 @@ vars (those without a fallback) **fail fast at boot** — that is intentional.
 | --- | --- | --- |
 | `HOSTNAME` | no (`octo-docs-local`) | node identity in logs/registry |
 | `HOCUSPOCUS_PORT` | no (`1234`) | WS listener |
-| `HTTP_PORT` | no (`3000`) | REST listener |
+| `HTTP_PORT` | no (`3000`) | REST listener and PPT WebSocket upgrade endpoint |
 | `INTERNAL_HTTP_PORT` | no (`0` = disabled) | Optional second REST listener serving **only** `/internal/html` (the html service's registration endpoint, whose sole caller is a sibling container); `HTTP_PORT` keeps serving every route that has an out-of-network caller — `/api/v1/docs`, `/api/v1/ppt`, the blob gateway, `/v1/bot/docs` and `/api/v1/card-actions/decide`. Each port 404s the other's routes. `0`/unset = one listener serves everything (unchanged behaviour). When set: `expose` it, never `ports:` it, never put it in nginx. Must be `0` or `1..65535` and must differ from both `HTTP_PORT` and `HOCUSPOCUS_PORT`, or boot fails; a bind failure on either listener exits the process. Reduces attack surface — it is **not** an auth boundary; the internal token check still runs. |
 | `INTERNAL_HTTP_HOST` | no (`0.0.0.0`) | Bind address for the internal listener. The default is correct on a compose/k8s bridge network, where an un-published port is only reachable from sibling containers. Set `127.0.0.1` when running with `network_mode: host`, on bare metal, or on macvlan — there `0.0.0.0` makes the internal port host-reachable and the isolation is gone. |
 | `TRUST_PROXY` | **recommended behind a proxy** (`1`) | Express `trust proxy` value. The REST API sits behind nginx, so this must be set for `req.ip` — and the per-IP rate limiter — to resolve the real client from `X-Forwarded-For` instead of the proxy address. `1` = one nginx hop; use the hop count for deeper chains, a preset/CIDR like `loopback`, or `false` when exposed directly. Do **not** use `true` in prod (permissive: clients can spoof `X-Forwarded-For`). |
@@ -225,9 +289,9 @@ vars (those without a fallback) **fail fast at boot** — that is intentional.
 | `COLLAB_TOKEN_SECRET` | **yes in prod** | signing secret for the short-lived collab JWT. Use an asymmetric key / KMS-managed secret; the HS256 default `dev-only-change-me` is dev only. |
 | `COLLAB_TOKEN_TTL_SECONDS` | no (`300`) | collab JWT TTL (5 min) |
 | `COLLAB_ALLOW_LEGACY_TOKENS_WITHOUT_HOME_SPACE_PROOF` | no (`false`) | Temporary compatibility for still-unexpired collab/PPT credentials that lack `home_space_verified`. It does **not** bypass the independent `current_space_verified` + `current_space_id` requirement for Docs Hocuspocus tokens. Never use this flag to bridge the current-Space rollout, and never leave it enabled after its Home-Space/PPT drain window. Accepts only `true`/`false`/`1`/`0`; invalid values fail startup. |
-| `COLLAB_TOKEN_PUBLIC_WS_URL` | **yes in prod** | public, browser-reachable collab WS origin returned to clients as `collabWsUrl` (§4.4). Absolute `ws://`/`wss://` only — the Hocuspocus WS server runs on its own `:1234` origin and is **not** reverse-proxied, so a relative path never reaches it. **Fail-fast prod gate:** if `NODE_ENV=production` and this is unset or malformed the process **refuses to start** (clients no longer carry a build-time WS fallback). Optional in local dev only. |
-| `PPT_RELAY_ENABLED` | no (`false`) | **Master on/off switch for the PPT collab relay. Default OFF.** When false the relay is NOT attached to the REST server and the collab-token issuance route is NOT mounted, so `/api/v1/ppt/collab` is entirely absent. The relay currently ships as **Half A** (durable transport + snapshotting + the server-only room-relative clock bound); the op-metadata trust boundary that ties an op's actor to the authenticated uid and enforces per-actor sequence continuity is **deferred to Half B** (paired with the R4-F1 client). While that boundary is absent, an authenticated writer could submit ops under an arbitrary `a`/`s` (actor impersonation) — so **leave this OFF in production until Half B lands.** Accepts `true`/`false`/`1`/`0` only; any other value fails startup. See "PPT relay op-metadata trust model" below. |
-| `PPT_RELAY_PUBLIC_WS_URL` | **yes in prod _when the relay is enabled_** | public, browser-reachable origin of the Bento PPT collab relay, returned to clients as `pptWsUrl` in the collab-token response (§7.1). Absolute `ws://`/`wss://` only. The relay is hosted **inside the REST server** on the `/api/v1/ppt/collab` upgrade path (unlike the Hocuspocus WS server), so this normally points at the REST origin. **Fail-fast prod gate — gated behind `PPT_RELAY_ENABLED`:** when the relay is enabled and `NODE_ENV=production`, an unset or malformed value makes the process **refuse to start**. When the relay is **off** (the default) its validation is **skipped entirely** — the value is neither required nor consulted, so a disabled relay never fails startup on this knob (XIN-1825). Optional in local dev. Only consulted when `PPT_RELAY_ENABLED=true`. |
+| `COLLAB_TOKEN_PUBLIC_WS_URL` | **yes in prod** | Public, browser-reachable collab URL returned as `collabWsUrl` (§4.4), e.g. `wss://web.example.com/docs-collab`. Absolute `ws://`/`wss://` only. The shared Web gateway routes `/docs-collab` to Hocuspocus `1234` and `/api/v1/ppt/collab` to Docs HTTP `3000`. A direct-port, non-proxied Hocuspocus deployment **must also set `PPT_RELAY_PUBLIC_WS_URL`** to the public Docs HTTP WebSocket endpoint; the derived PPT URL on Hocuspocus is unroutable. **Fail-fast prod gate:** unset or malformed values refuse startup in production; this validates URL shape, not network routing. Optional in local dev only. |
+| `PPT_RELAY_ENABLED` | no (`true`) | Optional emergency rollback. False unmounts WS and token routes; normal deployment needs no value. |
+| `PPT_RELAY_PUBLIC_WS_URL` | no with shared gateway; **required for direct-port/separate-origin PPT** | Browser-reachable PPT WebSocket endpoint on Docs HTTP `3000`, usually through the shared gateway. Defaults to the origin of `COLLAB_TOKEN_PUBLIC_WS_URL` plus `/api/v1/ppt/collab`; override it when that origin does not route PPT upgrades to the HTTP listener. |
 | `PPT_RELAY_SYNC_PV` | no (`2`) | Bento CRDT sync protocol version the relay speaks; a frame whose `pv` differs is refused `protocol-version` before any decode. Keep in step with `ppt_doc_state.bento_sync_pv`. |
 | `PPT_RELAY_TICKET_TTL_SECONDS` | no (`30`) | one-time WS handshake ticket TTL. Short by design; the ticket is single-use across relay nodes (Redis-backed store), so a leaked/replayed ticket is useless quickly. |
 | `PPT_RELAY_MAX_FRAME_BYTES` / `PPT_RELAY_MAX_OPS_PER_FRAME` | no (`1900000` / `512`) | per-op-frame wire-byte cap and op-count cap (both `too-large`, permanent). |
@@ -455,8 +519,8 @@ Apply the full schema once. `migrations/schema.sql` holds the complete
 mysql -u <user> -p <database> < migrations/schema.sql
 ```
 
-`schema.sql` is a **fresh-install-only** script. Its ten `CREATE TABLE`
-statements are bare — none use `IF NOT EXISTS` — so **re-running it against a
+`schema.sql` is a **fresh-install-only** script. It includes bare `CREATE TABLE`
+statements (starting with `doc_meta`), so **re-running it against a
 database that already holds these tables fails immediately**: MySQL aborts on
 the very first `CREATE TABLE` with error **1050 (`Table '...' already exists`)**.
 It does not gracefully skip the tables that are already there. On an existing
@@ -518,7 +582,7 @@ services:
     image: octo-docs-backend:cos-0ce1333
     env_file: ./octo-docs-backend.env
     ports:
-      - "3000:3000"   # REST (public surface, behind nginx)
+      - "3000:3000"   # REST and PPT WS (public surface, behind nginx)
       - "1234:1234"   # Hocuspocus WS
     # Internal s2s surface (only when INTERNAL_HTTP_PORT=9090 is in the env file).
     # `expose` publishes NOTHING to the host: it is reachable only from sibling
@@ -639,14 +703,15 @@ from your log pipeline. Example line:
 [ppt-relay] aged-op drop (data-integrity divergence risk; alert + reconcile) {"event":"ppt_relay_aged_op_drop","docId":"…","targetSeq":42,"bufferedLag":5000,"lagCap":4096,"droppedCount":1,"dropped":[{"a":"…","s":7}]}
 ```
 
-### 6.2 PPT relay — op-metadata trust model (Half A / Half B split, XIN-1821)
+### 6.2 PPT relay — actor-bound op-metadata trust model
 
-The PPT collab relay currently ships as **Half A**: durable transport, the dedup ledger,
-seq counter, replay, backpressure, room byte limits, the server-side snapshotter, the
-materialization proof, and the aged-op escalation above. **The relay is disabled by
-default (`PPT_RELAY_ENABLED=false`) and must stay off in production until Half B lands.**
+The production relay uses server-minted actors bound to the authenticated
+principal and required `clientSessionId` (a UUID v4 generated by the matching
+client). The token endpoint rejects missing/invalid session IDs; production
+WS rejects unbound tickets. The relay is enabled by default;
+`PPT_RELAY_ENABLED=false` is the emergency rollback.
 
-What Half A **does** enforce on op metadata (no client half required):
+Production enforcement:
 
 - **Wire shape / charset.** Each op's actor `a` is charset-restricted (`[a-z0-9-]{1,64}`)
   and the reserved reducer namespace (`@…`) is refused, and node ids / `set` keys naming ANY
@@ -665,19 +730,14 @@ What Half A **does** enforce on op metadata (no client half required):
   has outgrown the column and needs a schema/segmentation change — it is a hard capacity
   limit, surfaced to the client as a permanent `room-full`.
 
-What Half A **does NOT** enforce (deferred to **Half B**, paired with the R4-F1 client):
-
-- **Actor↔uid binding.** An op's `a` is NOT tied to the authenticated uid, so an
-  authenticated writer could author under another collaborator's actor (impersonation /
-  co-editor censorship). This needs the client to send a `clientSessionId` so the server can
-  mint and bind the actor.
-- **Per-actor `s` continuity.** A non-contiguous per-actor sequence is not refused at the
-  boundary (it can still park a buffered op that the aged-op path in §6.1 eventually drops).
-
-Because those two gates are absent, **the relay must not be exposed in production yet.**
-`PPT_RELAY_ENABLED=false` keeps `/api/v1/ppt/collab` unmounted and the collab-token route
-absent, so no ticket is issued and the endpoint cannot be reached. Turn it on only once
-Half B binds the actor to the authenticated identity.
+- **Actor identity.** Every op actor must match the session's signed actor.
+- **Per-actor continuity.** `DbPptRelayStore(true)` validates contiguous `s`
+  inside the append transaction. Durable `ppt_collab_actor_seq` rows survive
+  pruning/restart; existing sessions are seeded from snapshot/tail once.
+  Deduplicated frames are resolved before advancing the counter.
+- **Title consistency.** A title frame applies LWW before updating metadata and
+  shares the 512-character create/edit contract. Ordinary frames do not replay
+  the entire tail just to check their sequence.
 
 ### 6.3 PPT relay — quarantined frame is a manual-intervention event (XIN-1835 P0-1 / XIN-1840)
 
@@ -731,3 +791,41 @@ env block (§3.1). Two things must be reversible: the **image** and the **env**.
 
 After any rollback, re-run the §6 health checks before declaring the service
 recovered.
+
+
+### PPT canonical document identity
+
+PPT REST source/draft/live/comment/version/media operations and relay tickets
+use the stored `doc_meta.doc_id`, never a request spelling, as their room and
+persistence key. A case-insensitive metadata lookup may locate an alias, but
+all later calls use the canonical ID. Old credentials that disagree with their
+canonical document name or current metadata are refused at connect/reauth;
+clients must request a fresh ticket. Stop old relay writers before rollout.
+
+Before rollout, audit previous case-variant rows without changing them:
+
+```sql
+SELECT v.doc_id, m.doc_id AS canonical_id
+FROM ppt_version v JOIN doc_meta m ON v.doc_id COLLATE utf8mb4_0900_ai_ci = m.doc_id
+WHERE BINARY v.doc_id <> BINARY m.doc_id;
+```
+
+Repeat for `ppt_comment` and `ppt_collab_actor_seq`. If any rows exist, preserve
+a database backup and investigate version/pointer/actor collisions before a
+repair; never blindly lowercase or merge causal watermarks. Application
+normalization prevents new forks but does not rewrite historical corrupt rows.
+
+
+### PPT persistence failures and actor capacity
+
+Alert on `ppt_relay_persistence_failed`. The structured `reason` distinguishes
+`actor-capacity`, `actor-sequence`, `invalid-title` and other `storage` failures;
+raw SQL parameters and slide content are not logged. Clients still receive the
+existing permanent refusal and must retain their local pending edits.
+
+Causal actor admission remains bounded at 4096; existing actors may reconnect.
+Never delete actor watermarks or reset the version vector to recover capacity:
+that can replay old writes or lose edits. Capture a backup, stop edit traffic,
+export/read the current authoritative deck, then create a new PPT through the
+normal API and reapply explicitly reviewed permissions. Preserve the original
+for history; this is an operator-assisted migration, not automatic retirement.

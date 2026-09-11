@@ -23,7 +23,7 @@ import {
 const SIZE_16_9 = { width: 1280, height: 720 } as const
 
 const FONT_STACK =
-  "'Inter', 'Helvetica Neue', 'PingFang SC', 'Microsoft YaHei', Arial, sans-serif"
+  "'PingFang SC', 'Inter', -apple-system, BlinkMacSystemFont, 'Noto Sans SC', sans-serif"
 
 /** A caller-facing template card (id + display name + scenario blurb). */
 export interface PptTemplateSummary {
@@ -40,7 +40,13 @@ export interface PptTemplateSummary {
 const TEMPLATE_COLLAB = { room: 'template-room-placeholder', key: 'template-key-placeholder', on: false }
 
 function text(id: string, value: string, extra: Record<string, unknown> = {}): Record<string, unknown> {
-  return { id, type: 'text', text: value, ...extra }
+  const heading = id === 'e_title'
+  return {
+    id, type: 'text', x: 100, y: heading ? 160 : 330, w: 1080, h: heading ? 130 : 220,
+    rotation: 0, opacity: 1, html: `<p>${value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</p>`,
+    fontSize: heading ? 56 : 32, fontFamily: FONT_STACK, fontWeight: heading ? 700 : 400,
+    color: '#1E2A3A', align: 'center', valign: 'middle', lineHeight: 1.25, ...extra,
+  }
 }
 
 /**

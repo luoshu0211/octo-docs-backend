@@ -1,7 +1,7 @@
 // Env seeding MUST be first so config/env.ts reads it at load time.
 import './helpers/pptRelayEnv.js'
 
-import { beforeEach, describe, it, expect, vi } from 'vitest'
+import { beforeEach, describe, it, expect } from 'vitest'
 import {
   issuePptCollabToken,
   verifyPptRelayToken,
@@ -30,7 +30,7 @@ describe('PPT collab token + one-time ticket (§7.1)', () => {
     permission_epoch: 3,
     principalSpaceId: 's_1',
     snapshotVersion: 7,
-    homeSpaceVerified: true,
+    homeSpaceVerified: true, currentSpaceVerified: true,
     name: 'Ada',
   }
 
@@ -70,66 +70,25 @@ describe('PPT collab token + one-time ticket (§7.1)', () => {
     expect((jwt.decode(r.ticket) as { aud?: string }).aud).toBe(PPT_RELAY_TICKET_AUD)
   })
 
-  it('rejects pre-hotfix relay credentials without verified home-Space proof', () => {
-    const legacyClaims = {
-      uid: 'u_legacy',
-      docId: 'd_ppt1',
-      documentName: base.documentName,
-      role: 'writer',
-      permission_epoch: 3,
+  it.each([false, true])('rejects old credentials even with legacy switch %s', (compat) => {
+    config.collabToken.allowLegacyWithoutHomeSpaceProof = compat
+    for (const proof of [{}, { home_space_verified: true }, { current_space_verified: true }]) {
+      const claims = { uid: 'u_old', docId: 'd_ppt1', documentName: base.documentName, role: 'writer',
+        permission_epoch: 3, ...proof }
+      const token = jwt.sign(claims, config.collabToken.secret, { audience: PPT_RELAY_AUD, expiresIn: 60 })
+      const ticket = jwt.sign({ ...claims, jti: 'old' }, config.collabToken.secret, { audience: PPT_RELAY_TICKET_AUD, expiresIn: 60 })
+      expect(() => verifyPptRelayToken(token)).toThrow(/current-space proof/)
+      expect(() => verifyPptRelayTicket(ticket)).toThrow(/current-space proof/)
     }
-    const legacyToken = jwt.sign(legacyClaims, config.collabToken.secret, {
-      algorithm: 'HS256', audience: PPT_RELAY_AUD, expiresIn: 60,
-    })
-    const legacyTicket = jwt.sign({ ...legacyClaims, jti: 'legacy-jti' }, config.collabToken.secret, {
-      algorithm: 'HS256', audience: PPT_RELAY_TICKET_AUD, expiresIn: 60,
-    })
-    expect(() => verifyPptRelayToken(legacyToken)).toThrow(/home-space proof/)
-    expect(() => verifyPptRelayTicket(legacyTicket)).toThrow(/home-space proof/)
-
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
-    config.collabToken.allowLegacyWithoutHomeSpaceProof = true
-    expect(verifyPptRelayToken(legacyToken).uid).toBe('u_legacy')
-    expect(verifyPptRelayTicket(legacyTicket).jti).toBe('legacy-jti')
-    expect(warn).toHaveBeenCalledWith(
-      '[octo-docs] legacy_home_space_token_accepted',
-      { credentialKind: 'ppt_relay' },
-    )
-    expect(warn).toHaveBeenCalledWith(
-      '[octo-docs] legacy_home_space_token_accepted',
-      { credentialKind: 'ppt_ticket' },
-    )
-    expect(JSON.stringify(warn.mock.calls)).not.toContain('u_legacy')
-    warn.mockRestore()
   })
 
-  it('recovers same-Space principal context for rollout credentials that predate the claim', () => {
-    const legacyClaims = {
-      uid: 'u_legacy',
-      docId: 'd_ppt1',
-      documentName: base.documentName,
-      role: 'writer',
-      permission_epoch: 3,
-      home_space_verified: true,
+  it('accepts cross-Space credentials without granting home-Space sharing', () => {
+    const result = issuePptCollabToken({ ...base, principalSpaceId: 's_other', homeSpaceVerified: false, spaceMember: false })
+    for (const claims of [verifyPptRelayToken(result.token), verifyPptRelayTicket(result.ticket)]) {
+      expect(claims).toMatchObject({ principal_space_id: 's_other', current_space_verified: true, space_member: false })
     }
-    const token = jwt.sign(legacyClaims, config.collabToken.secret, {
-      algorithm: 'HS256', audience: PPT_RELAY_AUD, expiresIn: 60,
-    })
-    expect(verifyPptRelayToken(token).principal_space_id).toBe('s_1')
-  })
-
-  it('rejects a rollout credential without a principal claim when documentName is not canonical PPT addressing', () => {
-    const malformed = jwt.sign({
-      uid: 'u_legacy',
-      docId: 'd_ppt1',
-      documentName: 'octo:s_1:f_default:d_ppt1',
-      role: 'writer',
-      permission_epoch: 3,
-      home_space_verified: true,
-    }, config.collabToken.secret, {
-      algorithm: 'HS256', audience: PPT_RELAY_AUD, expiresIn: 60,
-    })
-    expect(() => verifyPptRelayToken(malformed)).toThrow(/invalid ppt collab token claims/)
+    const invalid = issuePptCollabToken({ ...base, principalSpaceId: 's_other', spaceMember: true })
+    expect(() => verifyPptRelayTicket(invalid.ticket)).toThrow(/invalid ppt collab token claims/)
   })
 
   it('cross-audience replay is rejected: a relay token is not a valid ticket (and vice versa)', () => {
