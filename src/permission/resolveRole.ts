@@ -14,6 +14,7 @@ import { docMetaRepo, type DocMeta } from '../db/repos/docMetaRepo.js'
 import { docMemberRepo } from '../db/repos/docMemberRepo.js'
 import { parseDocumentName } from './documentName.js'
 import { effectiveRole } from './shareScope.js'
+import { mergeDriveDerivedReader } from '../drive/derivedAccessClient.js'
 import type { ResolvedRole } from './role.js'
 
 export async function resolveRole(uid: string, docId: string, principalSpaceId: string): Promise<ResolvedRole> {
@@ -82,5 +83,11 @@ export async function recheckCurrentRole(
   const direct = uid === meta.owner_id && principalSpaceId === meta.owner_space_id ? 'admin' : ((await docMemberRepo.getRole(meta.doc_id, uid, principalSpaceId)) ?? 'none')
   // #64: max(directRole, share-derived). restricted docs (default) yield
   // shareDerived='none', so this is byte-identical to the pre-feature result.
-  return effectiveRole(direct, spaceMember, meta.share_scope, meta.share_role)
+  const base = effectiveRole(direct, spaceMember, meta.share_scope, meta.share_role)
+  // Source 3 (TES-137): fold in the drive-library-derived reader with the SAME
+  // merge the collab-token issuance and open-context paths use, so a caller who
+  // only reaches the doc via a drive library gets the identical role on this
+  // live-socket recheck as at issuance — the WS stays open for a derived viewer
+  // instead of being torn down on the first stale-token frame.
+  return mergeDriveDerivedReader(base, meta.doc_id, uid, principalSpaceId)
 }

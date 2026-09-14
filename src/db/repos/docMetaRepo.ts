@@ -131,6 +131,48 @@ export interface CanonicalHtmlInput extends CreateDocInput {
 const VALID_STORED_ROLES_SQL = STORED_ROLE_VALUES.join(', ')
 const validMemberRole = `dm.role IN (${VALID_STORED_ROLES_SQL})`
 
+/** One row of the `manageable` list (docs the caller directly owns/admins). */
+export interface ManageableDocItem {
+  doc_id: string
+  title: string
+  doc_type: string
+  owner_id: string
+  space_id: string
+  octo_doc_slug: string | null
+  updated_at: Date
+}
+
+/**
+ * Opaque keyset cursor for listManageable: the (updated_at, doc_id) of the last
+ * seen row. Same base64url(JSON) shape docViewHistoryRepo uses; only the server
+ * reads it. decode throws 'invalid_cursor' on a malformed value so the route can
+ * answer 400 rather than silently restarting from the first page.
+ */
+export function encodeManageableCursor(updatedAt: string, docId: string): string {
+  return Buffer.from(JSON.stringify({ u: updatedAt, d: docId }), 'utf8').toString('base64url')
+}
+
+export function decodeManageableCursor(raw: string | undefined): { updatedAt: string; docId: string } | null {
+  if (raw === undefined || raw === '') return null
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(Buffer.from(raw, 'base64url').toString('utf8'))
+  } catch {
+    throw new Error('invalid_cursor')
+  }
+  if (
+    !parsed ||
+    typeof parsed !== 'object' ||
+    typeof (parsed as { u?: unknown }).u !== 'string' ||
+    typeof (parsed as { d?: unknown }).d !== 'string'
+  ) {
+    throw new Error('invalid_cursor')
+  }
+  const { u, d } = parsed as { u: string; d: string }
+  if (Number.isNaN(new Date(u).getTime())) throw new Error('invalid_cursor')
+  return { updatedAt: u, docId: d }
+}
+
 export const docMetaRepo = {
   async create(input: CreateDocInput): Promise<void> {
     await query(
@@ -583,6 +625,73 @@ export const docMetaRepo = {
       [...roleOwnerArgs, ...args],
     )
     return { total, items }
+  },
+
+  /**
+   * Keyset list of docs the caller DIRECTLY administers — owner (uid + owner
+   * Space match) OR a doc_member `admin` row — in the caller's current Space
+   * (TES-131 drive picker). Deliberately DIRECT admin only: no share-derived and
+   * no drive-derived grant, so the picker shows exactly the docs the caller can
+   * hand to a drive library, mirroring the internal role endpoint's direct-role
+   * contract (see internalDocRole.ts) and avoiding any recursion into the drive
+   * derived-access lookup.
+   *
+   * Keyset (not offset) paginated on (updated_at, doc_id) DESC so a large, slowly
+   * changing library pages stably. `cursor` is the opaque token from the previous
+   * page's `nextCursor`; a malformed token throws 'invalid_cursor' (decoded here)
+   * so the route answers 400 rather than silently restarting. `nextCursor` is
+   * null on the last page.
+   */
+  async listManageable(params: {
+    uid: string
+    spaceId: string
+    principalSpaceId: string
+    pageSize: number
+    cursor?: string
+  }): Promise<{ items: ManageableDocItem[]; nextCursor: string | null }> {
+    // pageSize is inlined into LIMIT (mysql2 .execute rejects a bound ? in LIMIT,
+    // errno 1210), so clamp to a provable positive integer 1..100 first.
+    const pageSize = Math.min(100, Math.max(1, Number.isInteger(params.pageSize) ? params.pageSize : 20))
+    const cursor = decodeManageableCursor(params.cursor)
+
+    // owner OR direct admin(3) row, always scoped to the caller's Space. Bind
+    // order: JOIN dm.uid, dm.principal_space_id; then space_id; then owner_id,
+    // owner_space_id; then the optional cursor tuple.
+    const args: unknown[] = [
+      params.uid,
+      params.principalSpaceId,
+      params.spaceId,
+      params.uid,
+      params.principalSpaceId,
+    ]
+    let cursorSql = ''
+    if (cursor) {
+      // Bind the timestamp as a Date so mysql2 serializes it to the column's
+      // DATETIME format (a raw ISO string with 'T'/'Z' would not compare cleanly).
+      cursorSql = 'AND (m.updated_at < ? OR (m.updated_at = ? AND m.doc_id < ?))'
+      const at = new Date(cursor.updatedAt)
+      args.push(at, at, cursor.docId)
+    }
+    const rows = await query<ManageableDocItem>(
+      `SELECT m.doc_id, m.title, m.doc_type, m.owner_id, m.space_id, m.octo_doc_slug, m.updated_at
+       FROM doc_meta m
+       LEFT JOIN doc_member dm ON dm.doc_id = m.doc_id AND dm.uid = ? AND dm.principal_space_id = ?
+       WHERE m.status = 1 AND m.space_id = ?
+         AND ((m.owner_id = ? AND m.owner_space_id = ?) OR dm.role = ${ROLE_ADMIN})
+         ${cursorSql}
+       ORDER BY m.updated_at DESC, m.doc_id DESC
+       LIMIT ${pageSize + 1}`,
+      args,
+    )
+    // Over-fetch by one: an (n+1)th row means there is a next page. Trim to
+    // pageSize and build the cursor from the LAST kept row.
+    const hasMore = rows.length > pageSize
+    const items = hasMore ? rows.slice(0, pageSize) : rows
+    const last = items[items.length - 1]
+    const nextCursor = hasMore && last
+      ? encodeManageableCursor(new Date(last.updated_at).toISOString(), last.doc_id)
+      : null
+    return { items, nextCursor }
   },
 
   /**
