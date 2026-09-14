@@ -13,6 +13,10 @@
  *                                   If-Match(SV) optimistic-concurrency guard
  *   POST  /:docId/sheet/replace writer — server-side atomic replace-all under
  *                                        the same If-Match + writer gates
+ *   POST  /:docId/sheet/rows/insert writer — structural row insertion
+ *   POST  /:docId/sheet/rows/delete writer — structural row deletion
+ *   POST  /:docId/sheet/columns/insert writer — structural column insertion
+ *   POST  /:docId/sheet/columns/delete writer — structural column deletion
  *
  * The routes are mounted on BOTH the human /api/v1/docs chain and the bot
  * /v1/bot/docs chain (see app.ts), so each reads req.uid / req.spaceId from
@@ -41,6 +45,8 @@ import {
 } from '../../collab/versionRestore.js'
 import {
   SheetDataValidationInspectionBudgetError,
+  SHEET_MAX_COLUMNS,
+  SHEET_MAX_ROWS,
   SheetSnapshotInvalidError,
   type SheetCell,
   type StoredDrawing,
@@ -53,6 +59,7 @@ import {
   validateResourceLogicalId,
   validateSheetRange,
 } from '../../agent/sheetConversion.js'
+import type { SheetStructuralEdit } from '../../agent/sheetStructuralEdit.js'
 import {
   decodeSheetCursor,
   encodeSheetCursor,
@@ -698,6 +705,35 @@ interface SheetReplaceBody {
   range?: ReturnType<typeof validateSheetRange>
 }
 
+function parseSheetStructuralEditBody(
+  value: unknown,
+  kind: SheetStructuralEdit['kind'],
+): SheetStructuralEdit | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const body = value as Record<string, unknown>
+  const anchorField = kind === 'rows.insert' ? 'afterRow'
+    : kind === 'rows.delete' ? 'startRow'
+      : kind === 'columns.insert' ? 'afterColumn'
+        : 'startColumn'
+  const anchor = body[anchorField]
+  // A worksheet always retains at least one row and one column, so neither an
+  // insertion nor a deletion can ever validly use the full axis maximum.
+  const limit = kind.startsWith('rows.') ? SHEET_MAX_ROWS - 1 : SHEET_MAX_COLUMNS - 1
+  if (!Number.isInteger(anchor) || (anchor as number) < 0) return null
+  if (!Number.isInteger(body.count) || (body.count as number) < 1 || (body.count as number) > limit) return null
+  try {
+    return {
+      kind,
+      logicalId: validateResourceLogicalId(body.logicalId, 'structural edit logicalId'),
+      [anchorField]: anchor as number,
+      count: body.count as number,
+    } as SheetStructuralEdit
+  } catch (err) {
+    if (err instanceof SheetSnapshotInvalidError) return null
+    throw err
+  }
+}
+
 function parseSheetReplaceBody(value: unknown): SheetReplaceBody | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null
   const body = value as Record<string, unknown>
@@ -788,6 +824,92 @@ export async function replaceDocSheetHandler(req: Request, res: Response): Promi
       res.status(409).json({ error: 'sheet_snapshot_invalid' })
       return
     }
+    res.status(500).json({ error: 'internal_error' })
+  }
+}
+
+// ── Structural row/column edits ───────────────────────────────────────────────
+docSheetRouter.post('/:docId/sheet/rows/insert', insertDocSheetRowsHandler)
+docSheetRouter.post('/:docId/sheet/rows/delete', deleteDocSheetRowsHandler)
+docSheetRouter.post('/:docId/sheet/columns/insert', insertDocSheetColumnsHandler)
+docSheetRouter.post('/:docId/sheet/columns/delete', deleteDocSheetColumnsHandler)
+
+export async function insertDocSheetRowsHandler(req: Request, res: Response): Promise<void> {
+  await structuralEditDocSheetHandler(req, res, 'rows.insert')
+}
+
+export async function deleteDocSheetRowsHandler(req: Request, res: Response): Promise<void> {
+  await structuralEditDocSheetHandler(req, res, 'rows.delete')
+}
+
+export async function insertDocSheetColumnsHandler(req: Request, res: Response): Promise<void> {
+  await structuralEditDocSheetHandler(req, res, 'columns.insert')
+}
+
+export async function deleteDocSheetColumnsHandler(req: Request, res: Response): Promise<void> {
+  await structuralEditDocSheetHandler(req, res, 'columns.delete')
+}
+
+async function structuralEditDocSheetHandler(
+  req: Request,
+  res: Response,
+  kind: SheetStructuralEdit['kind'],
+): Promise<void> {
+  const guard = await requireDocRole(req, res, req.params.docId!, 'writer')
+  if (!guard) return
+  if (!requireSheetDocType(res, guard.meta.doc_type)) return
+
+  const baseVersionRaw = readBaseVersion(req)
+  const edit = parseSheetStructuralEditBody(req.body, kind)
+  if (baseVersionRaw === null || edit === null) {
+    res.status(400).json({ error: 'invalid_body' })
+    return
+  }
+
+  try {
+    const result = await editDocSheet({
+      uid: req.uid!,
+      docId: guard.meta.doc_id,
+      documentName: guard.meta.document_name,
+      principalSpaceId: req.principalSpaceId!,
+      clientBaseVersion: parseBaseVersion(baseVersionRaw),
+      cells: {},
+      dims: {},
+      drawings: {},
+      hyperlinks: {},
+      merges: {},
+      sheets: {},
+      freeze: {},
+      filters: {},
+      dataValidations: {},
+      structuralEdit: edit,
+      authorizedEpoch: guard.meta.permission_epoch,
+      isBot: req.botToken !== undefined,
+      token: req.octoToken,
+    })
+    if (result.ok) {
+      res.status(200).json({
+        docId: guard.meta.doc_id,
+        logicalId: edit.logicalId,
+        ...(edit.kind === 'rows.insert'
+          ? { afterRow: edit.afterRow, insertedRows: edit.count, rowCount: result.rowCount }
+          : edit.kind === 'rows.delete'
+            ? { startRow: edit.startRow, deletedRows: edit.count, rowCount: result.rowCount }
+            : edit.kind === 'columns.insert'
+              ? { afterColumn: edit.afterColumn, insertedColumns: edit.count, columnCount: result.columnCount }
+              : { startColumn: edit.startColumn, deletedColumns: edit.count, columnCount: result.columnCount }),
+        bytes: result.bytes,
+        baseVersion: result.baseVersion,
+        newDocVersionSeq: result.newDocVersionSeq,
+      })
+      return
+    }
+    const errorBody: Record<string, unknown> = { error: result.error }
+    if (result.payloadBytes !== undefined) errorBody.payloadBytes = result.payloadBytes
+    if (result.docBytes !== undefined) errorBody.docBytes = result.docBytes
+    if (result.limit !== undefined) errorBody.limit = result.limit
+    res.status(result.status).json(errorBody)
+  } catch {
     res.status(500).json({ error: 'internal_error' })
   }
 }

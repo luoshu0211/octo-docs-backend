@@ -60,6 +60,14 @@ import { SCHEMA_VERSION } from '../../schema/index.js'
 import { config } from '../../config/env.js'
 import { roleAtLeast, type ResolvedRole } from '../../permission/role.js'
 import { resolveEffectiveRole } from '../../permission/resolveEffectiveRole.js'
+import {
+  SheetRowInsertError,
+} from '../../agent/sheetRowInsert.js'
+import {
+  measureSheetAfterStructuralEdit,
+  SheetStructuralEditError,
+  type SheetStructuralEdit,
+} from '../../agent/sheetStructuralEdit.js'
 
 export interface EditDocSheetInput {
   uid: string
@@ -86,6 +94,8 @@ export interface EditDocSheetInput {
   filters?: Record<string, StoredFilter | null>
   /** Public replace-per-sheet rules; legacy flat checkbox keys remain repair-compatible. */
   dataValidations?: SheetDataValidationResourceChanges
+  /** Internal structural operation used by the row/column insert/delete routes. */
+  structuralEdit?: SheetStructuralEdit
   /** permission_epoch observed when the request was authorized (TOCTOU baseline). */
   authorizedEpoch: number
   /**
@@ -105,7 +115,14 @@ export interface EditDocSheetInput {
 }
 
 export type EditDocSheetResult =
-  | { ok: true; bytes: number; baseVersion: string; newDocVersionSeq: number }
+  | {
+      ok: true
+      bytes: number
+      baseVersion: string
+      newDocVersionSeq: number
+      rowCount?: number
+      columnCount?: number
+    }
   | {
       ok: false
       status: number
@@ -165,6 +182,16 @@ function mapEditError(err: unknown): {
 } | null {
   if (err instanceof BaseVersionStaleError) return { status: 412, error: 'base_version_stale' }
   if (err instanceof SheetSnapshotInvalidError) return { status: 422, error: 'sheet_cell_invalid' }
+  if (err instanceof SheetRowInsertError) {
+    if (err.code === 'sheet_not_found') return { status: 404, error: err.code }
+    if (err.code === 'sheet_formula_unsupported') return { status: 409, error: err.code }
+    return { status: 422, error: err.code }
+  }
+  if (err instanceof SheetStructuralEditError) {
+    if (err.code === 'sheet_not_found') return { status: 404, error: err.code }
+    if (err.code === 'sheet_formula_unsupported') return { status: 409, error: err.code }
+    return { status: 422, error: err.code }
+  }
   // Pre-mutation refusal (nothing applied / broadcast), so it belongs in this set: the caller's
   // safety snapshot is an orphan and gets compensated away by the shared handling below.
   if (err instanceof ProtectedRangeError) return { status: 403, error: 'protected_range' }
@@ -258,7 +285,8 @@ export async function editDocSheet(input: EditDocSheetInput): Promise<EditDocShe
     Object.keys(input.merges).length === 0 &&
     Object.keys(input.sheets).length === 0 &&
     Object.keys(freeze).length === 0 &&
-    Object.keys(filters).length === 0
+    Object.keys(filters).length === 0 &&
+    input.structuralEdit === undefined
 
   // cheap pre-compare: fail most GET<->PATCH conflicts before a snapshot row.
   if (!stateVectorsEqual(input.clientBaseVersion, baseSV)) {
@@ -270,6 +298,8 @@ export async function editDocSheet(input: EditDocSheetInput): Promise<EditDocShe
   let docBytes: number
   let payloadBytes: number | null
   let validationRepairShrank: boolean
+  let rowCount: number | undefined
+  let columnCount: number | undefined
   try {
     validateSheetCellBatch(input.cells)
     validateSheetDimBatch(input.dims)
@@ -279,25 +309,29 @@ export async function editDocSheet(input: EditDocSheetInput): Promise<EditDocShe
     validateSheetListBatch(input.sheets)
     validateSheetFreezeBatch(freeze)
     validateSheetFilterBatch(filters)
-    const measured = measureSheetAfterEdit(
-      preEditState,
-      input.cells,
-      input.dims,
-      input.drawings,
-      input.hyperlinks,
-      input.merges,
-      input.sheets,
-      freeze,
-      filters,
-      dataValidations,
-      {
-        maxRules: config.sheetWrite.maxDataValidations,
-        maxBytes: config.sheetWrite.maxDataValidationBytes,
-      },
-    )
+    const measured = input.structuralEdit
+      ? measureSheetAfterStructuralEdit(preEditState, input.structuralEdit)
+      : measureSheetAfterEdit(
+        preEditState,
+        input.cells,
+        input.dims,
+        input.drawings,
+        input.hyperlinks,
+        input.merges,
+        input.sheets,
+        freeze,
+        filters,
+        dataValidations,
+        {
+          maxRules: config.sheetWrite.maxDataValidations,
+          maxBytes: config.sheetWrite.maxDataValidationBytes,
+        },
+      )
     docBytes = measured.docBytes
     payloadBytes = measured.payloadBytes
-    validationRepairShrank = measured.validationRepairShrank
+    validationRepairShrank = 'validationRepairShrank' in measured ? measured.validationRepairShrank : false
+    rowCount = 'rowCount' in measured ? measured.rowCount : undefined
+    columnCount = 'columnCount' in measured ? measured.columnCount : undefined
   } catch (err) {
     const mapped = mapEditErrorWithRepairContext(err, preEditState, dataValidations)
     if (mapped) {
@@ -400,6 +434,7 @@ export async function editDocSheet(input: EditDocSheetInput): Promise<EditDocShe
       filters,
       dataValidations,
       txResult.isAdmin,
+      input.structuralEdit,
     )
     bytes = committed.bytes
     newSV = committed.newSV
@@ -446,5 +481,7 @@ export async function editDocSheet(input: EditDocSheetInput): Promise<EditDocShe
     bytes,
     baseVersion: encodeBaseVersion(newSV),
     newDocVersionSeq: txResult.safetyVersionId,
+    ...(rowCount === undefined ? {} : { rowCount }),
+    ...(columnCount === undefined ? {} : { columnCount }),
   }
 }
