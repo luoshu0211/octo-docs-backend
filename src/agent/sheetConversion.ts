@@ -2716,7 +2716,7 @@ export function measureSheetAfterEdit(
 }
 
 /** Measure the decoded GET payload for one already-hydrated sheet document. */
-function measureSheetReadPayloadBytes(doc: Y.Doc): number {
+export function measureSheetReadPayloadBytes(doc: Y.Doc): number {
   const rawCells: Record<string, unknown> = {}
   for (const [key, val] of doc.getMap(SHEET_YMAP_FIELD).entries()) rawCells[key] = val
   const rawDims: Record<string, unknown> = {}

@@ -278,3 +278,80 @@ describe('commitLiveSheetEdit — declared grid size', () => {
     })
   })
 })
+
+describe('commitLiveSheetEdit — structural row insertion', () => {
+  it('moves cells and rowCount in the guarded live transaction', async () => {
+    h.liveDoc = new Y.Doc()
+    h.liveDoc.getMap<StoredSheetMeta>(SHEET_LIST_FIELD).set('default', {
+      name: 'Sheet1', order: 0, rowCount: 20, columnCount: 20,
+    })
+    h.liveDoc.getMap(SHEET_YMAP_FIELD).set('default!10:0', { v: 'move me' })
+
+    await commitLiveSheetEdit(
+      'doc:sheet', 'u_1', Y.encodeStateVector(h.liveDoc),
+      {}, {}, {}, {}, {}, {}, {}, {}, {}, true,
+      { kind: 'rows.insert', logicalId: 'default', afterRow: 9, count: 5 },
+    )
+
+    expect(h.liveDoc.getMap(SHEET_YMAP_FIELD).has('default!10:0')).toBe(false)
+    expect(h.liveDoc.getMap(SHEET_YMAP_FIELD).get('default!15:0')).toEqual({ v: 'move me' })
+    expect(h.liveDoc.getMap<StoredSheetMeta>(SHEET_LIST_FIELD).get('default')?.rowCount).toBe(25)
+  })
+
+  it.each([
+    {
+      edit: { kind: 'rows.delete', logicalId: 'default', startRow: 2, count: 2 } as const,
+      movedKey: 'default!3:5', rowCount: 8, columnCount: 10,
+    },
+    {
+      edit: { kind: 'columns.insert', logicalId: 'default', afterColumn: 2, count: 2 } as const,
+      movedKey: 'default!5:7', rowCount: 10, columnCount: 12,
+    },
+    {
+      edit: { kind: 'columns.delete', logicalId: 'default', startColumn: 2, count: 2 } as const,
+      movedKey: 'default!5:3', rowCount: 10, columnCount: 8,
+    },
+  ])('commits $edit.kind through the guarded live transaction', async ({
+    edit, movedKey, rowCount, columnCount,
+  }) => {
+    h.liveDoc = new Y.Doc()
+    h.liveDoc.getMap<StoredSheetMeta>(SHEET_LIST_FIELD).set('default', {
+      name: 'Sheet1', order: 0, rowCount: 10, columnCount: 10,
+    })
+    h.liveDoc.getMap(SHEET_YMAP_FIELD).set('default!5:5', { v: 'move me' })
+
+    await commitLiveSheetEdit(
+      'doc:sheet', 'u_1', Y.encodeStateVector(h.liveDoc),
+      {}, {}, {}, {}, {}, {}, {}, {}, {}, true, edit,
+    )
+
+    expect(h.liveDoc.getMap(SHEET_YMAP_FIELD).has('default!5:5')).toBe(false)
+    expect(h.liveDoc.getMap(SHEET_YMAP_FIELD).get(movedKey)).toEqual({ v: 'move me' })
+    expect(h.liveDoc.getMap<StoredSheetMeta>(SHEET_LIST_FIELD).get('default')).toMatchObject({
+      rowCount, columnCount,
+    })
+  })
+
+  it('rejects a protected-sheet insertion before any coordinate changes', async () => {
+    h.liveDoc = new Y.Doc()
+    h.liveDoc.getMap<StoredSheetMeta>(SHEET_LIST_FIELD).set('default', {
+      name: 'Sheet1', order: 0, rowCount: 20, columnCount: 20,
+    })
+    h.liveDoc.getMap(SHEET_YMAP_FIELD).set('default!10:0', { v: 'stay' })
+    h.liveDoc.getMap(SHEET_PROTECTION_FIELD).set('default!r:r1', {
+      kind: 'r', permissionId: 'perm',
+      ranges: [{ startRow: 8, startColumn: 0, endRow: 12, endColumn: 1 }],
+    })
+    h.liveDoc.getMap(SHEET_PROTECTION_GRANTS_FIELD).set('perm', { allow: [] })
+
+    await expect(commitLiveSheetEdit(
+      'doc:sheet', 'u_1', Y.encodeStateVector(h.liveDoc),
+      {}, {}, {}, {}, {}, {}, {}, {}, {}, false,
+      { kind: 'rows.insert', logicalId: 'default', afterRow: 9, count: 5 },
+    )).rejects.toBeInstanceOf(ProtectedRangeError)
+
+    expect(h.liveDoc.getMap(SHEET_YMAP_FIELD).get('default!10:0')).toEqual({ v: 'stay' })
+    expect(h.liveDoc.getMap(SHEET_YMAP_FIELD).has('default!15:0')).toBe(false)
+    expect(h.liveDoc.getMap<StoredSheetMeta>(SHEET_LIST_FIELD).get('default')?.rowCount).toBe(20)
+  })
+})
