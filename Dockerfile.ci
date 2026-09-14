@@ -52,7 +52,7 @@ ARG TYPST_SHA256_ARM64=4f5b7ee6e57fb639019ee0f6bffcf940edad228ede6ff5269a9f05a15
 ARG GITLAB_TOKEN
 
 RUN sed -i 's#https://dl-cdn.alpinelinux.org#https://mirrors.tuna.tsinghua.edu.cn#g' /etc/apk/repositories \
-    && apk add --no-cache curl=8.21.0-r0 tar=1.35-r5 xz=5.8.3-r0 \
+    && apk add --no-cache curl=8.22.0-r0 tar=1.35-r5 xz=5.8.4-r0 \
     && ARCH="$(uname -m)" \
     && case "$ARCH" in \
          x86_64) TARGET=x86_64-unknown-linux-musl; TYPST_SHA256="$TYPST_SHA256_AMD64" ;; \
@@ -112,6 +112,8 @@ ENV TZ=Asia/Shanghai
 RUN addgroup -S octo && adduser -S -u 10001 -G octo octo
 
 COPY --chown=octo:octo migrations ./migrations
+# PPT HTML export reads assets/ppt/player.html relative to WORKDIR /app.
+COPY --chown=octo:octo assets/ppt ./assets/ppt
 COPY --from=prod-deps --chown=octo:octo /app/node_modules ./node_modules
 COPY --from=prod-deps --chown=octo:octo /app/package.json ./package.json
 COPY --from=builder --chown=octo:octo /app/dist ./dist
