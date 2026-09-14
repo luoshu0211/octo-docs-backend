@@ -63,7 +63,7 @@ export const SHEET_MERGES_FIELD = 'sheetMerges'
 
 /**
  * Y.Map field for the sheet-tab registry, keyed by logicalId, value
- * `{ name, order }` (matches octo-web binding.ts SHEET_LIST_FIELD / SheetMeta).
+ * `{ name, order, rowCount?, columnCount? }` (matches octo-web binding.ts SheetMeta).
  * This is what makes a sheet TAB exist in the UI: writing cells to a logicalId
  * NOT registered here leaves orphan cells the frontend won't render. The first
  * tab's logicalId is 'default'. Two-way synced + persisted; on the GET read surface.
@@ -78,6 +78,15 @@ export const SHEET_LIST_FIELD = 'sheetList'
  */
 export const SHEET_FREEZE_FIELD = 'sheetFreeze'
 export const SHEET_FILTERS_FIELD = 'sheetFilters'
+
+/** Fresh sheets are intentionally compact; legacy entries without counts retain the old size. */
+export const SHEET_DEFAULT_ROWS = 200
+export const SHEET_LEGACY_ROWS = 1000
+export const SHEET_MAX_ROWS = 10_000
+export const SHEET_DEFAULT_COLUMNS = 20
+export const SHEET_LEGACY_COLUMNS = 100
+export const SHEET_MAX_COLUMNS = 100
+
 export const SHEET_DATA_VALIDATIONS_FIELD = 'sheetDataValidations'
 
 export interface StoredSheetRange {
@@ -190,7 +199,10 @@ export function validateSheetDataValidation(key: unknown, value: unknown): Store
     const startColumn = range.startColumn as number
     const endRow = range.endRow as number
     const endColumn = range.endColumn as number
-    if (startRow < 0 || startColumn < 0 || endRow < startRow || endColumn < startColumn || endRow >= 1000 || endColumn >= 100) {
+    if (
+      startRow < 0 || startColumn < 0 || endRow < startRow || endColumn < startColumn ||
+      endRow >= SHEET_MAX_ROWS || endColumn >= SHEET_MAX_COLUMNS
+    ) {
       throw new SheetSnapshotInvalidError(`data validation ${key}: range ${index} is outside the sheet bounds`)
     }
     return { startRow, startColumn, endRow, endColumn }
@@ -1771,11 +1783,15 @@ export function validateSheetMerges(merges: Record<string, unknown>): Record<str
   return out
 }
 
-/** A sheet-tab registry entry (Univer SheetMeta): the tab's display name + order.
+/** A sheet-tab registry entry (Univer SheetMeta): display name, order, and declared grid size.
  * Extra fields are kept verbatim (opaque), like a drawing. */
 export interface StoredSheetMeta {
   name: string
   order: number
+  /** Missing only on legacy documents, which the frontend restores as 1000 rows. */
+  rowCount?: number
+  /** Missing only on legacy documents, which the frontend restores as 100 columns. */
+  columnCount?: number
   [k: string]: unknown
 }
 
@@ -1801,7 +1817,8 @@ const RESERVED_LOGICAL_IDS = new Set(['__proto__', 'constructor', 'prototype'])
 
 /**
  * Validate a single raw sheetList entry. Fail-closed. Key is a logicalId; value is
- * `{ name: non-empty string, order: finite number }` (extra fields kept verbatim).
+ * `{ name, order, rowCount?, columnCount? }`, with bounded integer dimensions.
+ * Extra fields are kept verbatim. Missing counts use the legacy 1000x100 grid.
  * This is the tab registry — a bot ADDS a tab by setting a new logicalId here, then
  * writes that tab's cells with keys `${logicalId}!row:col`.
  */
@@ -1825,6 +1842,24 @@ export function validateSheetListEntry(key: unknown, value: unknown): StoredShee
   }
   if (typeof rec.order !== 'number' || !Number.isFinite(rec.order)) {
     throw new SheetSnapshotInvalidError(`sheetList ${key}: order must be a finite number`)
+  }
+  if (
+    rec.rowCount !== undefined &&
+    (typeof rec.rowCount !== 'number' || !Number.isInteger(rec.rowCount) ||
+      rec.rowCount < 1 || rec.rowCount > SHEET_MAX_ROWS)
+  ) {
+    throw new SheetSnapshotInvalidError(
+      `sheetList ${key}: rowCount must be an integer between 1 and ${SHEET_MAX_ROWS}`,
+    )
+  }
+  if (
+    rec.columnCount !== undefined &&
+    (typeof rec.columnCount !== 'number' || !Number.isInteger(rec.columnCount) ||
+      rec.columnCount < 1 || rec.columnCount > SHEET_MAX_COLUMNS)
+  ) {
+    throw new SheetSnapshotInvalidError(
+      `sheetList ${key}: columnCount must be an integer between 1 and ${SHEET_MAX_COLUMNS}`,
+    )
   }
   return rec as StoredSheetMeta
 }
@@ -1873,8 +1908,112 @@ export function materializeLegacyDefaultSheet(
   }
   return {
     toDelete: batch.toDelete,
-    toSet: [['default', { name: 'Sheet1', order: 0 }], ...batch.toSet],
+    toSet: [[
+      'default',
+      {
+        name: 'Sheet1',
+        order: 0,
+        rowCount: SHEET_LEGACY_ROWS,
+        columnCount: SHEET_LEGACY_COLUMNS,
+      },
+    ], ...batch.toSet],
   }
+}
+
+/**
+ * Build the effective sheet-list mutation for one REST write.
+ *
+ * `sheets` entries are replace-style in Y.Map, so a legacy CLI rename shaped
+ * `{name,order}` must inherit current dimensions instead of shrinking a modern
+ * sheet back to the legacy fallback. New tabs default to 200 rows x 20 columns.
+ * A non-null cell write beyond either declared boundary grows that same sheet entry
+ * in the same Yjs transaction, which keeps CLI/bot writes visible after reload.
+ */
+export function prepareSheetListBatchForWrite(
+  existingEntries: Iterable<[string, StoredSheetMeta]>,
+  requestedBatch: SheetListBatch,
+  cells: Record<string, SheetCell | null>,
+  preserveLegacyDefault = false,
+): SheetListBatch {
+  const existing = new Map(existingEntries)
+  const materialized = materializeLegacyDefaultSheet(
+    existing.keys(),
+    requestedBatch,
+    preserveLegacyDefault,
+  )
+  const deleted = new Set(materialized.toDelete)
+  const toSet = new Map<string, StoredSheetMeta>()
+
+  for (const [logicalId, requested] of materialized.toSet) {
+    const current = existing.get(logicalId)
+    // A pre-sheetList workbook already has one implicit `default` tab. Its first explicit
+    // registry write can be a legacy rename/reorder payload, so missing counts must inherit
+    // the legacy boundary rather than make the existing tab look like a fresh 200x20 tab.
+    const isImplicitLegacyDefault = existing.size === 0 && logicalId === 'default'
+    const rowCount = requested.rowCount ??
+      (current?.rowCount ?? (current || isImplicitLegacyDefault ? SHEET_LEGACY_ROWS : SHEET_DEFAULT_ROWS))
+    const columnCount = requested.columnCount ??
+      (current?.columnCount ?? (current || isImplicitLegacyDefault ? SHEET_LEGACY_COLUMNS : SHEET_DEFAULT_COLUMNS))
+    toSet.set(logicalId, validateSheetListEntry(logicalId, { ...requested, rowCount, columnCount }))
+  }
+
+  for (const [cellKey, cell] of Object.entries(cells)) {
+    if (cell === null) continue
+    if (!CELL_KEY_RE.test(cellKey)) continue // validateSheetCellBatch reports the canonical key error.
+    const bang = cellKey.indexOf('!')
+    const colon = cellKey.indexOf(':', bang + 1)
+    const logicalId = cellKey.slice(0, bang)
+    const requiredRows = Number(cellKey.slice(bang + 1, colon)) + 1
+    const requiredColumns = Number(cellKey.slice(colon + 1)) + 1
+    if (requiredRows > SHEET_MAX_ROWS) {
+      throw new SheetSnapshotInvalidError(
+        `cell ${cellKey}: row must be between 0 and ${SHEET_MAX_ROWS - 1}`,
+      )
+    }
+    if (requiredColumns > SHEET_MAX_COLUMNS) {
+      throw new SheetSnapshotInvalidError(
+        `cell ${cellKey}: column must be between 0 and ${SHEET_MAX_COLUMNS - 1}`,
+      )
+    }
+    if (deleted.has(logicalId)) continue
+
+    const pending = toSet.get(logicalId)
+    if (pending) {
+      const rowCount = Math.max(pending.rowCount ?? SHEET_DEFAULT_ROWS, requiredRows)
+      const columnCount = Math.max(pending.columnCount ?? SHEET_DEFAULT_COLUMNS, requiredColumns)
+      if (pending.rowCount !== rowCount || pending.columnCount !== columnCount) {
+        toSet.set(logicalId, { ...pending, rowCount, columnCount })
+      }
+      continue
+    }
+
+    const current = existing.get(logicalId)
+    if (current) {
+      const currentRows = current.rowCount ?? SHEET_LEGACY_ROWS
+      const currentColumns = current.columnCount ?? SHEET_LEGACY_COLUMNS
+      if (currentRows < requiredRows || currentColumns < requiredColumns) {
+        toSet.set(logicalId, {
+          ...current,
+          rowCount: Math.max(currentRows, requiredRows),
+          columnCount: Math.max(currentColumns, requiredColumns),
+        })
+      }
+      continue
+    }
+
+    // A pre-sheetList workbook has one implicit legacy `default` tab. Materialize it only when
+    // a write actually needs to grow beyond the old 1000-row declaration.
+    if (existing.size === 0 && logicalId === 'default' && requiredRows > SHEET_LEGACY_ROWS) {
+      toSet.set('default', {
+        name: 'Sheet1',
+        order: 0,
+        rowCount: requiredRows,
+        columnCount: SHEET_LEGACY_COLUMNS,
+      })
+    }
+  }
+
+  return { toDelete: materialized.toDelete, toSet: Array.from(toSet.entries()) }
 }
 
 /** Materialize V1 `default` only when this checkbox feature needs that implicit tab to survive. */
@@ -1903,7 +2042,7 @@ export function applySheetListToYMap(
   for (const [key, meta] of toSet) ymap.set(key, meta)
 }
 
-/** Read: Y.Doc state -> plain `{ logicalId: {name,order} }` map (GET read surface). */
+/** Read: Y.Doc state -> plain `{ logicalId: {name,order,rowCount?,columnCount?} }` map. */
 export function yDocStateToSheetList(state: Uint8Array): Record<string, StoredSheetMeta> {
   const ydoc = new Y.Doc()
   Y.applyUpdate(ydoc, state)
@@ -1920,14 +2059,11 @@ export function validateSheetList(sheets: Record<string, unknown>): Record<strin
   return out
 }
 
-// The current web workbook is deliberately bounded to 1000x100. Keeping the
-// resource ranges inside that same grid prevents a bot from persisting rules the
-// browser can never display or repair.
-const SHEET_MAX_ROWS = 1000
-const SHEET_MAX_COLUMNS = 100
+// Keep persisted resource ranges inside the same hard grid bounds as cells so a
+// bot cannot create rules that the browser can never display or repair.
 const MAX_RESOURCE_DEPTH = 20
 
-function validateResourceLogicalId(key: unknown, label: string): string {
+export function validateResourceLogicalId(key: unknown, label: string): string {
   if (typeof key !== 'string' || !LIST_KEY_RE.test(key) || RESERVED_LOGICAL_IDS.has(key)) {
     throw new SheetSnapshotInvalidError(`${label} key must be a valid logicalId: ${String(key).slice(0, 64)}`)
   }
@@ -1935,7 +2071,8 @@ function validateResourceLogicalId(key: unknown, label: string): string {
 }
 
 /** Clone a JSON-compatible plugin payload while rejecting values Yjs/JSON cannot
- * round-trip faithfully (undefined, functions, symbols, bigint, NaN/Infinity). */
+ * round-trip faithfully. Optional object properties with `undefined` are omitted,
+ * matching JSON.stringify; unsupported array entries and scalar values still fail. */
 function cloneResourceJson(value: unknown, label: string, depth = 0): unknown {
   if (depth > MAX_RESOURCE_DEPTH) {
     throw new SheetSnapshotInvalidError(`${label}: nested value is too deep`)
@@ -1956,6 +2093,7 @@ function cloneResourceJson(value: unknown, label: string, depth = 0): unknown {
     if (key === '__proto__' || key === 'prototype' || key === 'constructor') {
       throw new SheetSnapshotInvalidError(`${label}: reserved field '${key}' is not allowed`)
     }
+    if (entry === undefined) continue
     out[key] = cloneResourceJson(entry, `${label}.${key}`, depth + 1)
   }
   return out
@@ -1975,7 +2113,9 @@ export function validateSheetRange(value: unknown, label = 'range'): StoredSheet
   const er = endRow as number
   const ec = endColumn as number
   if (sr < 0 || sc < 0 || er < sr || ec < sc || er >= SHEET_MAX_ROWS || ec >= SHEET_MAX_COLUMNS) {
-    throw new SheetSnapshotInvalidError(`${label}: bounds are outside the 1000x100 grid`)
+    throw new SheetSnapshotInvalidError(
+      `${label}: bounds are outside the ${SHEET_MAX_ROWS}x${SHEET_MAX_COLUMNS} grid`,
+    )
   }
   return { startRow: sr, startColumn: sc, endRow: er, endColumn: ec }
 }
@@ -2517,9 +2657,10 @@ export function measureSheetAfterEdit(
     if (!(validationDeletionOnly && error instanceof SheetDataValidationInspectionBudgetError)) throw error
   }
   const requestedListBatch = validateSheetListBatch(sheets)
-  const listBatch = materializeLegacyDefaultSheet(
-    listMap.keys(),
+  const listBatch = prepareSheetListBatchForWrite(
+    listMap.entries(),
     requestedListBatch,
+    cells,
     listMap.size === 0 &&
       requestedListBatch.toSet.length > 0 &&
       hasLegacyDefaultDataValidationRule(validationMap.entries(), dataValidations),
@@ -2575,7 +2716,7 @@ export function measureSheetAfterEdit(
 }
 
 /** Measure the decoded GET payload for one already-hydrated sheet document. */
-function measureSheetReadPayloadBytes(doc: Y.Doc): number {
+export function measureSheetReadPayloadBytes(doc: Y.Doc): number {
   const rawCells: Record<string, unknown> = {}
   for (const [key, val] of doc.getMap(SHEET_YMAP_FIELD).entries()) rawCells[key] = val
   const rawDims: Record<string, unknown> = {}

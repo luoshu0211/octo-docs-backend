@@ -1,41 +1,19 @@
-/**
- * PPT human-create endpoint: `POST /api/v1/ppt/docs` (R2-B1).
- *
- * Creates an `html_ppt` deck from one of the four fixed bundled templates. The
- * caller identity is the authenticated session (`req.uid`) and the space is the
- * enforced `X-Space-Id` header (`req.spaceId`) — NEVER the body. Body-supplied
- * server-owned fields (`ownerId`, `spaceId`, `mountType`, `octoDocSlug`,
- * `botToken`) and a body `idempotencyKey` are rejected (§3.1 / §4.1). Idempotency
- * is carried ONLY by the `Idempotency-Key` header.
- *
- * On success the deck is minted by materializing the chosen template (strip
- * `template`, fresh Bento docId, drop `collab`), persisting the `doc_meta` row
- * (`doc_type='html_ppt'`, `octo_doc_slug=NULL`, `documentName` via
- * `buildPptDocumentName`), granting the creator admin membership, and recording
- * the create-time PPT state + starter deck. All responses use the C-style
- * envelope; failures raise a {@link PptApiError} that the router-scoped handler
- * renders.
- */
-import { Router, type Request, type Response, type NextFunction, type Router as ExpressRouter } from 'express'
-import { docMetaRepo } from '../../db/repos/docMetaRepo.js'
-import { docMemberRepo } from '../../db/repos/docMemberRepo.js'
+import type { Request } from 'express'
 import { pptDocStateRepo } from '../../db/repos/pptDocStateRepo.js'
 import {
   pptIdempotencyRepo,
   PPT_IDEMPOTENCY_SCOPE_CREATE,
 } from '../../db/repos/pptIdempotencyRepo.js'
-import { transaction } from '../../db/pool.js'
+import { createDocument } from '../services/createDocument.js'
 import { hashCanonicalPayload } from '../../ppt/idempotency.js'
 import { buildPptDocumentName, DocumentNameError } from '../../permission/documentName.js'
 import { HTML_PPT_DOC_TYPE } from '../../db/docType.js'
-import { ROLE_ADMIN } from '../../permission/role.js'
 import { newDocId } from '../../util/ids.js'
 import { buildDocShareUrl, buildPptEditorUrl } from '../../util/docShareLink.js'
 import { config } from '../../config/env.js'
 import { getPptTemplate } from '../../ppt/templates.js'
 import { instantiateTemplate } from '../../ppt/bentoDoc.js'
-import { PptApiError, sendPptData } from './envelope.js'
-import { pptAuthMiddleware, pptSpaceContextMiddleware, pptRequireSpaceMembership } from './auth.js'
+import { PptApiError } from './envelope.js'
 
 const DEFAULT_FOLDER = 'f_default'
 /** Matches `doc_meta.title VARCHAR(512)` and the legacy create title bound. */
@@ -84,8 +62,8 @@ class KeyReservedElsewhereError extends Error {
   }
 }
 
-/** POST /docs — human create from `{ title, folderId?, templateId }`. */
-export async function createPptDocHandler(req: Request, res: Response): Promise<void> {
+/** Create from `{ title, folderId?, templateId }` after the mount's auth guards. */
+export async function createPptDocument(req: Request): Promise<PptCreateResponse> {
   const uid = req.uid!
   const spaceId = req.spaceId!
   const body = (req.body ?? {}) as Record<string, unknown>
@@ -116,7 +94,7 @@ export async function createPptDocHandler(req: Request, res: Response): Promise<
   }
 
   // 4. templateId: required, one of the four fixed bundled templates.
-  const templateIdRaw = body.templateId
+  const templateIdRaw = body.templateId ?? 'blank'
   const template = typeof templateIdRaw === 'string' ? getPptTemplate(templateIdRaw) : null
   if (!template) {
     throw vErr('templateId must be one of the four bundled templates', { field: 'templateId' })
@@ -163,14 +141,14 @@ export async function createPptDocHandler(req: Request, res: Response): Promise<
     }
     // A committed row is always complete (reserve+complete commit together), so
     // this replays the original response.
-    sendPptData(res, prior.responseData, prior.responseStatus)
-    return
+    return prior.responseData as PptCreateResponse
   }
 
   // Materialize the deck (pure, no I/O): strip `template`, mint a fresh Bento
   // docId, drop collab. Done before the transaction so no work is wasted holding
   // a DB connection.
   const deck = instantiateTemplate(template, new Date().toISOString())
+  deck.title = title.trim()
 
   // ATOMIC create. Reserve the idempotency key, write doc_meta + owner membership
   // + PPT state, and complete the idempotency record in ONE transaction. If any
@@ -180,7 +158,10 @@ export async function createPptDocHandler(req: Request, res: Response): Promise<
   // still succeed (no duplicate deck).
   let data: PptCreateResponse
   try {
-    data = await transaction(async (tx) => {
+    data = await createDocument({
+      input: { docId, documentName, title, ownerId: uid, spaceId, folderId: folder, docType: HTML_PPT_DOC_TYPE, createdBy: uid },
+      humanOwnerUid: req.docSpaceScope?.mode === 'bot' ? req.botOwnerUid : undefined,
+      before: async tx => {
       const { reserved } = await pptIdempotencyRepo.reserveTx(
         tx,
         spaceId,
@@ -193,20 +174,9 @@ export async function createPptDocHandler(req: Request, res: Response): Promise<
       // transaction's placeholder attempt) and fall through to a committed re-read.
       if (!reserved) throw new KeyReservedElsewhereError()
 
-      await docMetaRepo.createTx(tx, {
-        docId,
-        documentName,
-        title,
-        ownerId: uid,
-        spaceId,
-        folderId: folder,
-        docType: HTML_PPT_DOC_TYPE,
-        createdBy: uid,
-      })
-      await docMemberRepo.upsertDirectTx(tx, { docId, uid, principalSpaceId: spaceId, roleNum: ROLE_ADMIN, grantedBy: uid })
-      await pptDocStateRepo.createTx(tx, { docId, templateId, draftDoc: deck })
-
-      const meta = await docMetaRepo.getByDocIdTx(tx, docId)
+      },
+      initialize: tx => pptDocStateRepo.createTx(tx, { docId, templateId, draftDoc: deck }),
+      complete: async (tx, meta) => {
       const payload: PptCreateResponse = {
         docId,
         documentName,
@@ -236,6 +206,7 @@ export async function createPptDocHandler(req: Request, res: Response): Promise<
         docId,
       )
       return payload
+      },
     })
   } catch (err) {
     if (err instanceof KeyReservedElsewhereError) {
@@ -248,8 +219,7 @@ export async function createPptDocHandler(req: Request, res: Response): Promise<
         })
       }
       if (winner && winner.completed) {
-        sendPptData(res, winner.responseData, winner.responseStatus)
-        return
+        return winner.responseData as PptCreateResponse
       }
       // The winner's transaction has not committed yet (rare, transient). Ask the
       // client to retry; nothing was created here.
@@ -261,33 +231,5 @@ export async function createPptDocHandler(req: Request, res: Response): Promise<
     throw err
   }
 
-  sendPptData(res, data, 201)
-}
-
-/** Adapt an async handler so a thrown error reaches the router-scoped envelope handler. */
-function asyncHandler(fn: (req: Request, res: Response) => Promise<void>) {
-  return (req: Request, res: Response, next: NextFunction): void => {
-    fn(req, res).catch(next)
-  }
-}
-
-/**
- * Build the PPT docs sub-router (`/api/v1/ppt/docs`). The parent PPT router
- * (createPptRouter) already applies the router-scoped `express.json` and the
- * envelope error handler, so a malformed body is rendered as a C-style
- * VALIDATION_ERROR. Auth + space guards run before the create handler.
- */
-export function createPptDocsRouter(): ExpressRouter {
-  const router = Router()
-  // Create is a space-selector route (the deck does not exist yet, so there is no
-  // role to resolve) — hence the membership gate. The sibling read route in
-  // ppt/source.ts deliberately omits it; see pptRequireSpaceMembership.
-  router.post(
-    '/docs',
-    pptAuthMiddleware,
-    pptSpaceContextMiddleware,
-    pptRequireSpaceMembership,
-    asyncHandler(createPptDocHandler),
-  )
-  return router
+  return data
 }

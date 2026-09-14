@@ -1,10 +1,11 @@
 import type ExcelJS from 'exceljs'
 import yauzl, { type Entry, type ZipFile } from 'yauzl'
+import { SHEET_MAX_ROWS } from '../../agent/sheetConversion.js'
 import { config } from '../../config/env.js'
 import { sanitizeSvg } from '../../util/sanitizeSvg.js'
 import { isSafeSpreadsheetFormula } from './formulaSafety.js'
 
-export const MAX_IMPORT_ROWS = 1000
+export const MAX_IMPORT_ROWS = SHEET_MAX_ROWS
 export const MAX_IMPORT_COLS = 100
 export const MAX_IMPORT_IMAGES = 50
 export const MAX_IMPORT_IMAGE_BYTES = 5 * 1024 * 1024

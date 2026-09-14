@@ -23,6 +23,8 @@
  */
 import { createHash } from 'node:crypto'
 import { pptDocStateRepo } from '../db/repos/pptDocStateRepo.js'
+import { readCurrentPpt } from './currentSource.js'
+import { getPptVersion } from './versions.js'
 import { BENTO_FORMAT, BENTO_FORMAT_VERSION, BENTO_SYNC_V, type BentoDoc } from './bentoDoc.js'
 
 /** The three logical sources a deck can be read from (§4 `mode`). */
@@ -138,19 +140,9 @@ export const PPT_BENTO_COMPAT = {
 } as const
 
 /**
- * Default production provider.
- *
- * draft/live read `ppt_doc_state.draft_doc` (the R2-B1 materialized working
- * deck). Pre-relay there is no separate authoritative live snapshot, so `live`
- * resolves to the SAME persisted working deck as `draft` — both are unpublished
- * writer/admin-only state, both are `private, no-store`, so the access + cache
- * contract is identical for the two (which is exactly what the reader/commenter
- * negative control must prove). R4-B1 replaces `getLive` with the relay's
- * `ppt_live_snapshot` read.
- *
- * `getPublished` returns `null` until R5-B1 lands `ppt_version`: an R2/R3 deck
- * has `published_version_seq = NULL`, so there is no published source to serve
- * and the route renders the reader/commenter empty state (PPT-UI-003).
+ * Recovery draft reads the legacy state. Current content replays the durable
+ * live snapshot and op tail, falling back only before the one-way handoff.
+ * Published versions are separate; publication remains an unimplemented R5 seam.
  */
 export const defaultPptSourceProvider: PptSourceProvider = {
   async getDraft(docId: string): Promise<PptSourceContent | null> {
@@ -165,8 +157,9 @@ export const defaultPptSourceProvider: PptSourceProvider = {
   },
 
   async getLive(docId: string): Promise<PptSourceContent | null> {
-    // Pre-relay: the persisted working deck IS the current authoritative state.
-    // R4-B1 replaces this with the relay-maintained `ppt_live_snapshot` read.
+    const live = await readCurrentPpt(docId)
+    if (live) return { ...live, contentHash: hashBentoDeck(live.deck), assets: [] }
+    // Before the one-way collaboration handoff, the draft is the current state.
     const src = await pptDocStateRepo.getSource(docId)
     if (!src) return null
     return {
@@ -177,10 +170,9 @@ export const defaultPptSourceProvider: PptSourceProvider = {
     }
   },
 
-  async getPublished(): Promise<PptSourceContent | null> {
-    // No published version exists until R5-B1 mints `ppt_version`. Returning null
-    // is the correct "nothing published yet" signal — NOT an error. The route
-    // renders it as NOT_FOUND, i.e. the reader/commenter empty state.
-    return null
+  async getPublished(docId, version): Promise<PptSourceContent | null> {
+    const stored = await getPptVersion(docId, version)
+    return stored ? { deck: stored.deck, revision: stored.versionSeq, versionSeq: stored.versionSeq,
+      contentHash: stored.contentHash, html: stored.html, assets: [] } : null
   },
 }

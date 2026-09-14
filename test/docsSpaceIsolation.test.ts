@@ -1,3 +1,5 @@
+vi.mock('../src/db/repos/docMemberRepo.js', () => ({ docMemberRepo: { upsertDirectTx: vi.fn(async () => {}) } }))
+vi.mock('../src/db/pool.js', () => ({ query: vi.fn(async () => []), transaction: vi.fn(async fn => fn({})) }))
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 
 // Route-level tests for strict by-space isolation (P1): list and create must
@@ -6,6 +8,8 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 // and POST '/' handlers off the docsRouter stack (mirrors membersRoutes.test.ts).
 vi.mock('../src/db/repos/docMetaRepo.js', () => ({
   docMetaRepo: {
+    createTx: vi.fn(async (_tx, input) => docMetaRepo.create(input)),
+    getByDocIdTx: vi.fn(async (_tx, id) => docMetaRepo.getByDocId(id)),
     listForUser: vi.fn(async () => ({ total: 0, items: [] })),
     create: vi.fn(async () => {}),
     getByDocId: vi.fn(async () => ({ title: 'T', created_at: new Date(0) })),

@@ -10,13 +10,15 @@ import {
   CanonicalHtmlLegacyConflictError,
   DocOwnershipError,
 } from '../../db/repos/docMetaRepo.js'
-import { docMemberRepo } from '../../db/repos/docMemberRepo.js'
+import { documentAsync } from '../services/documentRoute.js'
+import { createDocument } from '../services/createDocument.js'
+import { createPptDocument } from '../ppt/docs.js'
 import { docViewHistoryRepo } from '../../db/repos/docViewHistoryRepo.js'
 import { normalizeTypeFilter, isDocType, HTML_DOC_TYPE, HTML_PPT_DOC_TYPE } from '../../db/docType.js'
 import { buildDocumentName, buildHtmlDocumentName, DocumentNameError } from '../../permission/documentName.js'
 import { enqueueDocIndex, isSearchIndexedDoc } from '../../search/docIndexQueue.js'
-import { refreshAndPublish, bumpEpoch } from '../../permission/epoch.js'
-import { ROLE_ADMIN, roleFromNumber, type Role } from '../../permission/role.js'
+import { refreshAndPublish } from '../../permission/epoch.js'
+import { roleFromNumber, type Role } from '../../permission/role.js'
 import {
   parseShareScope,
   parseShareRole,
@@ -37,6 +39,8 @@ import { getOctoIdentity } from '../../auth/octoIdentity.js'
 import { requireDocRole } from '../guard.js'
 import { resolveRole } from '../../permission/resolveRole.js'
 import { resolveRequestPrincipalSpace } from '../../permission/principalSpace.js'
+import { editPptLive } from '../../ppt/liveEdit.js'
+import { PptApiError, PPT_ERROR_STATUS } from '../ppt/envelope.js'
 import { resolveEffectiveRole } from '../../permission/resolveEffectiveRole.js'
 import { issueCollabTokenByDocId } from '../../auth/issueCollabToken.js'
 import { recordVerifiedRecentView } from '../services/recordRecentView.js'
@@ -142,21 +146,6 @@ export function buildCreatedDocumentName(
   return buildDocumentName(spaceId, folder, docId)
 }
 
-async function grantBotOwnerAdmin(req: Request, docId: string, documentName: string): Promise<void> {
-  const uid = req.uid!
-  const botOwnerUid = req.botOwnerUid
-  if (botOwnerUid && botOwnerUid !== uid) {
-    await docMemberRepo.upsertDirect({
-      docId,
-      uid: botOwnerUid,
-      principalSpaceId: req.principalSpaceId!,
-      roleNum: ROLE_ADMIN,
-      grantedBy: uid,
-    })
-    await bumpEpoch(docId, documentName, botOwnerUid)
-  }
-}
-
 /** POST /api/v1/docs — create. Creator becomes owner (implicit admin, §4.2). */
 export async function createDocHandler(req: Request, res: Response) {
   const uid = req.uid!
@@ -177,16 +166,16 @@ export async function createDocHandler(req: Request, res: Response) {
   }
   const folder = typeof folderId === 'string' && folderId !== '' ? folderId : DEFAULT_FOLDER
   const resolvedDocType = typeof docType === 'string' && docType !== '' ? docType : 'doc'
-  if (resolvedDocType !== HTML_DOC_TYPE && idempotencyKey !== undefined) {
-    res.status(400).json({ error: 'idempotencyKey is only valid for html documents' })
+  if (resolvedDocType === HTML_PPT_DOC_TYPE) {
+    try { res.status(201).json(await createPptDocument(req)) }
+    catch (error) {
+      if (!(error instanceof PptApiError)) throw error
+      res.status(PPT_ERROR_STATUS[error.code]).json({ error: error.message, code: error.code, details: error.details })
+    }
     return
   }
-  if (resolvedDocType === HTML_PPT_DOC_TYPE) {
-    // html_ppt (Bento slide-deck) is created ONLY through /api/v1/ppt/** (§3.1 /
-    // §5.2), never the legacy /api/v1/docs create path. Reject as wrong-kind so a
-    // PPT row is never minted here with a 4-seg document key (which would route
-    // the deck into the Yjs/ProseMirror collab + version path).
-    res.status(422).json({ error: 'unsupported_document_type' })
+  if (resolvedDocType !== HTML_DOC_TYPE && idempotencyKey !== undefined) {
+    res.status(400).json({ error: 'idempotencyKey is only valid for html documents' })
     return
   }
   if (!isDocType(resolvedDocType)) {
@@ -295,15 +284,16 @@ export async function createDocHandler(req: Request, res: Response) {
       throw err
     }
   } else {
-    await docMetaRepo.create(createInput)
-    writeResult = { meta: await docMetaRepo.getByDocId(docId), created: true, memberReconciled: false }
+    writeResult = await createDocument({
+      input: createInput,
+      humanOwnerUid: req.docSpaceScope?.mode === 'bot' ? req.botOwnerUid : undefined,
+      complete: async (_tx, meta) => ({ meta, created: true, memberReconciled: false }),
+    })
   }
   const meta = writeResult.meta
   // Fresh and historical legacy membership writes happen in the repository
   // transaction. Publish only a committed historical reconcile.
-  if (meta && resolvedDocType !== HTML_DOC_TYPE) {
-    await grantBotOwnerAdmin(req, meta.doc_id ?? docId, meta.document_name ?? documentName)
-  } else if (meta && normalizedIdempotencyKey === undefined && writeResult.memberReconciled) {
+  if (meta && resolvedDocType === HTML_DOC_TYPE && normalizedIdempotencyKey === undefined && writeResult.memberReconciled) {
     await refreshAndPublish(
       meta.document_name ?? documentName,
       writeResult.permissionEpoch ?? Number(meta.permission_epoch),
@@ -360,7 +350,7 @@ export async function createDocHandler(req: Request, res: Response) {
 // The `/:docId` routes below also do NOT carry it: requireDocRole is strictly
 // stronger there (real-uid role resolution + principal-qualified direct-role resolution for Bot/Human requests).
 // See api/middleware/spaceContext.ts for why this is per-route, not global.
-docsRouter.post('/', requireSpaceMembership, createDocHandler)
+docsRouter.post('/', requireSpaceMembership, documentAsync(createDocHandler))
 
 /** Notify the backend after HTML content is durably published. */
 export async function publishHtmlHandler(req: Request, res: Response) {
@@ -703,6 +693,40 @@ export async function listRecentHandler(req: Request, res: Response) {
 docsRouter.get('/recent', listRecentHandler)
 
 /**
+ * GET /manageable — keyset list of docs the caller DIRECTLY administers (owner
+ * or a doc_member `admin` row) in the current Space, for the TES-131 drive
+ * picker. Direct admin only (no share/drive-derived widening), mirroring the
+ * internal role endpoint's direct-role contract. `X-Space-Id` is required
+ * (spaceContextMiddleware). `?page_size=` clamps to 1..100; `?cursor=` is the
+ * opaque token from the previous page's `nextCursor` (malformed => 400).
+ */
+export async function listManageableHandler(req: Request, res: Response) {
+  const uid = req.uid!
+  const spaceId = req.spaceId!
+  const cursor = typeof req.query.cursor === 'string' ? req.query.cursor : undefined
+  const pageSize = Math.min(100, Math.max(1, Number(req.query.page_size ?? 20) || 20))
+  let result
+  try {
+    result = await docMetaRepo.listManageable({ uid, spaceId, principalSpaceId: req.principalSpaceId!, pageSize, cursor })
+  } catch (err) {
+    if (err instanceof Error && err.message === 'invalid_cursor') {
+      res.status(400).json({ error: 'invalid_cursor' })
+      return
+    }
+    throw err
+  }
+  const items = result.items.map((d) => ({
+    docId: d.doc_id,
+    title: d.title,
+    ownerId: d.owner_id,
+    docType: d.doc_type,
+    ...(d.octo_doc_slug ? { octoDocSlug: d.octo_doc_slug } : {}),
+    updatedAt: new Date(d.updated_at).toISOString(),
+  }))
+  res.status(200).json({ items, nextCursor: result.nextCursor })
+}
+
+/**
  * GET /api/v1/docs/recent/creators — distinct creators of the caller's
  * recently-viewed docs for the CreatorFilter dropdown (FEAT-B, §3.4). Scope:
  * q-filtered, creator-NOT-filtered, pre-pagination, permission-filtered — the
@@ -796,7 +820,17 @@ async function renameDocById(req: Request, res: Response, docId: string): Promis
     res.status(400).json({ error: 'title too long' })
     return
   }
-  await docMetaRepo.rename(docId, title, req.uid!)
+  if (guard.meta.doc_type === 'html_ppt') {
+    const spaceId = await resolveRequestPrincipalSpace(req)
+    if (!spaceId) { res.status(403).json({ error: 'principal_space_unverified' }); return }
+    try {
+      await editPptLive({ docId: guard.meta.doc_id, uid: req.uid!, spaceId, authorizedEpoch: Number(guard.meta.permission_epoch),
+        isBot: req.docSpaceScope?.mode === 'bot' }, { title })
+    } catch (error) {
+      if (error instanceof PptApiError) { res.status(error.httpStatus).json({ error: error.code.toLowerCase(), message: error.message }); return }
+      throw error
+    }
+  } else await docMetaRepo.rename(docId, title, req.uid!)
   // Title lives in the search index (matched as title^2, returned as _source.title),
   // so a rename must re-index or the new title is missed / the stale one keeps
   // showing until an unrelated body edit reindexes. Enqueue a body signal: the
@@ -1146,7 +1180,8 @@ export async function docIdCollabTokenHandler(req: Request, res: Response): Prom
  * `X-Space-Id` is REQUIRED here (per-route spaceContextMiddleware, so a
  * single-document request passing through this router without a match never
  * trips the 400). Mounted BEFORE the DocumentResourceRouter so the fixed paths
- * (`/`, `/search`, `/recent`, `/recent/creators`) are never shadowed by `/:docId`.
+ * (`/`, `/search`, `/recent`, `/recent/creators`, `/manageable`) are never
+ * shadowed by `/:docId`.
  */
 export const spaceCollectionRouter: ExpressRouter = Router()
 // Creating a document has no existing doc role to authorize against, so the
@@ -1154,11 +1189,12 @@ export const spaceCollectionRouter: ExpressRouter = Router()
 // their row-level owner/doc_member predicates and only add Space-shared rows for
 // confirmed members; gating those reads would subtract legitimate cross-Space
 // direct grants.
-spaceCollectionRouter.post('/', spaceContextMiddleware, requireSpaceMembership, createDocHandler)
+spaceCollectionRouter.post('/', spaceContextMiddleware, requireSpaceMembership, documentAsync(createDocHandler))
 spaceCollectionRouter.get('/', spaceContextMiddleware, requireSpaceMembership, listDocsHandler)
 spaceCollectionRouter.post('/search', spaceContextMiddleware, requireSpaceMembership, searchDocsHandler)
 spaceCollectionRouter.get('/recent', spaceContextMiddleware, requireSpaceMembership, listRecentHandler)
 spaceCollectionRouter.get('/recent/creators', spaceContextMiddleware, requireSpaceMembership, listRecentCreatorsHandler)
+spaceCollectionRouter.get('/manageable', spaceContextMiddleware, requireSpaceMembership, listManageableHandler)
 
 /**
  * Human DocumentResourceRouter (remove-sp §6): every single-document operation,

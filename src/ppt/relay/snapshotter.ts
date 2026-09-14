@@ -2,14 +2,9 @@
  * In-process, server-side snapshotter for the PPT relay (R4-B1 XIN-1759 Part B,
  * owner-approved XIN-1758 / XIN-1764 Option 2).
  *
- * The relay is a single-replica, per-room total-order broadcast relay: it already
- * owns process-local room membership, byte accounting, and a per-room mutation
- * chain ({@link PptRelay} `roomChains`). Snapshot advancement and op-log pruning
- * therefore serialize in that SAME room chain — no distributed lock, no second
- * service, no cross-replica scheduler. This module holds the deterministic Bento
- * op reducer and the read → reduce → save → prune sequence; {@link PptRelay} runs
- * every call inside the room chain so it is atomic w.r.t. appends and other
- * snapshot jobs.
+ * Local room chains coalesce work. Cross-node safety comes from the durable
+ * snapshot-version compare-and-swap: a reducer whose base was replaced cannot
+ * publish or prune its result. Appends use the shared database room counter.
  *
  * PRUNE SAFETY (the whole reason this moved server-side): a snapshot may prune
  * `ppt_collab_op.seq <= coveredSeq` ONLY after `(doc, state, coveredSeq)` is
@@ -543,7 +538,7 @@ export class PptSnapshotter {
         const trigger: 'seq-lag' | 'byte-budget' = lagAged ? 'seq-lag' : 'byte-budget'
         const doc = probe.doc
         const state = probe.engine.toJSON()
-        const saved = await this.store.saveSnapshot({ docId, coveredSeq: targetSeq, doc, state })
+        const saved = await this.store.saveSnapshot({ docId, coveredSeq: targetSeq, doc, state, expectedSnapshotVersion: existing?.snapshotVersion ?? 0 })
         const prunableSeq = saved.coveredSeq ?? targetSeq
         const freedBytes = await this.store.pruneOpsThrough(docId, prunableSeq)
         // Escalate AFTER the compacting snapshot + prune committed, so the room is
@@ -572,7 +567,7 @@ export class PptSnapshotter {
     const state = engine.toJSON()
 
     // Persist doc + state + coverage atomically BEFORE any prune (§7.3).
-    const saved = await this.store.saveSnapshot({ docId, coveredSeq: safeSeq, doc, state })
+    const saved = await this.store.saveSnapshot({ docId, coveredSeq: safeSeq, doc, state, expectedSnapshotVersion: existing?.snapshotVersion ?? 0 })
     // Prune with the AUTHORITATIVE post-write coveredSeq the store read back
     // (GREATEST(existing, incoming)), never the raw target: a snapshot may only
     // ever prune the op prefix the persisted doc actually subsumes (XIN-1693 P0-1).

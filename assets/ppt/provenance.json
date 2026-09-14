@@ -1,0 +1,26 @@
+{
+  "source": "nyblnet/bento",
+  "commit": "cc038183dbf79a33bee7fe49d0aa1c23f7224874",
+  "inputSha256": {
+    "runtime/ppt-player/README.md": "af08e443e817799bd4a43ce16bc156b2718646227d2fe19499b2d0d25f81b9b0",
+    "runtime/ppt-player/entry.ts": "0b75b8a6bcb86903ff0e05d1499c94a2b508e5dec666069a3b7c18b5c71aa664",
+    "runtime/ppt-player/index.html": "a3780649ea82df124078fb6ee3351bbb3e99c4dbb3cb8b654e1c2b3528142570",
+    "runtime/ppt-player/vendor/chinese.ts": "2cd53eca5a35da653d6b9ccf1935e6fa0003e39efad76c93a36c235b6d9a883d",
+    "runtime/ppt-player/vendor/codeElement.ts": "868665eda544ce8d415f0e757ac2b3a11a87830db4a18f68c2b07737ba4bf553",
+    "runtime/ppt-player/vendor/codePanel.ts": "12de9c6f13cd4d5f3fcaf969bff40715bfcfb6f6067a83dd7b2d8e1b248a1d23",
+    "runtime/ppt-player/vendor/hostedDialog.ts": "7085c74c83feab40ff67fc68b154d5272d85e97d6c8a32a6d08bd8967d956481",
+    "runtime/ppt-player/vendor/native/code.ts": "0ce29d989935ff1d64f5370befa98b6fcd20657d3f6a5a43b71130a671b722a1",
+    "runtime/ppt-player/vendor/native/diff.ts": "66b047d9f2d62b475fc9e3e693c8ddf7c1a22aebe0acb1024d69ed818c6d4308",
+    "runtime/ppt-player/vendor/native/model.ts": "6ee40a250c86c8b3ac9b575470ce508fc2235f4fcdc31bec69a91e44933969a1",
+    "runtime/ppt-player/vendor/native/provenance.json": "f25ff648ca749e34cbd22c63dfc9ccde5032b655df8a9f450997bd0876aa77d7",
+    "runtime/ppt-player/vendor/native/tokenize.ts": "c9492366e8378aff98f29948c3982b435d7fe94909a35e488f3f2e0b4b9b9ab2",
+    "runtime/ppt-player/vendor/overlayTokens.css": "5f9ba4c9dcb4de25c25156964b2eba697937e6ff8ccbf84e4d9076b7172afa92",
+    "runtime/ppt-player/vendor/overlays.css": "b375cfeae92a20a6ca38b8b618268b6653b9d0c344c3ff994e12874e87c65f25",
+    "runtime/ppt-player/vendor/presentationControls.ts": "083971020435a28fa7619a67c43925050ddb50baa65c8af2f1056399f0f9ceb9",
+    "runtime/ppt-player/vendor/presenter.ts": "20e97e3373402e2c799b40b27712741abe3d11972fa22adcc0e0f345ed7388cb",
+    "scripts/buildPptPlayer.mjs": "1f98c3128fa16a612924f52f101bc463c193beb7ec632230acfdf3576a6d6fd9",
+    "scripts/ppt-code-plugin.mjs": "d4dd33c88b6bf9cc8dbe9166f2268280a3df2a571d893cb6e702258123d11928",
+    "src/ppt/offlineHost.ts": "5c52d8fd3776d9def93c11c1026a89b47fbadd09564bb0026ad8ca653b355ed0"
+  },
+  "sha256": "bf9fec23a757dbd1de7a4c6e567b9717035dc1b06a5955a108f0b945594cabc2"
+}

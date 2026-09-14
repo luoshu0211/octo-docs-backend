@@ -5,6 +5,7 @@ import {
   SHEET_DIMS_FIELD,
   SHEET_LIST_FIELD,
   SHEET_DATA_VALIDATIONS_FIELD,
+  SHEET_MAX_ROWS,
   type SheetCell,
   type StoredDataValidation,
   type StoredSheetMeta,
@@ -360,7 +361,7 @@ describe('PATCH /sheet — batch write', () => {
     await patchDocSheetHandler(req({ docId: 'd_1' }, { body: {
       baseVersion: encodeBaseVersion(view.baseSV),
       filters: {
-        default: { ref: { startRow: 0, startColumn: 0, endRow: 1000, endColumn: 1 } },
+        default: { ref: { startRow: 0, startColumn: 0, endRow: SHEET_MAX_ROWS, endColumn: 1 } },
       },
     } }), res as never)
 
@@ -964,5 +965,26 @@ describe('cell contract validation', () => {
 
     expect(res.statusCode).toBe(422)
     expect(res.body).toEqual({ error: 'sheet_cell_invalid' })
+  })
+
+  it('422 sheet_cell_invalid on rowCount or a cell row beyond the 10000-row ceiling', async () => {
+    for (const body of [
+      { sheets: { default: { name: 'Sheet1', order: 0, rowCount: 10_001 } } },
+      { cells: { 'default!10000:0': { v: 'hidden' } } },
+    ]) {
+      const view = liveSheet({}, {}, true)
+      vi.mocked(readLiveSheet).mockResolvedValue(view)
+      mockTx(okMeta)
+
+      const res = mockRes()
+      await patchDocSheetHandler(
+        req({ docId: 'd_1' }, { body: { baseVersion: encodeBaseVersion(view.baseSV), ...body } }),
+        res as never,
+      )
+
+      expect(res.statusCode).toBe(422)
+      expect(res.body).toEqual({ error: 'sheet_cell_invalid' })
+      expect(vi.mocked(commitLiveSheetEdit)).not.toHaveBeenCalled()
+    }
   })
 })

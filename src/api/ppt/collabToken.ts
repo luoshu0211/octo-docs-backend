@@ -29,6 +29,7 @@ import { parseDocumentName, isDocTypeConsistentWithName } from '../../permission
 import { getOctoIdentity } from '../../auth/octoIdentity.js'
 import { issuePptCollabToken } from '../../auth/pptCollabToken.js'
 import type { Role } from '../../permission/role.js'
+import { preparePptCollab } from '../../ppt/collabSession.js'
 
 /** POST /docs/collab-token — issue relay token + one-time WS ticket. */
 export async function collabTokenHandler(req: Request, res: Response): Promise<void> {
@@ -41,20 +42,17 @@ export async function collabTokenHandler(req: Request, res: Response): Promise<v
   if (typeof docIdRaw !== 'string' || docIdRaw.trim() === '') {
     throw new PptApiError('VALIDATION_ERROR', 'docId is required', { details: { field: 'docId' } })
   }
-  const docId = docIdRaw.trim()
+  const requestedDocId = docIdRaw.trim()
+  const clientSessionId = body.clientSessionId
+  if (typeof clientSessionId !== 'string' || !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(clientSessionId)) {
+    throw new PptApiError('VALIDATION_ERROR', 'invalid clientSessionId')
+  }
 
-  // Shared load + role resolution (throws NOT_FOUND / CONFLICT /
-  // UNSUPPORTED_DOCUMENT_TYPE); `role` may be 'none'. `spaceMember` is the SAME
-  // membership decision the effective role was resolved with (XIN-1739): the
-  // relay ticket signs THIS value so a later live downgrade recheck agrees with
-  // issuance, and a direct writer/admin resolved no membership IO. The ticket path
-  // uses the fail-closed membership resolver (XIN-1835 spec deviation): a lookup
-  // throw must degrade to non-member so the ticket carries a concrete signable
-  // boolean, never break issuance.
-  const { meta, role, spaceMember } = await loadPptDocForRead(uid, spaceId, docId, {
+  // Resolve Human current-Space membership and qualified ACL/share rights once.
+  const { meta, role, spaceMember } = await loadPptDocForRead(uid, spaceId, requestedDocId, {
     token,
-    membershipErrorMode: 'fail-closed',
   })
+  const docId = meta.doc_id
 
   // Access floor FIRST: a caller with no role must be told only that it has no
   // access — never a stored-name/type defect below. Checking access before the
@@ -70,7 +68,8 @@ export async function collabTokenHandler(req: Request, res: Response): Promise<v
   // this closes the stored-name half.
   try {
     const parsed = parseDocumentName(meta.document_name)
-    if (!isDocTypeConsistentWithName(parsed, meta.doc_type)) {
+    if (!isDocTypeConsistentWithName(parsed, meta.doc_type) || parsed.kind !== 'ppt' ||
+        parsed.doc !== meta.doc_id || parsed.space !== meta.space_id || parsed.folder !== meta.folder_id) {
       throw new PptApiError('FORBIDDEN', 'document name is inconsistent with its type')
     }
   } catch (err) {
@@ -85,6 +84,7 @@ export async function collabTokenHandler(req: Request, res: Response): Promise<v
   // snapshot => 0 (a freshly created deck before any live snapshot). This is NOT
   // the replay cursor: the relay's replay `since` is an op-sequence the client
   // seeds from `ready.q` (0 on first join), a distinct coordinate (XIN-1655 C5).
+  await preparePptCollab(docId, Number(meta.permission_epoch))
   const liveSnapshot = await pptLiveSnapshotRepo.get(docId)
   const snapshotVersion = liveSnapshot?.snapshotVersion ?? 0
 
@@ -106,6 +106,7 @@ export async function collabTokenHandler(req: Request, res: Response): Promise<v
   // wrongly revoke a live share writer.
 
   const result = issuePptCollabToken({
+    clientSessionId,
     uid,
     docId,
     documentName: meta.document_name,
@@ -114,9 +115,8 @@ export async function collabTokenHandler(req: Request, res: Response): Promise<v
     principalSpaceId: spaceId,
     snapshotVersion,
     spaceMember,
-    // loadPptDocForRead proved active membership in the request Space and exact
-    // equality with the deck's canonical home Space before this point.
-    homeSpaceVerified: true,
+    homeSpaceVerified: spaceMember,
+    currentSpaceVerified: true,
     ...(displayName !== '' ? { name: displayName } : {}),
   })
   sendPptData(res, result)

@@ -1,3 +1,4 @@
+vi.mock('../src/db/pool.js', () => ({ query: vi.fn(async () => []), transaction: vi.fn(async fn => fn({})) }))
 import { describe, it, expect, vi, beforeAll, afterAll, beforeEach } from 'vitest'
 import type { AddressInfo } from 'node:net'
 import type { Server } from 'node:http'
@@ -20,6 +21,8 @@ vi.mock('../src/db/repos/docMetaRepo.js', () => ({
   CanonicalHtmlArchivedError: class CanonicalHtmlArchivedError extends Error {},
   CanonicalHtmlLegacyConflictError: class CanonicalHtmlLegacyConflictError extends Error {},
   docMetaRepo: {
+    createTx: vi.fn(async (_tx, input) => docMetaRepo.create(input)),
+    getByDocIdTx: vi.fn(async (_tx, id) => docMetaRepo.getByDocId(id)),
     create: vi.fn(async () => undefined),
     getByDocId: vi.fn(async () => ({ doc_id: 'd_html', title: 'T', owner_id: 's_tmos_bot', owner_space_id: 's_1', space_id: 's_1', status: 1, share_scope: 0, created_at: new Date(0) })),
     getByOctoDocSlug: vi.fn(async () => null),
@@ -51,6 +54,7 @@ vi.mock('../src/db/repos/docMetaRepo.js', () => ({
 }))
 vi.mock('../src/db/repos/docMemberRepo.js', () => ({
   docMemberRepo: {
+    upsertDirectTx: vi.fn(async (_tx, input) => docMemberRepo.upsertDirect(input)),
     getRole: vi.fn(async () => undefined),
     upsertDirect: vi.fn(async () => undefined),
   },
@@ -165,8 +169,8 @@ describe('bot doc create auto-grants the bot owner admin (XIN-576)', () => {
     // Doc owner is still the bot (existing behavior unchanged).
     expect(body.ownerId).toBe('s_tmos_bot')
     // The human owner was added as an admin member on top.
-    expect(upsertDirect).toHaveBeenCalledTimes(1)
-    expect(upsertDirect.mock.calls[0]![0]).toMatchObject({
+    expect(upsertDirect).toHaveBeenCalledTimes(2)
+    expect(upsertDirect.mock.calls[1]![0]).toMatchObject({
       docId: body.docId,
       uid: 'u_human',
       principalSpaceId: 's_1',
@@ -174,8 +178,7 @@ describe('bot doc create auto-grants the bot owner admin (XIN-576)', () => {
       grantedBy: 's_tmos_bot',
     })
     // Membership change bumps the epoch for the added owner.
-    expect(bumpEpochMock).toHaveBeenCalledTimes(1)
-    expect(bumpEpochMock.mock.calls[0]![2]).toBe('u_human')
+    expect(bumpEpochMock).not.toHaveBeenCalled()
   })
 
   it('skips the grant when the bot has no distinct human owner (owner == bot)', async () => {
@@ -188,7 +191,7 @@ describe('bot doc create auto-grants the bot owner admin (XIN-576)', () => {
       body: JSON.stringify({ title: 'Platform Doc' }),
     })
     expect(res.status).toBe(201)
-    expect(upsertDirect).not.toHaveBeenCalled()
+    expect(upsertDirect).toHaveBeenCalledTimes(1)
     expect(bumpEpochMock).not.toHaveBeenCalled()
   })
 
@@ -200,7 +203,7 @@ describe('bot doc create auto-grants the bot owner admin (XIN-576)', () => {
       body: JSON.stringify({ title: 'No Owner Doc' }),
     })
     expect(res.status).toBe(201)
-    expect(upsertDirect).not.toHaveBeenCalled()
+    expect(upsertDirect).toHaveBeenCalledTimes(1)
     expect(bumpEpochMock).not.toHaveBeenCalled()
   })
 
@@ -216,8 +219,8 @@ describe('bot doc create auto-grants the bot owner admin (XIN-576)', () => {
     })
     expect(res.status).toBe(201)
     expect(create).toHaveBeenCalledTimes(1)
-    // No botOwnerUid on the human path => no extra member write, no epoch bump.
-    expect(upsertDirect).not.toHaveBeenCalled()
+    // The creator grant commits with metadata; no extra human owner or epoch broadcast.
+    expect(upsertDirect).toHaveBeenCalledTimes(1)
     expect(bumpEpochMock).not.toHaveBeenCalled()
   })
 })

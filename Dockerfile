@@ -37,7 +37,7 @@ ENV TYPST_EXPORT_FONT_PATH=/usr/share/fonts
 # Compile concurrency is capped in typstService.ts (TYPST_EXPORT_MAX_CONCURRENT,
 # default 2).
 ARG TYPST_VERSION=v0.13.1
-RUN apk add --no-cache --virtual .typst-fetch curl=8.21.0-r0 tar=1.35-r5 xz=5.8.3-r0 \
+RUN apk add --no-cache --virtual .typst-fetch curl=8.22.0-r0 tar=1.35-r5 xz=5.8.4-r0 \
     && ARCH="$(uname -m)" \
     && case "$ARCH" in \
          x86_64) TARGET=x86_64-unknown-linux-musl ;; \
@@ -57,10 +57,12 @@ RUN npm ci
 COPY tsconfig.json ./
 COPY src ./src
 COPY migrations ./migrations
+# PPT HTML export reads assets/ppt/player.html relative to WORKDIR /app.
+COPY assets/ppt ./assets/ppt
 RUN npm run build
 
 ENV NODE_ENV=production
-# 3000 = public REST API, 1234 = Hocuspocus collab WS, 9090 = optional
+# 3000 = public HTTP API + PPT collab WS, 1234 = Hocuspocus Yjs WS, 9090 = optional
 # internal-only API (bound only when INTERNAL_HTTP_PORT is set; serves
 # /internal/html). EXPOSE is documentation/intra-network only — never publish
 # 9090 to the host (caveat: `docker run -P` publishes EVERY EXPOSEd port to an

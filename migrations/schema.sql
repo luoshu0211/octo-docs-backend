@@ -467,3 +467,45 @@ CREATE TABLE ppt_collab_frame (
   PRIMARY KEY (doc_id, frame_id),
   KEY idx_ppt_collab_frame_doc_seq (doc_id, seq)           -- range key for the retention prune `WHERE doc_id=? AND seq<=?` (XIN-1825 P2-1); without it the DELETE range-scans the whole (doc_id) PK partition and next-key-locks every row it examines
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Immutable PPT history, independent of Yjs doc_version.
+-- PPT anchors are not Yjs relative positions. Soft deletion retains thread roots.
+CREATE TABLE IF NOT EXISTS ppt_comment (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  doc_id VARCHAR(64) NOT NULL,
+  parent_id BIGINT UNSIGNED NULL,
+  author_uid VARCHAR(64) NOT NULL,
+  author_space_id VARCHAR(128) NOT NULL,
+  body TEXT NOT NULL,
+  anchor_json TEXT NULL,
+  revision BIGINT UNSIGNED NOT NULL DEFAULT 1,
+  resolved TINYINT NOT NULL DEFAULT 0,
+  deleted TINYINT NOT NULL DEFAULT 0,
+  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (id),
+  KEY idx_ppt_comment_thread (doc_id, parent_id, id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
+CREATE TABLE IF NOT EXISTS ppt_version (
+  doc_id VARCHAR(64) NOT NULL,
+  version_seq BIGINT UNSIGNED NOT NULL,
+  kind VARCHAR(16) NOT NULL,
+  label VARCHAR(256) NOT NULL DEFAULT '',
+  base_revision BIGINT UNSIGNED NOT NULL,
+  deck_json MEDIUMTEXT NOT NULL,
+  html LONGTEXT NOT NULL,
+  content_hash CHAR(64) NOT NULL,
+  created_by VARCHAR(64) NOT NULL,
+  principal_space_id VARCHAR(128) NOT NULL,
+  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (doc_id, version_seq)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
+-- Per-actor continuity survives frame pruning and process restarts.
+CREATE TABLE IF NOT EXISTS ppt_collab_actor_seq (
+  doc_id VARCHAR(64) NOT NULL,
+  actor VARCHAR(255) NOT NULL,
+  last_s BIGINT UNSIGNED NOT NULL,
+  PRIMARY KEY (doc_id, actor)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;

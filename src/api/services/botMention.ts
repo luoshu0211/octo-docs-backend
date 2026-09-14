@@ -138,7 +138,7 @@ export interface BotMentionParams {
    * different route entirely (routes/htmlComments.ts), so it states the kind
    * rather than having this service sniff it.
    */
-  docKind?: 'html'
+  docKind?: 'html' | 'ppt'
   /**
    * Id of the comment just created.
    *
