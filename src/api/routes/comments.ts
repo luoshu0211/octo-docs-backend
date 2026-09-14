@@ -22,8 +22,9 @@
  */
 import { Router, type Router as ExpressRouter, type Request, type Response } from 'express'
 import { requireDocRole } from '../guard.js'
+import { commentMutationRole, isCommentAuthor, isCommentBody } from '../../comments/policy.js'
 import { roleAtLeast } from '../../permission/role.js'
-import { docCommentRepo, type DocComment } from '../../db/repos/docCommentRepo.js'
+import { type DocComment } from '../../db/repos/docCommentRepo.js'
 import {
   resolveAnchorFromLiveDoc,
   AmbiguousAnchorError,
@@ -32,11 +33,17 @@ import {
 import { notifyDocMentioned } from '../services/docsNotify.js'
 import { reportBotMentions } from '../services/botMention.js'
 import type { BlockPath } from '../../collab/docBodyEdit.js'
-import { isDocType, HTML_PPT_DOC_TYPE } from '../../db/docType.js'
+import { isDocType } from '../../db/docType.js'
 import { validateExplicitCommentAnchors } from '../services/commentAnchors.js'
 import { publishCommentMutation } from '../services/commentEvents.js'
 
+import { commentStorage, pptPrincipalFromGuard } from '../services/commentStorage.js'
+import { validatePptComment, listPptComments } from '../../ppt/comments.js'
+import { reportPptCommentMention } from '../services/pptCommentMention.js'
+import { documentAsync, documentErrorHandler } from '../services/documentRoute.js'
+
 export const commentsRouter: ExpressRouter = Router()
+commentsRouter.use((_req, res, next) => { res.setHeader('Cache-Control', 'private, no-store'); next() })
 
 const DEFAULT_LIMIT = 50
 const MAX_LIMIT = 100
@@ -147,6 +154,20 @@ function fireBotMentionReport(params: Parameters<typeof reportBotMentions>[0]): 
     })
 }
 
+function notifyCommentCreated(req: Request, guard: import('../guard.js').DocGuard, id: number, body: string, parentId?: number) {
+  void notifyDocMentioned({ docId: guard.meta.doc_id, spaceId: guard.meta.space_id,
+    title: guard.meta.title, authorUid: req.uid!, body })
+  if (guard.meta.doc_type === 'html_ppt') {
+    void reportPptCommentMention(pptPrincipalFromGuard(req, guard), id,
+      validatePptComment(req.body), req.octoToken ?? '')
+  } else {
+    fireBotMentionReport({ docId: guard.meta.doc_id, commentId: id, parentId,
+      spaceId: guard.meta.space_id, authorUid: req.uid!, authorRole: guard.role,
+      ownedBots: req.ownedBots ?? [], callerToken: req.octoToken, body, isBotCaller: req.botToken !== undefined })
+  }
+  void publishCommentMutation(guard.meta.document_name, guard.meta.doc_id, id, 'created')
+}
+
 /** Serialize a stored comment for the wire (anchors -> base64). */
 function serialize(c: DocComment) {
   return {
@@ -155,6 +176,7 @@ function serialize(c: DocComment) {
     parentId: c.parentId,
     authorUid: c.authorUid,
     body: c.body,
+    ...(c.anchor !== undefined ? { anchor: c.anchor, revision: c.revision, authorSpaceId: c.authorSpaceId, deleted: c.deleted } : {}),
     anchorStart: c.anchorStart ? c.anchorStart.toString('base64') : null,
     anchorEnd: c.anchorEnd ? c.anchorEnd.toString('base64') : null,
     anchorText: c.anchorText,
@@ -166,32 +188,34 @@ function serialize(c: DocComment) {
   }
 }
 
-commentsRouter.get('/:docId/comments/markers', listCommentMarkersHandler)
-commentsRouter.get('/:docId/comments/:id/thread', getCommentThreadHandler)
-commentsRouter.get('/:docId/comments', listCommentsHandler)
+commentsRouter.get('/:docId/comments/markers', documentAsync(listCommentMarkersHandler))
+commentsRouter.get('/:docId/comments/:id/thread', documentAsync(getCommentThreadHandler))
+commentsRouter.get('/:docId/comments', documentAsync(listCommentsHandler))
 
 /** Fetch one grouped root by marker id without walking paginated thread pages. */
 export async function getCommentThreadHandler(req: Request, res: Response): Promise<void> {
   const guard = await requireDocRole(req, res, req.params.docId!, 'reader')
   if (!guard) return
+  const store = commentStorage(req, guard)
   const id = parseId(req.params.id)
   if (id === null) {
     res.status(404).json({ error: 'not_found' })
     return
   }
-  const root = await docCommentRepo.getById(id)
-  if (!root || root.docId !== guard.meta.doc_id || root.parentId !== null || root.deleted) {
+  const root = await store.getById(id)
+  if (!root || root.docId !== guard.meta.doc_id || root.parentId !== null || (root.deleted && guard.meta.doc_type !== 'html_ppt')) {
     res.status(404).json({ error: 'not_found' })
     return
   }
-  const replies = await docCommentRepo.listReplies(id)
-  res.status(200).json({ ...serialize(root), replies: replies.map(serialize) })
+  const replies = await store.listReplies(id)
+  res.status(200).json({ ...serialize(root), replies: replies.map(serialize), ...(guard.meta.doc_type === 'html_ppt' ? { repliesNextCursor: replies.length === 25 ? replies[24]!.id : null } : {}) })
 }
 
 /** Paginated lightweight marker feed; every page contains unresolved roots only. */
 export async function listCommentMarkersHandler(req: Request, res: Response): Promise<void> {
   const guard = await requireDocRole(req, res, req.params.docId!, 'reader')
   if (!guard) return
+  const store = commentStorage(req, guard)
   if (guard.meta.doc_type !== 'board') {
     res.status(409).json({ error: 'unsupported_doc_type' })
     return
@@ -204,7 +228,7 @@ export async function listCommentMarkersHandler(req: Request, res: Response): Pr
   }
   const limitRaw = Number(req.query.limit ?? DEFAULT_LIMIT)
   const limit = Math.min(MAX_LIMIT, Math.max(1, Number.isFinite(limitRaw) ? Math.trunc(limitRaw) : DEFAULT_LIMIT))
-  const roots = await docCommentRepo.listUnresolvedMarkers(guard.meta.doc_id, cursor, limit)
+  const roots = await store.listUnresolvedMarkers(guard.meta.doc_id, cursor, limit)
   const items = roots.map((root) => ({
     id: root.id,
     anchorStart: root.anchorStart.toString('base64'),
@@ -220,16 +244,17 @@ export async function listCommentMarkersHandler(req: Request, res: Response): Pr
 export async function listCommentsHandler(req: Request, res: Response): Promise<void> {
   const guard = await requireDocRole(req, res, req.params.docId!, 'reader')
   if (!guard) return
+  const store = commentStorage(req, guard)
 
   const includeResolved = req.query.includeResolved === '1'
   const cursor = parseId(req.query.cursor)
   const limitRaw = Number(req.query.limit ?? DEFAULT_LIMIT)
   const limit = Math.min(MAX_LIMIT, Math.max(1, Number.isFinite(limitRaw) ? Math.trunc(limitRaw) : DEFAULT_LIMIT))
 
-  const roots = await docCommentRepo.listRoots(guard.meta.doc_id, { includeResolved, cursor, limit })
+  const roots = await store.listRoots(guard.meta.doc_id, { includeResolved, cursor, limit })
   // Batch all replies for this page of roots in ONE query, then group by
   // parent in memory — avoids an N+1 (one listReplies per root, up to ~101).
-  const replies = await docCommentRepo.listRepliesForRoots(roots.map((r) => r.id))
+  const replies = await store.listRepliesForRoots(roots.map((r) => r.id))
   const byParent = new Map<number, DocComment[]>()
   for (const reply of replies) {
     const group = byParent.get(reply.parentId!)
@@ -239,21 +264,24 @@ export async function listCommentsHandler(req: Request, res: Response): Promise<
   const items = roots.map((root) => ({
     ...serialize(root),
     replies: (byParent.get(root.id) ?? []).map(serialize),
+    ...(guard.meta.doc_type === 'html_ppt' ? { repliesNextCursor: (byParent.get(root.id)?.length ?? 0) === 25 ? byParent.get(root.id)![24]!.id : null } : {}),
   }))
   const nextCursor = roots.length === limit ? roots[roots.length - 1]!.id : null
 
   res.status(200).json({ items, nextCursor })
 }
 
-commentsRouter.post('/:docId/comments', createCommentHandler)
+commentsRouter.post('/:docId/comments', documentAsync(createCommentHandler))
 
 export async function createCommentHandler(req: Request, res: Response): Promise<void> {
   const guard = await requireDocRole(req, res, req.params.docId!, 'commenter')
   if (!guard) return
+  const store = commentStorage(req, guard)
 
   const { body, anchorStart, anchorEnd, anchorText, parentId } = req.body ?? {}
+  const pptInput = guard.meta.doc_type === 'html_ppt' ? validatePptComment(req.body) : undefined
 
-  if (typeof body !== 'string' || body.trim() === '') {
+  if (!isCommentBody(body)) {
     res.status(400).json({ error: 'body required' })
     return
   }
@@ -269,7 +297,7 @@ export async function createCommentHandler(req: Request, res: Response): Promise
       return
     }
     // Validate and insert under one row lock so a concurrent root delete cannot create an orphan.
-    const id = await docCommentRepo.createReplyIfRoot({
+    const id = await store.createReplyIfRoot({
       docId,
       documentName,
       parentId: pid,
@@ -281,25 +309,7 @@ export async function createCommentHandler(req: Request, res: Response): Promise
       res.status(404).json({ error: 'not_found' })
       return
     }
-    // Best-effort: notify mentions and invalidate live comment views.
-    void notifyDocMentioned({ docId, spaceId: guard.meta.space_id, title: guard.meta.title, authorUid: req.uid!, body })
-    fireBotMentionReport({
-      docId,
-      commentId: id,
-      parentId: pid,
-      // upstream #170 起 space 不再从请求参数取,统一读 guard 解析出的文档归属 —— 
-      // 与上面 notifyDocMentioned 用同一个来源,免得两处 space 漂开。
-      spaceId: guard.meta.space_id,
-      authorUid: req.uid!,
-      authorRole: guard.role,
-      ownedBots: req.ownedBots ?? [],
-      // The author's own session token authenticates the friend-bot lookup
-      // (GET /v1/robot/my_bots answers only for the token holder). Never logged.
-      callerToken: req.octoToken,
-      body,
-      isBotCaller: req.botToken !== undefined,
-    })
-    void publishCommentMutation(documentName, docId, id, 'created')
+    if (store.didCreate()) notifyCommentCreated(req, guard, id, body, pid)
     res.status(201).json({ id })
     return
   }
@@ -314,20 +324,13 @@ export async function createCommentHandler(req: Request, res: Response): Promise
 
   let start: Buffer
   let end: Buffer
-  if (hasStart && hasEnd) {
+  if (pptInput) {
+    start = Buffer.alloc(0); end = Buffer.alloc(0)
+  } else if (hasStart && hasEnd) {
     // (a) Explicit anchors. Board anchors are canonical versioned JSON; all
     // other document types retain their existing opaque formats and reject the
     // board namespace.
     if (!isDocType(guard.meta.doc_type)) {
-      res.status(409).json({ error: 'unsupported_doc_type' })
-      return
-    }
-    // html_ppt (Bento slide-deck) is NOT served by this legacy comment surface —
-    // deck comments get their own /api/v1/ppt endpoints in R2. Adding html_ppt to
-    // DOC_TYPES widened the isDocType() gate above (it used to reject an html_ppt
-    // row as unsupported); reject it explicitly so a deck cannot store opaque
-    // anchors here and end up with two comment surfaces.
-    if (guard.meta.doc_type === HTML_PPT_DOC_TYPE) {
       res.status(409).json({ error: 'unsupported_doc_type' })
       return
     }
@@ -380,38 +383,22 @@ export async function createCommentHandler(req: Request, res: Response): Promise
     res.status(400).json({ error: 'anchorStart and anchorEnd required for a root comment' })
     return
   }
-  const id = await docCommentRepo.create({
+  const id = await store.create({
     docId,
     documentName,
     parentId: null,
     authorUid: req.uid!,
     body,
+    ...(pptInput ? { anchor: pptInput.anchor } : {}),
     anchorStart: start,
     anchorEnd: end,
     anchorText: typeof anchorText === 'string' ? anchorText.slice(0, 512) : '',
   })
-  // Best-effort: notify mentions and invalidate live comment views.
-  void notifyDocMentioned({ docId, spaceId: guard.meta.space_id, title: guard.meta.title, authorUid: req.uid!, body })
-  // A root comment sends no parent_id, so octo-server derives the thread from comment_id.
-  fireBotMentionReport({
-    docId,
-    commentId: id,
-    // 同上:upstream #170 后 space 统一取 guard.meta.space_id。
-    spaceId: guard.meta.space_id,
-    authorUid: req.uid!,
-    authorRole: guard.role,
-    ownedBots: req.ownedBots ?? [],
-    // The author's own session token authenticates the friend-bot lookup
-    // (GET /v1/robot/my_bots answers only for the token holder). Never logged.
-    callerToken: req.octoToken,
-    body,
-    isBotCaller: req.botToken !== undefined,
-  })
-  void publishCommentMutation(documentName, docId, id, 'created')
+  if (store.didCreate()) notifyCommentCreated(req, guard, id, body)
   res.status(201).json({ id })
 }
 
-commentsRouter.patch('/:docId/comments/:id', patchCommentHandler)
+commentsRouter.patch('/:docId/comments/:id', documentAsync(patchCommentHandler))
 
 export async function patchCommentHandler(req: Request, res: Response): Promise<void> {
   const docId = req.params.docId!
@@ -421,13 +408,14 @@ export async function patchCommentHandler(req: Request, res: Response): Promise<
   // author check below ever gets a chance to allow a write.
   const guard = await requireDocRole(req, res, docId, 'commenter')
   if (!guard) return
+  const store = commentStorage(req, guard)
 
   const id = parseId(req.params.id)
   if (id === null) {
     res.status(404).json({ error: 'not_found' })
     return
   }
-  const comment = await docCommentRepo.getById(id)
+  const comment = await store.getById(id)
   // Cross-doc / missing / deleted => 404 (do not leak existence).
   if (!comment || comment.docId !== guard.meta.doc_id || comment.deleted) {
     res.status(404).json({ error: 'not_found' })
@@ -438,7 +426,7 @@ export async function patchCommentHandler(req: Request, res: Response): Promise<
 
   // Resolve / reopen a thread root — requires writer (elevated above the floor).
   if (resolved !== undefined) {
-    if (!roleAtLeast(guard.role, 'writer')) {
+    if (!roleAtLeast(guard.role, commentMutationRole('edit'))) {
       res.status(403).json({ error: 'forbidden' })
       return
     }
@@ -450,7 +438,7 @@ export async function patchCommentHandler(req: Request, res: Response): Promise<
       res.status(400).json({ error: 'resolved must be a boolean' })
       return
     }
-    await docCommentRepo.setResolved(id, resolved, req.uid!)
+    await store.setResolved(id, resolved, req.uid!)
     // Resolve/reopen changes both thread and marker visibility; clients refresh.
     void publishCommentMutation(guard.meta.document_name, guard.meta.doc_id, id, 'updated')
     res.status(200).json({ id })
@@ -459,15 +447,15 @@ export async function patchCommentHandler(req: Request, res: Response): Promise<
 
   // Body edit remains a writer operation; writers may edit only their own comments.
   if (body !== undefined) {
-    if (comment.authorUid !== req.uid || !roleAtLeast(guard.role, 'writer')) {
+    if (!isCommentAuthor(comment, { uid: req.uid!, spaceId: req.principalSpaceId }) || !roleAtLeast(guard.role, commentMutationRole('edit'))) {
       res.status(403).json({ error: 'forbidden' })
       return
     }
-    if (typeof body !== 'string' || body.trim() === '') {
+    if (!isCommentBody(body)) {
       res.status(400).json({ error: 'body required' })
       return
     }
-    await docCommentRepo.updateBody(id, body)
+    await store.updateBody(id, body)
     void publishCommentMutation(guard.meta.document_name, guard.meta.doc_id, id, 'updated')
     res.status(200).json({ id })
     return
@@ -476,7 +464,7 @@ export async function patchCommentHandler(req: Request, res: Response): Promise<
   res.status(400).json({ error: 'nothing to update' })
 }
 
-commentsRouter.delete('/:docId/comments/:id', deleteCommentHandler)
+commentsRouter.delete('/:docId/comments/:id', documentAsync(deleteCommentHandler))
 
 export async function deleteCommentHandler(req: Request, res: Response): Promise<void> {
   const docId = req.params.docId!
@@ -484,13 +472,14 @@ export async function deleteCommentHandler(req: Request, res: Response): Promise
   // enforces doc-status 404/409 semantics before the author check below.
   const guard = await requireDocRole(req, res, docId, 'commenter')
   if (!guard) return
+  const store = commentStorage(req, guard)
 
   const id = parseId(req.params.id)
   if (id === null) {
     res.status(404).json({ error: 'not_found' })
     return
   }
-  const comment = await docCommentRepo.getById(id)
+  const comment = await store.getById(id)
   if (!comment || comment.docId !== guard.meta.doc_id || comment.deleted) {
     res.status(404).json({ error: 'not_found' })
     return
@@ -500,23 +489,53 @@ export async function deleteCommentHandler(req: Request, res: Response): Promise
 
   if (hard) {
     // Hard delete is a moderator action — needs admin (admin/owner).
-    if (!roleAtLeast(guard.role, 'admin')) {
+    if (!roleAtLeast(guard.role, commentMutationRole('delete', true))) {
       res.status(403).json({ error: 'forbidden' })
       return
     }
     // doc_id from the guard is authoritative; scopes the destructive cascade.
-    await docCommentRepo.hardDelete(id, guard.meta.doc_id)
+    await store.hardDelete(id, guard.meta.doc_id)
     void publishCommentMutation(guard.meta.document_name, guard.meta.doc_id, id, 'deleted')
     res.status(200).json({ id })
     return
   }
 
   // Soft delete — only the author can remove their own comment.
-  if (comment.authorUid !== req.uid) {
+  if (!isCommentAuthor(comment, { uid: req.uid!, spaceId: req.principalSpaceId })) {
     res.status(403).json({ error: 'forbidden' })
     return
   }
-  await docCommentRepo.softDelete(id)
+  await store.softDelete(id)
   void publishCommentMutation(guard.meta.document_name, guard.meta.doc_id, id, 'deleted')
   res.status(200).json({ id })
 }
+
+/** A bounded continuation of one thread, also used by content adapters. */
+commentsRouter.get('/:docId/comments/:id/replies', documentAsync(async (req, res) => {
+  const guard = await requireDocRole(req, res, req.params.docId!, 'reader')
+  if (!guard) return
+  const id = parseId(req.params.id), cursor = parseId(req.query.cursor) ?? 0
+  if (id === null) { res.status(400).json({ error: 'invalid_id' }); return }
+  const store = commentStorage(req, guard)
+  const root = await store.getById(id)
+  if (!root || root.docId !== guard.meta.doc_id || root.parentId !== null || (root.deleted && guard.meta.doc_type !== 'html_ppt')) {
+    res.status(404).json({ error: 'not_found' }); return
+  }
+  if (guard.meta.doc_type === 'html_ppt') {
+    res.json(await listPptComments(pptPrincipalFromGuard(req, guard), cursor, id)); return
+  }
+  const replies = (await store.listReplies(id)).filter(row => row.id > cursor)
+  res.json({ items: replies.slice(0, 25).map(serialize), nextCursor: replies.length > 25 ? replies[24]!.id : null })
+}))
+commentsRouter.get('/:docId/comments/:id', documentAsync(async (req, res) => {
+  const guard = await requireDocRole(req, res, req.params.docId!, 'reader')
+  if (!guard) return
+  const id = parseId(req.params.id)
+  const store = commentStorage(req, guard)
+  const comment = id === null ? null : await store.getById(id)
+  if (!comment || comment.docId !== guard.meta.doc_id || comment.deleted) { res.status(404).json({ error: 'not_found' }); return }
+  const root = comment.parentId === null ? comment : await store.getById(comment.parentId)
+  if (!root || root.docId !== guard.meta.doc_id || root.deleted) { res.status(404).json({ error: 'not_found' }); return }
+  res.json({ comment: serialize(comment), root: serialize(root) })
+}))
+commentsRouter.use(documentErrorHandler)

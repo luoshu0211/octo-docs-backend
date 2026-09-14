@@ -37,6 +37,11 @@ export default tseslint.config(
     },
   },
   {
+    // Vendored frontend/Bento input remains byte-identical to its reviewed source.
+    files: ['runtime/ppt-player/vendor/**/*.ts'],
+    rules: { '@typescript-eslint/no-explicit-any': 'off', 'prefer-const': 'off' },
+  },
+  {
     files: ['test/**/*.ts'],
     languageOptions: {
       globals: {

@@ -191,6 +191,23 @@ describe('GET /sheet — live cells + dims + base version', () => {
     })
   })
 
+  it('returns the declared rowCount in sheetList', async () => {
+    const doc = new Y.Doc()
+    doc.getMap<StoredSheetMeta>(SHEET_LIST_FIELD).set('default', {
+      name: 'Sheet1', order: 0, rowCount: 200,
+    })
+    const state = Y.encodeStateAsUpdate(doc)
+    vi.mocked(readLiveSheet).mockResolvedValue({ state, baseSV: Y.encodeStateVector(doc) })
+
+    const res = mockRes()
+    await getDocSheetHandler(req({ docId: 'd_1' }), res as never)
+
+    expect(res.statusCode).toBe(200)
+    expect((res.body as { sheetList: Record<string, StoredSheetMeta> }).sheetList).toEqual({
+      default: { name: 'Sheet1', order: 0, rowCount: 200 },
+    })
+  })
+
   it('returns checkbox validation rules with the live sheet state', async () => {
     const doc = new Y.Doc()
     doc.getMap<StoredSheetMeta>(SHEET_LIST_FIELD).set('default', { name: 'Sheet1', order: 0 })

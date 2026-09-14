@@ -26,100 +26,14 @@
  */
 import { Router, json, type Request, type Response, type NextFunction } from 'express'
 import { config } from '../../config/env.js'
-import { createPptDocsRouter } from './docs.js'
+import { createPptDraftRouter } from './draft.js'
+import { createPptLiveRouter } from './live.js'
+import { createPptExportRouter } from './export.js'
 import { createPptSourceRouter } from './source.js'
 import { createPptCollabTokenRouter } from './collabToken.js'
 
-/**
- * Fixed HTTP-status-to-code map. The first ten codes are C's enum verbatim; the
- * eleventh (`UNSUPPORTED_DOCUMENT_TYPE`) is the PPT-specific addition. C maps
- * `UPSTREAM_UNAVAILABLE` to 502/503 — B pins the single canonical 502 for the
- * outbound status line while still accepting either upstream.
- */
-export const PPT_ERROR_STATUS = {
-  VALIDATION_ERROR: 400,
-  AUTH_REQUIRED: 401,
-  FORBIDDEN: 403,
-  NOT_FOUND: 404,
-  CONFLICT: 409,
-  PAYLOAD_TOO_LARGE: 413,
-  UNSUPPORTED_MEDIA_TYPE: 415,
-  UNSUPPORTED_DOCUMENT_TYPE: 422,
-  RATE_LIMITED: 429,
-  INTERNAL_ERROR: 500,
-  UPSTREAM_UNAVAILABLE: 502,
-} as const
-
-export type PptErrorCode = keyof typeof PPT_ERROR_STATUS
-
-/**
- * The subset of {@link PptErrorCode} that exists in C's `errorEnum`. Kept as an
- * explicit list so a contract test can assert that PPT adds EXACTLY
- * `UNSUPPORTED_DOCUMENT_TYPE` on top of the ported C codes — no silent drift.
- */
-export const C_PORTED_ERROR_CODES: readonly PptErrorCode[] = [
-  'VALIDATION_ERROR',
-  'AUTH_REQUIRED',
-  'FORBIDDEN',
-  'NOT_FOUND',
-  'CONFLICT',
-  'PAYLOAD_TOO_LARGE',
-  'UNSUPPORTED_MEDIA_TYPE',
-  'RATE_LIMITED',
-  'INTERNAL_ERROR',
-  'UPSTREAM_UNAVAILABLE',
-]
-
-/** The PPT-only additions on top of the C-ported enum. */
-export const PPT_ONLY_ERROR_CODES: readonly PptErrorCode[] = ['UNSUPPORTED_DOCUMENT_TYPE']
-
-/** Shape of the `error` object inside a failure envelope. */
-export interface PptErrorBody {
-  code: PptErrorCode
-  message: string
-  details?: unknown
-  hint?: string
-}
-
-/** Cursor pagination block on a list envelope (PRD §4.1 — NOT C's offset shape). */
-export interface PptCursorPagination {
-  /** Opaque cursor for the next page, or null when there is no next page. */
-  nextCursor: string | null
-  /** True when another page exists (i.e. `nextCursor` is non-null). */
-  hasMore: boolean
-}
-
-export interface PptErrorOptions {
-  details?: unknown
-  hint?: string
-}
-
-/**
- * A typed PPT API failure. Handlers throw this (or call {@link sendPptError}
- * directly); the router-scoped {@link pptErrorHandler} renders it as the failure
- * envelope with the enum's fixed HTTP status. Carrying the code (not the status)
- * keeps the HTTP status a pure function of the enum.
- */
-export class PptApiError extends Error {
-  readonly code: PptErrorCode
-  readonly httpStatus: number
-  readonly details?: unknown
-  readonly hint?: string
-
-  constructor(code: PptErrorCode, message: string, opts: PptErrorOptions = {}) {
-    super(message)
-    this.name = 'PptApiError'
-    this.code = code
-    this.httpStatus = PPT_ERROR_STATUS[code]
-    if (opts.details !== undefined) this.details = opts.details
-    if (opts.hint !== undefined) this.hint = opts.hint
-  }
-
-  /** Convenience factory for the PPT-specific wrong-kind failure (422). */
-  static unsupportedDocumentType(message = 'document type does not support this operation', opts: PptErrorOptions = {}): PptApiError {
-    return new PptApiError('UNSUPPORTED_DOCUMENT_TYPE', message, opts)
-  }
-}
+import { PptApiError, PPT_ERROR_STATUS, type PptErrorCode, type PptErrorBody, type PptErrorOptions, type PptCursorPagination } from './errors.js'
+export * from './errors.js'
 
 /** Write a success envelope: `{ data }` at `status` (default 200). */
 export function sendPptData<T>(res: Response, data: T, status = 200): void {
@@ -204,14 +118,15 @@ export function createPptRouter(): Router {
   // parsed by the router-scoped `json()` above, so these handlers read req.body
   // directly and a malformed body is enveloped by pptErrorHandler.
   // R2-B1: human create — POST /api/v1/ppt/docs.
-  router.use(createPptDocsRouter())
+  router.use(createPptDraftRouter())
+  router.use(createPptLiveRouter())
+  router.use(createPptExportRouter())
   // R3-B1: source/bootstrap — GET /api/v1/ppt/docs/:docId/source.
   router.use(createPptSourceRouter())
   // R4-B1: collab-token/ticket — POST /api/v1/ppt/docs/collab-token. Mounted ONLY
-  // when the relay is enabled (default OFF, XIN-1821): issuing a relay ticket for an
-  // endpoint that is not attached would be a dead credential, and keeping issuance
-  // reachable while the op-metadata trust boundary is deferred to Half B is exactly
-  // what the reviewers flagged. With the relay disabled the path resolves to the
+  // when the relay is enabled (default ON): issuing a relay ticket for an
+  // endpoint that is not attached would be a dead credential. With the relay
+  // disabled the path resolves to the
   // enveloped NOT_FOUND below, same as any other unmounted PPT route.
   if (config.ppt.relay.enabled) {
     router.use(createPptCollabTokenRouter())

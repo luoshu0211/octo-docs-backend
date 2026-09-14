@@ -93,7 +93,7 @@ class WsClient {
 interface Harness {
   relay: PptRelay
   store: PptRelayStore
-  connect: (opts: { uid: string; role: Role; name?: string; ticket?: string; path?: string }) => Promise<WsClient>
+  connect: (opts: { uid: string; role: Role; name?: string; ticket?: string; path?: string; autoPong?: boolean }) => Promise<WsClient>
   ticketFor: (opts: { uid: string; role: Role; name?: string; epoch?: number }) => string
   setEpoch: (e: number) => void
   setRole: (uid: string, r: ResolvedRole) => void
@@ -103,8 +103,91 @@ interface Harness {
 
 const harnesses: Harness[] = []
 
+describe('PPT authenticated online users', () => {
+  const join = async (client: WsClient) => {
+    client.send({ t: 'hello', pv: 2, presence: true })
+    return (await client.recvUntil(frame => frame.ctl === 'peers')).at(-1)!
+  }
+  it('lists authenticated users, deduplicates tabs, and removes the last closed tab', async () => {
+    const h = await setup()
+    const a = await h.connect({ uid: 'alice', role: 'writer', name: 'Alice' })
+    expect(await join(a)).toMatchObject({ users: [{ uid: 'alice', name: 'Alice' }], total: 1 })
+    const b = await h.connect({ uid: 'bob', role: 'reader', name: 'Bob' })
+    expect(await join(b)).toMatchObject({ total: 2 })
+    expect((await a.recvUntil(f => f.ctl === 'peers' && f.total === 2)).at(-1)).toMatchObject({ users: [{ uid: 'alice' }, { uid: 'bob' }] })
+    const second = await h.connect({ uid: 'alice', role: 'writer' })
+    expect(await join(second)).toMatchObject({ total: 2 })
+    second.close()
+    b.close()
+    expect((await a.recvUntil(f => f.ctl === 'peers' && f.total === 1)).at(-1)).toMatchObject({ users: [{ uid: 'alice' }] })
+    expect(await h.store.currentSeq(DOC)).toBe(0)
+  })
+  it('does not announce sockets that close before hello', async () => {
+    const h = await setup()
+    const a = await h.connect({ uid: 'alice', role: 'writer' }); await join(a)
+    const unseen = await h.connect({ uid: 'not-ready', role: 'reader' })
+    unseen.close(); await unseen.closed
+    await expect(a.recv(80)).rejects.toThrow('recv timeout')
+  })
+  it('refreshes trusted names on reauth and removes a revoked reader', async () => {
+    const h = await setup()
+    const a = await h.connect({ uid: 'alice', role: 'writer', name: 'Old' }); await join(a)
+    a.send({ t: 'reauth', pv: 2, ticket: h.ticketFor({ uid: 'alice', role: 'writer', name: 'New' }) })
+    expect((await a.recvUntil(f => f.ctl === 'peers')).at(-1)).toMatchObject({ users: [{ uid: 'alice', name: 'New' }] })
+    const b = await h.connect({ uid: 'bob', role: 'reader' }); await join(b)
+    await a.recvUntil(f => f.ctl === 'peers' && f.total === 2)
+    h.setRole('bob', 'none'); h.setEpoch(1); await h.relay.applyEpochBump(DOCNAME, 1)
+    expect((await b.closed).code).toBe(4403)
+    expect((await a.recvUntil(f => f.ctl === 'peers' && f.total === 1)).at(-1)).toMatchObject({ users: [{ uid: 'alice' }] })
+  })
+  it('removes half-open direct readers that stop responding to ping', async () => {
+    const h = await setup({ limits: { heartbeatIntervalMs: 100 } })
+    const a = await h.connect({ uid: 'alice', role: 'writer' }); await join(a)
+    const b = await h.connect({ uid: 'bob', role: 'reader', autoPong: false }); await join(b)
+    await a.recvUntil(f => f.ctl === 'peers' && f.total === 2)
+    await b.closed
+    expect((await a.recvUntil(f => f.ctl === 'peers' && f.total === 1)).at(-1)).toMatchObject({ users: [{ uid: 'alice' }] })
+  })
+})
+
+describe('PPT bound draft sessions', () => {
+  const session = '11111111-1111-4111-8111-111111111111'
+  const credential = (clientSessionId = session) => issuePptCollabToken({
+    uid: 'u_writer', docId: DOC, documentName: DOCNAME, role: 'writer', permission_epoch: 0,
+    principalSpaceId: 's_1', snapshotVersion: 0, homeSpaceVerified: true, currentSpaceVerified: true, clientSessionId,
+  })
+  it('rejects old unbound credentials on strict production rooms', async () => {
+    const h = await setup({ requireBoundActors: true })
+    const c = await h.connect({ uid: 'u_writer', role: 'writer' })
+    expect((await c.closed).code).toBe(4401)
+  })
+  it('binds ops to one session and retains read-only access on downgrade', async () => {
+    const h = await setup({ requireBoundActors: true })
+    const auth = credential()
+    const c = await h.connect({ uid: 'u_writer', role: 'writer', ticket: auth.ticket })
+    await helloReady(c)
+    c.send(OPS_FRAME(1, 'spoof', 0, [{ op: 'set', a: 'another-actor', s: 1, l: 1, k: 'title', v: 'spoof' }]))
+    expect((await c.recv()).ctl).toBe('refused')
+    expect(await h.store.currentSeq(DOC)).toBe(0)
+    h.setRole('u_writer', 'reader'); h.setEpoch(1)
+    await h.relay.applyEpochBump(DOCNAME, 1)
+    expect((await c.recvUntil(m => m.ctl === 'role-changed')).at(-1)).toMatchObject({ role: 'reader' })
+    c.send(OPS_FRAME(2, 'reader-write', 1, [{ op: 'set', a: auth.actor, s: 1, l: 1, k: 'theme', v: {} }]))
+    expect((await c.recvUntil(m => m.ctl === 'refused')).at(-1)).toMatchObject({ code: 'forbidden-role' })
+    expect(await h.store.currentSeq(DOC)).toBe(0)
+  })
+  it('rejects reauth that swaps the authenticated session actor', async () => {
+    const h = await setup({ requireBoundActors: true })
+    const c = await h.connect({ uid: 'u_writer', role: 'writer', ticket: credential().ticket })
+    await helloReady(c)
+    c.send({ t: 'reauth', pv: 2, ticket: credential('22222222-2222-4222-8222-222222222222').ticket })
+    expect((await c.closed).code).toBe(4403)
+  })
+})
+
 async function setup(
   opts: {
+    requireBoundActors?: boolean
     store?: PptRelayStore
     limits?: Partial<RelayLimits>
     roleProvider?: (ctx: { uid: string; docId: string; documentName: string; spaceMember: boolean }) => Promise<ResolvedRole>
@@ -120,6 +203,7 @@ async function setup(
   let docStatus: 'live' | 'deleted' = 'live'
 
   const relay = new PptRelay({
+    requireBoundActors: opts.requireBoundActors,
     store,
     epochProvider: opts.epochProvider ?? (async () => liveEpoch),
     roleProvider: opts.roleProvider ?? (async ({ uid }) => roleMap.get(uid) ?? 'writer'),
@@ -142,13 +226,13 @@ async function setup(
       permission_epoch: o.epoch ?? liveEpoch,
       principalSpaceId: 's_1',
       snapshotVersion: 0,
-      homeSpaceVerified: true,
+      homeSpaceVerified: true, currentSpaceVerified: true,
       ...(o.name ? { name: o.name } : {}),
     }).ticket
 
-  const connect = (o: { uid: string; role: Role; name?: string; ticket?: string; path?: string }): Promise<WsClient> => {
+  const connect = (o: { uid: string; role: Role; name?: string; ticket?: string; path?: string; autoPong?: boolean }): Promise<WsClient> => {
     const ticket = o.ticket ?? ticketFor(o)
-    const ws = new WebSocket(`ws://127.0.0.1:${port}${o.path ?? '/api/v1/ppt/collab'}`, ['ppt-relay', ticket])
+    const ws = new WebSocket(`ws://127.0.0.1:${port}${o.path ?? '/api/v1/ppt/collab'}`, ['ppt-relay', ticket], { autoPong: o.autoPong ?? true })
     const client = new WsClient(ws)
     return new Promise<WsClient>((res, rej) => {
       ws.on('open', () => res(client))
@@ -232,30 +316,14 @@ describe('PPT relay: connect / replay / ready (PPT-WS-001)', () => {
     expect((await c.closed).code).toBe(4401)
   })
 
-  it('accepts a pre-hotfix ticket on initial connect only during the rollout window', async () => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+  it('rejects old tickets on initial connect even when the legacy switch is enabled', async () => {
     config.collabToken.allowLegacyWithoutHomeSpaceProof = true
     const h = await setup()
-    const legacyTicket = jwt.sign({
-      uid: 'u_legacy',
-      docId: DOC,
-      documentName: DOCNAME,
-      role: 'writer',
-      permission_epoch: 0,
-      jti: randomUUID(),
-    }, config.collabToken.secret, {
-      algorithm: 'HS256',
-      audience: PPT_RELAY_TICKET_AUD,
-      expiresIn: 30,
-    })
-    const c = await h.connect({ uid: 'u_legacy', role: 'writer', ticket: legacyTicket })
-    const { ready } = await helloReady(c)
-    expect(ready).toMatchObject({ ctl: 'ready', role: 'writer' })
-    expect(warn).toHaveBeenCalledWith(
-      '[octo-docs] legacy_home_space_token_accepted',
-      { credentialKind: 'ppt_ticket' },
-    )
-    warn.mockRestore()
+    const ticket = jwt.sign({ uid: 'u_old', docId: DOC, documentName: DOCNAME, role: 'writer',
+      permission_epoch: 0, home_space_verified: true, principal_space_id: 's_1', jti: randomUUID() },
+      config.collabToken.secret, { audience: PPT_RELAY_TICKET_AUD, expiresIn: 30 })
+    const c = await h.connect({ uid: 'u_old', role: 'writer', ticket })
+    expect((await c.closed).code).toBe(4401)
   })
 
   it('relay shutdown drains an already-connected socket', async () => {
@@ -1139,7 +1207,7 @@ describe('PPT relay: share-aware role re-resolution (B6 / P1-7)', () => {
       permission_epoch: 0,
       principalSpaceId: 's_1',
       snapshotVersion: 0,
-      homeSpaceVerified: true,
+      homeSpaceVerified: true, currentSpaceVerified: true,
       spaceMember: true,
     }).ticket
     const c = await h.connect({ uid: 'u_share', role: 'writer', ticket })
@@ -1161,7 +1229,7 @@ describe('PPT relay: share-aware role re-resolution (B6 / P1-7)', () => {
       permission_epoch: 0,
       principalSpaceId: 's_1',
       snapshotVersion: 0,
-      homeSpaceVerified: true,
+      homeSpaceVerified: true, currentSpaceVerified: true,
       spaceMember: false,
     }).ticket
     const c = await h.connect({ uid: 'u_out', role: 'writer', ticket })
@@ -1693,7 +1761,7 @@ describe('PPT relay: round-6 fixes (XIN-1693)', () => {
       permission_epoch: 0,
       principalSpaceId: 's_1',
       snapshotVersion: 0,
-      homeSpaceVerified: true,
+      homeSpaceVerified: true, currentSpaceVerified: true,
       spaceMember: true,
     }).ticket
     const c = await h.connect({ uid: 'u_share', role: 'writer', ticket })
@@ -1733,7 +1801,7 @@ describe('PPT relay: round-6 fixes (XIN-1693)', () => {
       permission_epoch: 0,
       principal_space_id: 's_1',
       space_member: true,
-      home_space_verified: true,
+      home_space_verified: true, current_space_verified: true,
       jti: randomUUID(),
     }, config.collabToken.secret, {
       algorithm: 'HS256',
@@ -1768,7 +1836,7 @@ describe('PPT relay: round-6 fixes (XIN-1693)', () => {
       permission_epoch: 0,
       principal_space_id: 's_1',
       space_member: true,
-      home_space_verified: true,
+      home_space_verified: true, current_space_verified: true,
       jti: randomUUID(),
     }, config.collabToken.secret, {
       algorithm: 'HS256',
@@ -2355,7 +2423,7 @@ describe('PPT relay: ordering-model redesign (XIN-1739)', () => {
   /** Sign a fresh single-use ticket (the client mints this via the collab-token endpoint). */
   const freshTicket = (o: { uid: string; role: Role; spaceMember: boolean; epoch?: number; ttl?: number; principalSpaceId?: string }): string =>
     jwt.sign(
-      { uid: o.uid, docId: DOC, documentName: DOCNAME, role: o.role, permission_epoch: o.epoch ?? 0, principal_space_id: o.principalSpaceId ?? 's_1', space_member: o.spaceMember, home_space_verified: true, jti: randomUUID() },
+      { uid: o.uid, docId: DOC, documentName: DOCNAME, role: o.role, permission_epoch: o.epoch ?? 0, principal_space_id: o.principalSpaceId ?? 's_1', space_member: o.spaceMember, home_space_verified: true, current_space_verified: true, jti: randomUUID() },
       config.collabToken.secret,
       { algorithm: 'HS256', audience: PPT_RELAY_TICKET_AUD, expiresIn: o.ttl ?? 30 },
     )
@@ -2413,26 +2481,16 @@ describe('PPT relay: ordering-model redesign (XIN-1739)', () => {
     expect((await c.closed).code).toBe(4403)
   })
 
-  it('P1-3: accepts a pre-hotfix reauth ticket only during the rollout window', async () => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+  it('P1-3: legacy compatibility cannot bypass current-Space proof during reauth', async () => {
     config.collabToken.allowLegacyWithoutHomeSpaceProof = true
     const h = await setup({ roleProvider: async () => 'writer' })
     const c = await h.connect({ uid: 'u_share', role: 'writer', ticket: freshTicket({ uid: 'u_share', role: 'writer', spaceMember: true }) })
     await helloReady(c)
-    const legacyReauth = jwt.sign(
-      { uid: 'u_share', docId: DOC, documentName: DOCNAME, role: 'writer', permission_epoch: 0, space_member: true, jti: randomUUID() },
-      config.collabToken.secret,
-      { algorithm: 'HS256', audience: PPT_RELAY_TICKET_AUD, expiresIn: 30 },
-    )
-    c.send({ t: 'reauth', pv: 2, ticket: legacyReauth })
-    c.send(OPS_FRAME(10, 'legacy-reauth-proof'))
-    const out = await c.recvUntil((m) => m.ctl === 'ack' || m.ctl === 'refused')
-    expect(out[out.length - 1]).toMatchObject({ ctl: 'ack', k: 10 })
-    expect(warn).toHaveBeenCalledWith(
-      '[octo-docs] legacy_home_space_token_accepted',
-      { credentialKind: 'ppt_ticket' },
-    )
-    warn.mockRestore()
+    const ticket = jwt.sign({ uid: 'u_share', docId: DOC, documentName: DOCNAME, role: 'writer',
+      permission_epoch: 0, home_space_verified: true, principal_space_id: 's_1', jti: randomUUID() },
+      config.collabToken.secret, { audience: PPT_RELAY_TICKET_AUD, expiresIn: 30 })
+    c.send({ t: 'reauth', pv: 2, ticket })
+    expect((await c.closed).code).toBe(4403)
   })
 
   it('P1-3: a reauth for a DIFFERENT uid/doc is rejected (identity is immutable across reauth)', async () => {
@@ -2440,7 +2498,7 @@ describe('PPT relay: ordering-model redesign (XIN-1739)', () => {
     const c = await h.connect({ uid: 'u_share', role: 'writer', ticket: freshTicket({ uid: 'u_share', role: 'writer', spaceMember: true }) })
     await helloReady(c)
     const foreign = jwt.sign(
-      { uid: 'someone_else', docId: DOC, documentName: DOCNAME, role: 'writer', permission_epoch: 0, principal_space_id: 's_1', space_member: true, home_space_verified: true, jti: randomUUID() },
+      { uid: 'someone_else', docId: DOC, documentName: DOCNAME, role: 'writer', permission_epoch: 0, principal_space_id: 's_1', space_member: true, home_space_verified: true, current_space_verified: true, jti: randomUUID() },
       config.collabToken.secret,
       { algorithm: 'HS256', audience: PPT_RELAY_TICKET_AUD, expiresIn: 30 },
     )
@@ -2600,7 +2658,7 @@ describe('PPT relay: round-18 fixes (XIN-1754)', () => {
   /** Sign a fresh single-use ticket (mirrors the ordering-model block's helper). */
   const freshTicket = (o: { uid: string; role: Role; spaceMember: boolean; epoch?: number; ttl?: number }): string =>
     jwt.sign(
-      { uid: o.uid, docId: DOC, documentName: DOCNAME, role: o.role, permission_epoch: o.epoch ?? 0, principal_space_id: 's_1', space_member: o.spaceMember, home_space_verified: true, jti: randomUUID() },
+      { uid: o.uid, docId: DOC, documentName: DOCNAME, role: o.role, permission_epoch: o.epoch ?? 0, principal_space_id: 's_1', space_member: o.spaceMember, home_space_verified: true, current_space_verified: true, jti: randomUUID() },
       config.collabToken.secret,
       { algorithm: 'HS256', audience: PPT_RELAY_TICKET_AUD, expiresIn: o.ttl ?? 30 },
     )
@@ -2909,4 +2967,21 @@ describe('PPT relay: relative room-clock bound (XIN-1821 P0-2 / P0-3)', () => {
     expect(ack.ctl).toBe('ack')
     expect(ack.q).toBe(1)
   })
+})
+
+it('admits WS edits after REST compaction resets the active room byte budget', async () => {
+  const { inPptRoom, pptRoomEvents } = await import('../src/ppt/roomCoordinator.js')
+  const { PptSnapshotter } = await import('../src/ppt/relay/snapshotter.js')
+  const store = new InMemoryPptRelayStore()
+  const h = await setup({ store, baseDocProvider: async () => deck(), limits: { maxRoomFrameBytes: 1600 } })
+  const writer = await h.connect({ uid: 'u_writer', role: 'writer' }); await helloReady(writer)
+  writer.send(OPS_FRAME(1, 'before-compact', 0, [{op:'set',a:'u-test',s:1,l:1,k:'padding',v:'x'.repeat(1000)}]))
+  expect((await writer.recvUntil(m=>m.ctl==='ack')).at(-1)?.ctl).toBe('ack')
+  await inPptRoom(DOC, async () => {
+    await new PptSnapshotter(store).advance(DOC, async()=>deck())
+    pptRoomEvents.emit('compacted', DOC)
+  })
+  expect(await store.roomBytes(DOC)).toBe(0)
+  writer.send(OPS_FRAME(2, 'after-compact', 0, [{op:'set',a:'u-test',s:2,l:2,k:'padding',v:'y'.repeat(1000)}]))
+  expect((await writer.recvUntil(m=>m.ctl==='ack'||m.ctl==='refused')).at(-1)?.ctl).toBe('ack')
 })

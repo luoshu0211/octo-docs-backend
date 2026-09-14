@@ -29,14 +29,24 @@ anything whiteboard/Excalidraw related (deferred by the contract).
                                   ├─ docs CRUD / members / invites (§8.4)
                                   └─ invite accept flow (§4.6)
 
+ PPT front-end ──ws──▶  PPT relay on the same HTTP listener (:3000)
+                         └─ /api/v1/ppt/collab (PPT CRDT protocol)
+
  Authoritative store: MySQL   |   Broadcast bus + epoch cache + registry: Redis
  Identity: octo (token→uid, uid→profile, §4.7)   |   Attachments: object storage (§3.5, stub)
 ```
 
+The shared public gateway routes `/docs-collab` WebSocket upgrades to Hocuspocus
+`1234` and `/api/v1/ppt/collab` upgrades to HTTP `3000`. Both use the same public
+domain and TLS listener. For direct-port deployments, configure the separate
+PPT endpoint as described in [deployment configuration](docs/DEPLOYMENT.md).
+
 Key design invariants (from the contract):
 
-- **Authoritative state is the Y.Doc binary**, not JSON (§3.1). Single-row
+- **For Yjs document types, authoritative state is the Y.Doc binary** (§3.1). Single-row
   merged-state model with **merge-on-write + diffUpdate bypass** (§3.2/§3.3).
+- **PPT retains its native CRDT operations and snapshots** in MySQL; it does not
+  send those frames to Hocuspocus or use Y.Doc binary persistence.
 - **Document-autonomous permissions**: `resolveRole = doc_member + owner`, no
   group inheritance (§4.2).
 - **Two-layer token chain**: octo session token → `POST /collab-token` →
@@ -72,7 +82,7 @@ Copy `.env.example` to `.env` and adjust. Summary:
 
 | Var | Purpose | Contract |
 | --- | --- | --- |
-| `HOCUSPOCUS_PORT` / `HTTP_PORT` | WS / REST ports | §2.1 / §8.4 |
+| `HOCUSPOCUS_PORT` / `HTTP_PORT` | Hocuspocus Yjs WS / HTTP API and PPT WS ports | §2.1 / §8.4 |
 | `MYSQL_*` | authoritative store connection | §3.4 |
 | `REDIS_*` (incl. `REDIS_PREFIX`) | broadcast bus / cache / registry | §5 |
 | `COLLAB_TOKEN_SECRET` / `COLLAB_TOKEN_TTL_SECONDS` | collab JWT signing + TTL (5 min) | §4.4 |
@@ -113,7 +123,7 @@ mysql -u <user> -p <database> < migrations/schema.sql
 npm run build
 npm run migrate
 
-# 3. dev server (tsx watch) — starts both WS (:1234) and REST (:3000)
+# 3. dev server (tsx watch) — Hocuspocus WS (:1234), HTTP API + PPT WS (:3000)
 npm run dev
 
 # build + run compiled output
@@ -206,6 +216,8 @@ apparent "dead zone" myth, so they are documented together here.
 
 | Dimension | What it measures | How | Cap (env) | Where enforced |
 | --- | --- | --- | --- | --- |
+| **Write request** | One `PATCH /:docId/sheet` JSON body | Raw HTTP request bytes | `SHEET_WRITE_MAX_REQUEST_BYTES` (default **3 MiB**) | Route-selected `express.json` parser → **413 `sheet_too_large`** |
+| **Write entries** | Operations in each Sheet PATCH resource map | Number of object entries; cell sets and deletes both count | `SHEET_WRITE_MAX_CELLS` (default **20,000**) | Route gate `docSheet.ts` → **413 `too_many_cells`** or the resource-specific equivalent |
 | **Read payload** | The JSON body a `GET /:docId/sheet` returns | UTF-8 bytes of the decoded cells and whole-grid maps, including checkbox validations | `SHEET_READ_MAX_CELL_BYTES` (default **1 MB**) → `config.sheetRead.maxCellBytes` | Read gate `docSheet.ts` → **413 `sheet_too_large`**; write gate `editDocSheet.ts` measures it the SAME way and pre-rejects a write that would exceed it |
 | **Storage** | The persisted Y.Doc binary update | `Y.encodeStateAsUpdate(doc).length` | `MAX_DOC_BYTES` (default **10 MB**) → `config.maxDocBytes` | `persistence.store`; write gate `editDocSheet.ts` → **413 `doc_too_large`** |
 
@@ -271,9 +283,13 @@ npm test          # vitest run (offline unit tests)
 npm run test:watch
 ```
 
-The unit suite (52 tests) covers the critical contract paths and needs **no
-MySQL/Redis**. Anything requiring live infra is mocked. Integration tests
-against real MySQL/Redis are a future round (gate them behind env if added).
+The default unit suite covers the critical contract paths with mocked services.
+Live database suites are opt-in. The `ppt_cluster_integration` CI job starts
+disposable MySQL 8 and Redis 7 services, sets `PPT_CANONICAL_MYSQL_TEST=1` and
+`PPT_CLUSTER_MYSQL_TEST=1`, and runs `test/pptCanonicalId.mysql.test.ts` to verify
+canonical IDs, shared routes and collaboration across independent processes.
+Use the isolated service configuration in `.gitlab-ci.yml` when running this
+suite locally; never point these database tests at an existing deployment.
 
 ---
 
@@ -380,5 +396,3 @@ Honest accounting of what is **stubbed / deferred** for the next round:
 - **Incremental-log persistence model (§3.3 alternative)** — DDLs for
   `yjs_snapshot` / `yjs_update_log` are in `schema.sql` but the model is the
   default-off alternative; not implemented.
-- **Integration tests** — only offline unit tests this round. No live
-  MySQL/Redis integration suite yet.

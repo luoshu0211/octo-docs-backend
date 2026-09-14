@@ -259,7 +259,7 @@ export function decodeSheetMergesSnapshot(targetState: Uint8Array): Record<strin
 
 /**
  * Read the sheet-tab registry out of a snapshot's binary state. Returns a plain
- * `{ logicalId: {name,order} }` object (empty for a text doc). Fail-closed like the
+ * `{ logicalId: {name,order,rowCount?,columnCount?} }` object (empty for a text doc). Fail-closed like the
  * other sheet decoders. Part of the GET read surface — this is how a bot LISTS the
  * tabs of a multi-sheet doc (name + order + logicalId to address each with cells).
  */

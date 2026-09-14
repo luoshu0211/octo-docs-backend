@@ -1,0 +1,35 @@
+/* Octo UI-SPEC v1.1 tokens for the isolated, light-only PPT frame. */
+:root {
+  --wk-brand-primary: #1c1c23;
+  --wk-white: #fff;
+  --wk-color-error: #f54a45;
+  --wk-error-alpha-08: rgb(245 74 69 / 8%);
+  --wk-error-alpha-10: rgb(245 74 69 / 10%);
+  --wk-danger-text: var(--wk-color-error);
+  --wk-danger-bg: var(--wk-error-alpha-08);
+  --wk-danger-hover: var(--wk-error-alpha-10);
+  --wk-brand-alpha-04: rgb(28 28 35 / 4%);
+  --wk-brand-alpha-08: rgb(28 28 35 / 8%);
+  --wk-brand-alpha-20: rgb(28 28 35 / 20%);
+  --wk-brand-alpha-60: rgb(28 28 35 / 60%);
+  --wk-black-alpha-06: rgb(0 0 0 / 6%);
+  --wk-black-alpha-08: rgb(0 0 0 / 8%);
+  --wk-black-alpha-12: rgb(0 0 0 / 12%);
+  --wk-black-alpha-36: rgb(17 19 24 / 36%);
+  --wk-bg-surface: var(--wk-white);
+  --wk-bg-hover: var(--wk-brand-alpha-04);
+  --wk-control-secondary: var(--wk-brand-alpha-04);
+  --wk-control-secondary-hover: var(--wk-brand-alpha-08);
+  --wk-text-primary: var(--wk-brand-primary);
+  --wk-text-secondary: var(--wk-brand-alpha-60);
+  --wk-text-on-primary: var(--wk-white);
+  --wk-border-default: var(--wk-black-alpha-08);
+  --wk-focus-ring: var(--wk-brand-alpha-20);
+  --wk-overlay-backdrop: var(--wk-black-alpha-36);
+  --wk-shadow-md: 0 4px 12px var(--wk-black-alpha-08);
+  --wk-shadow-overlay: 0 0 0 1px var(--wk-black-alpha-06), 0 8px 24px var(--wk-black-alpha-12);
+  --wk-font-sans: 'PingFang SC', Inter, -apple-system, BlinkMacSystemFont, 'Noto Sans SC', sans-serif;
+  --wk-r-overlay: 12px;
+  --wk-r-full: 9999px;
+  --wk-duration-fast: 150ms;
+}

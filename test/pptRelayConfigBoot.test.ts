@@ -1,18 +1,6 @@
 import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest'
 
-/**
- * XIN-1825 P1-2 — the relay's `PPT_RELAY_PUBLIC_WS_URL` production fail-fast is
- * gated behind `PPT_RELAY_ENABLED`.
- *
- * The relay ships OFF by default and Half A's whole containment argument is that
- * it is inert at boot. But `PPT_RELAY_PUBLIC_WS_URL`'s validation used to run
- * unconditionally in the config object literal, so an unset value threw at module
- * load in production EVEN WITH the relay disabled — bricking the whole process
- * (REST + the Hocuspocus listener + every non-PPT document type). These tests
- * drive the config module through a real `import()` under `NODE_ENV=production`
- * (yujiawei's exact reproduction) and pin: disabled + unset boots clean; enabled
- * + unset still fails fast; enabled + set boots.
- */
+/** PPT derives its endpoint from the existing trusted collaboration URL. */
 
 // A production env in which EVERY other boot gate is satisfied, so only the
 // PPT_RELAY_PUBLIC_WS_URL gate is under test.
@@ -57,23 +45,25 @@ describe('PPT relay public WS URL boot gate (XIN-1825 P1-2)', () => {
     expect(config.ppt.relay.publicWsUrl).toBe('') // inert, never consulted while disabled
   })
 
-  it('relay UNSET (default off) + PPT_RELAY_PUBLIC_WS_URL unset => boots clean in production', async () => {
+  it('relay UNSET (default on) + PPT_RELAY_PUBLIC_WS_URL unset => boots clean in production', async () => {
     const config = (await loadConfigWith({
       ...BASE_PROD_ENV,
-      // PPT_RELAY_ENABLED omitted -> defaults to false
+      // PPT_RELAY_ENABLED omitted -> defaults to true
       PPT_RELAY_PUBLIC_WS_URL: '',
     })) as { ppt: { relay: { enabled: boolean } } }
-    expect(config.ppt.relay.enabled).toBe(false)
+    expect(config.ppt.relay.enabled).toBe(true)
   })
 
-  it('relay ENABLED + PPT_RELAY_PUBLIC_WS_URL unset => STILL fails fast at boot in production', async () => {
-    await expect(
-      loadConfigWith({
-        ...BASE_PROD_ENV,
-        PPT_RELAY_ENABLED: 'true',
-        PPT_RELAY_PUBLIC_WS_URL: '',
-      }),
-    ).rejects.toThrow(/PPT_RELAY_PUBLIC_WS_URL must be set in production/)
+  it('reuses the existing URL without extra PPT configuration', async () => {
+    const config = await loadConfigWith({ ...BASE_PROD_ENV,
+      COLLAB_TOKEN_PUBLIC_WS_URL: 'wss://im-test.example.com/docs-collab', OCTO_WEB_ORIGIN: '',
+    }) as { webOrigin: string; ppt: { relay: { enabled: boolean; publicWsUrl: string } } }
+    expect(config.ppt.relay).toMatchObject({ enabled: true, publicWsUrl: 'wss://im-test.example.com/api/v1/ppt/collab' })
+    expect(config.webOrigin).toBe('https://im-test.example.com')
+  })
+
+  it.each(['https://wrong.example.com', 'wss://user:password@example.com', 'wss://example.com/?token=secret', 'wss://example.com/#fragment'])('rejects an unsafe override %s', async url => {
+    await expect(loadConfigWith({ ...BASE_PROD_ENV, PPT_RELAY_PUBLIC_WS_URL: url })).rejects.toThrow()
   })
 
   it('relay ENABLED + PPT_RELAY_PUBLIC_WS_URL set => boots in production', async () => {

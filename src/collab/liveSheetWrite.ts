@@ -24,7 +24,7 @@ import {
   validateSheetListBatch,
   validateSheetFreezeBatch,
   validateSheetFilterBatch,
-  materializeLegacyDefaultSheet,
+  prepareSheetListBatchForWrite,
   hasLegacyDefaultDataValidationRule,
   validateSheetDataValidationResourceBatch,
   validateSheetDataValidationResourceDeletionRepairBatch,
@@ -52,6 +52,11 @@ import { advanceEditVersion } from './liveDocWrite.js'
 import { stateVectorsEqual, BaseVersionStaleError } from './docBodyEdit.js'
 import { persistedByteLength } from './persistedEncoding.js'
 import { config } from '../config/env.js'
+import {
+  applySheetStructuralEditPlan,
+  prepareSheetStructuralEdit,
+  type SheetStructuralEdit,
+} from '../agent/sheetStructuralEdit.js'
 
 /**
  * Read the live sheet document for a content read (mirrors readLiveForEdit).
@@ -130,6 +135,7 @@ export async function commitLiveSheetEdit(
    * gets the safe answer (protection enforced) rather than a bypass.
    */
   isAdmin = false,
+  structuralEdit?: SheetStructuralEdit,
 ): Promise<{ newSV: Uint8Array; bytes: number }> {
   // Compatibility with !124's short-lived positional signature, where the
   // argument now named `freeze` carried flat checkbox changes and `filters`
@@ -157,16 +163,20 @@ export async function commitLiveSheetEdit(
       // the caller's literal `sheets` payload.
       const listMap = doc.getMap<StoredSheetMeta>(SHEET_LIST_FIELD)
       const validationMap = doc.getMap<StoredDataValidation>(SHEET_DATA_VALIDATIONS_FIELD)
+      const structuralEditPlan = structuralEdit
+        ? prepareSheetStructuralEdit(doc, structuralEdit)
+        : null
       const validationDeletionOnly = Object.keys(dataValidations).length > 0 &&
         Object.values(dataValidations).every((value) => value === null || (Array.isArray(value) && value.length === 0)) &&
         Object.keys(cells).length === 0 && Object.keys(dims).length === 0 &&
         Object.keys(drawings).length === 0 && Object.keys(hyperlinks).length === 0 &&
         Object.keys(merges).length === 0 && Object.keys(sheets).length === 0 &&
-        Object.keys(freeze).length === 0 && Object.keys(filters).length === 0
+        Object.keys(freeze).length === 0 && Object.keys(filters).length === 0 && structuralEdit === undefined
       const requestedListBatch = validateSheetListBatch(sheets)
-      const listBatch = materializeLegacyDefaultSheet(
-        listMap.keys(),
+      const listBatch = prepareSheetListBatchForWrite(
+        listMap.entries(),
         requestedListBatch,
+        cells,
         listMap.size === 0 &&
           requestedListBatch.toSet.length > 0 &&
           hasLegacyDefaultDataValidationRule(validationMap.entries(), dataValidations),
@@ -174,6 +184,9 @@ export async function commitLiveSheetEdit(
       const protectedSheetChanges: Record<string, StoredSheetMeta | null> = Object.create(null)
       for (const key of listBatch.toDelete) protectedSheetChanges[key] = null
       for (const [key, meta] of listBatch.toSet) protectedSheetChanges[key] = meta
+      if (structuralEditPlan) {
+        protectedSheetChanges[structuralEditPlan.logicalId] = structuralEditPlan.sheetMeta
+      }
 
       const nextLogicalIds = sheetLogicalIdsWithLegacyDefault(listMap.keys())
       for (const key of listBatch.toDelete) nextLogicalIds.delete(key)
@@ -199,6 +212,7 @@ export async function commitLiveSheetEdit(
       for (const key of Object.keys(dataValidations)) {
         if (!key.includes('!')) resourceSheets.add(key)
       }
+      if (structuralEditPlan) resourceSheets.add(structuralEditPlan.logicalId)
 
       // (1b) PROTECTION guard — still before any mutation. Reads the protection
       //      rules + grant lists off the SAME live doc, so a non-admin writing
@@ -260,6 +274,7 @@ export async function commitLiveSheetEdit(
       for (const [key, value] of filterBatch.toSet) filterMap.set(key, value)
       for (const key of validationBatch.toDelete) validationMap.delete(key)
       for (const [key, rule] of validationBatch.toSet) validationMap.set(key, rule)
+      if (structuralEditPlan) applySheetStructuralEditPlan(doc, structuralEditPlan)
       // (3) Advance the edit-version counter so a delete-only batch also moves
       //     the state vector forward; the token is read AFTER this bump.
       advanceEditVersion(doc)

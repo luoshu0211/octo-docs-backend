@@ -11,6 +11,12 @@
  *   GET   /:docId/sheet   reader  — read the LIVE cells + dims + base version
  *   PATCH /:docId/sheet   writer  — batch cell set/delete under a strict
  *                                   If-Match(SV) optimistic-concurrency guard
+ *   POST  /:docId/sheet/replace writer — server-side atomic replace-all under
+ *                                        the same If-Match + writer gates
+ *   POST  /:docId/sheet/rows/insert writer — structural row insertion
+ *   POST  /:docId/sheet/rows/delete writer — structural row deletion
+ *   POST  /:docId/sheet/columns/insert writer — structural column insertion
+ *   POST  /:docId/sheet/columns/delete writer — structural column deletion
  *
  * The routes are mounted on BOTH the human /api/v1/docs chain and the bot
  * /v1/bot/docs chain (see app.ts), so each reads req.uid / req.spaceId from
@@ -25,6 +31,7 @@ import { Router, type Router as ExpressRouter, type Request, type Response } fro
 import { requireDocRole } from '../guard.js'
 import { readLiveSheet } from '../../collab/liveSheetWrite.js'
 import { editDocSheet } from '../services/editDocSheet.js'
+import { replaceDocSheet, type SheetFindBy } from '../services/replaceDocSheet.js'
 import { encodeBaseVersion, parseBaseVersion } from '../../collab/docBodyEdit.js'
 import {
   decodeSheetSnapshot,
@@ -38,6 +45,8 @@ import {
 } from '../../collab/versionRestore.js'
 import {
   SheetDataValidationInspectionBudgetError,
+  SHEET_MAX_COLUMNS,
+  SHEET_MAX_ROWS,
   SheetSnapshotInvalidError,
   type SheetCell,
   type StoredDrawing,
@@ -47,7 +56,10 @@ import {
   type StoredFilter,
   type StoredDataValidationRule,
   type SheetDataValidationResourceChanges,
+  validateResourceLogicalId,
+  validateSheetRange,
 } from '../../agent/sheetConversion.js'
+import type { SheetStructuralEdit } from '../../agent/sheetStructuralEdit.js'
 import {
   decodeSheetCursor,
   encodeSheetCursor,
@@ -495,12 +507,12 @@ function validateCellsShape(cells: unknown): cells is Record<string, SheetCell |
 /**
  * Request-shape bounds enforced BEFORE the no-lock batch validation (DoS gate),
  * mirroring docContent's checkOpsBounds. validateCellsShape only checks the
- * container; this caps magnitude so a ≤1mb body cannot force unbounded
+ * container; this caps magnitude so a byte-bounded body cannot force unbounded
  * validate/set work:
  *   - cell count            → 413 too_many_cells
  *   - single cell payload   → 413 cell_too_large
- * Byte-size is measured on the already-parsed (≤1mb) body, so the check itself
- * is bounded. Returns the error to send, or null when within bounds.
+ * Byte-size is measured on the already-parsed, route-capped body, so the check
+ * itself is bounded. Returns the error to send, or null when within bounds.
  */
 function checkCellsBounds(
   cells: Record<string, SheetCell | null>,
@@ -621,7 +633,7 @@ function checkMergesBounds(
 }
 
 /**
- * A sheets-edit batch: `{ logicalId: {name,order} | null }` (null = delete a tab).
+ * A sheets-edit batch: `{ logicalId: {name,order,rowCount?,columnCount?} | null }`.
  * Shape-only: a non-object or array batch is a 400; each value must be null or a
  * plain object. Contract validation (logicalId key shape, name/order types) is
  * deferred to validateSheetListBatch in the service → 422.
@@ -681,6 +693,225 @@ function checkResourceBounds(value: Record<string, unknown>): { status: number; 
     return { status: 413, error: 'too_many_sheet_resources' }
   }
   return null
+}
+
+interface SheetReplaceBody {
+  findString: string
+  replaceString: string
+  findBy: SheetFindBy
+  caseSensitive: boolean
+  matchesTheWholeCell: boolean
+  logicalId?: string
+  range?: ReturnType<typeof validateSheetRange>
+}
+
+function parseSheetStructuralEditBody(
+  value: unknown,
+  kind: SheetStructuralEdit['kind'],
+): SheetStructuralEdit | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const body = value as Record<string, unknown>
+  const anchorField = kind === 'rows.insert' ? 'afterRow'
+    : kind === 'rows.delete' ? 'startRow'
+      : kind === 'columns.insert' ? 'afterColumn'
+        : 'startColumn'
+  const anchor = body[anchorField]
+  // A worksheet always retains at least one row and one column, so neither an
+  // insertion nor a deletion can ever validly use the full axis maximum.
+  const limit = kind.startsWith('rows.') ? SHEET_MAX_ROWS - 1 : SHEET_MAX_COLUMNS - 1
+  if (!Number.isInteger(anchor) || (anchor as number) < 0) return null
+  if (!Number.isInteger(body.count) || (body.count as number) < 1 || (body.count as number) > limit) return null
+  try {
+    return {
+      kind,
+      logicalId: validateResourceLogicalId(body.logicalId, 'structural edit logicalId'),
+      [anchorField]: anchor as number,
+      count: body.count as number,
+    } as SheetStructuralEdit
+  } catch (err) {
+    if (err instanceof SheetSnapshotInvalidError) return null
+    throw err
+  }
+}
+
+function parseSheetReplaceBody(value: unknown): SheetReplaceBody | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const body = value as Record<string, unknown>
+  if (typeof body.findString !== 'string' || typeof body.replaceString !== 'string') return null
+  const findString = body.findString.trim()
+  if (findString === '') return null
+
+  const findBy = body.findBy ?? 'value'
+  const caseSensitive = body.caseSensitive ?? false
+  const matchesTheWholeCell = body.matchesTheWholeCell ?? false
+  if (findBy !== 'value' && findBy !== 'formula') return null
+  if (typeof caseSensitive !== 'boolean' || typeof matchesTheWholeCell !== 'boolean') return null
+  if (body.range !== undefined && body.logicalId === undefined) return null
+
+  try {
+    const logicalId = body.logicalId === undefined
+      ? undefined
+      : validateResourceLogicalId(body.logicalId, 'replace logicalId')
+    const range = body.range === undefined
+      ? undefined
+      : validateSheetRange(body.range, 'replace range')
+    return {
+      findString,
+      replaceString: body.replaceString,
+      findBy,
+      caseSensitive,
+      matchesTheWholeCell,
+      logicalId,
+      range,
+    }
+  } catch (err) {
+    if (err instanceof SheetSnapshotInvalidError) return null
+    throw err
+  }
+}
+
+// ── POST /:docId/sheet/replace — atomic server-side replace-all (writer) ─────
+docSheetRouter.post('/:docId/sheet/replace', replaceDocSheetHandler)
+
+export async function replaceDocSheetHandler(req: Request, res: Response): Promise<void> {
+  const guard = await requireDocRole(req, res, req.params.docId!, 'writer')
+  if (!guard) return
+  if (!requireSheetDocType(res, guard.meta.doc_type)) return
+
+  const baseVersionRaw = readBaseVersion(req)
+  const body = parseSheetReplaceBody(req.body)
+  if (baseVersionRaw === null || body === null) {
+    res.status(400).json({ error: 'invalid_body' })
+    return
+  }
+
+  try {
+    const result = await replaceDocSheet({
+      uid: req.uid!,
+      docId: guard.meta.doc_id,
+      documentName: guard.meta.document_name,
+      principalSpaceId: req.principalSpaceId!,
+      clientBaseVersion: parseBaseVersion(baseVersionRaw),
+      ...body,
+      authorizedEpoch: guard.meta.permission_epoch,
+      isBot: req.botToken !== undefined,
+      token: req.octoToken,
+    })
+    if (result.ok) {
+      res.status(200).json({
+        docId: guard.meta.doc_id,
+        matchedCells: result.matchedCells,
+        replacedCells: result.replacedCells,
+        replacements: result.replacements,
+        baseVersion: result.baseVersion,
+        ...('bytes' in result ? {
+          bytes: result.bytes,
+          newDocVersionSeq: result.newDocVersionSeq,
+        } : {}),
+      })
+      return
+    }
+    const errorBody: Record<string, unknown> = { error: result.error }
+    if (result.payloadBytes !== undefined) errorBody.payloadBytes = result.payloadBytes
+    if (result.docBytes !== undefined) errorBody.docBytes = result.docBytes
+    if (result.limit !== undefined) errorBody.limit = result.limit
+    if (result.baseVersion !== undefined) errorBody.baseVersion = result.baseVersion
+    if (result.repairDataValidationKey !== undefined) errorBody.repairDataValidationKey = result.repairDataValidationKey
+    if (result.hint !== undefined) errorBody.hint = result.hint
+    res.status(result.status).json(errorBody)
+  } catch (err) {
+    if (err instanceof SheetSnapshotInvalidError) {
+      res.status(409).json({ error: 'sheet_snapshot_invalid' })
+      return
+    }
+    res.status(500).json({ error: 'internal_error' })
+  }
+}
+
+// ── Structural row/column edits ───────────────────────────────────────────────
+docSheetRouter.post('/:docId/sheet/rows/insert', insertDocSheetRowsHandler)
+docSheetRouter.post('/:docId/sheet/rows/delete', deleteDocSheetRowsHandler)
+docSheetRouter.post('/:docId/sheet/columns/insert', insertDocSheetColumnsHandler)
+docSheetRouter.post('/:docId/sheet/columns/delete', deleteDocSheetColumnsHandler)
+
+export async function insertDocSheetRowsHandler(req: Request, res: Response): Promise<void> {
+  await structuralEditDocSheetHandler(req, res, 'rows.insert')
+}
+
+export async function deleteDocSheetRowsHandler(req: Request, res: Response): Promise<void> {
+  await structuralEditDocSheetHandler(req, res, 'rows.delete')
+}
+
+export async function insertDocSheetColumnsHandler(req: Request, res: Response): Promise<void> {
+  await structuralEditDocSheetHandler(req, res, 'columns.insert')
+}
+
+export async function deleteDocSheetColumnsHandler(req: Request, res: Response): Promise<void> {
+  await structuralEditDocSheetHandler(req, res, 'columns.delete')
+}
+
+async function structuralEditDocSheetHandler(
+  req: Request,
+  res: Response,
+  kind: SheetStructuralEdit['kind'],
+): Promise<void> {
+  const guard = await requireDocRole(req, res, req.params.docId!, 'writer')
+  if (!guard) return
+  if (!requireSheetDocType(res, guard.meta.doc_type)) return
+
+  const baseVersionRaw = readBaseVersion(req)
+  const edit = parseSheetStructuralEditBody(req.body, kind)
+  if (baseVersionRaw === null || edit === null) {
+    res.status(400).json({ error: 'invalid_body' })
+    return
+  }
+
+  try {
+    const result = await editDocSheet({
+      uid: req.uid!,
+      docId: guard.meta.doc_id,
+      documentName: guard.meta.document_name,
+      principalSpaceId: req.principalSpaceId!,
+      clientBaseVersion: parseBaseVersion(baseVersionRaw),
+      cells: {},
+      dims: {},
+      drawings: {},
+      hyperlinks: {},
+      merges: {},
+      sheets: {},
+      freeze: {},
+      filters: {},
+      dataValidations: {},
+      structuralEdit: edit,
+      authorizedEpoch: guard.meta.permission_epoch,
+      isBot: req.botToken !== undefined,
+      token: req.octoToken,
+    })
+    if (result.ok) {
+      res.status(200).json({
+        docId: guard.meta.doc_id,
+        logicalId: edit.logicalId,
+        ...(edit.kind === 'rows.insert'
+          ? { afterRow: edit.afterRow, insertedRows: edit.count, rowCount: result.rowCount }
+          : edit.kind === 'rows.delete'
+            ? { startRow: edit.startRow, deletedRows: edit.count, rowCount: result.rowCount }
+            : edit.kind === 'columns.insert'
+              ? { afterColumn: edit.afterColumn, insertedColumns: edit.count, columnCount: result.columnCount }
+              : { startColumn: edit.startColumn, deletedColumns: edit.count, columnCount: result.columnCount }),
+        bytes: result.bytes,
+        baseVersion: result.baseVersion,
+        newDocVersionSeq: result.newDocVersionSeq,
+      })
+      return
+    }
+    const errorBody: Record<string, unknown> = { error: result.error }
+    if (result.payloadBytes !== undefined) errorBody.payloadBytes = result.payloadBytes
+    if (result.docBytes !== undefined) errorBody.docBytes = result.docBytes
+    if (result.limit !== undefined) errorBody.limit = result.limit
+    res.status(result.status).json(errorBody)
+  } catch {
+    res.status(500).json({ error: 'internal_error' })
+  }
 }
 
 // ── PATCH /:docId/sheet — batch cell edit (writer) ────────────────────────────

@@ -33,6 +33,7 @@ export async function pptAuthMiddleware(req: Request, _res: Response, next: Next
       return
     }
     req.uid = identity.uid
+    req.ownedBots = identity.ownedBots ?? []
     req.octoToken = token
     next()
   } catch (err) {

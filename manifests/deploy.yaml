@@ -19,7 +19,8 @@ metadata:
     app.kubernetes.io/part-of: octo-docs
     octo.docs/env: "{{BRANCH}}"
 spec:
-  # The colocated process contains REST plus Hocuspocus WS. Cross-node collab
+  # The process serves HTTP API + PPT WS on 3000 and Hocuspocus Yjs WS on 1234.
+  # PPT uses its ordered MySQL log and Redis notifications. Cross-node Yjs
   # state is carried by the Redis extension mounted unconditionally in
   # src/collab/server.ts, so a document opened on two pods stays one logical
   # doc: a two-instance run verified the concurrent baseVersion guard (exactly

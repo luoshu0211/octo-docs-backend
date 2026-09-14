@@ -1,0 +1,3 @@
+
+# Generated player bundles preserve whitespace inside upstream string literals.
+assets/ppt/*.html -whitespace

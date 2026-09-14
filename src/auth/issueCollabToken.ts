@@ -25,6 +25,7 @@ import { parseDocumentName, isDocTypeConsistentWithName } from '../permission/do
 import { resolveRole, resolveDocMetaByName } from '../permission/resolveRole.js'
 import { docMetaRepo } from '../db/repos/docMetaRepo.js'
 import { effectiveRole, SHARE_SCOPE_ANYONE } from '../permission/shareScope.js'
+import { mergeDriveDerivedReader } from '../drive/derivedAccessClient.js'
 import { HTML_DOC_TYPE, HTML_PPT_DOC_TYPE } from '../db/docType.js'
 
 export type IssueResult =
@@ -125,7 +126,12 @@ export async function issueCollabToken(
   // space_member claim, so the live-socket write recheck (§5.3) can re-derive
   // access on a scope narrowing without a fresh membership call.
   const spaceMember = currentSpace === meta.space_id
-  const role = effectiveRole(direct, spaceMember, meta.share_scope, meta.share_role)
+  const base = effectiveRole(direct, spaceMember, meta.share_scope, meta.share_role)
+  // Source 3 (TES-137): fold in the drive-library-derived reader with the SAME
+  // merge resolveEffectiveRole and the WS recheck use, so a caller who reaches
+  // the doc only via a drive library is issued a reader token here (and opens the
+  // WS read-only) instead of a 403 — the three seams agree for the same caller.
+  const role = await mergeDriveDerivedReader(base, meta.doc_id, uid, viewerSpaceId)
   if (role === 'none') return { ok: false, status: 403, error: 'forbidden' }
 
   // Keep legacy issuance aligned with the docId-first and open-context paths.
@@ -237,7 +243,12 @@ export async function issueCollabTokenByDocId(
   if (meta.share_scope === SHARE_SCOPE_ANYONE && currentSpace === meta.space_id) {
     spaceMember = await getOctoIdentity().isSpaceMember(uid, meta.space_id, octoToken)
   }
-  const role = effectiveRole(direct, spaceMember, meta.share_scope, meta.share_role)
+  const role = await mergeDriveDerivedReader(
+    effectiveRole(direct, spaceMember, meta.share_scope, meta.share_role),
+    meta.doc_id,
+    uid,
+    viewerSpaceId,
+  )
   if (role === 'none') return { ok: false, status: 403, error: 'forbidden' }
 
   // Treat a malformed or internally inconsistent persisted identity as absent.

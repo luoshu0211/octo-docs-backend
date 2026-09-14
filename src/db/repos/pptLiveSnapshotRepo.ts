@@ -129,16 +129,11 @@ export const pptLiveSnapshotRepo = {
    *
    * STATE GROWTH (XIN-1821 P1-3): `state_json` embeds the Bento version vector `vv`
    * (one entry per actor that ever landed an op) plus the `regs`/`tombs`/`txt`/`stash`/
-   * `limbo` maps, and NONE of them is GC'd. In Half A the actor id is CLIENT-CHOSEN
-   * (`[a-z0-9-]{1,64}`, `frames.ts`), not server-minted, so `vv` cardinality is not
-   * bounded by authenticated sessions — a writer could inflate it. Two controls keep
-   * this from becoming an unrecoverable loss: (1) the relay is gated OFF by default
-   * (`PPT_RELAY_ENABLED`), so this surface is unreachable in production until Half B
-   * lands the server-minted actor binding that re-bounds `vv`; and (2) the hard column
-   * guard below fails CLOSED before any write/prune. A `vv`-retirement / per-actor cap
-   * is deferred to Half B alongside the actor binding (adding it here, without the
-   * binding, risks dropping a live replica's seq — the silent-loss class XIN-1800 P0-1
-   * fixed). Bounding per-frame junk further is covered by the op/frame byte caps.
+   * `limbo` maps, and NONE of them is GC'd. Actor ids are server-minted and
+   * bound to authenticated client sessions; session churn can still grow vv.
+   * The hard column guard fails closed before write/prune. Safe vv retirement
+   * remains future work: dropping a live replica's sequence causes silent loss.
+   * Per-frame metadata and blobs are additionally bounded by wire byte limits.
    */
   async upsertAdvanceTx(
     tx: Tx,

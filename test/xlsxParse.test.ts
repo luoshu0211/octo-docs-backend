@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import ExcelJS from 'exceljs'
 import zlib from 'node:zlib'
-import { parseXlsx, XlsxParseError, MAX_IMPORT_COLS } from '../src/import/xlsx/parse.js'
+import { parseXlsx, XlsxParseError, MAX_IMPORT_COLS, MAX_IMPORT_ROWS } from '../src/import/xlsx/parse.js'
 
 /** Build a small workbook in-memory and return its .xlsx bytes as a Buffer. */
 async function buildWorkbook(configure: (wb: ExcelJS.Workbook) => void): Promise<Buffer> {
@@ -101,6 +101,8 @@ describe('parseXlsx', () => {
       const ws = wb.addWorksheet('Wide')
       // Write a cell well beyond MAX_IMPORT_COLS to inflate the used range.
       ws.getCell(1, MAX_IMPORT_COLS + 50).value = 'far'
+      ws.getCell(MAX_IMPORT_ROWS, 1).value = 'last-row'
+      ws.getCell(MAX_IMPORT_ROWS + 1, 1).value = 'past-row-limit'
       ws.getCell('A1').value = 'near'
     })
     const wbk = await parseXlsx(buf)
@@ -109,6 +111,8 @@ describe('parseXlsx', () => {
     // the far cell is beyond the clamp, so only the near cell survives
     expect(sheet.cells.some((c) => c.value === 'near')).toBe(true)
     expect(sheet.cells.some((c) => c.value === 'far')).toBe(false)
+    expect(sheet.cells.some((c) => c.value === 'last-row')).toBe(true)
+    expect(sheet.cells.some((c) => c.value === 'past-row-limit')).toBe(false)
   })
 
   it('rejects a high-ratio ZIP before ExcelJS inflates it', async () => {
