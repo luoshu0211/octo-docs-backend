@@ -984,6 +984,41 @@ export const config = {
     retainDays: num('DOC_VIEW_RETAIN_DAYS', 90),
   },
 
+  // Drive-library-derived viewer access (TES-131). A THIRD, supplementary read
+  // permission source: when a doc lives inside a drive library the caller can
+  // reach, the drive service grants a derived reader role even with no
+  // doc_member row / share grant. docs-backend asks the drive service per
+  // (doc, uid, principal space) via derivedAccessClient, merged in
+  // resolveEffectiveRole as max(direct, share, drive-reader). Default OFF: while
+  // disabled the lookup is never made and the effective role is byte-identical to
+  // pre-feature. Fail-closed everywhere — any drive error yields no derived access.
+  driveDerived: {
+    // Master switch. false (default) => no drive lookup, effective role unchanged.
+    // strictBool so an operator typo fails startup loudly rather than silently
+    // leaving the feature in an unknown state (mirrors PPT_RELAY_ENABLED).
+    enabled: strictBool('DRIVE_DERIVED_ENABLED', false),
+    // Base URL of the internal drive service the derived-access lookup POSTs to
+    // (`<base>/internal/v1/docs/derived-access`). Empty => the lookup is a no-op
+    // (returns no derived access) even when enabled, so a half-configured deploy
+    // fails closed instead of erroring on every read.
+    internalBaseUrl: str('DRIVE_INTERNAL_BASE_URL', ''),
+    // Per-request timeout for the derived-access lookup. Kept tight: the lookup
+    // sits on the read/authorize hot path, so a hung drive service must abort fast
+    // and fail closed rather than pin the request open.
+    timeoutMs: numMin('DRIVE_DERIVED_TIMEOUT_MS', 500, 1),
+    // Short-TTL cache window for a resolved derived-access answer, per
+    // (doc, uid, principal space), to bound drive QPS on hot docs. Only a
+    // CONFIRMED answer is cached (never a fail-closed error), so a transient
+    // outage is retried on the next call rather than pinned for the TTL.
+    ttlMs: numMin('DRIVE_DERIVED_TTL_MS', 15_000, 1),
+    // Shared internal token for the docs<->drive service-to-service calls: sent as
+    // X-Internal-Token on the outbound derived-access lookup, and the value the
+    // inbound GET /internal/docs/:docId/role compares against (timing-safe). Empty
+    // => the internal role endpoint rejects every caller (fail-closed) and the
+    // outbound client omits the header. NEVER logged.
+    internalToken: str('DRIVE_INTERNAL_TOKEN', ''),
+  },
+
   // R3-B1 PPT (html_ppt) source/bootstrap loading (XIN-1495 §4 / §8).
   // GET /api/v1/ppt/docs/:docId/source access + cache policy knobs. The bootstrap
   // payload embeds SHORT-LIVED signed asset GET URLs (never a long-lived token in

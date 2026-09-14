@@ -76,6 +76,7 @@ import { createRateLimiter, type RateLimiterOptions } from './middleware/rateLim
 import { collabTokenRouter } from './routes/collabToken.js'
 import { docsRouter, documentResourceRouter, spaceCollectionRouter } from './routes/docs.js'
 import { internalHtmlRegistrationRouter } from './routes/internalHtmlRegistration.js'
+import { internalDocRoleRouter } from './routes/internalDocRole.js'
 import { membersRouter } from './routes/members.js'
 import { forwardGrantRouter } from './routes/forwardGrant.js'
 import { accessRequestsRouter } from './routes/accessRequests.js'
@@ -324,6 +325,11 @@ export function createApp(
   // Internal surface: the html service registers published docs here with the
   // shared internal token — no browser ever calls it.
   if (serveInternal) app.use('/internal/html', createRateLimiter(opts.rateLimit), internalHtmlRegistrationRouter)
+
+  // Internal surface (TES-131): the drive service asks for a caller's DIRECT doc
+  // role here (X-Internal-Token) to decide a drive-library-derived grant. Same
+  // in-network-only posture as /internal/html — never on a nginx upstream.
+  if (serveInternal) app.use('/internal/docs', createRateLimiter(opts.rateLimit), internalDocRoleRouter)
 
   // Bot-facing entry (§ v4.3): the SAME nine metadata routers, re-mounted behind
   // a bot identity middleware at a physically distinct prefix so nginx can route

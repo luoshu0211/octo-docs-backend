@@ -9,7 +9,7 @@
  * it without a cross-layer import, and so a test that mocks api/guard does not
  * accidentally strip it from the services.
  *
- *   effectiveRole = max(directRole, share-derived)   // only ever raises access
+ *   effectiveRole = max(directRole, share-derived, drive-derived-reader)  // only ever raises access
  *
  * Membership is resolved LAZILY: only when the doc is `anyone_in_space` AND the
  * direct role is below what the share path can ever grant (`writer`). A
@@ -36,6 +36,7 @@
 import { effectiveRole, SHARE_SCOPE_ANYONE, SHARE_SCOPE_AUTHENTICATED } from './shareScope.js'
 import { roleAtLeast, type ResolvedRole } from './role.js'
 import { getOctoIdentity } from '../auth/octoIdentity.js'
+import { mergeDriveDerivedReader } from '../drive/derivedAccessClient.js'
 
 /**
  * The doc_meta fields the share path reads. A structural type so both the full
@@ -43,6 +44,15 @@ import { getOctoIdentity } from '../auth/octoIdentity.js'
  * transactional write services satisfy it.
  */
 export interface ShareResolvable {
+  /**
+   * The document id, needed for the drive-derived source (TES-131). Present on
+   * the full DocMeta row the REST guard passes, so a read/open path can consult
+   * the drive service. ABSENT on the narrow FOR-UPDATE meta the three
+   * transactional write services build ({space_id, share_scope, share_role}
+   * only) — those require `writer`, which drive (reader-only) can never grant, so
+   * they skip the drive lookup entirely and stay byte-identical to pre-feature.
+   */
+  doc_id?: string
   space_id: string
   share_scope: number
   share_role: number
@@ -100,36 +110,45 @@ export async function resolveEffectiveRoleWithMembership(
   meta: ShareResolvable,
   caller: ShareCaller = {},
 ): Promise<EffectiveRoleWithMembership> {
+  let role: ResolvedRole
+  let member = false
   if (![SHARE_SCOPE_ANYONE, SHARE_SCOPE_AUTHENTICATED].includes(meta.share_scope) || roleAtLeast(direct, 'writer')) {
-    return { role: direct, spaceMember: false }
+    role = direct
+  } else if (meta.share_scope === SHARE_SCOPE_AUTHENTICATED) {
+    role = effectiveRole(direct, false, meta.share_scope, meta.share_role)
+  } else if (caller.principalSpaceId !== meta.space_id) {
+    role = direct
+  } else {
+    try {
+      member = caller.isBot
+        ? true
+        : await getOctoIdentity().isSpaceMember(uid, meta.space_id, caller.token ?? '')
+    } catch {
+      // Fail-closed, SCOPED to the relay ticket path: a lookup error never widens
+      // access, and the SAME false drives both the role and the token claim so they
+      // stay consistent (a ticket must carry a concrete, signable boolean; a throw
+      // here would break issuance/reauth instead of degrading gracefully). The
+      // legacy `resolveEffectiveRole` below does NOT swallow — it lets the error
+      // propagate as at merge-base. The event intentionally omits identifiers and
+      // raw error details while keeping the swallowed failure operator-visible.
+      // eslint-disable-next-line no-console
+      console.warn('[octo-docs] space_membership_verify_error', {
+        reason: 'identity_call_threw',
+        path: 'ppt_relay',
+      })
+      member = false
+    }
+    role = effectiveRole(direct, member, meta.share_scope, meta.share_role)
   }
-  if (meta.share_scope === SHARE_SCOPE_AUTHENTICATED) {
-    return { role: effectiveRole(direct, false, meta.share_scope, meta.share_role), spaceMember: false }
-  }
-  if (caller.principalSpaceId !== meta.space_id) {
-    return { role: direct, spaceMember: false }
-  }
-  let member: boolean
-  try {
-    member = caller.isBot
-      ? true
-      : await getOctoIdentity().isSpaceMember(uid, meta.space_id, caller.token ?? '')
-  } catch {
-    // Fail-closed, SCOPED to the relay ticket path: a lookup error never widens
-    // access, and the SAME false drives both the role and the token claim so they
-    // stay consistent (a ticket must carry a concrete, signable boolean; a throw
-    // here would break issuance/reauth instead of degrading gracefully). The
-    // legacy `resolveEffectiveRole` below does NOT swallow — it lets the error
-    // propagate as at merge-base. The event intentionally omits identifiers and
-    // raw error details while keeping the swallowed failure operator-visible.
-    // eslint-disable-next-line no-console
-    console.warn('[octo-docs] space_membership_verify_error', {
-      reason: 'identity_call_threw',
-      path: 'ppt_relay',
-    })
-    member = false
-  }
-  return { role: effectiveRole(direct, member, meta.share_scope, meta.share_role), spaceMember: member }
+  // Source 3 (TES-131/TES-137) — fold in the drive-library-derived reader, the
+  // IDENTICAL merge the REST guard (resolveEffectiveRole) and the WS recheck use,
+  // so this relay ticket path agrees with them for the same caller (single-
+  // resolution invariant). Applied on every branch: a base already >= reader
+  // short-circuits inside the helper (no drive call), so a direct writer/admin
+  // stays untouched. A drive reader is space-membership-independent, so it never
+  // changes the `spaceMember` claim signed into the ticket.
+  role = await mergeDriveDerivedReader(role, meta.doc_id, uid, caller.principalSpaceId)
+  return { role, spaceMember: member }
 }
 
 export async function resolveEffectiveRole(
@@ -138,20 +157,26 @@ export async function resolveEffectiveRole(
   meta: ShareResolvable,
   caller: ShareCaller = {},
 ): Promise<ResolvedRole> {
-  // Legacy REST guard + the three transactional write services. Membership is
+  // Sources 1+2 — direct role and the space-share grant (#64). Membership is
   // resolved WITHOUT the relay path's fail-closed swallow, so an unexpected
   // identity-service throw PROPAGATES (byte-identical to merge-base) rather than
   // silently degrading an `anyone_in_space` share writer to 403. `isSpaceMember`
   // still fails closed to `false` on a transport error at its own source, so the
   // normal outage path is unchanged; only a genuinely unexpected throw surfaces.
+  let base: ResolvedRole
   if (![SHARE_SCOPE_ANYONE, SHARE_SCOPE_AUTHENTICATED].includes(meta.share_scope) || roleAtLeast(direct, 'writer')) {
-    return direct
+    base = direct
+  } else if (meta.share_scope === SHARE_SCOPE_ANYONE && caller.principalSpaceId !== meta.space_id) {
+    base = direct
+  } else {
+    const member = meta.share_scope === SHARE_SCOPE_AUTHENTICATED ? false : caller.isBot
+      ? true
+      : await getOctoIdentity().isSpaceMember(uid, meta.space_id, caller.token ?? '')
+    base = effectiveRole(direct, member, meta.share_scope, meta.share_role)
   }
-  if (meta.share_scope === SHARE_SCOPE_ANYONE && caller.principalSpaceId !== meta.space_id) {
-    return direct
-  }
-  const member = meta.share_scope === SHARE_SCOPE_AUTHENTICATED ? false : caller.isBot
-    ? true
-    : await getOctoIdentity().isSpaceMember(uid, meta.space_id, caller.token ?? '')
-  return effectiveRole(direct, member, meta.share_scope, meta.share_role)
+
+  // Source 3 (TES-131) — drive-library-derived reader. Delegated to the shared
+  // merge so every effective-role seam folds drive in identically (short-circuit
+  // when base >= reader, fail-closed, byte-identical when the flag is OFF).
+  return mergeDriveDerivedReader(base, meta.doc_id, uid, caller.principalSpaceId)
 }

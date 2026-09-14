@@ -693,6 +693,40 @@ export async function listRecentHandler(req: Request, res: Response) {
 docsRouter.get('/recent', listRecentHandler)
 
 /**
+ * GET /manageable — keyset list of docs the caller DIRECTLY administers (owner
+ * or a doc_member `admin` row) in the current Space, for the TES-131 drive
+ * picker. Direct admin only (no share/drive-derived widening), mirroring the
+ * internal role endpoint's direct-role contract. `X-Space-Id` is required
+ * (spaceContextMiddleware). `?page_size=` clamps to 1..100; `?cursor=` is the
+ * opaque token from the previous page's `nextCursor` (malformed => 400).
+ */
+export async function listManageableHandler(req: Request, res: Response) {
+  const uid = req.uid!
+  const spaceId = req.spaceId!
+  const cursor = typeof req.query.cursor === 'string' ? req.query.cursor : undefined
+  const pageSize = Math.min(100, Math.max(1, Number(req.query.page_size ?? 20) || 20))
+  let result
+  try {
+    result = await docMetaRepo.listManageable({ uid, spaceId, principalSpaceId: req.principalSpaceId!, pageSize, cursor })
+  } catch (err) {
+    if (err instanceof Error && err.message === 'invalid_cursor') {
+      res.status(400).json({ error: 'invalid_cursor' })
+      return
+    }
+    throw err
+  }
+  const items = result.items.map((d) => ({
+    docId: d.doc_id,
+    title: d.title,
+    ownerId: d.owner_id,
+    docType: d.doc_type,
+    ...(d.octo_doc_slug ? { octoDocSlug: d.octo_doc_slug } : {}),
+    updatedAt: new Date(d.updated_at).toISOString(),
+  }))
+  res.status(200).json({ items, nextCursor: result.nextCursor })
+}
+
+/**
  * GET /api/v1/docs/recent/creators — distinct creators of the caller's
  * recently-viewed docs for the CreatorFilter dropdown (FEAT-B, §3.4). Scope:
  * q-filtered, creator-NOT-filtered, pre-pagination, permission-filtered — the
@@ -1146,7 +1180,8 @@ export async function docIdCollabTokenHandler(req: Request, res: Response): Prom
  * `X-Space-Id` is REQUIRED here (per-route spaceContextMiddleware, so a
  * single-document request passing through this router without a match never
  * trips the 400). Mounted BEFORE the DocumentResourceRouter so the fixed paths
- * (`/`, `/search`, `/recent`, `/recent/creators`) are never shadowed by `/:docId`.
+ * (`/`, `/search`, `/recent`, `/recent/creators`, `/manageable`) are never
+ * shadowed by `/:docId`.
  */
 export const spaceCollectionRouter: ExpressRouter = Router()
 // Creating a document has no existing doc role to authorize against, so the
@@ -1159,6 +1194,7 @@ spaceCollectionRouter.get('/', spaceContextMiddleware, requireSpaceMembership, l
 spaceCollectionRouter.post('/search', spaceContextMiddleware, requireSpaceMembership, searchDocsHandler)
 spaceCollectionRouter.get('/recent', spaceContextMiddleware, requireSpaceMembership, listRecentHandler)
 spaceCollectionRouter.get('/recent/creators', spaceContextMiddleware, requireSpaceMembership, listRecentCreatorsHandler)
+spaceCollectionRouter.get('/manageable', spaceContextMiddleware, requireSpaceMembership, listManageableHandler)
 
 /**
  * Human DocumentResourceRouter (remove-sp §6): every single-document operation,

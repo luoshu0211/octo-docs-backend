@@ -15,6 +15,7 @@ vi.mock('../src/db/pool.js', () => ({
 import { docVersionRepo } from '../src/db/repos/docVersionRepo.js'
 import { docCommentRepo } from '../src/db/repos/docCommentRepo.js'
 import { docMetaRepo } from '../src/db/repos/docMetaRepo.js'
+import { encodeManageableCursor, decodeManageableCursor } from '../src/db/repos/docMetaRepo.js'
 import { pptCollabOpRepo } from '../src/db/repos/pptCollabOpRepo.js'
 import { query, transaction } from '../src/db/pool.js'
 
@@ -516,5 +517,103 @@ describe('docMetaRepo html registration slug SQL', () => {
     expect(out.meta.doc_id).toBe('d_html')
     const updateCall = mockQuery.mock.calls.find((call) => /^UPDATE doc_meta/i.test(call[0] as string))
     expect(updateCall?.[1]).toEqual(['HTML raced', 'bot_1', 'd_html', 's_1'])
+  })
+})
+
+// TES-131 drive picker: docMetaRepo.listManageable is a keyset (not offset) list
+// of docs the caller DIRECTLY administers. These assert the LIMIT is an inlined
+// pageSize+1 (never a `?` bind, per the errno 1210 remedy above), the direct
+// owner-or-admin predicate binds positionally, and the opaque cursor round-trips
+// / rejects a malformed value with 'invalid_cursor'.
+describe('docMetaRepo.listManageable keyset pagination', () => {
+  it('inlines LIMIT as pageSize+1 and drops it from params; no cursor => no cursor predicate', async () => {
+    await docMetaRepo.listManageable({ uid: 'u_1', spaceId: 's_1', principalSpaceId: 's_1', pageSize: 25 })
+    const { sql, params } = lastCall()
+    expect(sql).toMatch(/LIMIT 26\b/) // pageSize(25) + 1 sentinel row
+    expect(sql).not.toMatch(/LIMIT \?/)
+    expect(sql).not.toMatch(/m\.updated_at < \?/) // no cursor => no keyset predicate
+    expect(params).not.toContain(26)
+    expect(params).not.toContain(25)
+    // Bind order: JOIN dm.uid, dm.principal_space_id; space_id; owner_id, owner_space_id.
+    expect(params).toEqual(['u_1', 's_1', 's_1', 'u_1', 's_1'])
+    // Direct admin only: owner match OR a doc_member admin(3) row. No share_scope /
+    // drive derivation leaks into the picker.
+    expect(sql).toMatch(/dm\.role = 3/)
+    expect(sql).not.toMatch(/share_scope/)
+  })
+
+  it('clamps an out-of-range pageSize to 1..100 before inlining', async () => {
+    await docMetaRepo.listManageable({ uid: 'u_1', spaceId: 's_1', principalSpaceId: 's_1', pageSize: 9999 })
+    expect(lastCall().sql).toMatch(/LIMIT 101\b/) // clamp(100) + 1
+    await docMetaRepo.listManageable({ uid: 'u_1', spaceId: 's_1', principalSpaceId: 's_1', pageSize: 0 })
+    expect(lastCall().sql).toMatch(/LIMIT 2\b/) // clamp(1) + 1
+  })
+
+  it('appends the keyset predicate and binds the cursor tuple (updated_at as a Date, then doc_id)', async () => {
+    const cursor = encodeManageableCursor('2024-01-02T03:04:05.000Z', 'd_last')
+    await docMetaRepo.listManageable({ uid: 'u_1', spaceId: 's_1', principalSpaceId: 's_1', pageSize: 10, cursor })
+    const { sql, params } = lastCall()
+    expect(sql).toMatch(/m\.updated_at < \? OR \(m\.updated_at = \? AND m\.doc_id < \?\)/)
+    // Cursor binds trail the base args; the timestamp is a Date (mysql2 serializes
+    // it to the column's DATETIME), the same Date instance twice, then the doc_id.
+    expect(params.length).toBe(8)
+    const at = params[5]
+    expect(at).toBeInstanceOf(Date)
+    expect((at as Date).toISOString()).toBe('2024-01-02T03:04:05.000Z')
+    expect(params[6]).toBe(at) // same Date reused for the tie-break equality arm
+    expect(params[7]).toBe('d_last')
+  })
+
+  it('builds nextCursor from the last KEPT row only when an (n+1)th sentinel row is present', async () => {
+    const rows = Array.from({ length: 3 }, (_, i) => ({
+      doc_id: `d_${i}`,
+      title: `T${i}`,
+      doc_type: 'doc',
+      owner_id: 'u_1',
+      space_id: 's_1',
+      octo_doc_slug: null,
+      updated_at: new Date(`2024-01-0${i + 1}T00:00:00.000Z`),
+    }))
+    // pageSize 2 + 1 sentinel = 3 rows returned => there IS a next page.
+    mockQuery.mockResolvedValueOnce(rows as never)
+    const out = await docMetaRepo.listManageable({ uid: 'u_1', spaceId: 's_1', principalSpaceId: 's_1', pageSize: 2 })
+    expect(out.items).toHaveLength(2) // sentinel trimmed
+    expect(out.nextCursor).not.toBeNull()
+    // The cursor points at the LAST KEPT row (index 1), not the trimmed sentinel.
+    expect(decodeManageableCursor(out.nextCursor!)).toEqual({
+      updatedAt: '2024-01-02T00:00:00.000Z',
+      docId: 'd_1',
+    })
+  })
+
+  it('returns a null nextCursor on the last page (no sentinel row)', async () => {
+    const rows = [{
+      doc_id: 'd_0', title: 'T', doc_type: 'doc', owner_id: 'u_1',
+      space_id: 's_1', octo_doc_slug: null, updated_at: new Date('2024-01-01T00:00:00.000Z'),
+    }]
+    mockQuery.mockResolvedValueOnce(rows as never)
+    const out = await docMetaRepo.listManageable({ uid: 'u_1', spaceId: 's_1', principalSpaceId: 's_1', pageSize: 2 })
+    expect(out.items).toHaveLength(1)
+    expect(out.nextCursor).toBeNull()
+  })
+})
+
+describe('manageable cursor codec', () => {
+  it('round-trips an (updatedAt, docId) pair through an opaque base64url token', () => {
+    const token = encodeManageableCursor('2024-05-06T07:08:09.000Z', 'doc-xyz')
+    expect(token).not.toContain('{') // opaque, not raw JSON
+    expect(decodeManageableCursor(token)).toEqual({ updatedAt: '2024-05-06T07:08:09.000Z', docId: 'doc-xyz' })
+  })
+
+  it('returns null for a missing/empty cursor (=> first page)', () => {
+    expect(decodeManageableCursor(undefined)).toBeNull()
+    expect(decodeManageableCursor('')).toBeNull()
+  })
+
+  it("throws 'invalid_cursor' on garbage, a non-object, a missing field, or a non-date timestamp", () => {
+    expect(() => decodeManageableCursor('!!!not-base64-json!!!')).toThrow('invalid_cursor')
+    expect(() => decodeManageableCursor(Buffer.from('123', 'utf8').toString('base64url'))).toThrow('invalid_cursor')
+    expect(() => decodeManageableCursor(Buffer.from(JSON.stringify({ u: 'x' }), 'utf8').toString('base64url'))).toThrow('invalid_cursor')
+    expect(() => decodeManageableCursor(Buffer.from(JSON.stringify({ u: 'not-a-date', d: 'x' }), 'utf8').toString('base64url'))).toThrow('invalid_cursor')
   })
 })
