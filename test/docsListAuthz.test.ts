@@ -32,7 +32,14 @@ function mockRes(): MockRes {
   }
 }
 function req(extra: Record<string, unknown>) {
-  return { uid: 'u_1', spaceId: 's_target', octoToken: 'tok', query: {}, ...extra } as never
+  return {
+    uid: 'u_1',
+    spaceId: 's_target',
+    principalSpaceId: 's_target',
+    octoToken: 'tok',
+    query: {},
+    ...extra,
+  } as never
 }
 
 beforeEach(() => {
@@ -92,6 +99,83 @@ describe('GET /api/v1/docs — listDocsHandler membership gate (P1-a, XIN-1297 R
     await listDocsHandler(req({ spaceId: 's_target' }), res as never)
     expect(res.statusCode).toBe(200)
     expect(vi.mocked(docMetaRepo.listForUser).mock.calls[0]![0].isSpaceMember).toBe(false)
+  })
+
+  it('enables global discovery only for a confirmed Human member with a nonblank q', async () => {
+    isSpaceMemberMock.mockResolvedValue(true)
+    const res = mockRes()
+    await listDocsHandler(req({ query: { discoverable: 'true', q: ' roadmap ' } }), res as never)
+
+    expect(vi.mocked(docMetaRepo.listForUser).mock.calls[0]![0]).toMatchObject({
+      includeDiscoverable: true,
+      owner: undefined,
+      q: ' roadmap ',
+    })
+  })
+
+  it.each([
+    ['blank q', { query: { discoverable: 'true', q: '   ' } }],
+    ['non-member', { query: { discoverable: 'true', q: 'roadmap' } }],
+    ['Bot caller', { botToken: 'bot-tok', query: { discoverable: 'true', q: 'roadmap' } }],
+  ])('does not enable discovery for %s', async (kind, extra) => {
+    isSpaceMemberMock.mockResolvedValue(kind !== 'non-member')
+    const res = mockRes()
+    await listDocsHandler(req(extra), res as never)
+    expect(vi.mocked(docMetaRepo.listForUser).mock.calls[0]![0].includeDiscoverable).toBe(false)
+  })
+})
+
+describe('GET /api/v1/docs — discovery result projection', () => {
+  it('keeps a restricted opted-in row but exposes no role or HTML addressing', async () => {
+    isSpaceMemberMock.mockResolvedValue(true)
+    vi.mocked(docMetaRepo.listForUser).mockResolvedValue({
+      total: 1,
+      items: [{
+        doc_id: 'd_locked',
+        title: 'Roadmap',
+        owner_id: 'u_2',
+        doc_type: 'html',
+        octo_doc_slug: 'private-body-address',
+        role: null,
+        updated_at: new Date(0),
+      }] as never,
+    })
+    const res = mockRes()
+    await listDocsHandler(req({ query: { discoverable: 'true', q: 'roadmap' } }), res as never)
+
+    expect(res.body).toEqual({
+      total: 1,
+      items: [{
+        docId: 'd_locked',
+        title: 'Roadmap',
+        ownerId: 'u_2',
+        docType: 'html',
+        canOpen: false,
+        updatedAt: new Date(0),
+      }],
+    })
+  })
+
+  it('marks an accessible discovery row and preserves its effective role', async () => {
+    isSpaceMemberMock.mockResolvedValue(true)
+    vi.mocked(docMetaRepo.listForUser).mockResolvedValue({
+      total: 1,
+      items: [{
+        doc_id: 'd_open',
+        title: 'Roadmap',
+        owner_id: 'u_2',
+        doc_type: 'doc',
+        role: 2,
+        updated_at: new Date(0),
+      }] as never,
+    })
+    const res = mockRes()
+    await listDocsHandler(req({ query: { discoverable: 'true', q: 'roadmap' } }), res as never)
+    expect((res.body as { items: Array<Record<string, unknown>> }).items[0]).toMatchObject({
+      docId: 'd_open',
+      role: 'writer',
+      canOpen: true,
+    })
   })
 })
 

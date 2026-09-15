@@ -436,12 +436,16 @@ export async function listDocsHandler(req: Request, res: Response) {
   // FEAT-B: `owner=me` narrows to strictly the caller's own docs (excludes
   // shared-with-me); `q` is a filename substring search. Both are optional and
   // additive — omitting them preserves the pre-FEAT-B behavior verbatim.
-  const owner = req.query.owner === 'me' ? 'me' : undefined
+  const requestedOwner = req.query.owner === 'me' ? 'me' : undefined
   // FEAT: for owner=me, "my documents" also includes docs owned by bots this
   // human owns (req.ownedBots, from octo verify). Defaults to [] so listForUser
   // degrades to strictly the caller's own docs when absent.
   const ownedBots = req.ownedBots ?? []
   const q = typeof req.query.q === 'string' ? req.query.q : undefined
+  // Explicit Human-only filename discovery. The repository also requires a
+  // nonblank q and confirmed Space membership, so this flag can never widen a
+  // blank listing or the Bot collection surface.
+  const discoveryRequested = req.query.discoverable === 'true' && (q ?? '').trim() !== ''
   // FEAT-B/XIN-1188: optional multi-value `?type=` kind filter (repeated param,
   // never CSV). Validated against the fixed enum; unknown/absent => no filter.
   const types = normalizeTypeFilter(req.query.type)
@@ -452,19 +456,31 @@ export async function listDocsHandler(req: Request, res: Response) {
   // Space-share visibility must match the write side: only a confirmed member of
   // the queried space sees its anyone_in_space docs. owner='me' excludes the share
   // branch outright, so skip the membership lookup entirely in that case.
-  const isSpaceMember = owner === 'me' ? false : await resolveViewerSpaceMembership(req)
+  const isSpaceMember = requestedOwner === 'me' && !discoveryRequested
+    ? false
+    : await resolveViewerSpaceMembership(req)
+  const includeDiscoverable = discoveryRequested
+    && req.botToken === undefined
+    && isSpaceMember
+  // An explicit discovery search is global within the verified Space, even if
+  // a stale client also sends owner=me. Outside discovery mode old semantics
+  // stay byte-for-byte compatible.
+  const owner = includeDiscoverable ? undefined : requestedOwner
 
-  const { total, items } = await docMetaRepo.listForUser({ uid, spaceId, principalSpaceId: req.principalSpaceId!, isSpaceMember, folderId, owner, ownedBots, q, types, page, pageSize, sort })
+  const { total, items } = await docMetaRepo.listForUser({ uid, spaceId, principalSpaceId: req.principalSpaceId!, isSpaceMember, folderId, owner, ownedBots, includeDiscoverable, q, types, page, pageSize, sort })
   const visibleItems = items.flatMap((d) => {
     const role = roleName(Number(d.role))
-    if (!role) return []
+    if (!role && !includeDiscoverable) return []
     return [{
       docId: d.doc_id,
       title: d.title,
       ownerId: d.owner_id,
       docType: d.doc_type,
-      ...(d.octo_doc_slug ? { octoDocSlug: d.octo_doc_slug } : {}),
-      role,
+      // A discoverable-but-inaccessible row exposes only list metadata. In
+      // particular, never disclose the HTML collaboration/body addressing.
+      ...(role && d.octo_doc_slug ? { octoDocSlug: d.octo_doc_slug } : {}),
+      ...(role ? { role } : {}),
+      ...(includeDiscoverable ? { canOpen: !!role } : {}),
       updatedAt: d.updated_at,
     }]
   })

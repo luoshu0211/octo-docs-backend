@@ -76,6 +76,48 @@ describe('docMetaRepo.listForUser — owner=me / q (FEAT-B)', () => {
     expect(itemsCall().sql).not.toContain('LIKE')
   })
 
+  it('global filename discovery includes opted-in rows independently from access', async () => {
+    await docMetaRepo.listForUser({
+      uid: 'u_1',
+      spaceId: 's1',
+      principalSpaceId: 's1',
+      isSpaceMember: true,
+      includeDiscoverable: true,
+      q: 'roadmap',
+      page: 1,
+      pageSize: 20,
+      sort: 'updatedAt:desc',
+    })
+    const { sql } = itemsCall()
+
+    // Selection is owner/direct-member OR the independent discovery bit. A
+    // restricted opted-in row therefore remains in the result set.
+    expect(sql).toContain('OR m.discoverability_scope = 1)')
+    expect(sql).toContain("m.title LIKE ? ESCAPE '\\\\'")
+    // Access is computed separately: both link-sharing scopes can grant a role,
+    // while a restricted discovery-only row falls through to NULL.
+    expect(sql).toContain('(m.share_scope = 1 OR m.share_scope = 2)')
+    expect(sql).toContain('ELSE NULL END')
+  })
+
+  it.each([
+    ['unconfirmed Space membership', { isSpaceMember: false, q: 'roadmap' }],
+    ['blank query', { isSpaceMember: true, q: '   ' }],
+    ['owner-only mode', { isSpaceMember: true, q: 'roadmap', owner: 'me' as const }],
+  ])('fails closed when discovery is requested with %s', async (_case, extra) => {
+    await docMetaRepo.listForUser({
+      uid: 'u_1',
+      spaceId: 's1',
+      principalSpaceId: 's1',
+      includeDiscoverable: true,
+      page: 1,
+      pageSize: 20,
+      sort: 'updatedAt:desc',
+      ...extra,
+    })
+    expect(itemsCall().sql).not.toContain('OR m.discoverability_scope = 1)')
+  })
+
   it('orders by updated_at with a doc_id tie-break and an inlined LIMIT/OFFSET', async () => {
     await docMetaRepo.listForUser({ uid: 'u_1', spaceId: 's1', principalSpaceId: 's1', page: 2, pageSize: 20, sort: 'updatedAt:desc' })
     const { sql, params } = itemsCall()
