@@ -84,7 +84,7 @@ Copy `.env.example` to `.env` and adjust. Summary:
 | --- | --- | --- |
 | `HOCUSPOCUS_PORT` / `HTTP_PORT` | Hocuspocus Yjs WS / HTTP API and PPT WS ports | §2.1 / §8.4 |
 | `MYSQL_*` | authoritative store connection | §3.4 |
-| `REDIS_*` (incl. `REDIS_PREFIX`) | broadcast bus / cache / registry | §5 |
+| `REDIS_URL` / `REDIS_*` (incl. `REDIS_PREFIX`) | authenticated broadcast bus / cache / registry; URL overrides all connection fields | §5 / [Redis configuration](docs/redis-configuration.md) |
 | `COLLAB_TOKEN_SECRET` / `COLLAB_TOKEN_TTL_SECONDS` | collab JWT signing + TTL (5 min) | §4.4 |
 | `COLLAB_ALLOW_LEGACY_TOKENS_WITHOUT_HOME_SPACE_PROOF` | temporary Home-Space/PPT compatibility only; it never bypasses Docs current-Space proof | §4.4 / deployment guide |
 | `OCTO_IDENTITY_MODE` (`http`/`middleware`) / `OCTO_SERVER_BASE_URL` | octo identity integration | §4.7 |

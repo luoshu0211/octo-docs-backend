@@ -5,6 +5,8 @@
  * reads a typed, validated config object.
  */
 
+import { parseRedisConfig } from './redis.js'
+
 function str(name: string, fallback?: string): string {
   const v = process.env[name]
   if (v === undefined || v === '') {
@@ -340,8 +342,15 @@ export const config = {
   },
 
   redis: {
-    host: str('REDIS_HOST', '127.0.0.1'),
-    port: num('REDIS_PORT', 6379),
+    ...parseRedisConfig({
+      REDIS_URL: process.env.REDIS_URL,
+      REDIS_HOST: process.env.REDIS_HOST,
+      REDIS_PORT: process.env.REDIS_PORT,
+      REDIS_USERNAME: process.env.REDIS_USERNAME,
+      REDIS_PASSWORD: process.env.REDIS_PASSWORD,
+      REDIS_DB: process.env.REDIS_DB,
+      REDIS_TLS: process.env.REDIS_TLS,
+    }),
     prefix: str('REDIS_PREFIX', 'octo-docs'),
   },
 

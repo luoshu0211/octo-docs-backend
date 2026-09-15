@@ -21,6 +21,7 @@
   // widening to "test" is left as its own change.
   "include": [
     "src",
+    "test/redis*.test.ts",
     "test/botMentionAuthorGate.test.ts",
     "test/persistence.test.ts",
     "test/persistenceV2.test.ts",

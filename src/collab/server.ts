@@ -10,7 +10,7 @@
  */
 import { Server } from '@hocuspocus/server'
 import { CollabDatabase } from './collabDatabase.js'
-import { Redis } from '@hocuspocus/extension-redis'
+import { createCollabRedis } from './redis.js'
 import { Logger } from '@hocuspocus/extension-logger'
 import { config } from '../config/env.js'
 import { persistence } from './persistence.js'
@@ -280,7 +280,7 @@ export function validateAwarenessStates(
   }
 }
 
-export function createServer() {
+export function createServer(redis = createCollabRedis(config.redis)) {
   const server = new Server({
     name: `octo-docs-${config.hostname}`,
     port: config.hocuspocusPort,
@@ -301,11 +301,7 @@ export function createServer() {
         // lastContext flows through so store can write doc_meta.updated_by (P2-A).
         store: (documentName, doc, context) => persistence.store(documentName, doc, context),
       }),
-      new Redis({
-        host: config.redis.host,
-        port: config.redis.port,
-        prefix: config.redis.prefix, // multi-product key isolation (§2.1)
-      }),
+      redis,
     ],
 
     // §4.1 onAuthenticate
