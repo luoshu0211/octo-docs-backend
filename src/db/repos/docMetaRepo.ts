@@ -12,6 +12,7 @@ import {
   DISCOVERABILITY_HIDDEN,
   DISCOVERABILITY_SPACE,
   SHARE_SCOPE_ANYONE,
+  SHARE_SCOPE_AUTHENTICATED,
   SHARE_ROLE_COMMENT,
   SHARE_ROLE_EDIT,
 } from '../../permission/shareScope.js'
@@ -488,7 +489,10 @@ export const docMetaRepo = {
    * user-typed `%`/`_`/`\` matches literally. `types` (FEAT-B/XIN-1188 kind
    * filter) narrows to a multi-value OR set of `doc_type`s at the same layer as
    * `q` — BEFORE pagination, so count and page agree. Empty `types` applies no
-   * predicate (backward compatible).
+   * predicate (backward compatible). `includeDiscoverable` is the Human
+   * current-Space filename-search mode: in addition to directly owned/member
+   * rows it includes rows whose independent discovery bit is enabled. That bit
+   * never grants access; callers without an effective role receive a null role.
    */
   async listForUser(params: {
     uid: string
@@ -498,12 +502,13 @@ export const docMetaRepo = {
     folderId?: string
     owner?: 'me'
     ownedBots?: string[]
+    includeDiscoverable?: boolean
     q?: string
     types?: string[]
     page: number
     pageSize: number
     sort: 'updatedAt:desc' | 'updatedAt:asc'
-  }): Promise<{ total: number; items: Array<DocMeta & { role: number }> }> {
+  }): Promise<{ total: number; items: Array<DocMeta & { role: number | null }> }> {
     const where: string[] = ['m.status <> 0']
     // Optional space/folder/q filters appear in the WHERE clause between the
     // JOIN's `dm.uid = ?` and the trailing owner/visibility predicate. Collect
@@ -551,6 +556,13 @@ export const docMetaRepo = {
     //      (cross-space leak). Non-member => collapses to owner OR doc_member.
     // SHARE_SCOPE_ANYONE is a numeric constant, inlined (no extra bind).
     const includeSpaceShare = params.owner !== 'me' && params.isSpaceMember === true
+    // Defense in depth: discovery is meaningful only for a nonblank filename
+    // search in a Space whose membership was verified by the route. A mistaken
+    // internal call cannot turn an unscoped/blank list into a Space directory.
+    const includeDiscoverable = params.includeDiscoverable === true
+      && params.owner !== 'me'
+      && params.isSpaceMember === true
+      && q !== ''
     let visibility: string
     let ownerSet: string[] | null = null
     // Bind values contributed by the visibility clause, in placeholder order.
@@ -563,6 +575,12 @@ export const docMetaRepo = {
       // ownerSet always has >=1 element (params.uid); empty ownedBots => IN (?).
       visibility = `(m.owner_id IN (${ownerSet.map(() => '?').join(', ')}) AND m.owner_space_id = ?)`
       visibilityArgs.push(...ownerSet, params.principalSpaceId)
+    } else if (includeDiscoverable) {
+      // Discovery and authorization are intentionally independent. This branch
+      // selects directly visible rows OR opted-in rows; roleExpr below decides
+      // separately whether each selected row can actually be opened.
+      visibility = `(m.owner_id = ? AND m.owner_space_id = ? OR ${validMemberRole} OR m.discoverability_scope = ${DISCOVERABILITY_SPACE})`
+      visibilityArgs.push(params.uid, params.principalSpaceId)
     } else if (includeSpaceShare) {
       visibility = `(m.owner_id = ? AND m.owner_space_id = ? OR ${validMemberRole} OR (m.share_scope = ${SHARE_SCOPE_ANYONE} AND m.discoverability_scope = ${DISCOVERABILITY_SPACE}))`
       visibilityArgs.push(params.uid, params.principalSpaceId)
@@ -604,7 +622,17 @@ export const docMetaRepo = {
       ? `(m.owner_id IN (${ownerSet.map(() => '?').join(', ')}) AND m.owner_space_id = ?)`
       : '(m.owner_id = ? AND m.owner_space_id = ?)'
     const roleOwnerArgs: unknown[] = ownerSet ? [...ownerSet, params.principalSpaceId] : [params.uid, params.principalSpaceId]
-    const roleExpr = includeSpaceShare
+    const roleExpr = includeDiscoverable
+      ? `CASE WHEN ${roleOwnerPredicate} THEN 3
+              WHEN (m.share_scope = ${SHARE_SCOPE_ANYONE} OR m.share_scope = ${SHARE_SCOPE_AUTHENTICATED}) AND m.share_role = ${SHARE_ROLE_EDIT}
+                THEN CASE WHEN dm.role = 3 THEN 3 WHEN dm.role = 2 THEN 2 ELSE 2 END
+              WHEN (m.share_scope = ${SHARE_SCOPE_ANYONE} OR m.share_scope = ${SHARE_SCOPE_AUTHENTICATED}) AND m.share_role = ${SHARE_ROLE_COMMENT}
+                THEN CASE WHEN dm.role = 3 THEN 3 WHEN dm.role = 2 THEN 2 ELSE 4 END
+              WHEN m.share_scope = ${SHARE_SCOPE_ANYONE} OR m.share_scope = ${SHARE_SCOPE_AUTHENTICATED}
+                THEN CASE WHEN dm.role = 3 THEN 3 WHEN dm.role = 2 THEN 2 WHEN dm.role = 4 THEN 4 WHEN dm.role = 1 THEN 1 ELSE 1 END
+              WHEN dm.role = 3 THEN 3 WHEN dm.role = 2 THEN 2 WHEN dm.role = 4 THEN 4 WHEN dm.role = 1 THEN 1
+              ELSE NULL END`
+      : includeSpaceShare
       ? `CASE WHEN ${roleOwnerPredicate} THEN 3
               WHEN m.share_scope = ${SHARE_SCOPE_ANYONE} AND m.discoverability_scope = ${DISCOVERABILITY_SPACE} AND m.share_role = ${SHARE_ROLE_EDIT}
                 THEN CASE WHEN dm.role = 3 THEN 3 WHEN dm.role = 2 THEN 2 ELSE 2 END
@@ -617,7 +645,7 @@ export const docMetaRepo = {
       : `CASE WHEN ${roleOwnerPredicate} THEN 3
               WHEN dm.role = 3 THEN 3 WHEN dm.role = 2 THEN 2 WHEN dm.role = 4 THEN 4 WHEN dm.role = 1 THEN 1
               ELSE NULL END`
-    const items = await query<DocMeta & { role: number }>(
+    const items = await query<DocMeta & { role: number | null }>(
       `SELECT m.*, ${roleExpr} AS role
        ${base}
        ORDER BY m.updated_at ${order}, m.doc_id ${order}

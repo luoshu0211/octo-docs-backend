@@ -1298,6 +1298,19 @@ Response 200:
 }
 ```
 
+按文件名在当前已验证 Space 中全局发现文档：
+
+```
+GET /api/v1/docs?discoverable=true&q=%E9%9C%80%E6%B1%82&page=1&pageSize=20
+```
+
+- 仅 Human 调用且 `q` 非空时启用；Bot、空查询保持普通列表语义。
+- 候选集为调用者直接拥有/加入的文档，加上管理员开启
+  `spaceSearchable` 的文档；始终由服务端已验证的当前 Space 限定。
+- `spaceSearchable` 只允许标题被发现，不授予访问权限。无权限结果返回
+  `canOpen: false` 且省略 `role`、正文和协作寻址；有权限结果返回
+  `canOpen: true` 和有效 `role`。
+
 **重命名**
 
 ```
