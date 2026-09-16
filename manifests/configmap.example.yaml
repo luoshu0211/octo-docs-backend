@@ -44,6 +44,48 @@ data:
   # DELETE is exact and directory-free; Human DELETE follows the service-token-
   # first policy for its creator-owned-Bot cascade.
 
+  # Drive-library-derived viewer access (TES-131 / docs!129). Third, supplementary
+  # read-permission source: an effective member of a drive library that has a doc
+  # mounted derives a READER grant even with no doc_member row / share. Master
+  # switch default false => no drive lookup, effective role unchanged. Requires the
+  # drive side to expose POST /internal/v1/docs/derived-access. Auth uses independent
+  # inbound/outbound tokens (see DOCS_INTERNAL_TOKEN / DRIVE_INTERNAL_TOKEN below);
+  # the outbound token must equal drive's internal_token, but the inbound token is
+  # docs-side authoritative and independent. Fail-closed on any drive error.
+  # See docs/DEPLOYMENT.md §3.1.2.
+  DRIVE_DERIVED_ENABLED: "false"
+  # Base URL of the drive internal service; docs POSTs to
+  # <base>/internal/v1/docs/derived-access. Empty => the lookup is a no-op even
+  # when enabled, so a half-configured deploy fails closed instead of erroring on
+  # every read. In-network only; must never be browser-reachable.
+  DRIVE_INTERNAL_BASE_URL: "http://octo-drive-{{BRANCH}}:8080"
+  # Per-request timeout (ms) for the derived-access lookup: it sits on the
+  # read/authorize hot path, so a hung drive service aborts fast and fails closed.
+  DRIVE_DERIVED_TIMEOUT_MS: "500"
+  # Short-TTL cache window (ms) for a CONFIRMED derived-access answer, per
+  # (doc, uid, principal space), to bound drive QPS on hot docs. A drive-side
+  # revocation takes at most this long to propagate.
+  DRIVE_DERIVED_TTL_MS: "15000"
+  # ─────────────────────────────────────────────────────────────
+  # Note: the two internal tokens are credential-grade shared secrets. They are
+  # provisioned exclusively via `octo-docs-backend-secret` (secretKeyRef in
+  # manifests/deploy.yaml) — NOT here. Access to a ConfigMap needs only
+  # namespace configmap-read RBAC (commonly broad), which is why every
+  # credential in this backend (MYSQL_PASSWORD, COLLAB_TOKEN_SECRET,
+  # OCTO_SERVER_TOKEN, ATTACHMENT_*, …) lives in the Secret, not here.
+  #   • DOCS_INTERNAL_TOKEN  – inbound (drive → docs role), docs-side authoritative.
+  #     Docs generates and rotates; drive syncs its docs_backend.internal_token
+  #     to the same value. Compared (timing-safe) on GET /internal/docs/:docId/role
+  #     (internal listener 9090). Empty ⇒ every caller rejected (fail-closed).
+  #   • DRIVE_INTERNAL_TOKEN – outbound (docs → drive derived-access),
+  #     drive-side authoritative. Drive generates and rotates; docs syncs.
+  #     Sent as X-Internal-Token on POST <DRIVE_INTERNAL_BASE_URL>/internal/v1/docs/derived-access.
+  #     Empty ⇒ docs omits the header, drive returns 401, derived viewer degrades
+  #     to 'none' (fail-closed).
+  # See manifests/deploy.yaml env: entries and docs/DEPLOYMENT.md §3.1.2 for the
+  # secretKeyRef wiring. Never logged, never printed, never in ConfigMap.
+  # ─────────────────────────────────────────────────────────────
+
   ATTACHMENT_BUCKET: "octo-docs-attachments"
   ATTACHMENT_DRIVER: "local-hmac"
   ATTACHMENT_KEY_PREFIX: "octo-docs/{{BRANCH}}"

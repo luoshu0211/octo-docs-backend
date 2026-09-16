@@ -1011,12 +1011,20 @@ export const config = {
     // CONFIRMED answer is cached (never a fail-closed error), so a transient
     // outage is retried on the next call rather than pinned for the TTL.
     ttlMs: numMin('DRIVE_DERIVED_TTL_MS', 15_000, 1),
-    // Shared internal token for the docs<->drive service-to-service calls: sent as
-    // X-Internal-Token on the outbound derived-access lookup, and the value the
-    // inbound GET /internal/docs/:docId/role compares against (timing-safe). Empty
-    // => the internal role endpoint rejects every caller (fail-closed) and the
-    // outbound client omits the header. NEVER logged.
-    internalToken: str('DRIVE_INTERNAL_TOKEN', ''),
+    // Inbound token: the value the inbound GET /internal/docs/:docId/role compares
+    // X-Internal-Token against (timing-safe). Authority is on the DOCS side — docs
+    // generates/rotates it and tells drive to set docs_backend.internal_token to
+    // this value. Empty => the internal role endpoint rejects every caller
+    // (fail-closed). No fallback to the outbound token: the two directions are
+    // fully independent. NEVER logged.
+    inboundToken: str('DOCS_INTERNAL_TOKEN', ''),
+
+    // Outbound token: sent as X-Internal-Token on the outbound derived-access
+    // lookup to the drive service. Authority is on the DRIVE side — docs only holds
+    // a copy that must match drive's top-level internal_token. Empty => the outbound
+    // client omits the header, so the derived-access lookup fails closed. No fallback
+    // to the inbound token: the two directions are fully independent. NEVER logged.
+    outboundToken: str('DRIVE_INTERNAL_TOKEN', ''),
   },
 
   // R3-B1 PPT (html_ppt) source/bootstrap loading (XIN-1495 §4 / §8).
@@ -1146,3 +1154,21 @@ export const config = {
     },
   },
 } as const
+
+// Warn (never fatal) on an empty drive-internal token: each direction fails closed
+// on its own, so a missing token silently disables just that direction. Surfaced at
+// boot so an operator sees which half is off rather than debugging a 401 later.
+if (!config.driveDerived.inboundToken) {
+  // eslint-disable-next-line no-console
+  console.warn(
+    '[config] driveDerived.inboundToken (DOCS_INTERNAL_TOKEN) is empty; ' +
+      'drive -> docs role calls will 401 (HTTP-role mount fails closed).',
+  )
+}
+if (!config.driveDerived.outboundToken) {
+  // eslint-disable-next-line no-console
+  console.warn(
+    '[config] driveDerived.outboundToken (DRIVE_INTERNAL_TOKEN) is empty; ' +
+      'docs -> drive derived-access calls fail closed (derived viewer will not work).',
+  )
+}

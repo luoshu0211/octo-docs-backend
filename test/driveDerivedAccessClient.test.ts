@@ -1,5 +1,20 @@
 import { describe, it, expect, afterEach, vi } from 'vitest'
 
+// The client injects token/baseUrl/etc via constructor opts in every test below,
+// EXCEPT the outbound-token-default test, which omits `token` to exercise the
+// config fallback. Mock config so that fallback resolves to a known value.
+vi.mock('../src/config/env.js', () => ({
+  config: {
+    driveDerived: {
+      enabled: true,
+      internalBaseUrl: '',
+      outboundToken: 'cfg-outbound',
+      timeoutMs: 500,
+      ttlMs: 15_000,
+    },
+  },
+}))
+
 /**
  * TES-132 — the drive derived-access client. Asks the drive service, per
  * (doc, uid, principal space), whether the caller reaches a drive library that
@@ -78,6 +93,16 @@ describe('HttpDriveDerivedAccess.derivedRole (TES-132)', () => {
     await makeClient({ token: '' }).derivedRole('doc1', 'u1', 's1')
     const [, init] = fetchMock.mock.calls[0]! as unknown as [string, RequestInit]
     expect((init.headers as Record<string, string>)['X-Internal-Token']).toBeUndefined()
+  })
+
+  it('defaults the outbound header to config.driveDerived.outboundToken when no token opt is given', async () => {
+    const fetchMock = vi.fn(async () => roleResponse('reader'))
+    vi.stubGlobal('fetch', fetchMock)
+    // No `token` opt => the client falls back to the configured outbound token,
+    // proving the outbound direction is wired to outboundToken (not inboundToken).
+    await new HttpDriveDerivedAccess({ enabled: true, baseUrl: BASE }).derivedRole('doc1', 'u1', 's1')
+    const [, init] = fetchMock.mock.calls[0]! as unknown as [string, RequestInit]
+    expect((init.headers as Record<string, string>)['X-Internal-Token']).toBe('cfg-outbound')
   })
 
   it('fail-closed: non-200 => none', async () => {

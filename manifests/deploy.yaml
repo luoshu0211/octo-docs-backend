@@ -124,6 +124,28 @@ spec:
                   name: octo-docs-backend-secret
                   key: ATTACHMENT_S3_SECRET_KEY
                   optional: true
+            # TES-149/TES-150 drive↔docs internal tokens. Two independent
+            # shared secrets, one per direction; each authoritative on the
+            # side that generates it. Credential-grade → Secret (never
+            # ConfigMap). See docs/DEPLOYMENT.md §3.1.2.
+            # Inbound (drive → docs role, GET /internal/docs/:docId/role):
+            # docs-side authoritative; drive syncs docs_backend.internal_token.
+            # Empty ⇒ inbound endpoint rejects every caller (fail-closed).
+            - name: DOCS_INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: octo-docs-backend-secret
+                  key: DOCS_INTERNAL_TOKEN
+                  optional: true
+            # Outbound (docs → drive derived-access, X-Internal-Token):
+            # drive-side authoritative; must equal drive top-level internal_token.
+            # Empty ⇒ docs omits the header; drive 401 ⇒ derived viewer 'none'.
+            - name: DRIVE_INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: octo-docs-backend-secret
+                  key: DRIVE_INTERNAL_TOKEN
+                  optional: true
           readinessProbe:
             httpGet:
               path: /healthz

@@ -73,7 +73,7 @@ export class HttpDriveDerivedAccess implements DriveDerivedAccess {
   constructor(opts: HttpDriveDerivedAccessOptions = {}) {
     this.enabled = opts.enabled ?? config.driveDerived.enabled
     this.baseUrl = opts.baseUrl ?? config.driveDerived.internalBaseUrl
-    this.token = opts.token ?? config.driveDerived.internalToken
+    this.token = opts.token ?? config.driveDerived.outboundToken
     this.timeoutMs = opts.timeoutMs ?? config.driveDerived.timeoutMs
     this.cache = new TtlCache<boolean>(opts.ttlMs ?? config.driveDerived.ttlMs, opts.nowMs)
   }
