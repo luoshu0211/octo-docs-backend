@@ -284,8 +284,11 @@ vars (those without a fallback) **fail fast at boot** — that is intentional.
 | `RATE_LIMIT_WINDOW_MS` / `RATE_LIMIT_MAX` | no (`60000` / `300`) | Per-IP throttle window and cap on the REST route chains (human `/api/v1/docs` + bot `/v1/bot/docs`); `/healthz` is never throttled. Keyed on the real client IP, so `TRUST_PROXY` must be correct for the deployment. |
 | `MYSQL_HOST` / `MYSQL_PORT` / `MYSQL_USER` / `MYSQL_PASSWORD` / `MYSQL_DATABASE` | recommended | authoritative store connection |
 | `MYSQL_CONNECTION_LIMIT` | no (`10`) | pool size. PPT replay cursors reserve up to `PPT_RELAY_MAX_IN_FLIGHT_REPLAYS` connections while they stream pages; keep this high enough for ordinary REST traffic plus replay headroom. |
-| `REDIS_HOST` / `REDIS_PORT` | recommended | broadcast bus / cache / registry |
-| `REDIS_PREFIX` | no (`octo-docs`) | multi-product key isolation prefix |
+| `REDIS_URL` | no | `redis://:password@host:6379/0` or `rediss://username:password@host:6379/0`; overrides all Redis connection fields below; see [Redis configuration](redis-configuration.md) |
+| `REDIS_HOST` / `REDIS_PORT` | recommended without URL | host and port, defaults `127.0.0.1:6379` |
+| `REDIS_USERNAME` / `REDIS_PASSWORD` | no | ACL username and raw password; username requires password; ignored with URL |
+| `REDIS_DB` / `REDIS_TLS` | no (`0` / `false`) | database and verified TLS; ignored with URL |
+| `REDIS_PREFIX` | no (`octo-docs`) | key and Pub/Sub namespace, always applied; DB numbers do not isolate Pub/Sub |
 | `COLLAB_TOKEN_SECRET` | **yes in prod** | signing secret for the short-lived collab JWT. Use an asymmetric key / KMS-managed secret; the HS256 default `dev-only-change-me` is dev only. |
 | `COLLAB_TOKEN_TTL_SECONDS` | no (`300`) | collab JWT TTL (5 min) |
 | `COLLAB_ALLOW_LEGACY_TOKENS_WITHOUT_HOME_SPACE_PROOF` | no (`false`) | Temporary compatibility for still-unexpired collab/PPT credentials that lack `home_space_verified`. It does **not** bypass the independent `current_space_verified` + `current_space_id` requirement for Docs Hocuspocus tokens. Never use this flag to bridge the current-Space rollout, and never leave it enabled after its Home-Space/PPT drain window. Accepts only `true`/`false`/`1`/`0`; invalid values fail startup. |
