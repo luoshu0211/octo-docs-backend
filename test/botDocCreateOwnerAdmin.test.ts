@@ -693,7 +693,7 @@ describe('bot html doc registration', () => {
     expect(body.shareUrl).not.toContain('sid=')
   })
 
-  it('renames and soft-deletes html docs by octo-doc slug', async () => {
+  it('allows bot owners to rename HTML docs by slug but forbids deletion', async () => {
     setOctoIdentity(stub({ verifyBot: async () => ({ uid: 's_tmos_bot', spaceId: 's_1' }) }))
     getByOctoDocSlug.mockResolvedValue(htmlMeta as never)
     getByDocId.mockResolvedValue(htmlMeta as never)
@@ -712,12 +712,13 @@ describe('bot html doc registration', () => {
       headers: { authorization: 'Bearer bot-tok' },
     })
 
-    expect(deleteRes.status).toBe(200)
-    expect(softDelete).toHaveBeenCalledWith('d_html')
-    expect(refreshAndPublishMock).toHaveBeenCalledWith('octo:s_1:f_default:html:d_html', 1)
+    expect(deleteRes.status).toBe(403)
+    expect(await deleteRes.json()).toEqual({ error: 'bot_delete_forbidden' })
+    expect(softDelete).not.toHaveBeenCalled()
+    expect(refreshAndPublishMock).not.toHaveBeenCalled()
   })
 
-  it('treats an owner retry of a canonical html delete as success without deleting twice', async () => {
+  it('rejects a bot owner retry of a canonical HTML delete', async () => {
     setOctoIdentity(stub({ verifyBot: async () => ({ uid: 's_tmos_bot', spaceId: 's_1' }) }))
     getByOctoDocSlug.mockResolvedValue({
       ...htmlMeta,
@@ -731,12 +732,13 @@ describe('bot html doc registration', () => {
       headers: { authorization: 'Bearer bot-tok' },
     })
 
-    expect(res.status).toBe(204)
+    expect(res.status).toBe(403)
+    expect(await res.json()).toEqual({ error: 'bot_delete_forbidden' })
     expect(softDelete).not.toHaveBeenCalled()
     expect(refreshAndPublishMock).not.toHaveBeenCalled()
   })
 
-  it('does not turn another principal deletion of a deleted canonical html doc into success', async () => {
+  it('rejects another bot principal deleting an already deleted canonical HTML doc', async () => {
     setOctoIdentity(stub({ verifyBot: async () => ({ uid: 's_other_bot', spaceId: 's_1' }) }))
     getByOctoDocSlug.mockResolvedValue({
       ...htmlMeta,
@@ -750,15 +752,12 @@ describe('bot html doc registration', () => {
       headers: { authorization: 'Bearer bot-tok' },
     })
 
-    expect(res.status).toBe(404)
+    expect(res.status).toBe(403)
+    expect(await res.json()).toEqual({ error: 'bot_delete_forbidden' })
     expect(softDelete).not.toHaveBeenCalled()
   })
 
-  // A legacy registration may pick a slug that happens to equal its own doc id —
-  // the slug charset permits it. Slug/doc-id equality alone must therefore not
-  // grant the canonical delete-retry contract, or such a row silently loses the
-  // documented legacy 404.
-  it('keeps a legacy row whose slug equals its doc id non-idempotent on delete', async () => {
+  it('rejects bot deletion of a legacy row whose slug equals its doc id', async () => {
     setOctoIdentity(stub({ verifyBot: async () => ({ uid: 's_tmos_bot', spaceId: 's_1' }) }))
     getByOctoDocSlug.mockResolvedValue({
       ...htmlMeta,
@@ -772,11 +771,12 @@ describe('bot html doc registration', () => {
       headers: { authorization: 'Bearer bot-tok' },
     })
 
-    expect(res.status).toBe(404)
+    expect(res.status).toBe(403)
+    expect(await res.json()).toEqual({ error: 'bot_delete_forbidden' })
     expect(softDelete).not.toHaveBeenCalled()
   })
 
-  it('keeps deleted historical slug registrations non-idempotent', async () => {
+  it('rejects bot deletion of already deleted historical slug registrations', async () => {
     setOctoIdentity(stub({ verifyBot: async () => ({ uid: 's_tmos_bot', spaceId: 's_1' }) }))
     getByOctoDocSlug.mockResolvedValue({ ...htmlMeta, status: 0 } as never)
 
@@ -785,7 +785,8 @@ describe('bot html doc registration', () => {
       headers: { authorization: 'Bearer bot-tok' },
     })
 
-    expect(res.status).toBe(404)
+    expect(res.status).toBe(403)
+    expect(await res.json()).toEqual({ error: 'bot_delete_forbidden' })
     expect(softDelete).not.toHaveBeenCalled()
   })
 
