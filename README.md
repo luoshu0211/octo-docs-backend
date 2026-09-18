@@ -63,6 +63,17 @@ Key design invariants (from the contract):
 
 ---
 
+## Document deletion policy
+
+Bots cannot delete documents, including documents they own or administer.
+Authenticated bot requests to `DELETE /v1/bot/docs/:docId` and
+`DELETE /v1/bot/docs/octo-doc/:octoDocSlug` return HTTP 403 with
+`{"error":"bot_delete_forbidden"}` before document lookup or mutation. This also
+applies to retries for already deleted documents; invalid tokens still return 401.
+Human deletion through `DELETE /api/v1/docs/:docId` retains its existing verified
+Space and document-admin checks, soft deletion, and collaboration invalidation.
+This policy does not change bot creation, editing, or other resource operations.
+
 ## Prerequisites
 
 - **Node.js ≥ 20** (developed on v22), npm.

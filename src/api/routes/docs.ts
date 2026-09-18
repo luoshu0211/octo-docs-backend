@@ -864,7 +864,14 @@ async function renameDocById(req: Request, res: Response, docId: string): Promis
   res.status(200).json({ docId, title })
 }
 
+function requireHumanDocDeletion(req: Request, res: Response): boolean {
+  if (req.docSpaceScope?.mode === 'human') return true
+  res.status(403).json({ error: 'bot_delete_forbidden' })
+  return false
+}
+
 async function deleteDocById(req: Request, res: Response, docId: string): Promise<void> {
+  if (!requireHumanDocDeletion(req, res)) return
   const guard = await requireDocRole(req, res, docId, 'admin')
   if (!guard) return
   const deleted = await docMetaRepo.softDelete(docId)
@@ -884,6 +891,7 @@ export async function octoDocRenameHandler(req: Request, res: Response): Promise
 }
 
 export async function octoDocDeleteHandler(req: Request, res: Response): Promise<void> {
+  if (!requireHumanDocDeletion(req, res)) return
   const target = await resolveCanonicalDeleteBySlug(req, res)
   if (!target) return
   if (target.deleted) {
