@@ -80,7 +80,10 @@ export function pptErrorHandler(err: unknown, _req: Request, res: Response, next
     return
   }
   if (type === 'entity.too.large') {
-    sendPptError(res, 'PAYLOAD_TOO_LARGE', 'request body too large')
+    const { limit, length } = err as { limit?: number; length?: number }
+    sendPptError(res, 'PAYLOAD_TOO_LARGE', 'request body too large', {
+      details: { dimension: 'request', ...(typeof limit === 'number' ? { limit } : {}), ...(typeof length === 'number' ? { requestBytes: length } : {}) },
+    })
     return
   }
   if (type === 'charset.unsupported' || type === 'encoding.unsupported') {
@@ -112,7 +115,13 @@ export function createPptRouter(): Router {
   // malformed-JSON body raises `entity.parse.failed` INSIDE the router, so the
   // router-scoped pptErrorHandler below renders it as the C-style
   // VALIDATION_ERROR envelope instead of the global bare-JSON `invalid_body`.
-  router.use(json({ limit: '1mb' }))
+  const smallBody = json({ limit: '1mb' })
+  const fullDeckBody = json({ limit: config.ppt.write.maxRequestBytes })
+  router.use((req, res, next) => {
+    const fullDeck = (req.method === 'PATCH' && /^\/docs\/[^/]+\/live\/?$/i.test(req.path)) ||
+      (req.method === 'PUT' && /^\/docs\/[^/]+\/draft\/?$/i.test(req.path))
+    return (fullDeck ? fullDeckBody : smallBody)(req, res, next)
+  })
 
   // R2+ endpoint routers mount here (before the terminal 404). Body is already
   // parsed by the router-scoped `json()` above, so these handlers read req.body

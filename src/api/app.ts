@@ -234,6 +234,9 @@ export function createApp(
     // body is parsed by the global parser here, and the leak persists on exactly
     // the routes the router serves.
     if (/^\/api\/v1\/ppt(\/|$)/i.test(req.path)) return next()
+    // Parse only full-deck Bot PATCHes inside the authenticated PPT router,
+    // retaining its error envelope and leaving every other Bot route unchanged.
+    if (req.method === 'PATCH' && /^\/v1\/bot\/docs\/[^/]+\/ppt\/?$/i.test(req.path)) return next()
     // A styled Sheet PATCH can legitimately exceed the service-wide 1 MiB JSON
     // budget. Give only the two Sheet write surfaces their own finite parser cap;
     // every other JSON route retains the historical 1 MiB cap.

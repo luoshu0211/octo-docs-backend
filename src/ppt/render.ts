@@ -15,7 +15,8 @@ export function buildPptHtml(shell: string, deck: BentoDoc): string {
   validatePptDraft({ revision: 0, deck })
   return containedHtml(shell,deck)
 }
-export const MAX_PPT_VERSION_HTML_BYTES = 32 * 1024 * 1024
+// HTML includes the pinned player and escaped document, not just its JSON.
+export const MAX_PPT_VERSION_HTML_BYTES = 64 * 1024 * 1024
 export const MAX_PPT_EXPORT_HTML_BYTES = 160 * 1024 * 1024
 function containedHtml(shell: string, deck: BentoDoc, maxBytes = MAX_PPT_VERSION_HTML_BYTES): string {
   const data = Object.fromEntries(['format', 'version', 'title', 'size', 'theme', 'present', 'assets', 'fonts', 'layouts', 'slides']

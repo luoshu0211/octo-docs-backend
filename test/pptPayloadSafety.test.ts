@@ -1,12 +1,11 @@
 import { expect, it } from 'vitest'
 import { validatePptDraft } from '../src/ppt/draft.js'
-import { instantiateTemplate } from '../src/ppt/bentoDoc.js'
-import { getPptTemplate } from '../src/ppt/templates.js'
+import { legacyPptDeck } from './fixtures/pptLegacyDeck.js'
 import { offlineHostScript } from '../src/ppt/offlineHost.js'
 import { buildPptHtml } from '../src/ppt/render.js'
 import { JSDOM } from 'jsdom'
 
-const deck = () => instantiateTemplate(getPptTemplate('pitch')!, new Date().toISOString())
+const deck = () => legacyPptDeck()
 it('refuses excessively nested JSON before recursive hashing or CRDT diffing', () => {
   const value = deck(); let object: Record<string, unknown> = value
   for (let i = 0; i < 600; i++) { const next = {}; object.extra = next; object = next }

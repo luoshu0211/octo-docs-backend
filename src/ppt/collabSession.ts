@@ -3,6 +3,7 @@ import { pptLiveSnapshotRepo } from '../db/repos/pptLiveSnapshotRepo.js'
 import { PptApiError } from '../api/ppt/envelope.js'
 import { SyncState } from './sync/slidesSync.js'
 import type { BentoDoc } from './bentoDoc.js'
+import { assertPptDocumentBudget } from './documentBudget.js'
 
 /** Serialize the one-way draft -> live handoff with draft saves and ACL changes. */
 export async function preparePptCollab(docId: string, epoch: number): Promise<void> {
@@ -32,6 +33,9 @@ export async function preparePptCollab(docId: string, epoch: number): Promise<vo
           ...rest, html: `<p>${String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</p>` }
       })
     }
+    // Title refresh and legacy HTML/layout normalization can expand a valid
+    // draft. Check the actual persisted shape before adopting or writing it.
+    assertPptDocumentBudget(deck)
     const state = new SyncState('@relay')
     state.adopt(deck)
     await pptLiveSnapshotRepo.upsertAdvanceTx(tx, docId, 0, deck, state.toJSON())

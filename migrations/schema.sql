@@ -344,13 +344,13 @@ CREATE TABLE doc_access_notify_card (
 -- counters, and the initial materialized BentoDoc the create endpoint mints.
 CREATE TABLE ppt_doc_state (
   doc_id                VARCHAR(64)  NOT NULL,             -- FK-by-convention to doc_meta.doc_id (html_ppt row)
-  template_id           VARCHAR(64)  NOT NULL,             -- one of the four fixed bundled templates
+  template_id           VARCHAR(64)  NOT NULL,             -- creation catalogue ID; historical IDs remain valid here
   draft_revision        BIGINT       NOT NULL DEFAULT 0,   -- monotonic draft save counter (R2-B2 advances)
   snapshot_version      BIGINT       NOT NULL DEFAULT 0,   -- authoritative live snapshot version (R4 advances)
   published_version_seq BIGINT       NULL DEFAULT NULL,    -- latest published version seq (R5), NULL until first publish
   ppt_format_version    INT          NOT NULL DEFAULT 1,   -- BentoDoc FORMAT_VERSION at create
   bento_sync_pv         INT          NOT NULL DEFAULT 2,   -- Bento SYNC_V (relay protocol version)
-  draft_doc             MEDIUMTEXT   NOT NULL,             -- materialized starter BentoDoc JSON (template stripped)
+  draft_doc             LONGTEXT     NOT NULL,             -- materialized BentoDoc JSON; application budget applies
   created_at            DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   updated_at            DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
   PRIMARY KEY (doc_id)
@@ -405,14 +405,14 @@ CREATE TABLE ppt_live_snapshot (
   doc_id           VARCHAR(64) NOT NULL,                  -- one authoritative live snapshot per doc
   snapshot_version BIGINT      NOT NULL DEFAULT 0,        -- monotonic; advances atomically on each save
   covered_seq      BIGINT      NOT NULL DEFAULT 0,        -- ppt_collab_op.seq this snapshot covers (<= are prunable)
-  doc_json         MEDIUMTEXT  NOT NULL,                  -- the authoritative BentoDoc snapshot, plaintext JSON
+  doc_json         LONGTEXT    NOT NULL,                  -- the authoritative BentoDoc snapshot, plaintext JSON
   doc_sha          CHAR(64)    NOT NULL,                  -- sha256(hex) of doc_json (integrity / dedup)
   doc_bytes        INT         NOT NULL DEFAULT 0,        -- byte size of doc_json
   -- Serialized Bento SyncState reduced ALONGSIDE doc_json, persisted atomically
   -- with it and covered_seq so a late joiner replays (doc,state) then applies ops
   -- with seq > covered_seq deterministically (R4-B1 XIN-1759 Part B / XIN-1764
   -- Option 2). NULL only for a legacy doc-only row written before this column.
-  state_json       MEDIUMTEXT  NULL DEFAULT NULL,         -- serialized SyncStateJSON (nullable: legacy doc-only rows)
+  state_json       LONGTEXT    NULL DEFAULT NULL,         -- serialized SyncStateJSON (nullable: legacy doc-only rows)
   state_sha        CHAR(64)    NULL DEFAULT NULL,         -- sha256(hex) of state_json
   state_bytes      INT         NOT NULL DEFAULT 0,        -- byte size of state_json (0 when NULL)
   created_at       DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
@@ -493,7 +493,7 @@ CREATE TABLE IF NOT EXISTS ppt_version (
   kind VARCHAR(16) NOT NULL,
   label VARCHAR(256) NOT NULL DEFAULT '',
   base_revision BIGINT UNSIGNED NOT NULL,
-  deck_json MEDIUMTEXT NOT NULL,
+  deck_json LONGTEXT NOT NULL,
   html LONGTEXT NOT NULL,
   content_hash CHAR(64) NOT NULL,
   created_by VARCHAR(64) NOT NULL,

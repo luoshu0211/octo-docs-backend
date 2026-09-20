@@ -68,8 +68,7 @@ vi.mock('../src/db/pool.js', () => {
 import { changePptVersion, getPptVersion, validateVersionAction } from '../src/ppt/versions.js'
 import { editPptLive } from '../src/ppt/liveEdit.js'
 import { SyncState } from '../src/ppt/sync/slidesSync.js'
-import { getPptTemplate } from '../src/ppt/templates.js'
-import { instantiateTemplate } from '../src/ppt/bentoDoc.js'
+import { legacyPptDeck } from './fixtures/pptLegacyDeck.js'
 import { pptRoomEvents } from '../src/ppt/roomCoordinator.js'
 
 const principal = { docId: 'd_1', uid: 'bot1', spaceId: 's1', authorizedEpoch: 1, isBot: true }
@@ -81,7 +80,7 @@ function current(): BentoDoc {
   return value
 }
 beforeEach(() => {
-  const value = instantiateTemplate(getPptTemplate('pitch')!, new Date().toISOString())
+  const value = legacyPptDeck()
   db.snapshot = JSON.stringify(value)
   const sync = new SyncState('@genesis'); sync.adopt(value); db.state = JSON.stringify(sync.toJSON())
   db.seq = 0; db.frames = []; db.role = 'writer'; db.fail = ''; db.versions = []; db.receipts = {}; db.pointer = null
@@ -89,6 +88,19 @@ beforeEach(() => {
     owner_id: 'owner', owner_space_id: 's1', space_id: 's1', share_scope: 0, share_role: 1 }
 })
 
+it.each(['pitch', 'report', 'lesson'] as const)('restores an existing retired %s deck without a template lookup', async id => {
+  const original = legacyPptDeck(id)
+  db.snapshot = JSON.stringify(original)
+  const sync = new SyncState('@genesis'); sync.adopt(original); db.state = JSON.stringify(sync.toJSON())
+  await publish()
+  expect((await getPptVersion('d_1', 1))?.deck).toEqual(original)
+  const changed = current(); changed.slides[0]!.notes = 'Later edit'
+  await editPptLive(principal, { baseRevision: 0, deck: changed })
+  db.role = 'admin'
+  await changePptVersion(principal, 'restore', { baseRevision: 1, label: '', versionSeq: 1 }, 'restore-retired')
+  expect(current()).toEqual(original)
+  expect((await getPptVersion('d_1', 2))?.deck).toEqual(changed)
+})
 it('creates snapshots immutable source and replays the same receipt after later edits', async () => {
   const original = current(), receipt = await publish()
   const value = current(); value.slides[0]!.notes = 'Later work'

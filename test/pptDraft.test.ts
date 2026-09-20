@@ -39,13 +39,12 @@ vi.mock('../src/db/pool.js', () => ({
 import { createPptDraftRouter } from '../src/api/ppt/draft.js'
 import { pptErrorHandler } from '../src/api/ppt/envelope.js'
 import { validatePptDraft, savePptDraft } from '../src/ppt/draft.js'
-import { getPptTemplate } from '../src/ppt/templates.js'
+import { legacyPptDeck } from './fixtures/pptLegacyDeck.js'
 import { setOctoIdentity } from '../src/auth/octoIdentity.js'
+import { config } from '../src/config/env.js'
 
 function deck() {
-  const source = structuredClone(getPptTemplate('pitch')!)
-  delete source.template
-  delete source.collab
+  const source = legacyPptDeck()
   source.docId = 'bento-existing'
   return source
 }
@@ -74,6 +73,28 @@ function put(body: unknown, space = 's_1', token = 'test-session') {
 }
 
 describe('PPT draft save', () => {
+  it('rejects timestamp growth after validation without changing draft or metadata', async () => {
+    const value = { ...deck(), modified: '' }
+    const previousLimit = config.ppt.write.maxDocumentBytes
+    const previous = structuredClone(current)
+    try {
+      config.ppt.write.maxDocumentBytes = Buffer.byteLength(JSON.stringify(value))
+      expect(validatePptDraft({ revision: 0, deck: value }).deck).toBe(value)
+      await expect(savePptDraft({ docId: 'd_1', uid: 'writer', spaceId: 's_1', authorizedEpoch: 4, revision: 0, deck: value }))
+        .rejects.toMatchObject({ code: 'PAYLOAD_TOO_LARGE', details: {
+          dimension: 'document', documentBytes: config.ppt.write.maxDocumentBytes + 24, limit: config.ppt.write.maxDocumentBytes,
+        } })
+      expect(writes).not.toHaveBeenCalled()
+      expect(current).toEqual(previous)
+    } finally { config.ppt.write.maxDocumentBytes = previousLimit }
+  })
+  it.each(['pitch', 'report', 'lesson'] as const)('saves an existing retired %s deck without its template source', async id => {
+    const value = legacyPptDeck(id)
+    current = { draft_revision: 0, draft_doc: JSON.stringify(value) }
+    value.slides[0]!.notes = 'Still editable after template retirement'
+    expect((await put({ revision: 0, deck: value })).status).toBe(200)
+    expect(JSON.parse(current.draft_doc)).toMatchObject({ docId: value.docId, slides: value.slides })
+  })
   it('refuses whole-deck saves after the live collaboration handoff', async () => {
     live = true
     expect((await put({ revision: 0, deck: deck() })).status).toBe(409)

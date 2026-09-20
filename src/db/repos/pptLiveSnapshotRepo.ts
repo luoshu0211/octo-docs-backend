@@ -34,21 +34,17 @@ interface RawRow {
 }
 
 /**
- * MySQL `MEDIUMTEXT` byte ceiling (2^24 − 1). `doc_json` and `state_json` are
- * `MEDIUMTEXT` (`migrations/schema.sql`), so a serialized value ABOVE this cannot be
- * stored intact: in strict mode the write errors `ER_DATA_TOO_LONG` (not a transient
- * lock error, so `withStoreRetry` rethrows it non-retryably) and, worse, if `sql_mode`
- * omits `STRICT_TRANS_TABLES` MySQL TRUNCATES the value with only a warning, the upsert
- * "succeeds", `covered_seq` advances, and the relay then prunes the op log behind a
- * truncated, unparseable `doc_json` — total, silent loss of the deck (XIN-1821 P1-3).
- * We therefore fail CLOSED in application code BEFORE the write, so neither outcome is
- * reachable regardless of server `sql_mode`.
+ * Application snapshot safety budget, below the LONGTEXT storage ceiling.
+ * The 2026-09-20 migration MUST run before this code: legacy MEDIUMTEXT columns
+ * cannot hold 32 MiB decks. State has an independent budget because CRDT history
+ * can exceed visible document content; this does not increase the document cap.
+ * Fail before upsert/prune so an oversized state never loses its durable op log.
  */
-export const SNAPSHOT_COLUMN_MAX_BYTES = 16_777_215
+export const SNAPSHOT_COLUMN_MAX_BYTES = 64 * 1024 * 1024
 
 /**
- * A snapshot whose serialized `doc_json`/`state_json` exceeds the `MEDIUMTEXT` column
- * ceiling. Thrown BEFORE the write so the op log is never pruned behind a value that
+ * A snapshot whose serialized `doc_json`/`state_json` exceeds the safety
+ * budget. Thrown BEFORE the write so the op log is never pruned behind a value that
  * could not be persisted intact (XIN-1821 P1-3). Non-retryable by construction (it is
  * not a transient lock error), so the relay's forced-snapshot path surfaces it as a
  * permanent `room-full` (the deck is at storage capacity) rather than retrying forever,
@@ -58,7 +54,7 @@ export const SNAPSHOT_COLUMN_MAX_BYTES = 16_777_215
  * `console.warn` (soft path). Wiring it through the same `onAgedOpDrop`-style handler is
  * deferred; the guard's job here is to make the failure LOUD-and-safe (a refusal, never a
  * silent truncate-then-prune), which it does regardless of that channel. When it fires,
- * the deck's materialized state has outgrown the column and needs a schema/segmentation
+ * the deck's materialized state has outgrown the budget and needs a state-compaction
  * change.
  */
 export class SnapshotColumnOverflowError extends Error {
@@ -66,7 +62,7 @@ export class SnapshotColumnOverflowError extends Error {
     readonly column: 'doc_json' | 'state_json',
     readonly bytes: number,
   ) {
-    super(`ppt_live_snapshot.${column} is ${bytes} bytes, over the ${SNAPSHOT_COLUMN_MAX_BYTES}-byte MEDIUMTEXT ceiling`)
+    super(`ppt_live_snapshot.${column} is ${bytes} bytes, over the ${SNAPSHOT_COLUMN_MAX_BYTES}-byte snapshot budget`)
     this.name = 'SnapshotColumnOverflowError'
   }
 }
@@ -150,8 +146,8 @@ export const pptLiveSnapshotRepo = {
     const stateJson = state == null ? null : JSON.stringify(state)
     const stateSha = stateJson === null ? null : createHash('sha256').update(stateJson).digest('hex')
     const stateBytes = stateJson === null ? 0 : Buffer.byteLength(stateJson, 'utf8')
-    // Fail CLOSED before the write if either column would overflow the MEDIUMTEXT
-    // ceiling (XIN-1821 P1-3): a silent truncation followed by a prune destroys the
+    // Fail CLOSED before the write if either value exceeds the snapshot
+    // budget (XIN-1821 P1-3): a silent truncation followed by a prune destroys the
     // deck. Throwing here (non-retryable) leaves the op log durable; the relay surfaces
     // it as `room-full` on the forced path.
     if (bytes > SNAPSHOT_COLUMN_MAX_BYTES) throw new SnapshotColumnOverflowError('doc_json', bytes)
