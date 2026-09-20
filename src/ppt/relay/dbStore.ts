@@ -35,6 +35,7 @@ import { pptLiveSnapshotRepo } from '../../db/repos/pptLiveSnapshotRepo.js'
 import { pptRelaySeqRepo } from '../../db/repos/pptRelaySeqRepo.js'
 import { SyncState, type Op, type SyncStateJSON } from '../sync/slidesSync.js'
 import type { BentoDoc } from '../bentoDoc.js'
+import { assertPptDocumentBudget } from '../documentBudget.js'
 import {
   canonicalPayloadHash,
   DuplicateFramePayloadError,
@@ -78,10 +79,26 @@ export class DbPptRelayStore implements PptRelayStore {
     let last = Number(watermark?.last_s ?? 0)
     let doc: BentoDoc | undefined
     let state: SyncState | undefined
+    // A conservative serialized upper bound includes both visible data AND
+    // hidden CRDT state (pending text/limbo/stash can materialize later), plus
+    // every un-compacted operation including this one. The kernel only copies
+    // supplied values, joins text tokens, and adds small structural delimiters;
+    // per-frame headroom covers those delimiters. Never sum the visible deck
+    // alone: a small insert can expose large previously hidden state.
+    // Current reads under the room counter lock keep this valid across nodes.
+    const [budget] = await tx.query<{ snapshot_bytes: number | string | null; covered_seq: number }>(
+      `SELECT OCTET_LENGTH(doc_json) + OCTET_LENGTH(state_json) AS snapshot_bytes, covered_seq
+       FROM ppt_live_snapshot WHERE doc_id = ? FOR UPDATE`, [docId])
+    const [tailBudget] = await tx.query<{ tail_bytes: number | string }>(
+      'SELECT COALESCE(SUM(frame_bytes + 1024), 0) AS tail_bytes FROM ppt_collab_op WHERE doc_id = ? AND seq > ? FOR UPDATE',
+      [docId, budget?.covered_seq ?? 0])
+    const upperBound = Number(budget?.snapshot_bytes) + Number(tailBudget?.tail_bytes)
+    // SQL NULL (legacy missing state) is unknown, never a zero-byte snapshot.
+    const checkDocument = budget?.snapshot_bytes == null || !Number.isFinite(upperBound) || upperBound > config.ppt.write.maxDocumentBytes
     // Seed old sessions once from their durable snapshot/tail. Ordinary later
     // frames use a scalar watermark, not an ever-growing full-tail replay.
     // Title updates still need the actual LWW winner, not merely the wire value.
-    if (!watermark || changesTitle) {
+    if (!watermark || changesTitle || checkDocument) {
       const [row] = await tx.query<{ covered_seq: number; doc_json: string; state_json: string }>(
         'SELECT covered_seq, doc_json, state_json FROM ppt_live_snapshot WHERE doc_id = ? FOR UPDATE', [docId])
       if (!row?.state_json) throw new Error('live snapshot required')
@@ -100,8 +117,11 @@ export class DbPptRelayStore implements PptRelayStore {
       last = Math.max(last, state.vv[actor] ?? 0)
     }
     for (const op of ops) if (op.a !== actor || op.s !== ++last) throw new Error('actor sequence must be contiguous')
+    if (state && doc) {
+      state.apply(doc, ops)
+      assertPptDocumentBudget(doc)
+    }
     if (changesTitle) {
-      state!.apply(doc!, ops)
       if (typeof doc!.title !== 'string' || !doc!.title.trim() || doc!.title.length > 512) throw new Error('invalid title')
       await tx.execute('UPDATE doc_meta SET title = ?, updated_at = CURRENT_TIMESTAMP(3) WHERE doc_id = ?', [doc!.title.trim(), docId])
     }

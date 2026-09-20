@@ -73,6 +73,25 @@ ppt_cluster_integration:
     - node scripts/waitForPptTestServices.mjs
     - npm test -- test/pptCanonicalId.mysql.test.ts
 
+ppt_budget_integration:
+  extends: ppt_cluster_integration
+  services:
+    - name: mysql:8.0
+      alias: mysql
+      command: ["--max-allowed-packet=268435456"]
+    - name: redis:7-alpine
+      alias: redis
+  variables:
+    MYSQL_DATABASE: ppt_case_test_budget_ci
+    REDIS_PREFIX: ppt-ci-budget
+    PPT_CANONICAL_MYSQL_TEST: "0"
+    PPT_CLUSTER_MYSQL_TEST: "0"
+    PPT_BUDGET_MYSQL_TEST: "1"
+  script:
+    - npm ci
+    - node scripts/waitForPptTestServices.mjs
+    - npm test -- test/pptBudget.mysql.test.ts
+
 .package: &package
   stage: package
   tags:

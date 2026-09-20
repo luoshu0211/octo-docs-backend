@@ -35,8 +35,7 @@ vi.mock('../src/db/pool.js', () => ({ query: async () => [], transaction: async 
 
 import { editPptLive, validatePptEdit } from '../src/ppt/liveEdit.js'
 import { SyncState } from '../src/ppt/sync/slidesSync.js'
-import { getPptTemplate } from '../src/ppt/templates.js'
-import { instantiateTemplate } from '../src/ppt/bentoDoc.js'
+import { legacyPptDeck } from './fixtures/pptLegacyDeck.js'
 import { pptRoomEvents } from '../src/ppt/roomCoordinator.js'
 import { diffPpt } from '../src/ppt/diff.js'
 
@@ -48,12 +47,21 @@ function current(): BentoDoc {
   return value
 }
 beforeEach(() => {
-  const value = instantiateTemplate(getPptTemplate('pitch')!, new Date().toISOString())
+  const value = legacyPptDeck()
   db.snapshot = JSON.stringify(value)
   const sync = new SyncState('@genesis'); sync.adopt(value); db.state = JSON.stringify(sync.toJSON())
   db.seq = 0; db.frames = []; db.role = 'writer'; db.fail = false
   db.meta = { doc_id: 'd_1', doc_type: 'html_ppt', title: value.title, status: 1, permission_epoch: 1,
     owner_id: 'owner', owner_space_id: 's1', space_id: 's1', share_scope: 0, share_role: 1 }
+})
+it.each(['pitch', 'report', 'lesson'] as const)('reads and edits an existing retired %s deck as live content', async id => {
+  const value = legacyPptDeck(id)
+  db.snapshot = JSON.stringify(value)
+  const sync = new SyncState('@genesis'); sync.adopt(value); db.state = JSON.stringify(sync.toJSON())
+  expect(current()).toEqual(value)
+  value.slides[0]!.notes = 'Edited after template retirement'
+  expect(await editPptLive(principal, { baseRevision: 0, deck: value })).toMatchObject({ revision: 1, changed: true })
+  expect(current()).toEqual(value)
 })
 it('commits a content edit as replayable ops and broadcasts only after durability', async () => {
   const value = deck(); value.slides[0]!.notes = 'Bot wrote this'

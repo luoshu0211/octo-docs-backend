@@ -1,9 +1,9 @@
 /**
- * The four bundled PPT templates (v1, FIXED set — no admin-extensible registry).
+ * Bundled PPT gallery families and blank deck; no admin-extensible registry.
  *
- * Gate3 decision D6 (XIN-1493 §1.2): v1 ships exactly four bundled 16:9 decks;
- * there is NO admin template CRUD. `POST /api/v1/ppt/docs` materializes exactly
- * one of these by `templateId`; any other id is a 400 VALIDATION_ERROR.
+ * The shared create flow materializes one accepted `templateId` as a 16:9 deck;
+ * unsupported or retired IDs fail with 400 VALIDATION_ERROR. Existing documents
+ * use their persisted decks, not this new-document catalogue.
  *
  * Each template is authored as a bento/slides deck carrying the `template`
  * marker AND a `collab` block, so materialization (see instantiateTemplate) is
@@ -18,6 +18,10 @@ import {
   BENTO_FORMAT_VERSION,
   type BentoDoc,
 } from './bentoDoc.js'
+import signal from './gallery/signal.json' with { type: 'json' }
+import terra from './gallery/terra.json' with { type: 'json' }
+import orbital from './gallery/orbital.json' with { type: 'json' }
+import picnic from './gallery/picnic.json' with { type: 'json' }
 
 /** 16:9 slide coordinate space shared by every bundled template. */
 const SIZE_16_9 = { width: 1280, height: 720 } as const
@@ -80,59 +84,32 @@ function slide(id: string, elements: unknown[], name: string): BentoDoc['slides'
 }
 
 /**
- * The FIXED four. Order here is the order the picker shows them. Ids are the
- * wire `templateId` values the create endpoint accepts.
+ * Current creation templates, matching the frontend picker. Old starter decks
+ * are deliberately absent; retiring a template does not alter saved documents.
  */
 const TEMPLATES: Record<string, BentoDoc> = {
+  ...{ signal, terra, orbital, picnic } as unknown as Record<string, BentoDoc>,
   blank: template(
     'blank',
     'Blank',
     [slide('s_blank_1', [text('e_title', 'Title')], 'Title')],
     '#F7A600',
   ),
-  pitch: template(
-    'pitch',
-    'Pitch',
-    [
-      slide('s_pitch_cover', [text('e_title', 'Company Name'), text('e_sub', 'One-line pitch')], 'Cover'),
-      slide('s_pitch_problem', [text('e_title', 'Problem'), text('e_body', 'What hurts today')], 'Problem'),
-      slide('s_pitch_solution', [text('e_title', 'Solution'), text('e_body', 'How we fix it')], 'Solution'),
-    ],
-    '#2F6BFF',
-  ),
-  report: template(
-    'report',
-    'Report',
-    [
-      slide('s_report_cover', [text('e_title', 'Quarterly Report'), text('e_sub', 'Q_ · Team')], 'Cover'),
-      slide('s_report_metrics', [text('e_title', 'Key Metrics'), text('e_body', 'Highlights')], 'Metrics'),
-    ],
-    '#0FA958',
-  ),
-  lesson: template(
-    'lesson',
-    'Lesson',
-    [
-      slide('s_lesson_cover', [text('e_title', 'Lesson Title'), text('e_sub', 'Course · Unit')], 'Cover'),
-      slide('s_lesson_objectives', [text('e_title', 'Objectives'), text('e_body', 'What you will learn')], 'Objectives'),
-      slide('s_lesson_summary', [text('e_title', 'Summary')], 'Summary'),
-    ],
-    '#8B5CF6',
-  ),
 }
 
 /** The fixed template ids, in picker order. */
-export const PPT_TEMPLATE_IDS: readonly string[] = ['blank', 'pitch', 'report', 'lesson']
+export const PPT_TEMPLATE_IDS: readonly string[] = ['blank', 'signal', 'terra', 'orbital', 'picnic']
 
 /** Caller-facing summaries (id + name + scenario), in picker order. */
 export const PPT_TEMPLATE_SUMMARIES: readonly PptTemplateSummary[] = [
   { id: 'blank', name: 'Blank', scenario: 'Start from an empty 16:9 deck' },
-  { id: 'pitch', name: 'Pitch', scenario: 'Startup / product pitch deck' },
-  { id: 'report', name: 'Report', scenario: 'Quarterly business review' },
-  { id: 'lesson', name: 'Lesson', scenario: 'Teaching / training slides' },
+  { id: 'signal', name: 'Signal', scenario: 'Editorial typography · 7 coordinated page layouts' },
+  { id: 'terra', name: 'Terra', scenario: 'Premium product · 5 coordinated page layouts' },
+  { id: 'orbital', name: 'Orbital', scenario: 'Immersive technology · 6 coordinated page layouts' },
+  { id: 'picnic', name: 'Pixel Picnic', scenario: 'Playful learning · 6 coordinated page layouts' },
 ]
 
-/** True when `v` is one of the four fixed template ids. */
+/** True when `v` is an accepted bundled template ID. */
 export function isPptTemplateId(v: unknown): v is string {
   return typeof v === 'string' && Object.prototype.hasOwnProperty.call(TEMPLATES, v) && PPT_TEMPLATE_IDS.includes(v)
 }

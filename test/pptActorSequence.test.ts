@@ -1,9 +1,11 @@
-import { beforeEach, expect, it, vi } from 'vitest'
+import { beforeEach, afterEach, expect, it, vi } from 'vitest'
 const db=vi.hoisted(()=>({seq:0,watermarks:new Map<string,number>(),frames:[] as {seq:number;frame_json:string}[],ledger:new Map<string,{seq:number;payloadHash:string}>(),snapshot:{} as {covered_seq:number;doc_json:string;state_json:string},logs:[] as string[],title:''}))
 vi.mock('../src/db/pool.js',()=>({getPool:vi.fn(),query:async()=>[],transaction:async(fn:(tx:unknown)=>Promise<unknown>)=>{
  const saved=structuredClone(db)
  try{return await fn({query:async(sql:string,args:(string|number)[])=>{
  db.logs.push(sql)
+ if(sql.includes('AS snapshot_bytes'))return [{snapshot_bytes:db.snapshot.state_json == null ? null : Buffer.byteLength(db.snapshot.doc_json)+Buffer.byteLength(db.snapshot.state_json),covered_seq:db.snapshot.covered_seq}]
+ if(sql.includes('AS tail_bytes'))return [{tail_bytes:db.frames.filter(f=>f.seq>db.snapshot.covered_seq).reduce((n,f)=>n+Buffer.byteLength(f.frame_json)+1024,0)}]
  if(sql.includes('FROM ppt_collab_actor_seq'))return db.watermarks.has(String(args[1]))?[{last_s:db.watermarks.get(String(args[1]))}]:[]
  if(sql.includes('FROM ppt_live_snapshot'))return [db.snapshot]
  if(sql.includes('FROM ppt_collab_op'))return db.frames.filter(f=>f.seq>Number(args[1])&&f.seq<Number(args[2]))
@@ -22,11 +24,32 @@ import { DbPptRelayStore, MAX_PPT_SESSION_ACTORS } from '../src/ppt/relay/dbStor
 import { SyncState } from '../src/ppt/sync/slidesSync.js'
 import { instantiateTemplate } from '../src/ppt/bentoDoc.js'
 import { getPptTemplate } from '../src/ppt/templates.js'
+import { config } from '../src/config/env.js'
+const documentLimit = config.ppt.write.maxDocumentBytes
+afterEach(() => { config.ppt.write.maxDocumentBytes = documentLimit })
 beforeEach(()=>{
  const deck=instantiateTemplate(getPptTemplate('blank')!,new Date().toISOString());const sync=new SyncState('@genesis');sync.adopt(deck)
  Object.assign(db,{seq:0,watermarks:new Map(),frames:[],ledger:new Map(),logs:[],title:deck.title,snapshot:{covered_seq:0,doc_json:JSON.stringify(deck),state_json:JSON.stringify(sync.toJSON())}})
 })
 const frame=(s:number,k='custom',v:unknown=s)=>({t:'ops',ops:[{op:'set',a:'actor',s,l:s+100,k,v}]})
+it('does not treat a NULL legacy snapshot byte sum as a safe fast-path bound',async()=>{
+ const store=new DbPptRelayStore(true)
+ await store.appendOp('doc','first',frame(1))
+ Object.assign(db.snapshot,{state_json:null})
+ await expect(store.appendOp('doc','legacy-null',frame(2))).rejects.toThrow('live snapshot required')
+ expect(db.seq).toBe(1);expect(db.ledger.has('legacy-null')).toBe(false);expect(db.frames).toHaveLength(1);expect(db.watermarks.get('actor')).toBe(1)
+})
+it('checks accumulated document growth and rolls back rejected frames, ledger and actor sequence',async()=>{
+ const store=new DbPptRelayStore(true)
+ await store.appendOp('doc','first',frame(1,'custom','a'.repeat(1500)))
+ const deck=JSON.parse(db.snapshot.doc_json);const state=SyncState.fromJSON('@relay',JSON.parse(db.snapshot.state_json))
+ state.apply(deck,frame(1,'custom','a'.repeat(1500)).ops)
+ config.ppt.write.maxDocumentBytes=Buffer.byteLength(JSON.stringify(deck))
+ const before=structuredClone(db)
+ await expect(store.appendOp('doc','over',frame(2,'other','b'.repeat(500)))).rejects.toMatchObject({code:'PAYLOAD_TOO_LARGE'})
+ expect(db.seq).toBe(before.seq);expect(db.ledger.has('over')).toBe(false);expect(db.watermarks.get('actor')).toBe(1)
+ await expect(store.appendOp('doc','shrink',frame(2,'custom','small'))).resolves.toMatchObject({duplicate:false})
+})
 it('seeds old sessions once and avoids full-tail replay on subsequent small frames',async()=>{
  const store=new DbPptRelayStore(true)
  for(let i=1;i<=512;i++)await store.appendOp('doc',`f${i}`,frame(i))

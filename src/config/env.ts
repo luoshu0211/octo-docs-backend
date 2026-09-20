@@ -6,6 +6,7 @@
  */
 
 import { parseRedisConfig } from './redis.js'
+import { parsePptWriteConfig } from './pptWrite.js'
 
 function str(name: string, fallback?: string): string {
   const v = process.env[name]
@@ -1043,6 +1044,7 @@ export const config = {
   // content is served `private, no-cache` + ETag (revalidate every use) while
   // draft/live and any bootstrap are private/no-store.
   ppt: {
+    write: parsePptWriteConfig(process.env),
     // TTL for the signed asset GET URLs embedded in a bootstrap payload. Mirrors
     // C's 15-minute authorized-render window (asset_sig.go); short enough that a
     // leaked URL expires quickly, long enough to load a deck's media once. The
