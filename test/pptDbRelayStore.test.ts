@@ -567,10 +567,10 @@ describe('DbPptRelayStore — snapshot version atomicity (B2 / P0-3)', () => {
     expect(snap!.snapshotVersion).toBe(1)
   })
 
-  it('P1-3: a snapshot whose doc_json/state_json overflows the MEDIUMTEXT ceiling fails CLOSED before the write (no truncate-then-prune)', async () => {
+  it('P1-3: a snapshot above the safety budget fails CLOSED before the write (no truncate-then-prune)', async () => {
     const store = new DbPptRelayStore()
     await store.appendOp(D, 'f1', { n: 1 })
-    // A doc whose JSON exceeds the 16 MiB column ceiling must be REFUSED before the
+    // A doc whose JSON exceeds the snapshot safety budget must be REFUSED before the
     // upsert — a silent truncation followed by a prune would destroy the deck.
     const huge = deck('x'.repeat(SNAPSHOT_COLUMN_MAX_BYTES + 1))
     await expect(store.saveSnapshot({ docId: D, coveredSeq: 1, doc: huge })).rejects.toBeInstanceOf(

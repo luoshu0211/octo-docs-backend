@@ -19,6 +19,7 @@ import { canonicalPayloadHash, withStoreRetry } from './relay/store.js'
 import { opsOfFrame } from './relay/snapshotter.js'
 import { inPptRoom, pptRoomEvents } from './roomCoordinator.js'
 import { diffPpt } from './diff.js'
+import { assertPptDocumentBudget } from './documentBudget.js'
 
 export interface PptPrincipal {
   docId: string
@@ -78,9 +79,19 @@ export async function appendPptEditTx(tx: Tx, principal: PptPrincipal, live: Awa
   validatePptDraft({ revision: live.revision, deck: after })
   if (after.docId !== live.deck.docId) throw new PptApiError('VALIDATION_ERROR', 'Bento document identity cannot change')
   if (after.title !== live.deck.title) await lockPptAuthority(tx, principal, 'admin')
+  // JSON object order is not document content (Go clients sort object keys).
+  // Avoid minting CRDT stamps or revisions for a read-back submitted unchanged.
+  const contentHash = hashBentoDeck(after)
+  if (contentHash === hashBentoDeck(live.deck)) return { revision: live.revision, contentHash, changed: false, frames: [] }
+  // Replay with a distinct actor and the pre-diff vector: minting advances the
+  // originating actor, so replaying on live.sync would skip its own operations.
+  const replay = SyncState.fromJSON('@rest-budget-replay', live.sync.toJSON())
   const ops = diffPpt(live.sync, live.deck, after)
   const frames: { revision: number; frame: { t: 'ops'; pv: number; frameId: string; ops: typeof ops } }[] = []
   if (!ops.length) return { revision: live.revision, contentHash: hashBentoDeck(live.deck), changed: false, frames }
+  const materialized = structuredClone(live.deck)
+  replay.apply(materialized, ops)
+  assertPptDocumentBudget(materialized)
   // A restore can contain more than one wire frame. Pack it before any write,
   // then append every frame in one transaction; a failed chunk rolls back all.
   const packed: { frame: (typeof frames)[number]['frame']; json: string; bytes: number }[] = []
@@ -112,7 +123,7 @@ export async function appendPptEditTx(tx: Tx, principal: PptPrincipal, live: Awa
   }
   await tx.execute('UPDATE doc_meta SET title = ?, updated_by = ?, updated_at = CURRENT_TIMESTAMP(3) WHERE doc_id = ?',
     [after.title.trim(), principal.uid, principal.docId])
-  return { revision, contentHash: hashBentoDeck(after), changed: true, frames, roomBytesAfter: live.bytes + packed.reduce((sum, item) => sum + item.bytes, 0) }
+  return { revision, contentHash: hashBentoDeck(materialized), changed: true, frames, roomBytesAfter: live.bytes + packed.reduce((sum, item) => sum + item.bytes, 0) }
 }
 
 /** Whole JSON input is compiled into ordinary Bento ops. A stale full document

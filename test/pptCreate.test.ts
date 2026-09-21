@@ -135,6 +135,7 @@ import { docMemberRepo } from '../src/db/repos/docMemberRepo.js'
 import { pptDocStateRepo } from '../src/db/repos/pptDocStateRepo.js'
 import { transaction } from '../src/db/pool.js'
 import { ROLE_ADMIN } from '../src/permission/role.js'
+import { hashCanonicalPayload } from '../src/ppt/idempotency.js'
 
 const createTx = vi.mocked(docMetaRepo.createTx)
 const upsertDirectTx = vi.mocked(docMemberRepo.upsertDirectTx)
@@ -196,6 +197,27 @@ beforeEach(() => {
 })
 
 describe('shared document creation', () => {
+  it.each(['pitch', 'report', 'lesson'])('rejects retired Human template %s without writes', async templateId => {
+    const response = await post({ title: 'Retired template', templateId }, { key: `retired-${templateId}` })
+    expect(response.status).toBe(400)
+    expect(await response.json()).toMatchObject({ code: 'VALIDATION_ERROR' })
+    expect(transactionMock).not.toHaveBeenCalled()
+    expect(db.docMeta.size).toBe(0)
+    expect(db.pptState.size).toBe(0)
+    expect(db.members).toEqual([])
+    expect(db.idem.size).toBe(0)
+  })
+  it.each(['signal', 'terra', 'orbital', 'picnic'])('creates %s with its assets and page family intact', async templateId => {
+    const response = await post({ title: 'Gallery deck', templateId }, { key: `gallery-${templateId}` })
+    expect(response.status).toBe(201)
+    const state = stateCreateTx.mock.calls[0]![1] as { templateId: string; draftDoc: Record<string, unknown> }
+    expect(state.templateId).toBe(templateId)
+    expect((state.draftDoc.layouts as Array<{ id: string }>).every(layout => layout.id.startsWith(`layout-${templateId}-`))).toBe(true)
+    expect((state.draftDoc.layouts as unknown[]).length).toBeGreaterThanOrEqual(5)
+    expect(Object.keys(state.draftDoc.assets as object).length).toBeGreaterThan(0)
+    expect(state.draftDoc.template).toBeUndefined()
+    expect(state.draftDoc.collab).toBeUndefined()
+  })
   it('creates a PPT through docs with the common flat response', async () => {
     const response = await fetch(`${base}/api/v1/docs`, {
       method: 'POST', headers: { token: 'user-tok', 'X-Space-Id': 's_1',
@@ -211,7 +233,7 @@ describe('shared document creation', () => {
 
 describe('PPT-HUMAN-001 — human creates a PPT from a template', () => {
   it('returns 201 with the common create payload and makes the caller owner/admin', async () => {
-    const res = await post({ title: 'My Deck', templateId: 'pitch' }, { key: 'idem-1' })
+    const res = await post({ title: 'My Deck', templateId: 'blank' }, { key: 'idem-1' })
     expect(res.status).toBe(201)
     const body = (await res.json()) as Record<string, unknown>
     // The public Docs endpoint returns the common flat document payload.
@@ -224,7 +246,7 @@ describe('PPT-HUMAN-001 — human creates a PPT from a template', () => {
       ownerId: 'u_1',
       docType: 'html_ppt',
       role: 'admin',
-      templateId: 'pitch',
+      templateId: 'blank',
       draftRevision: 0,
       snapshotVersion: 0,
     })
@@ -263,7 +285,7 @@ describe('PPT-HUMAN-001 — human creates a PPT from a template', () => {
     // PPT state row + materialized starter deck persisted.
     expect(stateCreateTx).toHaveBeenCalledTimes(1)
     const stateArg = stateCreateTx.mock.calls[0]![1] as { templateId: string; draftDoc: Record<string, unknown> }
-    expect(stateArg.templateId).toBe('pitch')
+    expect(stateArg.templateId).toBe('blank')
     expect(stateArg.draftDoc.template).toBeUndefined()
     expect(stateArg.draftDoc.collab).toBeUndefined()
     expect(stateArg.draftDoc.format).toBe('bento/slides')
@@ -280,9 +302,9 @@ describe('PPT-HUMAN-001 — human creates a PPT from a template', () => {
 
 describe('PPT-HUMAN-002 — human create validation', () => {
   const cases: Array<[string, unknown]> = [
-    ['empty title', { title: '', templateId: 'pitch' }],
-    ['whitespace title', { title: '   ', templateId: 'pitch' }],
-    ['illegal folder segment', { title: 'ok', templateId: 'pitch', folderId: 'bad folder!' }],
+    ['empty title', { title: '', templateId: 'blank' }],
+    ['whitespace title', { title: '   ', templateId: 'blank' }],
+    ['illegal folder segment', { title: 'ok', templateId: 'blank', folderId: 'bad folder!' }],
     ['unsupported templateId', { title: 'ok', templateId: 'not-a-template' }],
   ]
   it.each(cases)('rejects %s with 400 VALIDATION_ERROR and no side effect', async (_label, body) => {
@@ -296,7 +318,7 @@ describe('PPT-HUMAN-002 — human create validation', () => {
   })
 
   it('attributes an invalid X-Space-Id segment to the X-Space-Id field (not folderId)', async () => {
-    const res = await post({ title: 'ok', templateId: 'pitch' }, { key: 'idem-badspace', space: 'bad space!' })
+    const res = await post({ title: 'ok', templateId: 'blank' }, { key: 'idem-badspace', space: 'bad space!' })
     expect(res.status).toBe(400)
     const j = (await res.json()) as { code: string; details?: { field?: string } }
     expect(j.code).toBe('VALIDATION_ERROR')
@@ -309,7 +331,7 @@ describe('PPT-API-004 — human create cannot spoof server-owned fields', () => 
   it.each([['ownerId', 'u_evil'], ['spaceId', 's_evil'], ['mountType', 'group'], ['octoDocSlug', 'slug'], ['botToken', 'tok']])(
     'rejects a body-supplied %s with 400 VALIDATION_ERROR and no create',
     async (field, value) => {
-      const res = await post({ title: 'ok', templateId: 'pitch', [field]: value }, { key: 'idem-spoof' })
+      const res = await post({ title: 'ok', templateId: 'blank', [field]: value }, { key: 'idem-spoof' })
       expect(res.status).toBe(400)
       const j = (await res.json()) as { code: string; details?: { fields?: string[] } }
       expect(j.code).toBe('VALIDATION_ERROR')
@@ -321,11 +343,11 @@ describe('PPT-API-004 — human create cannot spoof server-owned fields', () => 
 
 describe('PPT-IDEMP-001 — same key + same payload replays', () => {
   it('returns the original response and does not create a second doc', async () => {
-    const first = await post({ title: 'Once', templateId: 'report' }, { key: 'idem-r' })
+    const first = await post({ title: 'Once', templateId: 'blank' }, { key: 'idem-r' })
     const firstBody = (await first.json()) as { docId: string }
     expect(first.status).toBe(201)
 
-    const second = await post({ title: 'Once', templateId: 'report' }, { key: 'idem-r' })
+    const second = await post({ title: 'Once', templateId: 'blank' }, { key: 'idem-r' })
     const secondBody = (await second.json()) as { docId: string }
     expect(second.status).toBe(201)
     // Byte-identical replay, and the create side effect ran EXACTLY once.
@@ -337,13 +359,60 @@ describe('PPT-IDEMP-001 — same key + same payload replays', () => {
   })
 })
 
+describe.each(['Human', 'Bot'] as const)('retired template receipts — %s', actor => {
+  it.each(['pitch', 'report', 'lesson'])('replays a committed %s receipt without enabling new creation', async templateId => {
+    const uid = actor === 'Human' ? 'u_1' : 'b_bot'
+    const spaceId = actor === 'Human' ? 's_1' : 's_bot'
+    if (actor === 'Bot') setOctoIdentity(stub({ verifyBot: async () => ({ uid, spaceId, ownerUid: 'u_creator' }) }))
+    const body = { docType: 'html_ppt', title: 'Created before retirement', templateId }
+    const key = `committed-${templateId}`
+    const receipt = {
+      docId: 'd_saved', documentName: `octo:${spaceId}:f_default:ppt:d_saved`,
+      title: body.title, spaceId, folderId: 'f_default', ownerId: uid,
+      docType: 'html_ppt', role: 'admin', templateId, draftRevision: 0,
+      snapshotVersion: 0, editorUrl: '/docs?doc=d_saved', shareUrl: '/d/d_saved',
+    }
+    const record: Rec = { requestHash: hashCanonicalPayload({ title: body.title, folderId: 'f_default', templateId }),
+      responseStatus: 201, responseData: receipt, docId: receipt.docId, completed: true }
+    db.idem.set(idemK(spaceId, 'create', uid, key), record)
+    const send = (payload = body, requestKey = key) => actor === 'Human'
+      ? post(payload, { key: requestKey })
+      : fetch(`${base}/v1/bot/docs`, { method: 'POST', headers: {
+        authorization: 'Bearer bot-token', 'X-Space-Id': 'spoofed',
+        'content-type': 'application/json', 'Idempotency-Key': requestKey,
+      }, body: JSON.stringify(payload) })
+    const replay = await send()
+    expect(replay.status).toBe(201)
+    expect(await replay.json()).toEqual(receipt)
+    const conflict = await send({ ...body, title: 'Different request' })
+    expect(conflict.status).toBe(409)
+    expect(await conflict.json()).toMatchObject({ code: 'CONFLICT' })
+    expect((await send(body, 'new-key')).status).toBe(400)
+    // A receipt for another caller or Space must not authorize a replay.
+    db.idem.delete(idemK(spaceId, 'create', uid, key))
+    for (const [savedSpace, savedUid] of [[spaceId, 'someone_else'], ['another_space', uid]]) {
+      db.idem.clear()
+      db.idem.set(idemK(savedSpace!, 'create', savedUid!, key), record)
+      expect((await send()).status).toBe(400)
+    }
+    expect(transactionMock).not.toHaveBeenCalled()
+    expect(createTx).not.toHaveBeenCalled()
+    expect(upsertDirectTx).not.toHaveBeenCalled()
+    expect(stateCreateTx).not.toHaveBeenCalled()
+    expect(db.docMeta.size).toBe(0)
+    expect(db.pptState.size).toBe(0)
+    expect(db.members).toEqual([])
+    expect(db.idem.size).toBe(1)
+  })
+})
+
 describe('PPT-IDEMP-002 — same key + different payload conflicts', () => {
   it('returns 409 CONFLICT with details.idempotencyKey and no second create', async () => {
-    const first = await post({ title: 'Original', templateId: 'pitch' }, { key: 'idem-c' })
+    const first = await post({ title: 'Original', templateId: 'blank' }, { key: 'idem-c' })
     expect(first.status).toBe(201)
     expect(createTx).toHaveBeenCalledTimes(1)
 
-    const second = await post({ title: 'Changed', templateId: 'pitch' }, { key: 'idem-c' })
+    const second = await post({ title: 'Changed', templateId: 'blank' }, { key: 'idem-c' })
     expect(second.status).toBe(409)
     const j = (await second.json()) as { code: string; details?: { idempotencyKey?: string } }
     expect(j.code).toBe('CONFLICT')
@@ -357,7 +426,7 @@ describe('cross-user idempotency isolation — same key, different user (XIN-151
   it('a second user reusing the same key + payload gets their OWN deck, never the first user\'s response', async () => {
     // User A creates with key K.
     setOctoIdentity(stub({ verifyToken: async () => ({ uid: 'u_A' }) }))
-    const a = await post({ title: 'Shared', templateId: 'pitch' }, { key: 'shared-key' })
+    const a = await post({ title: 'Shared', templateId: 'blank' }, { key: 'shared-key' })
     expect(a.status).toBe(201)
     const aBody = (await a.json()) as { docId: string; ownerId: string; role: string }
     expect(aBody.ownerId).toBe('u_A')
@@ -368,7 +437,7 @@ describe('cross-user idempotency isolation — same key, different user (XIN-151
     // is scoped by uid, so B has no prior record and mints their OWN deck — B must
     // never receive A's response (the cross-user leak this test guards).
     setOctoIdentity(stub({ verifyToken: async () => ({ uid: 'u_B' }) }))
-    const b = await post({ title: 'Shared', templateId: 'pitch' }, { key: 'shared-key' })
+    const b = await post({ title: 'Shared', templateId: 'blank' }, { key: 'shared-key' })
     expect(b.status).toBe(201)
     const bBody = (await b.json()) as { docId: string; ownerId: string }
     expect(bBody.ownerId).toBe('u_B')
@@ -381,7 +450,7 @@ describe('cross-user idempotency isolation — same key, different user (XIN-151
 
     // A's replay still returns A's original response byte-identically, with no new create.
     setOctoIdentity(stub({ verifyToken: async () => ({ uid: 'u_A' }) }))
-    const aReplay = await post({ title: 'Shared', templateId: 'pitch' }, { key: 'shared-key' })
+    const aReplay = await post({ title: 'Shared', templateId: 'blank' }, { key: 'shared-key' })
     expect(aReplay.status).toBe(201)
     expect(await aReplay.json()).toEqual(aBody)
     expect(createTx).toHaveBeenCalledTimes(2)
@@ -392,7 +461,7 @@ describe('atomic create — partial write failure rolls back cleanly (GitHub RC 
   it('a mid-transaction failure leaves NO orphan rows and does NOT strand the idempotency key', async () => {
     // Force the member write (2nd write, after doc_meta insert) to throw.
     failMemberWrite = true
-    const r1 = await post({ title: 'Atomic', templateId: 'pitch' }, { key: 'atomic-key' })
+    const r1 = await post({ title: 'Atomic', templateId: 'blank' }, { key: 'atomic-key' })
     expect(r1.status).toBe(500)
     expect((await r1.json())).toMatchObject({ error: 'internal_error' })
 
@@ -406,7 +475,7 @@ describe('atomic create — partial write failure rolls back cleanly (GitHub RC 
     // A retry with the SAME key succeeds (no permanent "in progress" 409) and
     // creates exactly ONE deck — no duplicate.
     failMemberWrite = false
-    const r2 = await post({ title: 'Atomic', templateId: 'pitch' }, { key: 'atomic-key' })
+    const r2 = await post({ title: 'Atomic', templateId: 'blank' }, { key: 'atomic-key' })
     expect(r2.status).toBe(201)
     const r2Body = (await r2.json()) as { ownerId: string }
     expect(r2Body.ownerId).toBe('u_1')
@@ -419,7 +488,7 @@ describe('atomic create — partial write failure rolls back cleanly (GitHub RC 
 
 describe('PPT-IDEMP-003 — body idempotencyKey is invalid', () => {
   it('returns 400 VALIDATION_ERROR and creates nothing', async () => {
-    const res = await post({ title: 'ok', templateId: 'pitch', idempotencyKey: 'in-body' }, { key: 'idem-h' })
+    const res = await post({ title: 'ok', templateId: 'blank', idempotencyKey: 'in-body' }, { key: 'idem-h' })
     expect(res.status).toBe(400)
     const j = (await res.json()) as { code: string; details?: { fields?: string[] } }
     expect(j.code).toBe('VALIDATION_ERROR')
@@ -430,7 +499,7 @@ describe('PPT-IDEMP-003 — body idempotencyKey is invalid', () => {
 
 describe('create requires the Idempotency-Key header (§4.1)', () => {
   it('returns 400 VALIDATION_ERROR when the header is absent', async () => {
-    const res = await post({ title: 'ok', templateId: 'pitch' }) // no key
+    const res = await post({ title: 'ok', templateId: 'blank' }) // no key
     expect(res.status).toBe(400)
     expect((await res.json())).toMatchObject({ code: 'VALIDATION_ERROR' })
     expect(createTx).not.toHaveBeenCalled()
@@ -440,7 +509,7 @@ describe('create requires the Idempotency-Key header (§4.1)', () => {
 describe('PPT create uses shared Docs auth and Space errors', () => {
   it('returns enveloped 401 AUTH_REQUIRED when the session is missing/invalid', async () => {
     setOctoIdentity(stub({ verifyToken: async () => null }))
-    const res = await post({ title: 'ok', templateId: 'pitch' }, { key: 'idem-a', token: 'bad' })
+    const res = await post({ title: 'ok', templateId: 'blank' }, { key: 'idem-a', token: 'bad' })
     expect(res.status).toBe(401)
     expect((await res.json())).toMatchObject({ error: 'unauthorized' })
   })
@@ -450,7 +519,7 @@ describe('PPT create uses shared Docs auth and Space errors', () => {
     // client-supplied, so shape validity must not be mistaken for authority —
     // otherwise the deck would be minted INTO another space.
     setOctoIdentity(stub({ verifyToken: async () => ({ uid: 'u_1' }), isSpaceMember: async () => false }))
-    const res = await post({ title: 'ok', templateId: 'pitch' }, { key: 'idem-nm', space: 's_someone_elses' })
+    const res = await post({ title: 'ok', templateId: 'blank' }, { key: 'idem-nm', space: 's_someone_elses' })
     expect(res.status).toBe(404)
     // NOT_FOUND, never FORBIDDEN: a permission-style error would confirm the
     // space exists and turn this into a space-existence oracle.
@@ -466,7 +535,7 @@ describe('PPT create uses shared Docs auth and Space errors', () => {
         },
       }),
     )
-    const res = await post({ title: 'ok', templateId: 'pitch' }, { key: 'idem-fc', space: 's_1' })
+    const res = await post({ title: 'ok', templateId: 'blank' }, { key: 'idem-fc', space: 's_1' })
     // A transient identity outage must not open the boundary, nor surface as 500.
     expect(res.status).toBe(404)
     expect((await res.json())).toMatchObject({ error: 'not_found' })
@@ -488,7 +557,7 @@ describe('PPT create uses shared Docs auth and Space errors', () => {
         }) as never,
       }),
     )
-    const res = await post({ title: 'ok', templateId: 'pitch' }, { key: 'idem-fc-sync', space: 's_1' })
+    const res = await post({ title: 'ok', templateId: 'blank' }, { key: 'idem-fc-sync', space: 's_1' })
     expect(res.status).toBe(404)
     expect((await res.json())).toMatchObject({ error: 'not_found' })
   })
@@ -497,7 +566,7 @@ describe('PPT create uses shared Docs auth and Space errors', () => {
     const res = await fetch(`${base}/api/v1/docs`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', token: 'user-tok', 'Idempotency-Key': 'idem-s' },
-      body: JSON.stringify({ title: 'ok', templateId: 'pitch' }),
+      body: JSON.stringify({ title: 'ok', templateId: 'blank' }),
     })
     expect(res.status).toBe(400)
     expect((await res.json())).toMatchObject({ error: 'space_required' })
@@ -523,6 +592,16 @@ describe('Bot PPT creation uses verified authority and atomic owner grants', () 
     })
   }
   beforeEach(() => setOctoIdentity(stub({ verifyBot: async () => ({ uid: 'b_bot', spaceId: 's_bot', ownerUid: 'u_creator' }) })))
+  it.each(['pitch', 'report', 'lesson'])('rejects retired Bot template %s without writes', async templateId => {
+    const response = await botPost({ ...body, templateId }, `retired-bot-${templateId}`)
+    expect(response.status).toBe(400)
+    expect(await response.json()).toMatchObject({ code: 'VALIDATION_ERROR' })
+    expect(transactionMock).not.toHaveBeenCalled()
+    expect(db.docMeta.size).toBe(0)
+    expect(db.pptState.size).toBe(0)
+    expect(db.members).toEqual([])
+    expect(db.idem.size).toBe(0)
+  })
   it('creates a canonical PPT in the verified Space and grants the human creator admin', async () => {
     const response = await botPost()
     expect(response.status).toBe(201)

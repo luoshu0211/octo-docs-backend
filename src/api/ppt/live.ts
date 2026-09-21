@@ -1,5 +1,6 @@
 import { uploadPptMedia, downloadPptMedia } from './media.js'
-import { Router, type Request, type Response, type NextFunction } from 'express'
+import { Router, json, type Request, type Response, type NextFunction } from 'express'
+import { config } from '../../config/env.js'
 import { pptAuthMiddleware, pptSpaceContextMiddleware } from './auth.js'
 import { loadPptDocForRead } from './pptDocGuard.js'
 import { PptApiError, sendPptData, pptErrorHandler } from './envelope.js'
@@ -65,7 +66,7 @@ export function createBotPptRouter(): Router {
   router.post('/:docId/ppt/media', pptAsync(uploadPptMedia))
   router.get('/:docId/ppt/media/:attachId', pptAsync(downloadPptMedia))
   router.get('/:docId/ppt', read)
-  router.patch('/:docId/ppt', edit)
+  router.patch('/:docId/ppt', json({ limit: config.ppt.write.maxRequestBytes }), edit)
   router.use(createPptExportRouter(true))
   router.use(pptErrorHandler)
   return router

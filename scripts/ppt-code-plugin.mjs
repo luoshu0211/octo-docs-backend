@@ -2,6 +2,9 @@ import { resolve } from 'node:path'
 import { fileURLToPath, URL } from 'node:url'
 const renderer = fileURLToPath(new URL('../runtime/ppt-player/vendor/codeElement.ts', import.meta.url))
 const panel = fileURLToPath(new URL('../runtime/ppt-player/vendor/codePanel.ts', import.meta.url))
+const mediaPlayback = fileURLToPath(new URL('../runtime/ppt-player/vendor/mediaPlayback.ts', import.meta.url))
+const presentationNavigation = fileURLToPath(new URL('../runtime/ppt-player/vendor/presentationNavigation.ts', import.meta.url))
+const presentationChrome = fileURLToPath(new URL('../runtime/ppt-player/vendor/presentationChrome.ts', import.meta.url))
 const native = '01000838496ec863ba1035eae12a8a4943020cdc'
 const once = (code,before,after) => {
   if(code.split(before).length !== 2) throw new Error('Pinned native-code hook drift: '+before.slice(0,100))
@@ -35,10 +38,42 @@ export function pptCodePlugin(source) {
       return `import { buildNativeCodeProps } from ${JSON.stringify(panel)}\n`+code
     }
     if(id===resolve(source,'slides/src/present.ts')) {
+      code = `import { installPresentationChrome } from ${JSON.stringify(presentationChrome)}\n` + code
+      code = once(code, '  deck.initialize().then(() => {', `  deck.initialize().then(() => {
+    const updateChrome = installPresentationChrome(revealEl, doc.slides, () => deck.getIndices().h, index => deck.slide(index, 0))
+    // Reveal refreshes its physical-index chrome after dispatching slidechanged.
+    const refreshChrome = () => queueMicrotask(updateChrome)
+    deck.on('slidechanged', refreshChrome)
+    deck.on('resize', refreshChrome)`)
+      code = `import { isMediaPlaybackKey, releaseDepartedMediaFocus } from ${JSON.stringify(mediaPlayback)}\nimport { presentationAnchors, adjacentPresentationSlide, presentationPosition } from ${JSON.stringify(presentationNavigation)}\n` + code
+      // Replace the pinned audience navigation block as a unit: counters,
+      // button availability, rails and hotkeys must agree with the speaker view.
+      const navStart = code.indexOf('  const isState = (i: number) =>')
+      const navEnd = code.indexOf('  // ——— black-screen', navStart)
+      if (navStart < 0 || navEnd < navStart) throw new Error('Pinned presentation navigation hook drift')
+      code = once(code, code.slice(navStart, navEnd), `  const anchors = presentationAnchors(doc.slides)
+  const isState = (i: number) => anchors[i] !== undefined && anchors[i] !== i
+  const anchorOf = (i: number) => anchors[i] ?? i
+  const adjacent = (delta: -1 | 1) => adjacentPresentationSlide(doc.slides, deck.getIndices().h, delta)
+  const goNext = () => { const next = adjacent(1); if (next !== undefined) deck.slide(next, 0) }
+  const goPrev = () => { const prev = adjacent(-1); if (prev !== undefined) deck.slide(prev, 0) }
+  const hasNext = () => adjacent(1) !== undefined
+  const hasPrev = () => adjacent(-1) !== undefined
+  const visibleIndex = (i: number) => presentationPosition(doc.slides, i).current
+  const visibleTotal = presentationPosition(doc.slides, 0).total
+  const railIndices = anchors.filter((anchor, i) => anchor === i)
+  const goFirst = () => deck.slide(railIndices[0] ?? 0, 0)
+  const goLast = () => deck.slide(railIndices[railIndices.length - 1] ?? 0, 0)
+
+`)
+      code = once(code, '    const from = event.previousSlide as HTMLElement | undefined', '    const from = event.previousSlide as HTMLElement | undefined\n    releaseDepartedMediaFocus(from)')
+      code = once(code, '  const onKeydown = (ev: KeyboardEvent) => {', '  const onKeydown = (ev: KeyboardEvent) => {\n    if (isMediaPlaybackKey(ev)) return')
+      code = once(code, '    keyboardCondition: null,', `    keyboardCondition: (event: KeyboardEvent) => !isMediaPlaybackKey(event),
+    keyboard: { 35: goLast, 36: goFirst, 38: goPrev, 40: goNext, 72: goPrev, 74: goNext, 75: goPrev, 78: goNext, 80: goPrev },`)
       code=code.replaceAll('data-autoplay', 'data-octo-autoplay')
       code = once(code, "    const wl = (navigator as any).wakeLock", "    if (!(document as any).permissionsPolicy?.allowsFeature('screen-wake-lock') && !(document as any).featurePolicy?.allowsFeature('screen-wake-lock')) return\n    const wl = (navigator as any).wakeLock")
       const patches = [
-        ["  const openSpeaker = () => {", "  const openSpeaker = () => {\n    if ((window as any).__octoPresenter) { (window as any).__octoPresenter.open(); return }"],
+        ["  const openSpeaker = () => {", "  const openSpeaker = () => {\n    if ((window as any).__octoPresenter) {\n      openingSpeaker = true\n      void Promise.resolve((window as any).__octoPresenter.open()).finally(() => { window.setTimeout(() => { openingSpeaker = false }, 500) })\n      return\n    }"],
         ["    const toIdx = [...slidesEl.children].indexOf(to)", "    const toIdx = [...slidesEl.children].indexOf(to)\n    ;(window as any).__octoPresenter?.change(toIdx)"],
         ["    onExit(last)", "    onExit(last)\n    ;(window as any).__octoPresenter?.detach()"],
         ["    if (startIndex > 0) deck.slide(startIndex, 0)", "    if (startIndex > 0) deck.slide(startIndex, 0)\n    ;(window as any).__octoPresenter?.attach((index: number) => deck.slide(index, 0), startIndex)"],

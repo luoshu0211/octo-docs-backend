@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import { PptDocumentCapacityError } from '../documentBudget.js'
 import { connectionRegistry } from '../../permission/connectionRegistry.js'
 import type { Role } from '../../permission/role.js'
 import { nodeId } from '../../collab/compactionCluster.js'
@@ -2795,6 +2796,10 @@ export class PptRelay {
       seq = res.seq
       duplicate = res.duplicate
     } catch (err) {
+      if (err instanceof PptDocumentCapacityError) {
+        this.refuse(conn, 'too-large', { k, frameId, message: err.message })
+        return
+      }
       if (err instanceof RoomCapacityError) {
         this.refuse(conn, 'room-full', { k, frameId })
         return

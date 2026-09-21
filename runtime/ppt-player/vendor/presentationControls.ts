@@ -1,4 +1,5 @@
 import { showHostedNotice } from './hostedDialog'
+import { openPresenterView } from './openPresenter'
 import { installPresenter } from './presenter'
 import { renderSlide } from 'bento-slides/render'
 
@@ -58,7 +59,7 @@ export function prepareOfflinePresenter(deck: any): boolean {
   let navigate: ((index:number)=>void) | undefined, index = 0
   const state = () => send({type:'offline-state',index})
   ;(window as any).__octoPresenter = {
-    open: () => { state(); send({type:'offline-open'}) },
+    open: () => openPresenterView(() => { state(); send({type:'offline-open'}) }),
     attach: (go: (index:number)=>void, current:number) => { navigate=go; index=current; state() },
     change: (current:number) => { index=current; state() },
     detach: () => { navigate=undefined },

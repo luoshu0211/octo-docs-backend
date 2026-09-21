@@ -10,7 +10,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
  * call the exported handler directly (no live infra).
  */
 const { mockConfig } = vi.hoisted(() => ({
-  mockConfig: { driveDerived: { internalToken: 'drive-tok' } },
+  mockConfig: { driveDerived: { inboundToken: 'drive-tok', outboundToken: 'outbound-only-tok' } },
 }))
 vi.mock('../src/config/env.js', () => ({ config: mockConfig }))
 vi.mock('../src/db/repos/docMetaRepo.js', () => ({ docMetaRepo: { getByDocId: vi.fn() } }))
@@ -51,7 +51,8 @@ const meta = { doc_id: 'doc1', owner_id: 'owner-uid', owner_space_id: 's1', stat
 
 beforeEach(() => {
   vi.clearAllMocks()
-  mockConfig.driveDerived.internalToken = 'drive-tok'
+  mockConfig.driveDerived.inboundToken = 'drive-tok'
+  mockConfig.driveDerived.outboundToken = 'outbound-only-tok'
 })
 
 describe('internalDocRoleHandler (TES-131 direct-role lookup)', () => {
@@ -63,10 +64,26 @@ describe('internalDocRoleHandler (TES-131 direct-role lookup)', () => {
   })
 
   it('fails closed when the configured token is empty (rejects every caller)', async () => {
-    mockConfig.driveDerived.internalToken = ''
+    mockConfig.driveDerived.inboundToken = ''
     const res = response()
     await internalDocRoleHandler(request({ token: '' }) as never, res as never)
     expect(res.statusCode).toBe(401)
+  })
+
+  it('authorizes against inboundToken only, never outboundToken (the two tokens are independent)', async () => {
+    // Distinct values per direction: the inbound endpoint must accept the inbound
+    // token and reject the outbound one, proving it does not consult outboundToken.
+    mockConfig.driveDerived.inboundToken = 'docs-inbound'
+    mockConfig.driveDerived.outboundToken = 'drive-outbound'
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(meta as never)
+
+    const ok = response()
+    await internalDocRoleHandler(request({ token: 'docs-inbound', uid: 'owner-uid', principalSpaceId: 's1' }) as never, ok as never)
+    expect(ok.statusCode).toBe(200)
+
+    const rejected = response()
+    await internalDocRoleHandler(request({ token: 'drive-outbound' }) as never, rejected as never)
+    expect(rejected.statusCode).toBe(401)
   })
 
   it('400s on a missing uid or principal_space_id', async () => {

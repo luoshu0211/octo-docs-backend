@@ -6,7 +6,7 @@ import { roleAtLeast } from '../permission/role.js'
 import { PptApiError } from '../api/ppt/envelope.js'
 import type { BentoDoc } from './bentoDoc.js'
 import { hashBentoDeck } from './source.js'
-import { config } from '../config/env.js'
+import { assertPptDocumentBudget } from './documentBudget.js'
 
 function invalid(message: string): never {
   throw new PptApiError('VALIDATION_ERROR', message)
@@ -55,7 +55,7 @@ export function validatePptDraft(body: unknown): { revision: number; deck: Bento
       pending.push({ value: child, depth: depth + 1 })
     }
   }
-  if (Buffer.byteLength(JSON.stringify(deck)) > config.ppt.relay.maxSingleBlobBytes) invalid('document exceeds the size limit')
+  assertPptDocumentBudget(deck)
   return { revision: Number(input.revision), deck }
 }
 
@@ -94,6 +94,7 @@ export async function savePptDraft(input: {
     }
     if (previous.docId !== input.deck.docId) invalid('draft document identity cannot change')
     const deck = { ...input.deck, modified: new Date().toISOString() }
+    assertPptDocumentBudget(deck)
     await tx.execute('UPDATE ppt_doc_state SET draft_doc = ?, draft_revision = draft_revision + 1 WHERE doc_id = ?', [JSON.stringify(deck), input.docId])
     await tx.execute('UPDATE doc_meta SET title = ?, updated_by = ?, updated_at = CURRENT_TIMESTAMP(3) WHERE doc_id = ?', [deck.title.trim(), input.uid, input.docId])
     return { revision: input.revision + 1, contentHash: hashBentoDeck(deck) }

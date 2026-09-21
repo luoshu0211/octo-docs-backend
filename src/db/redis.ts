@@ -8,19 +8,27 @@
  */
 import { Redis } from 'ioredis'
 import { config } from '../config/env.js'
+import { buildRedisOptions } from './redisOptions.js'
+import { observeRedisErrors } from './redisLifecycle.js'
 
 let client: Redis | null = null
 
 export function getRedis(): Redis {
   if (!client) {
     client = new Redis({
-      host: config.redis.host,
-      port: config.redis.port,
+      ...buildRedisOptions(config.redis),
       lazyConnect: false,
       maxRetriesPerRequest: 2,
     })
+    observeRedisErrors(client, 'commands')
   }
   return client
+}
+
+export function createRedisSubscriber(): Redis {
+  const sub = new Redis(buildRedisOptions(config.redis))
+  observeRedisErrors(sub, 'events')
+  return sub
 }
 
 /** Namespaced key helper so multiple products can share one Redis (§2.1 prefix). */

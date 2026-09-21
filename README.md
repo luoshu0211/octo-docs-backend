@@ -63,6 +63,17 @@ Key design invariants (from the contract):
 
 ---
 
+## Document deletion policy
+
+Bots cannot delete documents, including documents they own or administer.
+Authenticated bot requests to `DELETE /v1/bot/docs/:docId` and
+`DELETE /v1/bot/docs/octo-doc/:octoDocSlug` return HTTP 403 with
+`{"error":"bot_delete_forbidden"}` before document lookup or mutation. This also
+applies to retries for already deleted documents; invalid tokens still return 401.
+Human deletion through `DELETE /api/v1/docs/:docId` retains its existing verified
+Space and document-admin checks, soft deletion, and collaboration invalidation.
+This policy does not change bot creation, editing, or other resource operations.
+
 ## Prerequisites
 
 - **Node.js ≥ 20** (developed on v22), npm.
@@ -84,7 +95,7 @@ Copy `.env.example` to `.env` and adjust. Summary:
 | --- | --- | --- |
 | `HOCUSPOCUS_PORT` / `HTTP_PORT` | Hocuspocus Yjs WS / HTTP API and PPT WS ports | §2.1 / §8.4 |
 | `MYSQL_*` | authoritative store connection | §3.4 |
-| `REDIS_*` (incl. `REDIS_PREFIX`) | broadcast bus / cache / registry | §5 |
+| `REDIS_URL` / `REDIS_*` (incl. `REDIS_PREFIX`) | authenticated broadcast bus / cache / registry; URL overrides all connection fields | §5 / [Redis configuration](docs/redis-configuration.md) |
 | `COLLAB_TOKEN_SECRET` / `COLLAB_TOKEN_TTL_SECONDS` | collab JWT signing + TTL (5 min) | §4.4 |
 | `COLLAB_ALLOW_LEGACY_TOKENS_WITHOUT_HOME_SPACE_PROOF` | temporary Home-Space/PPT compatibility only; it never bypasses Docs current-Space proof | §4.4 / deployment guide |
 | `OCTO_IDENTITY_MODE` (`http`/`middleware`) / `OCTO_SERVER_BASE_URL` | octo identity integration | §4.7 |
@@ -278,6 +289,48 @@ Key points:
 
 ## Tests
 
+### PPT size budgets
+
+Run `2026-09-20-ppt-document-budget.sql` before starting this version. It widens
+draft, live document/state, and version JSON columns from MEDIUMTEXT to LONGTEXT,
+preserving existing rows and allowing repeat runs. Rolling back the application
+does not require narrowing these columns; narrowing can destroy larger documents.
+Live snapshots retain a separate 64 MiB per-value safety budget, including CRDT
+history. The visible document cap remains 32 MiB, not 64 MiB.
+
+Whole-document writes allow up to 32 MiB of compact UTF-8 deck JSON
+(`PPT_MAX_DOCUMENT_BYTES`). Their HTTP parser allows 40 MiB
+(`PPT_WRITE_MAX_REQUEST_BYTES`) including the revision/envelope and JSON
+whitespace. This applies only to human `PATCH /api/v1/ppt/docs/:id/live`,
+`PUT /api/v1/ppt/docs/:id/draft`, and Bot `PATCH /v1/bot/docs/:id/ppt`.
+The former 8 MiB relay blob setting no longer limits a whole deck. Per-frame,
+per-blob, operation-count, and room-log budgets remain independent and unchanged.
+
+The human full-deck routes currently parse this bounded body after the per-IP
+rate limiter but before endpoint authentication; an unauthenticated request can
+therefore allocate up to the 40 MiB parser limit before being denied. Gateways
+must enforce request/concurrency limits as well as the application rate limit.
+Bot routes authenticate their token before invoking the large parser.
+
+Live collaboration checks the resulting deck before acknowledging persistence;
+an oversized edit rolls back rather than becoming a saved-but-unreadable deck.
+Draft-to-live initialization also checks the final deck after canonical-title
+refresh and legacy text/HTML normalization. An oversized conversion writes no
+snapshot and leaves the saved draft available for reduction and retry.
+The small-frame path uses a conservative snapshot/state/tail upper bound; near
+the document limit it materializes the actual result under the room lock.
+REST rejects oversized documents with `PAYLOAD_TOO_LARGE` and the measured
+document bytes/limit; parser errors identify the separate request dimension.
+
+Rendered version HTML has a separate 64 MiB budget; exported HTML retains its
+160 MiB budget. Escaping and embedded attachments can enlarge these artifacts.
+Deployments must allow the 40 MiB request through their gateway and provision
+MySQL `max_allowed_packet` for the combined deck/CRDT state or deck/version HTML
+(at least 128 MiB for ordinary near-limit decks). The version writer retains its
+database-packet preflight; increasing the JSON limit does not disable it.
+Large individual assets/operations still need the attachment path rather than
+bypassing the smaller collaboration frame limit.
+
 ```bash
 npm test          # vitest run (offline unit tests)
 npm run test:watch
@@ -290,6 +343,10 @@ disposable MySQL 8 and Redis 7 services, sets `PPT_CANONICAL_MYSQL_TEST=1` and
 canonical IDs, shared routes and collaboration across independent processes.
 Use the isolated service configuration in `.gitlab-ci.yml` when running this
 suite locally; never point these database tests at an existing deployment.
+The separate `ppt_budget_integration` job runs `test/pptBudget.mysql.test.ts`
+with `PPT_BUDGET_MYSQL_TEST=1`, an empty dedicated database and a 256 MiB MySQL
+packet limit. It covers migration idempotency, exact 32 MiB persistence,
+genesis rejection/recovery, overflow rollback, compaction, versioning and reopen.
 
 ---
 

@@ -1,0 +1,401 @@
+{
+  "pitch": {
+    "format": "bento/slides",
+    "version": 1,
+    "docId": "saved-pitch",
+    "title": "Pitch",
+    "size": {
+      "width": 1280,
+      "height": 720
+    },
+    "theme": {
+      "background": "#FFFFFF",
+      "color": "#1E2A3A",
+      "accent": "#2F6BFF",
+      "fontFamily": "'PingFang SC', 'Inter', -apple-system, BlinkMacSystemFont, 'Noto Sans SC', sans-serif"
+    },
+    "slides": [
+      {
+        "id": "s_pitch_cover",
+        "background": "#FFFFFF",
+        "transition": "fade",
+        "elements": [
+          {
+            "id": "e_title",
+            "type": "text",
+            "x": 100,
+            "y": 160,
+            "w": 1080,
+            "h": 130,
+            "rotation": 0,
+            "opacity": 1,
+            "html": "<p>Company Name</p>",
+            "fontSize": 56,
+            "fontFamily": "'PingFang SC', 'Inter', -apple-system, BlinkMacSystemFont, 'Noto Sans SC', sans-serif",
+            "fontWeight": 700,
+            "color": "#1E2A3A",
+            "align": "center",
+            "valign": "middle",
+            "lineHeight": 1.25
+          },
+          {
+            "id": "e_sub",
+            "type": "text",
+            "x": 100,
+            "y": 330,
+            "w": 1080,
+            "h": 220,
+            "rotation": 0,
+            "opacity": 1,
+            "html": "<p>One-line pitch</p>",
+            "fontSize": 32,
+            "fontFamily": "'PingFang SC', 'Inter', -apple-system, BlinkMacSystemFont, 'Noto Sans SC', sans-serif",
+            "fontWeight": 400,
+            "color": "#1E2A3A",
+            "align": "center",
+            "valign": "middle",
+            "lineHeight": 1.25
+          }
+        ],
+        "notes": "",
+        "name": "Cover"
+      },
+      {
+        "id": "s_pitch_problem",
+        "background": "#FFFFFF",
+        "transition": "fade",
+        "elements": [
+          {
+            "id": "e_title",
+            "type": "text",
+            "x": 100,
+            "y": 160,
+            "w": 1080,
+            "h": 130,
+            "rotation": 0,
+            "opacity": 1,
+            "html": "<p>Problem</p>",
+            "fontSize": 56,
+            "fontFamily": "'PingFang SC', 'Inter', -apple-system, BlinkMacSystemFont, 'Noto Sans SC', sans-serif",
+            "fontWeight": 700,
+            "color": "#1E2A3A",
+            "align": "center",
+            "valign": "middle",
+            "lineHeight": 1.25
+          },
+          {
+            "id": "e_body",
+            "type": "text",
+            "x": 100,
+            "y": 330,
+            "w": 1080,
+            "h": 220,
+            "rotation": 0,
+            "opacity": 1,
+            "html": "<p>What hurts today</p>",
+            "fontSize": 32,
+            "fontFamily": "'PingFang SC', 'Inter', -apple-system, BlinkMacSystemFont, 'Noto Sans SC', sans-serif",
+            "fontWeight": 400,
+            "color": "#1E2A3A",
+            "align": "center",
+            "valign": "middle",
+            "lineHeight": 1.25
+          }
+        ],
+        "notes": "",
+        "name": "Problem"
+      },
+      {
+        "id": "s_pitch_solution",
+        "background": "#FFFFFF",
+        "transition": "fade",
+        "elements": [
+          {
+            "id": "e_title",
+            "type": "text",
+            "x": 100,
+            "y": 160,
+            "w": 1080,
+            "h": 130,
+            "rotation": 0,
+            "opacity": 1,
+            "html": "<p>Solution</p>",
+            "fontSize": 56,
+            "fontFamily": "'PingFang SC', 'Inter', -apple-system, BlinkMacSystemFont, 'Noto Sans SC', sans-serif",
+            "fontWeight": 700,
+            "color": "#1E2A3A",
+            "align": "center",
+            "valign": "middle",
+            "lineHeight": 1.25
+          },
+          {
+            "id": "e_body",
+            "type": "text",
+            "x": 100,
+            "y": 330,
+            "w": 1080,
+            "h": 220,
+            "rotation": 0,
+            "opacity": 1,
+            "html": "<p>How we fix it</p>",
+            "fontSize": 32,
+            "fontFamily": "'PingFang SC', 'Inter', -apple-system, BlinkMacSystemFont, 'Noto Sans SC', sans-serif",
+            "fontWeight": 400,
+            "color": "#1E2A3A",
+            "align": "center",
+            "valign": "middle",
+            "lineHeight": 1.25
+          }
+        ],
+        "notes": "",
+        "name": "Solution"
+      }
+    ],
+    "modified": "2026-08-05T00:00:00.000Z"
+  },
+  "report": {
+    "format": "bento/slides",
+    "version": 1,
+    "docId": "saved-report",
+    "title": "Report",
+    "size": {
+      "width": 1280,
+      "height": 720
+    },
+    "theme": {
+      "background": "#FFFFFF",
+      "color": "#1E2A3A",
+      "accent": "#0FA958",
+      "fontFamily": "'PingFang SC', 'Inter', -apple-system, BlinkMacSystemFont, 'Noto Sans SC', sans-serif"
+    },
+    "slides": [
+      {
+        "id": "s_report_cover",
+        "background": "#FFFFFF",
+        "transition": "fade",
+        "elements": [
+          {
+            "id": "e_title",
+            "type": "text",
+            "x": 100,
+            "y": 160,
+            "w": 1080,
+            "h": 130,
+            "rotation": 0,
+            "opacity": 1,
+            "html": "<p>Quarterly Report</p>",
+            "fontSize": 56,
+            "fontFamily": "'PingFang SC', 'Inter', -apple-system, BlinkMacSystemFont, 'Noto Sans SC', sans-serif",
+            "fontWeight": 700,
+            "color": "#1E2A3A",
+            "align": "center",
+            "valign": "middle",
+            "lineHeight": 1.25
+          },
+          {
+            "id": "e_sub",
+            "type": "text",
+            "x": 100,
+            "y": 330,
+            "w": 1080,
+            "h": 220,
+            "rotation": 0,
+            "opacity": 1,
+            "html": "<p>Q_ · Team</p>",
+            "fontSize": 32,
+            "fontFamily": "'PingFang SC', 'Inter', -apple-system, BlinkMacSystemFont, 'Noto Sans SC', sans-serif",
+            "fontWeight": 400,
+            "color": "#1E2A3A",
+            "align": "center",
+            "valign": "middle",
+            "lineHeight": 1.25
+          }
+        ],
+        "notes": "",
+        "name": "Cover"
+      },
+      {
+        "id": "s_report_metrics",
+        "background": "#FFFFFF",
+        "transition": "fade",
+        "elements": [
+          {
+            "id": "e_title",
+            "type": "text",
+            "x": 100,
+            "y": 160,
+            "w": 1080,
+            "h": 130,
+            "rotation": 0,
+            "opacity": 1,
+            "html": "<p>Key Metrics</p>",
+            "fontSize": 56,
+            "fontFamily": "'PingFang SC', 'Inter', -apple-system, BlinkMacSystemFont, 'Noto Sans SC', sans-serif",
+            "fontWeight": 700,
+            "color": "#1E2A3A",
+            "align": "center",
+            "valign": "middle",
+            "lineHeight": 1.25
+          },
+          {
+            "id": "e_body",
+            "type": "text",
+            "x": 100,
+            "y": 330,
+            "w": 1080,
+            "h": 220,
+            "rotation": 0,
+            "opacity": 1,
+            "html": "<p>Highlights</p>",
+            "fontSize": 32,
+            "fontFamily": "'PingFang SC', 'Inter', -apple-system, BlinkMacSystemFont, 'Noto Sans SC', sans-serif",
+            "fontWeight": 400,
+            "color": "#1E2A3A",
+            "align": "center",
+            "valign": "middle",
+            "lineHeight": 1.25
+          }
+        ],
+        "notes": "",
+        "name": "Metrics"
+      }
+    ],
+    "modified": "2026-08-05T00:00:00.000Z"
+  },
+  "lesson": {
+    "format": "bento/slides",
+    "version": 1,
+    "docId": "saved-lesson",
+    "title": "Lesson",
+    "size": {
+      "width": 1280,
+      "height": 720
+    },
+    "theme": {
+      "background": "#FFFFFF",
+      "color": "#1E2A3A",
+      "accent": "#8B5CF6",
+      "fontFamily": "'PingFang SC', 'Inter', -apple-system, BlinkMacSystemFont, 'Noto Sans SC', sans-serif"
+    },
+    "slides": [
+      {
+        "id": "s_lesson_cover",
+        "background": "#FFFFFF",
+        "transition": "fade",
+        "elements": [
+          {
+            "id": "e_title",
+            "type": "text",
+            "x": 100,
+            "y": 160,
+            "w": 1080,
+            "h": 130,
+            "rotation": 0,
+            "opacity": 1,
+            "html": "<p>Lesson Title</p>",
+            "fontSize": 56,
+            "fontFamily": "'PingFang SC', 'Inter', -apple-system, BlinkMacSystemFont, 'Noto Sans SC', sans-serif",
+            "fontWeight": 700,
+            "color": "#1E2A3A",
+            "align": "center",
+            "valign": "middle",
+            "lineHeight": 1.25
+          },
+          {
+            "id": "e_sub",
+            "type": "text",
+            "x": 100,
+            "y": 330,
+            "w": 1080,
+            "h": 220,
+            "rotation": 0,
+            "opacity": 1,
+            "html": "<p>Course · Unit</p>",
+            "fontSize": 32,
+            "fontFamily": "'PingFang SC', 'Inter', -apple-system, BlinkMacSystemFont, 'Noto Sans SC', sans-serif",
+            "fontWeight": 400,
+            "color": "#1E2A3A",
+            "align": "center",
+            "valign": "middle",
+            "lineHeight": 1.25
+          }
+        ],
+        "notes": "",
+        "name": "Cover"
+      },
+      {
+        "id": "s_lesson_objectives",
+        "background": "#FFFFFF",
+        "transition": "fade",
+        "elements": [
+          {
+            "id": "e_title",
+            "type": "text",
+            "x": 100,
+            "y": 160,
+            "w": 1080,
+            "h": 130,
+            "rotation": 0,
+            "opacity": 1,
+            "html": "<p>Objectives</p>",
+            "fontSize": 56,
+            "fontFamily": "'PingFang SC', 'Inter', -apple-system, BlinkMacSystemFont, 'Noto Sans SC', sans-serif",
+            "fontWeight": 700,
+            "color": "#1E2A3A",
+            "align": "center",
+            "valign": "middle",
+            "lineHeight": 1.25
+          },
+          {
+            "id": "e_body",
+            "type": "text",
+            "x": 100,
+            "y": 330,
+            "w": 1080,
+            "h": 220,
+            "rotation": 0,
+            "opacity": 1,
+            "html": "<p>What you will learn</p>",
+            "fontSize": 32,
+            "fontFamily": "'PingFang SC', 'Inter', -apple-system, BlinkMacSystemFont, 'Noto Sans SC', sans-serif",
+            "fontWeight": 400,
+            "color": "#1E2A3A",
+            "align": "center",
+            "valign": "middle",
+            "lineHeight": 1.25
+          }
+        ],
+        "notes": "",
+        "name": "Objectives"
+      },
+      {
+        "id": "s_lesson_summary",
+        "background": "#FFFFFF",
+        "transition": "fade",
+        "elements": [
+          {
+            "id": "e_title",
+            "type": "text",
+            "x": 100,
+            "y": 160,
+            "w": 1080,
+            "h": 130,
+            "rotation": 0,
+            "opacity": 1,
+            "html": "<p>Summary</p>",
+            "fontSize": 56,
+            "fontFamily": "'PingFang SC', 'Inter', -apple-system, BlinkMacSystemFont, 'Noto Sans SC', sans-serif",
+            "fontWeight": 700,
+            "color": "#1E2A3A",
+            "align": "center",
+            "valign": "middle",
+            "lineHeight": 1.25
+          }
+        ],
+        "notes": "",
+        "name": "Summary"
+      }
+    ],
+    "modified": "2026-08-05T00:00:00.000Z"
+  }
+}

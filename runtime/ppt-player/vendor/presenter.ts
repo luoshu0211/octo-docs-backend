@@ -1,6 +1,7 @@
 import type { BentoDoc } from 'bento-slides/model'
 import { renderThumbnail } from 'bento-slides/render'
 import { injectFonts } from 'bento-slides/fonts'
+import { adjacentPresentationSlide, presentationPosition } from './presentationNavigation'
 
 /** Render deck content only inside the same opaque sandbox as the editor. */
 export function installPresenter(port: MessagePort, labels: Record<string, string>) {
@@ -17,23 +18,28 @@ export function installPresenter(port: MessagePort, labels: Record<string, strin
   find('.notes-title').textContent = labels.notes
   find('.previous').textContent = `← ${labels.previous}`; find('.forward').textContent = `${labels.next} →`
   let deck: BentoDoc | undefined, index = 0
-  const move = (delta: number) => port.postMessage({type:'presenter-navigate',index:index+delta})
+  const move = (delta: -1 | 1) => {
+    const next = deck && adjacentPresentationSlide(deck.slides, index, delta)
+    if (next !== undefined) port.postMessage({type:'presenter-navigate',index:next})
+  }
   find('.previous').onclick = () => move(-1); find('.forward').onclick = () => move(1)
   document.addEventListener('keydown', e => { if (e.key==='ArrowLeft'||e.key==='ArrowRight') { e.preventDefault(); move(e.key==='ArrowRight'?1:-1) } })
   const began = Date.now()
   setInterval(() => { const seconds = Math.floor((Date.now()-began)/1000); find('time').textContent = `${String(Math.floor(seconds/60)).padStart(2,'0')}:${String(seconds%60).padStart(2,'0')}` },1000)
   function draw() {
     if (!deck) return
-    for (const [selector,i] of [['.current',index],['.next',index+1]] as const) {
+    const next = adjacentPresentationSlide(deck.slides, index, 1)
+    for (const [selector,i] of [['.current',index],['.next',next]] as const) {
       const box = find(selector); box.replaceChildren()
-      const slide = deck.slides[i]
+      const slide = i === undefined ? undefined : deck.slides[i]
       if (slide) box.append(renderThumbnail(slide, deck, box.clientWidth))
     }
     find('h1').textContent = `${deck.title} · ${labels.title}`
     find('.notes').textContent = deck.slides[index]?.notes || labels.emptyNotes
-    find('.count').textContent = `${index+1} / ${deck.slides.length}`
-    find<HTMLButtonElement>('.previous').disabled = index <= 0
-    find<HTMLButtonElement>('.forward').disabled = index >= deck.slides.length-1
+    const position = presentationPosition(deck.slides, index)
+    find('.count').textContent = `${position.current} / ${position.total}`
+    find<HTMLButtonElement>('.previous').disabled = adjacentPresentationSlide(deck.slides,index,-1) === undefined
+    find<HTMLButtonElement>('.forward').disabled = next === undefined
   }
   new ResizeObserver(draw).observe(find('main'))
   return (data: any) => {

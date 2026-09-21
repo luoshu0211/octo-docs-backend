@@ -6,7 +6,7 @@
  * drive derivation never recurses back through the docs derived-access lookup.
  *
  *   GET /internal/docs/:docId/role?uid=<>&principal_space_id=<>
- *   X-Internal-Token: <DRIVE_INTERNAL_TOKEN>
+ *   X-Internal-Token: <DOCS_INTERNAL_TOKEN>
  *   -> 200 { role, role_rank, doc_status, owner_space_id }
  *
  * `role_rank` is the comparison ordinal from roleRank() (admin=40 … none=0), so
@@ -32,7 +32,7 @@ import { roleRank, type ResolvedRole } from '../../permission/role.js'
 export const internalDocRoleRouter: ExpressRouter = Router()
 
 function credentialMatches(actual: string): boolean {
-  const expected = config.driveDerived.internalToken
+  const expected = config.driveDerived.inboundToken
   if (expected === '' || actual === '') return false
   const digest = (value: string) => createHash('sha256').update(value).digest()
   return timingSafeEqual(digest(actual), digest(expected))

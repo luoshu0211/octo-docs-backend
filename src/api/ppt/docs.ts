@@ -93,13 +93,13 @@ export async function createPptDocument(req: Request): Promise<PptCreateResponse
     throw vErr('title is too long', { field: 'title', max: MAX_TITLE_LEN })
   }
 
-  // 4. templateId: required, one of the four fixed bundled templates.
+  // 4. Normalize the wire ID before hashing. Catalogue membership is checked
+  //    only for new creates: a committed receipt survives template retirement.
   const templateIdRaw = body.templateId ?? 'blank'
-  const template = typeof templateIdRaw === 'string' ? getPptTemplate(templateIdRaw) : null
-  if (!template) {
-    throw vErr('templateId must be one of the four bundled templates', { field: 'templateId' })
+  if (typeof templateIdRaw !== 'string') {
+    throw vErr('templateId must be a bundled template ID', { field: 'templateId' })
   }
-  const templateId = templateIdRaw as string
+  const templateId = templateIdRaw
 
   // 5. Folder: optional; default reserved folder. Building the documentName here
   //    validates the space + folder segments. Attribute a rejected segment to the
@@ -142,6 +142,11 @@ export async function createPptDocument(req: Request): Promise<PptCreateResponse
     // A committed row is always complete (reserve+complete commit together), so
     // this replays the original response.
     return prior.responseData as PptCreateResponse
+  }
+
+  const template = getPptTemplate(templateId)
+  if (!template) {
+    throw vErr('templateId must be a bundled template ID', { field: 'templateId' })
   }
 
   // Materialize the deck (pure, no I/O): strip `template`, mint a fresh Bento

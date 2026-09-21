@@ -284,8 +284,11 @@ vars (those without a fallback) **fail fast at boot** — that is intentional.
 | `RATE_LIMIT_WINDOW_MS` / `RATE_LIMIT_MAX` | no (`60000` / `300`) | Per-IP throttle window and cap on the REST route chains (human `/api/v1/docs` + bot `/v1/bot/docs`); `/healthz` is never throttled. Keyed on the real client IP, so `TRUST_PROXY` must be correct for the deployment. |
 | `MYSQL_HOST` / `MYSQL_PORT` / `MYSQL_USER` / `MYSQL_PASSWORD` / `MYSQL_DATABASE` | recommended | authoritative store connection |
 | `MYSQL_CONNECTION_LIMIT` | no (`10`) | pool size. PPT replay cursors reserve up to `PPT_RELAY_MAX_IN_FLIGHT_REPLAYS` connections while they stream pages; keep this high enough for ordinary REST traffic plus replay headroom. |
-| `REDIS_HOST` / `REDIS_PORT` | recommended | broadcast bus / cache / registry |
-| `REDIS_PREFIX` | no (`octo-docs`) | multi-product key isolation prefix |
+| `REDIS_URL` | no | `redis://:password@host:6379/0` or `rediss://username:password@host:6379/0`; overrides all Redis connection fields below; see [Redis configuration](redis-configuration.md) |
+| `REDIS_HOST` / `REDIS_PORT` | recommended without URL | host and port, defaults `127.0.0.1:6379` |
+| `REDIS_USERNAME` / `REDIS_PASSWORD` | no | ACL username and raw password; username requires password; ignored with URL |
+| `REDIS_DB` / `REDIS_TLS` | no (`0` / `false`) | database and verified TLS; ignored with URL |
+| `REDIS_PREFIX` | no (`octo-docs`) | key and Pub/Sub namespace, always applied; DB numbers do not isolate Pub/Sub |
 | `COLLAB_TOKEN_SECRET` | **yes in prod** | signing secret for the short-lived collab JWT. Use an asymmetric key / KMS-managed secret; the HS256 default `dev-only-change-me` is dev only. |
 | `COLLAB_TOKEN_TTL_SECONDS` | no (`300`) | collab JWT TTL (5 min) |
 | `COLLAB_ALLOW_LEGACY_TOKENS_WITHOUT_HOME_SPACE_PROOF` | no (`false`) | Temporary compatibility for still-unexpired collab/PPT credentials that lack `home_space_verified`. It does **not** bypass the independent `current_space_verified` + `current_space_id` requirement for Docs Hocuspocus tokens. Never use this flag to bridge the current-Space rollout, and never leave it enabled after its Home-Space/PPT drain window. Accepts only `true`/`false`/`1`/`0`; invalid values fail startup. |
@@ -316,6 +319,12 @@ vars (those without a fallback) **fail fast at boot** — that is intentional.
 | `OCTO_SERVER_BASE_URL` | when `http` | octo-server base for token→uid lookups |
 | `OCTO_SERVER_TOKEN` | optional (default empty) | Backend service token for octo-server human/service directory APIs. Human member writes prefer it when configured and otherwise fall back to the authenticated caller's `req.octoToken`. For Bot PUT, an omitted `principalSpaceId` means the Bot bearer-authenticated Space rather than the document Home Space; that exact target is validated with the Bot bearer against `/v1/bot/space/principals/:uid` (deploy octo-server PR #819 first) and may be upserted. If a Bot explicitly selects another Space, PUT deliberately performs no current directory-membership/eligibility revalidation and may only update an already-existing exact row. Bot member PUT and exact, non-cascading, directory-free DELETE therefore remain enabled when this token is empty. Human DELETE uses the same service-token-first directory policy, cascading a Human removal to authorized same-Space Bots while an explicitly targeted Bot remains exact. Directory failure is fail-closed. The token is also used for optional approver display-name resolution. |
 | `OCTO_DOCS_HTML_REGISTRATION_TOKEN` | yes for docs-html; empty disables access | Dedicated shared token. It must exactly match the token docs-html sends as `X-Internal-Token` to `POST /internal/html/register`. This rate-limited internal boundary authenticates docs-html, not the end user: docs-html authenticates the user and delegates that identity in `owner`; docs-backend enforces owner/space/slug scoping. Never expose this route to browsers or reuse a browser/session token. |
+| `DRIVE_DERIVED_ENABLED` | no (`false`) | Master switch for drive-library-derived viewer access (TES-131): an effective member of a drive library that has a doc mounted derives a READER grant for it even with no `doc_member` row and no share. `false` (default) makes **no** drive lookup and the effective role is byte-identical to pre-feature. Accepts only `true`/`false`/`1`/`0`; a typo fails startup, mirroring `COLLAB_ALLOW_LEGACY_TOKENS_WITHOUT_HOME_SPACE_PROOF`. Rollout and rollback: §3.1.2. |
+| `DRIVE_INTERNAL_BASE_URL` | **yes when `DRIVE_DERIVED_ENABLED=true`** | Base URL of the drive internal service; the derived-access lookup POSTs to `<base>/internal/v1/docs/derived-access`. Empty => the lookup is a no-op (no derived access) even when enabled, so a half-configured deploy fails closed instead of erroring on every read. In-network only; must never be browser-reachable. |
+| `DRIVE_DERIVED_TIMEOUT_MS` | no (`500`) | Per-request timeout (ms) for the derived-access lookup. It sits on the read/authorize hot path, so a hung drive service aborts fast and fails closed rather than pinning the request open. |
+| `DRIVE_DERIVED_TTL_MS` | no (`15000`) | Short-TTL cache window (ms) for a **confirmed** derived-access answer, per (doc, uid, principal space), to bound drive QPS on hot docs. Only confirmed answers are cached (never a fail-closed error), so a transient outage is retried on the next call; a drive-side revocation takes at most this long to propagate. |
+| `DOCS_INTERNAL_TOKEN` | **yes once drive is on the docs-API path, independent of the flag** | **Inbound (drive → docs role) shared secret. docs-side authoritative**: docs generates and rotates this value; drive syncs its `docs_backend.internal_token` to match. Compared (timing-safe) on `GET /internal/docs/:docId/role` (internal listener 9090) that drive calls instead of reading `doc_meta`/`doc_member` directly. Empty => the internal role endpoint rejects every caller (fail-closed). Provisioned via `octo-docs-backend-secret` (`secretKeyRef` in `manifests/deploy.yaml`) — Secret-grade; must NOT live in the ConfigMap. Never logged. |
+| `DRIVE_INTERNAL_TOKEN` | **yes once drive is on the docs-API path, independent of the flag** | **Outbound (docs → drive derived-access) shared secret. drive-side authoritative**: drive generates and rotates this value; docs syncs it to match drive's top-level `internal_token`. Sent as `X-Internal-Token` on the outbound derived-access lookup. Empty => docs omits the header and drive returns 401, so the derived viewer degrades to `none` (fail-closed). Provisioned via `octo-docs-backend-secret` (`secretKeyRef` in `manifests/deploy.yaml`) — Secret-grade; must NOT live in the ConfigMap. Never logged. |
 | `CARD_DISPLAY_TIME_ZONE` | no (`Asia/Shanghai`) | IANA zone used to render timestamps into user-visible card copy (e.g. the access-decision time). Pinned explicitly rather than following the container's `TZ`, which the image does not set (compose defaults it to UTC) — otherwise zh-CN card copy would show a time hours off. **Validated at startup:** an unrecognised zone (`Asia/Shangai`, `UTC+8`, …) fails the process at boot rather than throwing later on the decision path. |
 | `MAX_DOC_BYTES` | no (`10485760`) | single-doc Yjs state hard cap (~10MB) |
 | `SHEET_WRITE_MAX_REQUEST_BYTES` | no (`3145728`) | JSON body cap for `PATCH .../:docId/sheet` only; other JSON routes remain capped at 1 MiB |
@@ -370,6 +379,87 @@ identity-service transport/non-2xx/malformed-context failures that still
 intentionally fail closed at each caller's authorization boundary; protected
 selector/token routes commonly return 403/404. The event contains no session
 token or raw uid/Space id.
+
+### 3.1.2 Drive-library-derived viewer access (TES-131)
+
+A third, supplementary read-permission source. A doc can be mounted into a drive
+library (the octobuddy presentation of a drive shared space); every effective
+member of that library then derives a READER grant for the doc even with no
+`doc_member` row and no share. The final authorization still happens here: when
+the direct and share-derived roles are both below reader, `resolveEffectiveRole`
+asks the drive service — `POST <DRIVE_INTERNAL_BASE_URL>/internal/v1/docs/derived-access`
+with the caller's credential-derived identity — and merges the answer as
+`max(direct, shareDerived, driveDerived)`. The derived answer is capped at
+READER (a library Editor never derives more); a direct or share-derived grant
+at or above reader **short-circuits** the lookup; and every drive failure
+(timeout, non-2xx, malformed body) collapses to "no derived access" —
+fail-closed. There is **no database migration**: derivation is computed at
+request time and never persisted.
+
+Two service-to-service surfaces must both work; each uses its **own** shared
+secret (independent of the other, each authoritative on the side that generates
+it):
+
+- **docs → drive** (outbound derived-access lookup): configured by
+  `DRIVE_INTERNAL_BASE_URL` / `DRIVE_DERIVED_TIMEOUT_MS` /
+  `DRIVE_DERIVED_TTL_MS`, authenticated with `DRIVE_INTERNAL_TOKEN` as
+  `X-Internal-Token`. **drive-side authoritative**: value equals drive's
+  top-level `internal_token`; docs only holds a copy.
+- **drive → docs** (inbound role lookup): drive asks
+  `GET /internal/docs/:docId/role?uid=<>&principal_space_id=<>` on this
+  backend's internal listener (9090) for the caller's **direct** role (plus
+  `role_rank`, `doc_status`, `owner_space_id`) instead of reading
+  `doc_meta`/`doc_member` with its legacy `drive_reader` account — the drive
+  derivation must not recurse through the effective-role computation. The route
+  is mounted whenever `INTERNAL_HTTP_PORT` is set (the k8s deployment sets
+  9090), guarded by `DOCS_INTERNAL_TOKEN` (timing-safe compare; an empty
+  configured token rejects every caller). **docs-side authoritative**: docs
+  generates and rotates this value; drive syncs its `docs_backend.internal_token`
+  to match. Drive must be able to reach the internal Service port, which must
+  never be exposed through an Ingress or nginx. The drive picker additionally
+  lists mount candidates through the ordinary space-scoped
+  `GET /api/v1/docs/manageable` (direct admin/owner only, caller-authenticated,
+  no new env).
+
+Roll out in this order:
+
+1. Deploy both services with `DRIVE_DERIVED_ENABLED` unset or `false`. Docs
+   boots and behaves byte-identically to pre-feature; this step is risk-free.
+   Note: in any environment where drive is **already** on the docs-API path
+   (calling `GET /internal/docs/:docId/role` with the old shared token),
+   provision and sync `DOCS_INTERNAL_TOKEN` (step 2 below) **before** deploying
+   this build — otherwise those lookups 401 until step 2 completes.
+2. Provision **both** shared secrets on **both** services (each side independent
+   from the other) — these are credential-grade values and must NOT live in the
+   ConfigMap. On the docs side they are wired via `secretKeyRef` entries
+   pointing at `octo-docs-backend-secret` (see `manifests/deploy.yaml`):
+   - **`DOCS_INTERNAL_TOKEN`** — docs generates a fresh random value and stores
+     it as the `DOCS_INTERNAL_TOKEN` key of `octo-docs-backend-secret`; drive
+     syncs its `docs_backend.internal_token` to the same value.
+   - **`DRIVE_INTERNAL_TOKEN`** — drive generates a fresh random value on its
+     side; docs stores it as the `DRIVE_INTERNAL_TOKEN` key of
+     `octo-docs-backend-secret` (same secret object; `deploy.yaml` already has
+     the matching env entry). No Deployment change is needed once the secret
+     keys are populated.
+   Then set `DRIVE_INTERNAL_BASE_URL` in the docs ConfigMap (this one is
+   non-credential and stays in the ConfigMap) and verify network reachability
+   in both directions: docs → drive's derived-access endpoint, drive → docs
+   internal 9090. A wrong token or base URL fails closed — the symptom is
+   "derived viewer never granted" and, on the drive side, mount/role checks
+   failing — not a 5xx.
+3. Flip `DRIVE_DERIVED_ENABLED=true` and roll (configuration is read once at
+   process start, so this is a ConfigMap edit plus the ordinary rolling
+   restart). Verify: a library member with no direct grant opens a mounted doc
+   as viewer; a direct writer stays writer; removing the member from the
+   library drops the derived viewer within `DRIVE_DERIVED_TTL_MS` while direct
+   grants persist; with drive stopped, pure-derived users are refused but
+   owners/direct members still open their docs (the short-circuit keeps their
+   hot path drive-free).
+
+Rollback: set `DRIVE_DERIVED_ENABLED=false` (or unset the key) and roll — the
+lookup stops immediately and nothing was ever persisted, so there is nothing to
+migrate back. Keep **both** `DOCS_INTERNAL_TOKEN` and `DRIVE_INTERNAL_TOKEN`
+configured: drive's mount/role path depends on them independently of this flag.
 
 ### 3.2 Attachment storage — two modes
 

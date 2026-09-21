@@ -10,7 +10,10 @@
  * use Redis invalidations plus durable replay and expiring shared awareness;
  * no document affinity or single-replica deployment is required.
  */
-import { Redis } from 'ioredis'
+// Load deployment environment before any module that imports config.
+import './config/loadEnv.js'
+import { createCollabRedis } from './collab/redis.js'
+import { waitForRedisStartup } from './db/redisLifecycle.js'
 import { pptRoomChannel, receivePptRoomEvent, startPptRoomPublishing } from './ppt/clusterEvents.js'
 import { startNodeHeartbeat, withdrawNode } from './collab/compactionCluster.js'
 import {
@@ -21,8 +24,6 @@ import {
 } from './collab/oversizeGuard.js'
 import { overcapUnrestoredRepo } from './db/repos/overcapUnrestoredRepo.js'
 import type { Server } from 'node:http'
-// B3: load .env before config/env.js is evaluated (must be the first import).
-import './config/loadEnv.js'
 import { config } from './config/env.js'
 import { createServer, setEpochWatermark } from './collab/server.js'
 import { createApp } from './api/app.js'
@@ -31,7 +32,7 @@ import { createPptRelay } from './ppt/relay/index.js'
 import { epochInvalidateChannel, currentEpoch, invalidateEpochCache, type InvalidateEvent } from './permission/epoch.js'
 import { closePool, query } from './db/pool.js'
 import { assertAppendV1RoleEncoding } from './db/roleEncodingMarker.js'
-import { closeRedis } from './db/redis.js'
+import { closeRedis, getRedis, createRedisSubscriber } from './db/redis.js'
 import { closeKafkaProducer } from './db/kafka.js'
 import { broadcastCommentMutation, commentEventsChannel } from './api/services/commentEvents.js'
 
@@ -74,7 +75,16 @@ async function main(): Promise<void> {
     }
   }
 
-  const hocuspocus = createServer()
+  // Authenticate all four connections before creating listeners or starting
+  // Redis-dependent business work. No document can be live during failure cleanup.
+  const redis = createCollabRedis(config.redis)
+  const sub = createRedisSubscriber()
+  await waitForRedisStartup(
+    [getRedis(), redis.pub, redis.sub, sub],
+    config.redis,
+    () => sub.subscribe(epochInvalidateChannel(), commentEventsChannel(), pptRoomChannel()),
+  )
+  const hocuspocus = createServer(redis)
 
   // MR98-006: wire the DURABLE bottom of the over-cap retry chain BEFORE any
   // store can be rejected, so the very first rejection's state vector is written
@@ -101,8 +111,6 @@ async function main(): Promise<void> {
   // caches and refresh the local watermark. Acting on individual live
   // connections (close 4403 / flip readOnly) is the next layer; the
   // beforeHandleMessage per-principal recheck (§4.5 step 4) is the backstop.
-  const sub = new Redis({ host: config.redis.host, port: config.redis.port })
-  await sub.subscribe(epochInvalidateChannel(), commentEventsChannel(), pptRoomChannel())
   sub.on('message', (channel: string, message: string) => {
     if (channel === epochInvalidateChannel()) void handleInvalidate(message)
     else if (channel === commentEventsChannel()) broadcastCommentMutation(message)
