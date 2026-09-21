@@ -90,6 +90,8 @@ export interface HelloFrame {
   since?: number
   /** Opt in to server-authenticated online-user snapshots. */
   presence?: boolean
+  /** Opt in to in-place permission changes (old clients retain reconnect behavior). */
+  liveAuth?: boolean
 }
 export interface NeedFrame {
   t: 'need'
@@ -142,6 +144,7 @@ export interface ReauthFrame {
   pv: number
   /** A freshly-minted single-use relay ticket (same credential as the handshake). */
   ticket: string
+  requestId?: string
 }
 
 export type ClientFrame = HelloFrame | NeedFrame | PresenceFrame | ByeFrame | OpsFrame | SnapFrame | ReauthFrame
@@ -171,6 +174,13 @@ export interface ReadyCtl {
   snapshotVersion: number
   epoch: number
   role: string
+  liveAuth?: boolean
+}
+export interface AuthCtl {
+  ctl: 'auth-updated' | 'auth-refresh'
+  role: string
+  epoch: number
+  requestId?: string
 }
 export interface AckCtl {
   ctl: 'ack'
@@ -230,6 +240,7 @@ export interface OnlineUsersCtl {
 }
 
 export type ServerFrame =
+  | AuthCtl
   | ReadyCtl
   | AckCtl
   | RefusedCtl
@@ -285,6 +296,9 @@ export function parseClientFrame(raw: unknown, expectedPv: number): FrameParseRe
   }
   switch (t as ClientFrameType) {
     case 'hello':
+      if (f.liveAuth !== undefined && typeof f.liveAuth !== 'boolean') {
+        return { ok: false, code: 'protocol-version', k, frameId, message: 'liveAuth must be a boolean' }
+      }
       if (f.presence !== undefined && typeof f.presence !== 'boolean') {
         return { ok: false, code: 'protocol-version', k, frameId, message: 'presence must be a boolean' }
       }
@@ -311,6 +325,9 @@ export function parseClientFrame(raw: unknown, expectedPv: number): FrameParseRe
       }
       break
     case 'reauth':
+      if (f.requestId !== undefined && (typeof f.requestId !== 'string' || !f.requestId.length || f.requestId.length > 64)) {
+        return { ok: false, code: 'protocol-version', k, frameId, message: 'invalid reauth requestId' }
+      }
       if (typeof f.ticket !== 'string' || f.ticket === '') {
         return { ok: false, code: 'protocol-version', k, frameId, message: 'reauth requires a non-empty ticket string' }
       }

@@ -848,6 +848,168 @@ describe('PPT relay: snapshot + GC + offline replay (PPT-COLLAB-003 / PPT-COLLAB
   })
 })
 
+describe('PPT relay: negotiated live permissions', () => {
+  it.each(['downgrade', 'membership'] as const)('negotiates before a hello-time %s and completes the original replay', async kind => {
+    let epoch = 0, pause = false
+    let entered!: () => void, release!: () => void
+    const parked = new Promise<void>(resolve => { entered = resolve })
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const h = await setup({
+      epochProvider: async () => { if (pause) { pause = false; entered(); await gate } return epoch },
+      roleProvider: async ({ spaceMember }) => kind === 'membership' ? spaceMember ? 'reader' : 'none' : epoch ? 'reader' : 'writer',
+    })
+    const ticket = (value: number) => jwt.sign({ uid: 'u_hello', docId: DOC, documentName: DOCNAME,
+      role: kind === 'membership' ? 'reader' : 'writer', permission_epoch: value,
+      principal_space_id: 's_1', space_member: kind === 'membership', home_space_verified: true,
+      current_space_verified: true, jti: randomUUID() }, config.collabToken.secret, { audience: PPT_RELAY_TICKET_AUD, expiresIn: 30 })
+    await h.store.appendOp(DOC, 'initial', OPS_FRAME(1, 'initial'))
+    await h.store.saveSnapshot({ docId: DOC, coveredSeq: 1, doc: deck() })
+    const c = await h.connect({ uid: 'u_hello', role: 'writer', ticket: ticket(0) })
+    try {
+      pause = true; c.send({ t: 'hello', pv: 2, liveAuth: true }); await parked
+      epoch = 1; await h.relay.applyEpochBump(DOCNAME)
+      expect(await c.recv()).toMatchObject({ ctl: kind === 'membership' ? 'auth-refresh' : 'auth-updated', epoch: 1 })
+      release()
+      if (kind === 'membership') {
+        await expect(c.recv(50)).rejects.toThrow('recv timeout')
+        c.send({ t: 'reauth', pv: 2, ticket: ticket(1), requestId: 'hello-proof' })
+        expect(await c.recv()).toMatchObject({ ctl: 'auth-updated', requestId: 'hello-proof' })
+      }
+      const replay = await c.recvUntil(f => f.ctl === 'ready')
+      expect(replay.map(f => f.ctl)).toEqual(['snapshot', 'ready'])
+      expect(replay.at(-1)).toMatchObject({ role: 'reader', epoch: 1, liveAuth: true })
+      expect(c.ws.readyState).toBe(WebSocket.OPEN)
+    } finally { release() }
+  })
+  async function join(c: WsClient) {
+    c.send({ t: 'hello', pv: 2, liveAuth: true })
+    expect((await c.recvUntil(m => m.ctl === 'ready')).at(-1)).toMatchObject({ liveAuth: true })
+  }
+  it('pauses a queued initial snapshot for fresh proof without losing it or closing', async () => {
+    const h = await setup({ roleProvider: async ({ spaceMember }) => spaceMember ? 'reader' : 'none' })
+    const ticket = (epoch: number) => jwt.sign({ uid: 'u_share', docId: DOC, documentName: DOCNAME,
+      role: 'reader', permission_epoch: epoch, principal_space_id: 's_1', space_member: true,
+      home_space_verified: true, current_space_verified: true, jti: randomUUID() },
+      config.collabToken.secret, { audience: PPT_RELAY_TICKET_AUD, expiresIn: 30 })
+    await h.store.appendOp(DOC, 'initial', OPS_FRAME(1, 'initial'))
+    await h.store.saveSnapshot({ docId: DOC, coveredSeq: 1, doc: deck() })
+    const c = await h.connect({ uid: 'u_share', role: 'reader', ticket: ticket(0) })
+    const relay = h.relay as unknown as {
+      rooms: Map<string, Set<{ outboundDepth: number }>>
+      enqueueOutbound: (conn: unknown, task: () => Promise<void>) => Promise<void>
+    }
+    const conn = [...relay.rooms.get(DOC)!][0]
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    void relay.enqueueOutbound(conn, () => gate)
+    try {
+      c.send({ t: 'hello', pv: 2, liveAuth: true })
+      await vi.waitFor(() => expect(conn.outboundDepth).toBeGreaterThanOrEqual(2))
+      h.setEpoch(1); await h.relay.applyEpochBump(DOCNAME)
+      release()
+      expect(await c.recv()).toMatchObject({ ctl: 'auth-refresh', epoch: 1 })
+      await expect(c.recv(50)).rejects.toThrow('recv timeout')
+      expect(c.ws.readyState).toBe(WebSocket.OPEN)
+      c.send({ t: 'reauth', pv: 2, ticket: ticket(1), requestId: 'resume-initial' })
+      const frames = await c.recvUntil(f => f.ctl === 'ready')
+      expect(frames.map(f => f.ctl)).toEqual(['auth-updated', 'snapshot', 'ready'])
+      expect(frames.at(-1)).toMatchObject({ epoch: 1, role: 'reader' })
+    } finally { release() }
+  })
+  it('notifies unchanged roles and preserves the same socket across repeated epoch changes', async () => {
+    const h = await setup(); const c = await h.connect({ uid: 'u_live', role: 'writer' }); await join(c)
+    for (let epoch = 1; epoch <= 3; epoch++) {
+      h.setEpoch(epoch); await h.relay.applyEpochBump(DOCNAME)
+      expect(await c.recv()).toMatchObject({ ctl: 'auth-updated', role: 'writer', epoch })
+      c.send(OPS_FRAME(epoch, `live-${epoch}`, epoch))
+      expect((await c.recvUntil(m => m.ctl === 'ack')).at(-1)).toMatchObject({ ctl: 'ack' })
+      expect(c.ws.readyState).toBe(WebSocket.OPEN)
+    }
+  })
+  it('downgrades immediately, forbids writes, and upgrades only after correlated fresh reauth', async () => {
+    const h = await setup(); const c = await h.connect({ uid: 'u_live', role: 'writer' }); await join(c)
+    h.setRole('u_live', 'reader'); h.setEpoch(1); await h.relay.applyEpochBump(DOCNAME)
+    expect(await c.recv()).toMatchObject({ ctl: 'auth-updated', role: 'reader', epoch: 1 })
+    c.send(OPS_FRAME(1, 'forbidden', 1)); expect((await c.recv()).code).toBe('forbidden-role')
+    h.setRole('u_live', 'writer'); h.setEpoch(2); await h.relay.applyEpochBump(DOCNAME)
+    expect(await c.recv()).toMatchObject({ ctl: 'auth-refresh', role: 'reader', epoch: 2 })
+    c.send(OPS_FRAME(2, 'still-forbidden', 2)); expect((await c.recv()).code).toBe('forbidden-role')
+    c.send({ t: 'reauth', pv: 2, requestId: 'fresh-2', ticket: h.ticketFor({ uid: 'u_live', role: 'writer', epoch: 2 }) })
+    expect(await c.recv()).toMatchObject({ ctl: 'auth-updated', role: 'writer', epoch: 2, requestId: 'fresh-2' })
+    c.send(OPS_FRAME(3, 'allowed', 2)); expect((await c.recvUntil(m => m.ctl === 'ack')).at(-1)?.ctl).toBe('ack')
+    h.setRole('u_live', 'none'); h.setEpoch(3); await h.relay.applyEpochBump(DOCNAME)
+    expect((await c.closed).code).toBe(4403)
+  })
+  it('requires fresh membership on the existing socket and closes on timeout', async () => {
+    const h = await setup({ roleProvider: async ({ spaceMember }) => spaceMember ? 'reader' : 'none', limits: { reauthGraceMs: 100 } })
+    const ticket = jwt.sign({ uid: 'u_share', docId: DOC, documentName: DOCNAME, role: 'reader', permission_epoch: 0,
+      principal_space_id: 's_1', space_member: true, home_space_verified: true, current_space_verified: true, jti: randomUUID() },
+      config.collabToken.secret, { audience: PPT_RELAY_TICKET_AUD, expiresIn: 30 })
+    const c = await h.connect({ uid: 'u_share', role: 'reader', ticket }); await join(c)
+    h.setEpoch(1); await h.relay.applyEpochBump(DOCNAME)
+    expect(await c.recv()).toMatchObject({ ctl: 'auth-refresh', epoch: 1 })
+    expect(c.ws.readyState).toBe(WebSocket.OPEN)
+    expect((await c.closed).code).toBe(4403)
+  })
+  it('refreshes a load-bearing Space proof in place without sending another snapshot', async () => {
+    const h = await setup({ roleProvider: async ({ spaceMember }) => spaceMember ? 'reader' : 'none' })
+    const ticket = (epoch: number) => jwt.sign({ uid: 'u_share', docId: DOC, documentName: DOCNAME, role: 'reader', permission_epoch: epoch,
+      principal_space_id: 's_1', space_member: true, home_space_verified: true, current_space_verified: true, jti: randomUUID() },
+      config.collabToken.secret, { audience: PPT_RELAY_TICKET_AUD, expiresIn: 30 })
+    const c = await h.connect({ uid: 'u_share', role: 'reader', ticket: ticket(0) }); await join(c)
+    for (let epoch = 1; epoch <= 3; epoch++) {
+      h.setEpoch(epoch); await h.relay.applyEpochBump(DOCNAME)
+      expect(await c.recv()).toMatchObject({ ctl: 'auth-refresh', epoch })
+      c.send({ t: 'reauth', pv: 2, ticket: ticket(epoch), requestId: `proof-${epoch}` })
+      expect(await c.recv()).toMatchObject({ ctl: 'auth-updated', role: 'reader', epoch, requestId: `proof-${epoch}` })
+      expect(c.ws.readyState).toBe(WebSocket.OPEN)
+    }
+  })
+  it.each(['fresh proof', 'timeout', 'invalid proof'] as const)('keeps a usable proof epoch after lookup failure: %s', async mode => {
+    let epoch = 5, failNext = false
+    const h = await setup({ limits: { reauthGraceMs: 200 },
+      epochProvider: async () => { if (failNext) { failNext = false; throw Error('transient epoch read') } return epoch },
+      roleProvider: async ({ spaceMember }) => spaceMember ? 'reader' : 'none',
+    })
+    const ticket = (value: number) => jwt.sign({ uid: 'u_epoch', docId: DOC, documentName: DOCNAME, role: 'reader', permission_epoch: value,
+      principal_space_id: 's_1', space_member: true, home_space_verified: true, current_space_verified: true, jti: randomUUID() },
+      config.collabToken.secret, { audience: PPT_RELAY_TICKET_AUD, expiresIn: 30 })
+    const c = await h.connect({ uid: 'u_epoch', role: 'reader', ticket: ticket(epoch) }); await join(c)
+    failNext = true; await h.relay.applyEpochBump(DOCNAME)
+    expect(await c.recv()).toMatchObject({ ctl: 'auth-refresh', epoch: 5 })
+    if (mode === 'timeout') { expect((await c.closed).code).toBe(4403); return }
+    if (mode === 'invalid proof') {
+      c.send({ t: 'reauth', pv: 2, ticket: 'invalid', requestId: 'bad' })
+      expect((await c.closed).code).toBe(4403); return
+    }
+    // A later epoch can supersede the fallback while its ticket is being fetched.
+    epoch = 6; await h.relay.applyEpochBump(DOCNAME)
+    expect(await c.recv()).toMatchObject({ ctl: 'auth-refresh', epoch: 6 })
+    c.send({ t: 'reauth', pv: 2, ticket: ticket(epoch), requestId: 'recovered' })
+    expect(await c.recv()).toMatchObject({ ctl: 'auth-updated', epoch: 6, role: 'reader', requestId: 'recovered' })
+    await expect(c.recv(250)).rejects.toThrow('recv timeout')
+    expect(c.ws.readyState).toBe(WebSocket.OPEN)
+    expect(await h.store.currentSeq(DOC)).toBe(0)
+  })
+  it('drops superseded queued auth notifications without closing the live socket', async () => {
+    const h = await setup(); const c = await h.connect({ uid: 'u_live', role: 'writer' }); await join(c)
+    const relay = h.relay as unknown as {
+      rooms: Map<string, Set<unknown>>
+      enqueueOutbound: (conn: unknown, task: () => Promise<void>) => Promise<void>
+    }
+    const conn = [...relay.rooms.get(DOC)!][0]
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    void relay.enqueueOutbound(conn, () => gate)
+    h.setEpoch(1); await h.relay.applyEpochBump(DOCNAME)
+    h.setEpoch(2); await h.relay.applyEpochBump(DOCNAME)
+    release()
+    expect(await c.recv()).toMatchObject({ ctl: 'auth-updated', epoch: 2 })
+    expect(c.ws.readyState).toBe(WebSocket.OPEN)
+    c.send(OPS_FRAME(1, 'latest-epoch', 2)); expect((await c.recvUntil(m => m.ctl === 'ack')).at(-1)?.ctl).toBe('ack')
+  })
+})
+
 describe('PPT relay: permission epoch (PPT-EPOCH-001 / 002 / 003)', () => {
   it('downgrade: role-changed is delivered and old-epoch ops are refused stale-epoch', async () => {
     const h = await setup()

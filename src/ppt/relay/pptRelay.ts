@@ -52,6 +52,7 @@ import {
   type RefusedCode,
   type ServerFrame,
   type AckCtl,
+  type AuthCtl,
 } from './frames.js'
 import {
   canonicalPayloadHash,
@@ -283,6 +284,7 @@ interface Conn {
   connectionId: string
   heartbeatTimer?: ReturnType<typeof setInterval>
   presenceSubscribed: boolean
+  liveAuth?: boolean
   presenceReady: boolean
   actor?: string
   initialSnapshotSent?: boolean
@@ -1078,7 +1080,7 @@ export class PptRelay {
         }
       }
     }
-    const sends: Promise<void>[] = []
+    const sends: Promise<boolean>[] = []
     for (const peer of this.rooms.get(docId) ?? []) {
       if (!peer.presenceSubscribed || !peer.presenceReady || !this.canPushRead(peer)) continue
       // Recompute at send time: a queued roster must not retain departed/revoked users.
@@ -1131,6 +1133,17 @@ export class PptRelay {
 
   private sendFrame(conn: Conn, frame: ServerFrame): Promise<void> {
     return this.enqueueOutbound(conn, () => send(conn.socket, frame))
+  }
+
+  private sendAuth(conn: Conn, frame: AuthCtl): Promise<void> {
+    const generation = conn.authGeneration
+    return this.enqueueOutbound(conn, () => {
+      // A newer ACL update can supersede this queued notification. Do not send
+      // stale authority or close a socket merely because the next proof is pending.
+      if (conn.authGeneration !== generation || this.terminalRefusal(conn) !== null) return
+      if (frame.ctl === 'auth-updated' && !this.canPushRead(conn)) return
+      send(conn.socket, frame)
+    })
   }
 
   /**
@@ -1400,9 +1413,11 @@ export class PptRelay {
    * unbounded backlog (XIN-1693 P1-3). Bounded by the drain timeout so a
    * wedged client cannot stall replay forever; on a closed socket it is a no-op.
    */
-  private async gatedSend(conn: Conn, frame: ServerFrame | (() => ServerFrame)): Promise<void> {
+  private async gatedSend(conn: Conn, frame: ServerFrame | (() => ServerFrame), pauseReplay = false): Promise<boolean> {
+    let sent = false
     await this.enqueueOutbound(conn, async () => {
       if (!this.canPushRead(conn)) {
+        if (pauseReplay && conn.liveAuth && conn.auth.pendingReauth && !conn.auth.terminalClose) return
         const terminal = conn.auth.terminalClose
         conn.socket.close(terminal?.code ?? CLOSE_FORBIDDEN, terminal?.reason ?? 'read authorization invalidated')
         this.removeFromRoom(conn)
@@ -1420,6 +1435,7 @@ export class PptRelay {
       }
       if (socket.readyState !== WebSocket.OPEN) return
       if (!this.canPushRead(conn)) {
+        if (pauseReplay && conn.liveAuth && conn.auth.pendingReauth && !conn.auth.terminalClose) return
         const terminal = conn.auth.terminalClose
         conn.socket.close(terminal?.code ?? CLOSE_FORBIDDEN, terminal?.reason ?? 'read authorization invalidated')
         this.removeFromRoom(conn)
@@ -1431,7 +1447,9 @@ export class PptRelay {
         return
       }
       send(socket, typeof frame === 'function' ? frame() : frame)
+      sent = true
     })
+    return sent
   }
 
   /**
@@ -1523,8 +1541,10 @@ export class PptRelay {
     switch (frame.t) {
       case 'hello':
         if (this.enforceEphemeralLimits(conn, rawBytes)) return
-        if (!(await this.refreshReadAuth(conn, 'hello'))) return
+        // Negotiate synchronously: ACL events can run during the first read gate.
+        conn.liveAuth = frame.liveAuth === true
         conn.presenceSubscribed = frame.presence === true
+        // Replay owns the read gate and remembers the request if proof is pending.
         this.requestReplay(conn, typeof frame.since === 'number' ? frame.since : 0, /* ready */ true)
         return
       case 'need':
@@ -1555,7 +1575,7 @@ export class PptRelay {
         // freshly-minted ticket on the EXISTING socket so a share-derived writer
         // refreshes membership without a full disconnect/replay.
         if (this.enforceEphemeralLimits(conn, rawBytes)) return
-        await this.handleReauth(conn, (frame as ReauthFrame).ticket)
+        await this.handleReauth(conn, (frame as ReauthFrame).ticket, (frame as ReauthFrame).requestId)
         return
       case 'ops':
         // Serialize per room so the assigned seq order is also the broadcast
@@ -1697,7 +1717,7 @@ export class PptRelay {
    * Enforces the same short-ticket security bound by RE-VERIFYING in place rather
    * than forcing a full reconnect + replay.
    */
-  private async handleReauth(conn: Conn, ticket: string): Promise<void> {
+  private async handleReauth(conn: Conn, ticket: string, requestId?: string): Promise<void> {
     // Terminal-window guard (XIN-1835 P1-5): if this socket is already condemned —
     // a `terminalClose` set with its close QUEUED on the outbound chain (e.g. the
     // share-expiry grace timer fired, or role was revoked) — an in-place reauth must
@@ -1808,6 +1828,8 @@ export class PptRelay {
     }
     this.armShareExpiry(conn, claims.exp)
     conn.auth = { readAllowed: roleAtLeast(role, 'reader'), invalidated: false }
+    if (conn.liveAuth) await this.sendAuth(conn, { ctl: 'auth-updated', role, epoch: liveEpoch, requestId })
+    this.resumeReplay(conn)
     this.schedulePresence(conn.docId)
     if (conn.caughtUp) await this.drainLiveBuffer(conn)
   }
@@ -1853,6 +1875,7 @@ export class PptRelay {
       await this.closeConn(conn, CLOSE_NOT_FOUND, 'document unavailable')
       return false
     }
+    if (conn.liveAuth && conn.auth.pendingReauth) return false
     if (conn.roleEpoch !== live) {
       const closed = await this.refreshRoleDownOnly(conn, live)
       if (closed) return false
@@ -1898,17 +1921,25 @@ export class PptRelay {
     // starting a fresh replay mid-drain could interleave replay ops with the
     // buffered live frames and reorder them (XIN-1739 P1-2). Coalesce to the
     // latest cursor and let the current cutover finish first.
-    if (this.isReplayOrDrainBusy(conn)) {
-      conn.replayPending = { since, ready }
+    if (this.isReplayOrDrainBusy(conn) || (conn.liveAuth && conn.auth.pendingReauth)) {
+      conn.replayPending = { since, ready: ready || conn.replayPending?.ready === true }
       return
     }
     conn.replayInFlight = true
     void this.runReplay(conn, since, ready)
   }
 
+  /** Resume a proof-paused replay only after authority is restored. */
+  private resumeReplay(conn: Conn): void {
+    if (!this.canPushRead(conn) || this.isReplayOrDrainBusy(conn)) return
+    const pending = this.takePendingReplay(conn)
+    if (pending) this.requestReplay(conn, pending.since, pending.ready)
+  }
+
   /** Drive one replay, then either run a coalesced pending one or, once none
    * remains, drain the live buffer to empty and mark the connection caught up. */
   private async runReplay(conn: Conn, since: number, ready: boolean): Promise<void> {
+    const generation = conn.authGeneration
     let ok = false
     try {
       ok = await this.replay(conn, since, ready)
@@ -1916,6 +1947,13 @@ export class PptRelay {
       ok = false
     }
     conn.replayInFlight = false
+    // A freeze can land during a queued snapshot/op/ready send. Preserve the
+    // cursor without advancing it for a frame that was not actually delivered.
+    if (!ok && conn.liveAuth && (conn.auth.pendingReauth || conn.authGeneration !== generation) && !conn.auth.terminalClose) {
+      conn.replayPending = { since: conn.replayPending?.since ?? since, ready: ready || conn.replayPending?.ready === true }
+      this.resumeReplay(conn)
+      return
+    }
     const pending = this.takePendingReplay(conn)
     if (pending && conn.socket.readyState === WebSocket.OPEN) {
       conn.replayInFlight = true
@@ -2024,7 +2062,7 @@ export class PptRelay {
         // joiner can deterministically apply the ops that follow (XIN-1759 Part B).
         if (snapshot && (effectiveSince < snapshot.coveredSeq || (conn.actor && !conn.initialSnapshotSent))) {
           if (!this.canPushRead(conn)) return false
-          await this.gatedSend(conn, { ctl: 'snapshot', snapshotVersion: snapshot.snapshotVersion, doc: snapshot.doc, state: snapshot.state })
+          if (!(await this.gatedSend(conn, { ctl: 'snapshot', snapshotVersion: snapshot.snapshotVersion, doc: snapshot.doc, state: snapshot.state }, true))) return false
           conn.initialSnapshotSent = true
           fromSeq = snapshot.coveredSeq
           readySeq = snapshot.coveredSeq
@@ -2043,7 +2081,7 @@ export class PptRelay {
           for (const op of ops) {
             if (op.seq <= fromSeq) continue
             if (!this.canPushRead(conn)) return false
-            await this.gatedSend(conn, { ctl: 'op', q: op.seq, frame: op.frame })
+            if (!(await this.gatedSend(conn, { ctl: 'op', q: op.seq, frame: op.frame }, true))) return false
             this.markDeliveredThrough(conn, op.seq)
             delivered = conn.deliveredThrough
             readySeq = op.seq
@@ -2067,13 +2105,14 @@ export class PptRelay {
             /* keep replay usable with the last-known epoch; mutation re-checks */
           }
           if (!this.canPushRead(conn)) return false
-          await this.gatedSend(conn, {
+          if (!(await this.gatedSend(conn, () => ({
             ctl: 'ready',
             q: readySeq,
             snapshotVersion: snapshot?.snapshotVersion ?? 0,
-            epoch,
+            epoch: Math.max(epoch, conn.roleEpoch),
             role: conn.role,
-          })
+            ...(conn.liveAuth ? { liveAuth: true } : {}),
+          }), true))) return false
           conn.presenceReady = this.canPushRead(conn)
           this.schedulePresence(conn.docId)
         }
@@ -3034,6 +3073,15 @@ export class PptRelay {
           spaceMember: conn.spaceMember,
         })
         if (outcome.kind === 'close-membership') {
+          if (conn.liveAuth && gen !== undefined && conn.authGeneration === gen) {
+            // A fresh membership proof can be supplied on this same socket.
+            // Reads/writes stay frozen until verified; timeout still fails closed.
+            this.armReauthGrace(conn)
+            // A failed epoch lookup must not send 0 below the client's confirmed
+            // watermark. This only requests proof; authority remains frozen.
+            void this.sendAuth(conn, { ctl: 'auth-refresh', role: conn.role, epoch: Math.max(newEpoch, conn.roleEpoch) })
+            continue
+          }
           // The frozen space-membership claim became load-bearing and cannot be
           // re-verified on a live socket — fail closed (P1-6). The client re-mints
           // a ticket carrying fresh membership.
@@ -3081,7 +3129,12 @@ export class PptRelay {
         if (gen === undefined || conn.authGeneration !== gen) continue
         conn.auth = { readAllowed: roleAtLeast(conn.role, 'reader'), invalidated: false }
         this.schedulePresence(conn.docId)
-        if (downgraded) void this.gatedSend(conn, { ctl: 'role-changed', role: conn.role, epoch: newEpoch })
+        if (conn.liveAuth && epochOk) {
+          // No privilege increase without fresh authority. Same/lower roles can
+          // adopt the authoritative epoch without replaying document state.
+          void this.sendAuth(conn, { ctl: roleRank(role) > roleRank(conn.role) ? 'auth-refresh' : 'auth-updated', role: conn.role, epoch: newEpoch })
+        } else if (downgraded) void this.gatedSend(conn, { ctl: 'role-changed', role: conn.role, epoch: newEpoch })
+        this.resumeReplay(conn)
         if (roleAtLeast(conn.role, 'reader') && conn.caughtUp) void this.drainLiveBuffer(conn)
       }
     }
