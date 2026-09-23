@@ -33,7 +33,7 @@ describe('sanitizeSvg', () => {
     const out = clean(`<svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)">
       <script>alert(1)</script><style>@import url(https://evil.test/x)</style>
       <foreignObject><div xmlns="http://www.w3.org/1999/xhtml">x</div></foreignObject>
-      <image href="https://evil.test/pixel.png"/><use href="#safe"/>
+      <image href="https://evil.test/pixel.png"/>
       <a href="javascript:alert(1)"><path fill="url(https://evil.test/paint)"/></a>
     </svg>`)
     expect(out).not.toMatch(/script|foreignObject|onload|javascript:|https:\/\/evil|@import/i)
@@ -95,5 +95,86 @@ describe('sanitizeSvg', () => {
   it('rejects doctype/entity payloads and non-SVG documents', () => {
     expect(() => clean('<!DOCTYPE svg [<!ENTITY x SYSTEM "file:///etc/passwd">]><svg>&x;</svg>')).toThrow(InvalidSvgError)
     expect(() => clean('<html><body>x</body></html>')).toThrow(InvalidSvgError)
+  })
+
+  it('preserves local use geometry, transforms, paint and symbol viewports', () => {
+    const out = clean(`<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 100 100">
+      <defs><path id="petal" d="M0 0h10v10z"/><symbol id="badge" viewBox="0 0 10 10"><use href="#petal"/></symbol></defs>
+      <use xlink:href="#petal" x="10" y="20" transform="rotate(30)" fill="red"/>
+      <use href="#badge" x="40" y="30" width="50" height="50"/>
+    </svg>`)
+    const doc = new JSDOM(out, { contentType: 'image/svg+xml' }).window.document
+    expect(doc.querySelectorAll('use')).toHaveLength(3)
+    const petal = doc.documentElement.children[1]!
+    expect(petal.getAttribute('href')).toBe('#petal')
+    expect(petal.getAttribute('transform')).toBe('rotate(30)')
+    expect(petal.getAttribute('fill')).toBe('red')
+    expect(petal.getAttribute('x')).toBe('10')
+    expect(doc.getElementById('badge')?.getAttribute('viewBox')).toBe('0 0 10 10')
+    expect(doc.documentElement.children[2]?.getAttribute('width')).toBe('50')
+  })
+
+  it.each(['https://evil.test/s.svg#p', '//evil.test/x', 'data:image/svg+xml;base64,PHN2Zy8+', 'javascript:alert(1)', '#missing'])('rejects unsupported use references instead of storing a partial image: %s', href => {
+    expect(() => clean(`<svg xmlns="http://www.w3.org/2000/svg"><use href="${href}"/></svg>`)).toThrow(InvalidSvgError)
+  })
+
+  it('rejects ambiguous targets and reference cycles', () => {
+    for (const body of [
+      '<path id="p"/><rect id="p"/><use href="#p"/>',
+      '<use id="a" href="#a"/>',
+      '<use id="a" href="#b"/><use id="b" href="#a"/>',
+      '<g id="a"><g><use href="#a"/></g></g>',
+      '<defs><linearGradient id="paint"/></defs><use href="#paint"/>',
+    ]) expect(() => clean(`<svg xmlns="http://www.w3.org/2000/svg">${body}</svg>`)).toThrow(InvalidSvgError)
+  })
+
+  it('bounds expanded reference graphs, not only serialized size', () => {
+    const defs = ['<g id="n0"><rect width="1" height="1"/></g>']
+    for (let i = 1; i < 16; i++) defs.push(`<g id="n${i}"><use href="#n${i - 1}"/><use href="#n${i - 1}"/></g>`)
+    expect(() => clean(`<svg xmlns="http://www.w3.org/2000/svg"><defs>${defs.join('')}</defs><use href="#n15"/></svg>`)).toThrow(/svg_too_complex/)
+  })
+
+  it.each([
+    ['a%b', '#a%b'], ['a%20b', '#a%2520b'], ['图标', '#%E5%9B%BE%E6%A0%87'],
+    ['a+b', '#a+b'], ['a&b', '#a&amp;b'], ['a%图', '#a%%E5%9B%BE'],
+  ])('retains browser-compatible local fragment IDs: %s', (id, href) => {
+    const escapedId = id.replaceAll('&', '&amp;')
+    const out = clean(`<svg xmlns="http://www.w3.org/2000/svg"><defs><path id="${escapedId}" d="M0 0h10v10z"/></defs><use href="${href}"/></svg>`)
+    expect(new JSDOM(out, { contentType: 'image/svg+xml' }).window.document.querySelectorAll('use')).toHaveLength(1)
+  })
+
+  it('rejects ambiguous invalid UTF-8 and preserves BOM characters in fragment IDs', () => {
+    expect(() => clean('<svg xmlns="http://www.w3.org/2000/svg"><path id="�"/><path id="ÿ"/><use href="#%FF"/></svg>')).toThrow(InvalidSvgError)
+    expect(() => clean('<svg xmlns="http://www.w3.org/2000/svg"><path id="p"/><use href="#%EF%BB%BFp"/></svg>')).toThrow(InvalidSvgError)
+    expect(() => clean('<svg xmlns="http://www.w3.org/2000/svg"><path id="&#xFEFF;p"/><use href="#%EF%BB%BFp"/></svg>')).toThrow(InvalidSvgError)
+    expect(clean('<svg xmlns="http://www.w3.org/2000/svg"><path id="a&#xFEFF;p"/><use href="#a%EF%BB%BFp"/></svg>')).toContain('href="#a%EF%BB%BFp"')
+    expect(clean('<svg xmlns="http://www.w3.org/2000/svg"><path id="a%b"/><use href="#a%b"/></svg>')).toContain('href="#a%25b"')
+  })
+
+  it('preserves references to SVG switch elements', () => {
+    expect(clean('<svg xmlns="http://www.w3.org/2000/svg"><defs><switch id="p"><rect width="10" height="10"/></switch></defs><use href="#p"/></svg>')).toContain('<use href="#p"')
+  })
+
+  it.each([
+    `<path id="p" d="M0 0${'l1 1l-1 -1'.repeat(30000)}"/>`,
+    `<text id="p">${'文'.repeat(100000)}</text>`,
+  ])('bounds repeated long attribute values and text', target => {
+    const source = `<svg xmlns="http://www.w3.org/2000/svg"><defs>${target}</defs>${'<use href="#p"/>'.repeat(5000)}</svg>`
+    expect(Buffer.byteLength(source)).toBeLessThan(MAX_SANITIZED_SVG_BYTES)
+    expect(() => clean(source)).toThrow(/svg_too_complex/)
+  })
+
+  it('bounds long acyclic use chains', () => {
+    const chain = Array.from({ length: 130 }, (_, i) => `<use id="n${i}" href="#n${i + 1}"/>`).join('')
+    expect(() => clean(`<svg xmlns="http://www.w3.org/2000/svg">${chain}<path id="n130"/></svg>`)).toThrow(/svg_too_complex/)
+  })
+
+  it('retains href precedence and strips active content from referenced groups', () => {
+    const out = clean(`<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+      <g id="safe" onload="alert(1)"><script>alert(1)</script><rect width="10" height="10"/></g>
+      <use href="#safe" xlink:href="https://evil.test/x" onclick="alert(1)"/>
+    </svg>`)
+    expect(out).toContain('<use href="#safe"')
+    expect(out).not.toMatch(/script|onclick|onload|evil.test/)
   })
 })

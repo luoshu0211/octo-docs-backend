@@ -29,6 +29,9 @@ export const MAX_SANITIZED_SVG_BYTES = 1024 * 1024
 const MAX_SVG_ELEMENTS = 12_000
 const MAX_SVG_DEPTH = 128
 const MAX_SVG_ATTRIBUTES = 60_000
+const SVG_NAMESPACE = 'http://www.w3.org/2000/svg'
+const USE_TARGET_TAGS = new Set(['svg', 'symbol', 'g', 'switch', 'use', 'path', 'rect', 'circle',
+  'ellipse', 'line', 'polyline', 'polygon', 'text', 'image', 'a'])
 
 // Inline style is useful in SVG authoring tools, but it must not become a
 // general-purpose CSS injection surface. These are presentation-only SVG/CSS
@@ -173,6 +176,89 @@ function sanitizeInlineStyle(raw: string): string | null {
   return safe.length > 0 ? `${safe.join('; ')};` : null
 }
 
+/** URL fragments percent-decode valid byte sequences, preserving literal malformed percent signs. */
+function decodeFragmentId(fragment: string): string {
+  const encoded = Buffer.from(fragment, 'utf8')
+  const decoded: number[] = []
+  for (let i = 0; i < encoded.length; i += 1) {
+    const hex = encoded.subarray(i + 1, i + 3).toString('latin1')
+    if (encoded[i] === 0x25 && /^[0-9a-f]{2}$/i.test(hex)) {
+      decoded.push(Number.parseInt(hex, 16))
+      i += 2
+    } else {
+      decoded.push(encoded[i]!)
+    }
+  }
+  try {
+    return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(Uint8Array.from(decoded))
+  } catch {
+    // Browsers may apply legacy encodings to invalid UTF-8 fragments. Reject the ambiguity.
+    throw new InvalidSvgError()
+  }
+}
+
+/** Keep native use semantics, but validate and bound the browser's expanded tree. */
+function validateUseReferences(root: Element): void {
+  const elements = [root, ...Array.from(root.querySelectorAll('*'))]
+  const ids = new Map<string, Element | null>()
+  for (const el of elements) {
+    const id = el.getAttribute('id')
+    if (id) ids.set(id, ids.has(id) ? null : el)
+  }
+  const targets = new Map<Element, Element>()
+  for (const el of elements) {
+    if (el.localName !== 'use') continue
+    // SVG2 href wins over legacy xlink:href. Emit one unambiguous reference.
+    const href = (el.getAttribute('href') ?? el.getAttribute('xlink:href') ?? '').trim()
+    if (!href.startsWith('#') || href.length < 2 || /\s/u.test(href)) throw new InvalidSvgError()
+    const id = decodeFragmentId(href.slice(1))
+    const target = ids.get(id)
+    if (!target || target.namespaceURI !== SVG_NAMESPACE || !USE_TARGET_TAGS.has(target.localName)) {
+      throw new InvalidSvgError()
+    }
+    // Canonical UTF-8 ensures the browser resolves exactly the ID whose expansion we measured.
+    el.setAttribute('href', '#' + encodeURIComponent(id))
+    el.removeAttributeNS('http://www.w3.org/1999/xlink', 'href')
+    targets.set(el, target)
+  }
+  if (targets.size === 0) return
+
+  type Cost = { nodes: number; attributes: number; depth: number; bytes: number }
+  const memo = new Map<Element, Cost>()
+  const visiting = new Set<Element>()
+  function measure(el: Element): Cost {
+    if (visiting.has(el) || visiting.size >= MAX_SVG_DEPTH) throw new InvalidSvgError('svg_too_complex')
+    const saved = memo.get(el)
+    if (saved) return saved
+    visiting.add(el)
+    // Count attribute values and direct text at every expanded instance. Node counts alone let a
+    // tiny use graph multiply one long path/text/image into unbounded browser rendering work.
+    const ownBytes = Array.from(el.attributes).reduce((sum, attr) =>
+      sum + Buffer.byteLength(attr.name) + Buffer.byteLength(attr.value), 0) +
+      Array.from(el.childNodes).reduce((sum, child) =>
+        sum + (child.nodeType === 3 || child.nodeType === 4 ? Buffer.byteLength(child.nodeValue ?? '') : 0), 0)
+    const cost = { nodes: 1, attributes: el.attributes.length, depth: 1, bytes: ownBytes }
+    const descendants = Array.from(el.children)
+    const target = targets.get(el)
+    if (target) descendants.push(target)
+    for (const child of descendants) {
+      const next = measure(child)
+      cost.nodes += next.nodes
+      cost.attributes += next.attributes
+      cost.bytes += next.bytes
+      cost.depth = Math.max(cost.depth, next.depth + 1)
+      if (cost.nodes > MAX_SVG_ELEMENTS || cost.attributes > MAX_SVG_ATTRIBUTES ||
+        cost.depth > MAX_SVG_DEPTH || cost.bytes > MAX_SANITIZED_SVG_BYTES) {
+        throw new InvalidSvgError('svg_too_complex')
+      }
+    }
+    visiting.delete(el)
+    memo.set(el, cost)
+    return cost
+  }
+  measure(root)
+}
+
 /**
  * Sanitize an uploaded SVG before it reaches object storage.
  *
@@ -200,6 +286,7 @@ export function sanitizeSvg(input: Buffer): Buffer {
   const clean = purify.sanitize(source, {
     USE_PROFILES: { svg: true, svgFilters: true },
     FORBID_TAGS: FORBIDDEN_TAGS,
+    ADD_TAGS: ['use'],
     ADD_ATTR: ['style'],
     ALLOW_DATA_ATTR: false,
     ALLOW_UNKNOWN_PROTOCOLS: false,
@@ -213,7 +300,7 @@ export function sanitizeSvg(input: Buffer): Buffer {
     throw new InvalidSvgError()
   }
   const root = dom.window.document.documentElement
-  if (root.localName.toLowerCase() !== 'svg' || root.namespaceURI !== 'http://www.w3.org/2000/svg') {
+  if (root.localName.toLowerCase() !== 'svg' || root.namespaceURI !== SVG_NAMESPACE) {
     throw new InvalidSvgError()
   }
 
@@ -230,6 +317,9 @@ export function sanitizeSvg(input: Buffer): Buffer {
         else el.removeAttribute(attr.name)
         continue
       }
+      // use references get stricter target/graph validation below, including
+      // Unicode and percent-encoded IDs that are valid local SVG fragments.
+      if (el.localName === 'use' && (name === 'href' || name === 'xlink:href')) continue
       if (URL_ATTRS.has(name) && hasUnsafeUrl(attr.value)) {
         el.removeAttribute(attr.name)
         continue
@@ -240,6 +330,7 @@ export function sanitizeSvg(input: Buffer): Buffer {
     }
   }
 
+  validateUseReferences(root)
   const serialized = root.outerHTML
   const outputBytes = Buffer.byteLength(serialized, 'utf8')
   if (!serialized || outputBytes > MAX_SANITIZED_SVG_BYTES || outputBytes > input.length * 4 + 4096) {

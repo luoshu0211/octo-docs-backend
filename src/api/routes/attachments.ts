@@ -22,6 +22,7 @@ import { fetchExternalImage } from '../../util/fetchExternalImage.js'
 import { LinkCardError } from '../../util/ssrfGuard.js'
 import { sniffImageMime } from '../../import/docx/media.js'
 import { sanitizeSvg, InvalidSvgError, MAX_SANITIZED_SVG_BYTES } from '../../util/sanitizeSvg.js'
+import { ingestPptMediaUrls } from '../ppt/mediaIngest.js'
 
 export const attachmentsRouter: ExpressRouter = Router()
 
@@ -621,10 +622,10 @@ export async function cleanupCopiedAttachment(attachId: string): Promise<void> {
  * (loopback / private / link-local / CGNAT / metadata IPs refused, connect pinned to the
  * validated IP, http/https + port allowlist only); the downloaded bytes are validated by MAGIC
  * NUMBER (never the Content-Type header or the URL extension) and must be an allowed, non-blocked
- * image within the image size tier. This is deliberately image-only — arbitrary file ingestion
- * from a URL is a broader abuse surface we do not want here.
+ * image within the image size tier. Non-PPT documents remain image-only. PPT targets
+ * delegate to the bounded image/audio/video importer and return native media references.
  */
-attachmentsRouter.post('/:docId/attachments/ingest', ingestHandler)
+attachmentsRouter.post('/:docId/attachments/ingest', (req, res, next) => { void ingestHandler(req, res).catch(next) })
 
 export async function ingestHandler(req: Request, res: Response): Promise<void> {
   const guard = await requireDocRole(req, res, req.params.docId!, 'writer')
@@ -649,6 +650,11 @@ export async function ingestHandler(req: Request, res: Response): Promise<void> 
       return
     }
     if (!seen.has(u)) { seen.add(u); unique.push(u) }
+  }
+
+  if (guard.meta.doc_type === 'html_ppt') {
+    await ingestPptMediaUrls(req, res, guard, unique)
+    return
   }
 
   const ttl = config.attachments.readUrlTtlSeconds
