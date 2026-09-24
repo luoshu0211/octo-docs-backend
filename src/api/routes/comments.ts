@@ -155,7 +155,7 @@ function fireBotMentionReport(params: Parameters<typeof reportBotMentions>[0]): 
 }
 
 function notifyCommentCreated(req: Request, guard: import('../guard.js').DocGuard, id: number, body: string, parentId?: number) {
-  void notifyDocMentioned({ docId: guard.meta.doc_id, spaceId: guard.meta.space_id,
+  void notifyDocMentioned({ docId: guard.meta.doc_id, spaceId: guard.meta.space_id, principalSpaceId: req.principalSpaceId!,
     title: guard.meta.title, authorUid: req.uid!, body })
   if (guard.meta.doc_type === 'html_ppt') {
     void reportPptCommentMention(pptPrincipalFromGuard(req, guard), id,
