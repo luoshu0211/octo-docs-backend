@@ -303,6 +303,21 @@ describe('notifyDocMentioned', () => {
       body: 'see this @[user:u_1:Alice] and @[user:u_2:Bob]',
     }
   }
+  function sentMentionCards() {
+    return vi.mocked(fetch).mock.calls.map(([, init]) => JSON.parse(init!.body as string))
+  }
+  function expectRedactedCards() {
+    for (const request of sentMentionCards()) {
+      expect(request.docs_card).toEqual({
+        doc_id: 'doc-1', request_id: '', kind: 'commented',
+        title: '你在一篇文档中被提及', actor_uid: 'u-req', actor_name: expect.any(String),
+        excerpt: '你暂时没有访问权限，打开文档后可申请访问。', updated_at: expect.any(String),
+      })
+      expect(JSON.stringify(request)).not.toContain(mentionParams().title)
+      expect(JSON.stringify(request)).not.toContain('Alice')
+      expect(JSON.stringify(request)).not.toContain('Bob')
+    }
+  }
   beforeEach(() => {
     cfg.notify.docsToken = 'internal-token'
     // Restricted doc (default mock) whose readers are owner + these doc_members;
@@ -313,10 +328,11 @@ describe('notifyDocMentioned', () => {
       space_id: 'space-1',
       share_scope: 0,
       share_role: 1,
+      owner_space_id: 'space-1',
     })
     ;(docMemberRepo.list as ReturnType<typeof vi.fn>).mockResolvedValue([
-      { doc_id: 'doc-1', uid: 'u_1', role: 1 },
-      { doc_id: 'doc-1', uid: 'u_2', role: 2 },
+      { doc_id: 'doc-1', uid: 'u_1', principal_space_id: 'space-1', role: 1 },
+      { doc_id: 'doc-1', uid: 'u_2', principal_space_id: 'space-1', role: 2 },
     ])
     vi.stubGlobal(
       'fetch',
@@ -354,6 +370,84 @@ describe('notifyDocMentioned', () => {
     expect(body.docs_card.excerpt).toBe('see this @Alice and @Bob')
   })
 
+  it.each(['', '   '])('supplies a nonempty card title for an untitled document (%j)', async (title) => {
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init: RequestInit) => {
+      const body = JSON.parse(init.body as string)
+      return body.docs_card.title.trim() ? okResp(body.targets) : new Response('', { status: 400 })
+    }))
+    expect(await notifyDocMentioned({ ...mentionParams(), title })).toBe(2)
+    const [, init] = vi.mocked(fetch).mock.calls[0]!
+    expect(JSON.parse(init!.body as string).docs_card.title).toBe('无标题文档')
+  })
+
+  it('delivers to the verified mention Space instead of the document Home Space', async () => {
+    vi.mocked(docMemberRepo.list).mockResolvedValue([
+      { uid: 'u_1', principal_space_id: 'space-visitor', role: 1 },
+    ] as never)
+    expect(await notifyDocMentioned({ ...mentionParams(), principalSpaceId: 'space-visitor' })).toBe(2)
+    expect(sentMentionCards().map((request) => request.space_id)).toEqual(['space-visitor', 'space-visitor'])
+    expect(sentMentionCards()[0].docs_card.title).toBe('Test Doc')
+    expect(sentMentionCards()[1].docs_card.title).toBe('你在一篇文档中被提及')
+  })
+
+  it('does not borrow a same-uid membership from another Space', async () => {
+    vi.mocked(docMemberRepo.list).mockResolvedValue([
+      { uid: 'u_1', principal_space_id: 'space-foreign', role: 1 },
+    ] as never)
+    expect(await notifyDocMentioned(mentionParams())).toBe(2)
+    expectRedactedCards()
+  })
+
+  it('requires the owner principal Space to match as well as the uid', async () => {
+    vi.mocked(docMemberRepo.list).mockResolvedValue([])
+    expect(await notifyDocMentioned({ ...mentionParams(), principalSpaceId: 'space-foreign', body: '@[user:u-owner:Owner]' })).toBe(1)
+    expectRedactedCards()
+  })
+
+  it('does not extend Home-Space sharing to another Space without a direct grant', async () => {
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue({
+      doc_id: 'doc-1', space_id: 'space-1', owner_id: 'owner', owner_space_id: 'space-1', share_scope: 1,
+    } as never)
+    expect(await notifyDocMentioned({ ...mentionParams(), principalSpaceId: 'space-foreign' })).toBe(2)
+    expectRedactedCards()
+  })
+
+  it('honors authenticated sharing while retaining downstream Space-membership verification', async () => {
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue({
+      doc_id: 'doc-1', space_id: 'space-1', owner_id: 'owner', owner_space_id: 'space-1', share_scope: 2,
+    } as never)
+    expect(await notifyDocMentioned({ ...mentionParams(), principalSpaceId: 'space-foreign' })).toBe(2)
+    for (const request of sentMentionCards()) {
+      expect(request.space_id).toBe('space-foreign')
+      expect(request.docs_card.title).toBe('Test Doc')
+      expect(request.docs_card.excerpt).toBe('see this @Alice and @Bob')
+    }
+  })
+
+  it('fails closed without a verified principal Space', async () => {
+    expect(await notifyDocMentioned({ ...mentionParams(), principalSpaceId: '' })).toBe(0)
+    expect(fetch).not.toHaveBeenCalled()
+  })
+
+  it('redacts cards for invalid member roles', async () => {
+    vi.mocked(docMemberRepo.list).mockResolvedValue([{ uid: 'u_1', principal_space_id: 'space-1', role: 0 }] as never)
+    expect(await notifyDocMentioned(mentionParams())).toBe(2)
+    expectRedactedCards()
+  })
+
+  it('does not notify for deleted documents, even with open sharing', async () => {
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue({ doc_id: 'doc-1', status: 0, share_scope: 1 } as never)
+    expect(await notifyDocMentioned(mentionParams())).toBe(0)
+    expect(fetch).not.toHaveBeenCalled()
+  })
+
+  it('does not count filtered recipients as delivered', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      delivered: [], filtered: { u_1: 'not_space_member', u_2: 'busy' },
+    }), { status: 200 })))
+    expect(await notifyDocMentioned(mentionParams())).toBe(0)
+  })
+
   it('never throws on a 500 or network error (best-effort)', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response('nope', { status: 500 })))
     expect(await notifyDocMentioned(mentionParams())).toBe(0)
@@ -361,18 +455,37 @@ describe('notifyDocMentioned', () => {
     expect(await notifyDocMentioned(mentionParams())).toBe(0)
   })
 
-  // ── P0 regression: recipient authorization by doc read-access ──────────────
-  it('on a restricted doc, does NOT notify a mentioned user who is not a doc member (info-leak guard)', async () => {
-    // u_2 is NOT a doc member here — only u_1 (+ owner) can read the restricted doc.
+  it('notifies both readers and non-readers without disclosing restricted content to non-readers', async () => {
     ;(docMemberRepo.list as ReturnType<typeof vi.fn>).mockResolvedValue([
-      { doc_id: 'doc-1', uid: 'u_1', role: 1 },
+      { doc_id: 'doc-1', uid: 'u_1', principal_space_id: 'space-1', role: 1 },
     ])
     const delivered = await notifyDocMentioned(mentionParams())
-    expect(delivered).toBe(1)
-    const calls = (fetch as ReturnType<typeof vi.fn>).mock.calls
-    const recipients = calls.map((c) => JSON.parse((c[1] as RequestInit).body as string).targets[0])
-    expect(recipients).toEqual(['u_1'])
-    expect(recipients).not.toContain('u_2') // same-space non-member never notified
+    expect(delivered).toBe(2)
+    expect(sentMentionCards().map((request) => request.targets)).toEqual([['u_1'], ['u_2']])
+    expect(sentMentionCards()[0].docs_card).toMatchObject({
+      title: 'Test Doc', excerpt: 'see this @Alice and @Bob',
+    })
+    expect(sentMentionCards()[1].docs_card).toEqual({
+      doc_id: 'doc-1', request_id: '', kind: 'commented', title: '你在一篇文档中被提及',
+      actor_uid: 'u-req', actor_name: expect.any(String),
+      excerpt: '你暂时没有访问权限，打开文档后可申请访问。', updated_at: expect.any(String),
+    })
+  })
+
+  it('notifies once per non-reader and never notifies the author', async () => {
+    vi.mocked(docMemberRepo.list).mockResolvedValue([])
+    expect(await notifyDocMentioned({
+      ...mentionParams(), body: '@[user:u_1:Alice] @[user:u_1:Alice] @[user:u-req:Me] @[doc:d2:Private title]',
+    })).toBe(1)
+    expect(sentMentionCards().map((request) => request.targets)).toEqual([['u_1']])
+    expectRedactedCards()
+  })
+
+  it.each(['metadata', 'members'])('does not send when %s lookup fails', async (lookup) => {
+    if (lookup === 'metadata') vi.mocked(docMetaRepo.getByDocId).mockRejectedValue(new Error('DB unavailable'))
+    else vi.mocked(docMemberRepo.list).mockRejectedValue(new Error('DB unavailable'))
+    expect(await notifyDocMentioned(mentionParams())).toBe(0)
+    expect(fetch).not.toHaveBeenCalled()
   })
 
   it('notifies the doc owner when mentioned even without a doc_member row', async () => {
@@ -386,6 +499,7 @@ describe('notifyDocMentioned', () => {
       (c) => JSON.parse((c[1] as RequestInit).body as string).targets[0],
     )
     expect(recipients).toEqual(['u-owner'])
+    expect(sentMentionCards()[0].docs_card).toMatchObject({ title: 'Test Doc', excerpt: 'ping @Owner' })
   })
 
   it('on an anyone_in_space doc, notifies all mentioned (server does space-level filtering)', async () => {
@@ -403,6 +517,9 @@ describe('notifyDocMentioned', () => {
       .map((c) => JSON.parse((c[1] as RequestInit).body as string).targets[0])
       .sort()
     expect(recipients).toEqual(['u_1', 'u_2'])
+    for (const request of sentMentionCards()) {
+      expect(request.docs_card).toMatchObject({ title: 'Test Doc', excerpt: 'see this @Alice and @Bob' })
+    }
   })
 
   it('fails closed (notifies no one) when the doc row is missing', async () => {
@@ -412,18 +529,19 @@ describe('notifyDocMentioned', () => {
   })
 
   // ── P1 regression: fan-out is capped ───────────────────────────────────────
-  it('caps the recipient fan-out at MAX_MENTION_RECIPIENTS (50)', async () => {
-    // 200 unique mentioned users, all authorized readers of an anyone_in_space doc.
+  it.each([0, 1])('caps recipient fan-out at 50 for share scope %i, including redacted cards', async (shareScope) => {
     ;(docMetaRepo.getByDocId as ReturnType<typeof vi.fn>).mockResolvedValue({
       doc_id: 'doc-1',
       owner_id: 'u-owner',
       space_id: 'space-1',
-      share_scope: 1,
+      share_scope: shareScope,
       share_role: 1,
     })
-    const body = Array.from({ length: 200 }, (_, i) => `@[user:u_${i}:Name${i}]`).join(' ')
+    vi.mocked(docMemberRepo.list).mockResolvedValue([])
+    const body = Array.from({ length: 200 }, (_, index) => `@[user:u_${index}:Name${index}]`).join(' ')
     const delivered = await notifyDocMentioned({ ...mentionParams(), body })
     expect(delivered).toBe(50)
     expect((fetch as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(50)
+    if (shareScope === 0) expectRedactedCards()
   })
 })

@@ -31,6 +31,7 @@ vi.mock('../src/collab/anchorResolve.js', async () => {
 import { createCommentHandler } from '../src/api/routes/comments.js'
 import { requireDocRole } from '../src/api/guard.js'
 import { reportBotMentions } from '../src/api/services/botMention.js'
+import { notifyDocMentioned } from '../src/api/services/docsNotify.js'
 import { docCommentRepo } from '../src/db/repos/docCommentRepo.js'
 
 interface MockRes {
@@ -59,6 +60,7 @@ function req(body: unknown, over: Record<string, unknown> = {}) {
   return {
     uid: 'u-human',
     spaceId: 's1',
+    principalSpaceId: 's1',
     octoToken: 'tok',
     ownedBots: ['bot-1'],
     params: { docId: 'doc-1' },
@@ -105,6 +107,23 @@ beforeEach(() => {
 })
 
 describe('bot-mention reporting never breaks comment creation', () => {
+  it.each([false, true])('passes the verified principal Space to human notifications (reply=%s)', async (reply) => {
+    vi.mocked(reportBotMentions).mockResolvedValue({ accepted: 0, skipped: 0, failed: 0 })
+    const res = mockRes()
+    await createCommentHandler(req({
+      body: '@[user:human-target:同事] 看一下',
+      ...(reply ? { parentId: 5 } : {
+        anchorStart: Buffer.from([1, 2, 3]).toString('base64'),
+        anchorEnd: Buffer.from([4, 5, 6]).toString('base64'),
+      }),
+    }, { principalSpaceId: 'visitor-space' }), res as never)
+    expect(res.statusCode).toBe(201)
+    expect(notifyDocMentioned).toHaveBeenCalledWith(expect.objectContaining({
+      docId: 'doc-1', spaceId: 's1', principalSpaceId: 'visitor-space',
+      authorUid: 'u-human', body: '@[user:human-target:同事] 看一下',
+    }))
+  })
+
   it('a REJECTING report still returns 201 for a reply, with no unhandled rejection', async () => {
     ;(reportBotMentions as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('octo-server down'))
     const res = mockRes()
