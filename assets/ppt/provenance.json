@@ -3,6 +3,7 @@
   "commit": "cc038183dbf79a33bee7fe49d0aa1c23f7224874",
   "inputSha256": {
     "runtime/ppt-player/README.md": "af08e443e817799bd4a43ce16bc156b2718646227d2fe19499b2d0d25f81b9b0",
+    "runtime/ppt-player/chartInteraction.ts": "b5dbc34850490da7de9133721019b0bba2ef519a45975cbd94a5eeaa354290e3",
     "runtime/ppt-player/entry.ts": "0b75b8a6bcb86903ff0e05d1499c94a2b508e5dec666069a3b7c18b5c71aa664",
     "runtime/ppt-player/index.html": "a3780649ea82df124078fb6ee3351bbb3e99c4dbb3cb8b654e1c2b3528142570",
     "runtime/ppt-player/vendor/chinese.ts": "2cd53eca5a35da653d6b9ccf1935e6fa0003e39efad76c93a36c235b6d9a883d",
@@ -22,9 +23,10 @@
     "runtime/ppt-player/vendor/presentationControls.ts": "690da1f6178e67117c05c1deb38878996665f4c46379c62c50790e5bad06e4c9",
     "runtime/ppt-player/vendor/presentationNavigation.ts": "b62b85a9935340ee81ffa594e5babf5010cf09c89a54a6a1a2dade8605d0f8c8",
     "runtime/ppt-player/vendor/presenter.ts": "a30453ee0382654b3d748235752ea600ef6d440775d6841c6208bcd704be66e3",
-    "scripts/buildPptPlayer.mjs": "1f98c3128fa16a612924f52f101bc463c193beb7ec632230acfdf3576a6d6fd9",
+    "scripts/buildPptPlayer.mjs": "3c96e57d354740f57e77be1a04e4afb2097437ae53638a0680dcc0b7dadc763f",
+    "scripts/ppt-chart-plugin.mjs": "27ea3d243c525bd027fb2f54561ecb0fea681570b77cfc60dd6bad29d687921f",
     "scripts/ppt-code-plugin.mjs": "834bbb86ea0096ef0ca4b5e3bc248e89e8de2feec3c2572e522c893df26fc038",
     "src/ppt/offlineHost.ts": "5c52d8fd3776d9def93c11c1026a89b47fbadd09564bb0026ad8ca653b355ed0"
   },
-  "sha256": "790fe720db852bc62ccc001f599ec9f063392aec23d89712963c99be50aee3a7"
+  "sha256": "8d359462e61b32dc161f23c52a0604be03f03de5086df2f2014f02d6fbb84c5a"
 }
