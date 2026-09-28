@@ -16,6 +16,7 @@ describe('docMemberRepo.removePrincipalExact', () => {
       .mockResolvedValueOnce([{ uid: 'human' }])
       .mockResolvedValueOnce([])
       .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])
       .mockResolvedValueOnce([{ permission_epoch: 12 }])
 
     await expect(docMemberRepo.removePrincipalExact({
@@ -23,11 +24,13 @@ describe('docMemberRepo.removePrincipalExact', () => {
     })).resolves.toEqual({ changed: true, removedUids: ['human'], newEpoch: 12 })
 
     const calls = tx.query.mock.calls
-    expect(calls).toHaveLength(4)
+    expect(calls).toHaveLength(5)
+    expect(calls[1]![0]).toContain('DELETE FROM doc_member_notification')
+    expect(calls[1]![1]).toEqual(['d1', 'human', 'sp1'])
     expect(calls[0]![0]).toContain('FOR UPDATE')
     expect(calls[0]![1]).toEqual(['d1', 'human', 'sp1'])
-    expect(calls[1]![0]).toContain('DELETE FROM doc_member')
-    expect(calls[1]![1]).toEqual(['d1', 'human', 'sp1'])
+    expect(calls[2]![0]).toContain('DELETE FROM doc_member')
+    expect(calls[2]![1]).toEqual(['d1', 'human', 'sp1'])
     expect(calls.filter(([sql]) => String(sql).includes('permission_epoch = permission_epoch + 1'))).toHaveLength(1)
   })
 
@@ -36,6 +39,6 @@ describe('docMemberRepo.removePrincipalExact', () => {
     await expect(docMemberRepo.removePrincipalExact({
       docId: 'd1', principalSpaceId: 'sp1', uid: 'missing',
     })).resolves.toEqual({ changed: false, removedUids: [] })
-    expect(tx.query).toHaveBeenCalledTimes(1)
+    expect(tx.query).toHaveBeenCalledTimes(2)
   })
 })

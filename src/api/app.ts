@@ -78,6 +78,7 @@ import { docsRouter, documentResourceRouter, spaceCollectionRouter } from './rou
 import { internalHtmlRegistrationRouter } from './routes/internalHtmlRegistration.js'
 import { internalDocRoleRouter } from './routes/internalDocRole.js'
 import { membersRouter } from './routes/members.js'
+import { memberNotificationsRouter } from './routes/memberNotifications.js'
 import { forwardGrantRouter } from './routes/forwardGrant.js'
 import { accessRequestsRouter } from './routes/accessRequests.js'
 import { cardActionDecideHandler, CARD_ACTION_DECIDE_PATH } from './routes/cardActionDecide.js'
@@ -283,6 +284,7 @@ export function createApp(
   //     DocumentResourceRouter so the fixed paths (`/`, `/search`, `/recent`,
   //     `/recent/creators`) are never shadowed by the router's `/:docId`.
   api.use(spaceCollectionRouter)
+  api.use(memberNotificationsRouter)
 
   // 4b. DocumentResourceRouter (remove-sp §6): every single-document operation,
   //     located by path docId with NO spaceContextMiddleware — open-context, the
