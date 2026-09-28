@@ -416,7 +416,7 @@ function processSheetMapReconcile(liveDoc: Y.Doc, targetState: Uint8Array, apply
   validateSheetDataValidations(rawValidations, allowedValidationLogicalIds, true)
   const validatedConditionalFormats = new Map<string, Record<string, unknown>>()
   for (const [key, value] of targetConditionalFormats.entries()) {
-    validatedConditionalFormats.set(key, validateConditionalFormat(key, value))
+    validatedConditionalFormats.set(key, validateConditionalFormat(key, value, allowedValidationLogicalIds))
   }
   if (!apply) return true
   // Cells: make live equal target (delete live-only, set/overwrite target).
