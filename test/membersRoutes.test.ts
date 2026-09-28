@@ -12,6 +12,7 @@ vi.mock("../src/api/guard.js", () => ({
 vi.mock("../src/db/repos/docMemberRepo.js", () => ({
   docMemberRepo: {
     upsertDirect: vi.fn(async () => {}),
+    upsertDirectWithNotification: vi.fn(async () => ({ created: true })),
     updateExistingDirect: vi.fn(async () => true),
     removePrincipalExact: vi.fn(async () => ({
       changed: true,
@@ -159,6 +160,8 @@ function stubIdentity(
 beforeEach(() => {
   vi.mocked(requireDocRole).mockReset();
   vi.mocked(docMemberRepo.upsertDirect).mockClear();
+  vi.mocked(docMemberRepo.upsertDirectWithNotification).mockReset();
+  vi.mocked(docMemberRepo.upsertDirectWithNotification).mockResolvedValue({ created: true });
   vi.mocked(docMemberRepo.updateExistingDirect).mockReset();
   vi.mocked(docMemberRepo.updateExistingDirect).mockResolvedValue(true);
   vi.mocked(docMemberRepo.removePrincipalExact).mockReset();
@@ -197,10 +200,36 @@ describe("PUT /api/v1/docs/:docId/members — anti ghost-member check", () => {
     );
 
     expect(res.statusCode).toBe(200);
-    expect(res.body).toEqual({ ok: true });
-    expect(vi.mocked(docMemberRepo.upsertDirect)).toHaveBeenCalledTimes(1);
+    expect(res.body).toEqual({ ok: true, created: true, notified: true });
+    expect(vi.mocked(docMemberRepo.upsertDirectWithNotification)).toHaveBeenCalledTimes(1);
     // The doc guard is scoped to req.spaceId (4th arg).
     expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe("admin");
+  });
+
+  it("reports an existing member role edit without notifying again", async () => {
+    stubIdentity({ u_real: { uid: "u_real", name: "Real User" } });
+    vi.mocked(docMemberRepo.upsertDirectWithNotification).mockResolvedValueOnce({ created: false });
+    const res = mockRes();
+
+    await putMemberHandler()(req({ uid: "u_real", role: "reader" }), res as never);
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toEqual({ ok: true, created: false, notified: false });
+  });
+
+  it("does not create a notification when the exact document owner is added", async () => {
+    stubIdentity({ u_admin: { uid: "u_admin", name: "Owner" } });
+    const res = mockRes();
+
+    await putMemberHandler()(
+      req({ uid: "u_admin", role: "writer" }),
+      res as never,
+    );
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toEqual({ ok: true });
+    expect(docMemberRepo.upsertDirectWithNotification).not.toHaveBeenCalled();
+    expect(docMemberRepo.upsertDirect).toHaveBeenCalledTimes(1);
   });
 
   it("add member with role=commenter -> 200 ok (commentable tier assignable)", async () => {
@@ -212,10 +241,10 @@ describe("PUT /api/v1/docs/:docId/members — anti ghost-member check", () => {
     );
 
     expect(res.statusCode).toBe(200);
-    expect(res.body).toEqual({ ok: true });
+    expect(res.body).toEqual({ ok: true, created: true, notified: true });
     // commenter stored value is 4 (rank ordinal != stored number).
     expect(
-      vi.mocked(docMemberRepo.upsertDirect).mock.calls.at(-1)![0],
+      vi.mocked(docMemberRepo.upsertDirectWithNotification).mock.calls.at(-1)![0],
     ).toMatchObject({ roleNum: 4 });
   });
 
@@ -236,7 +265,7 @@ describe("PUT /api/v1/docs/:docId/members — anti ghost-member check", () => {
       res as never,
     );
     expect(res.statusCode).toBe(200);
-    expect(vi.mocked(docMemberRepo.upsertDirect)).toHaveBeenCalledWith(
+    expect(vi.mocked(docMemberRepo.upsertDirectWithNotification)).toHaveBeenCalledWith(
       expect.objectContaining({ roleNum: 4 }),
     );
   });

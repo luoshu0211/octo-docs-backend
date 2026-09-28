@@ -131,6 +131,7 @@ membersRouter.put("/:docId/members", async (req: Request, res: Response) => {
   // already exists. isSpaceMember() is not used because it answers only for the
   // token holder, not an arbitrary target.
   const identity = getOctoIdentity();
+  let notifyRecipient = false;
   const targetIsBotSpace = isBotRequest && targetPrincipalSpaceId === req.principalSpaceId;
   if (targetIsBotSpace) {
     // A Bot may create grants only in its bearer-authenticated Space. Validate
@@ -152,6 +153,7 @@ membersRouter.put("/:docId/members", async (req: Request, res: Response) => {
       res.status(404).json({ error: "principal_not_in_space" });
       return;
     }
+    notifyRecipient = lookup.principalType === 'human';
   } else if (!isBotRequest) {
     // Human behavior remains the established authoritative roster + Bot creator
     // validation, authenticated with the caller session (or service fallback
@@ -170,6 +172,7 @@ membersRouter.put("/:docId/members", async (req: Request, res: Response) => {
       return;
     }
     const target = roster.find((member) => member.uid === uid);
+    notifyRecipient = !!target && !target.isBot;
     if (!target || target.isBot) {
       const bots = await identity.spaceBots(
         targetPrincipalSpaceId,
@@ -196,7 +199,22 @@ membersRouter.put("/:docId/members", async (req: Request, res: Response) => {
     roleNum: roleToNumber(parsedRole),
     grantedBy: req.uid!,
   };
-  if (targetIsBotSpace || (!isBotRequest && targetPrincipalSpaceId === guard.meta.space_id)) {
+  let created = false;
+  const notificationEligible =
+    (targetIsBotSpace || (!isBotRequest && targetPrincipalSpaceId === guard.meta.space_id)) &&
+    notifyRecipient &&
+    !(
+      uid === guard.meta.owner_id &&
+      targetPrincipalSpaceId === guard.meta.owner_space_id
+    );
+  if (notificationEligible) {
+    // The member row and the recipient's durable unread reminder commit together.
+    // Existing rows are role edits and deliberately do not create a new reminder.
+    ({ created } = await docMemberRepo.upsertDirectWithNotification({
+      ...write,
+      notifyRecipient,
+    }));
+  } else if (targetIsBotSpace || (!isBotRequest && targetPrincipalSpaceId === guard.meta.space_id)) {
     // Humans retain Home-Space upsert semantics. Bots may upsert in their own
     // authenticated Space even when the document belongs to another Space.
     await docMemberRepo.upsertDirect(write);
@@ -212,7 +230,11 @@ membersRouter.put("/:docId/members", async (req: Request, res: Response) => {
   }
   // doc_member change => epoch +1 + broadcast invalidation (§4.5).
   await bumpEpoch(guard.meta.doc_id, guard.meta.document_name, uid);
-  res.status(200).json({ ok: true });
+  res.status(200).json(
+    notificationEligible
+      ? { ok: true, created, notified: created }
+      : { ok: true },
+  );
 });
 
 /** DELETE member (needs admin); owner cannot be removed (§4.5). */

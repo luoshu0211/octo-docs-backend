@@ -57,7 +57,7 @@ describe('HttpOctoIdentity.lookupSpacePrincipalAsBot — exact bearer lookup', (
     }), { status: 200 }))
     vi.stubGlobal('fetch', fetchMock)
     const identity = new HttpOctoIdentity('http://octo.test')
-    expect(await identity.lookupSpacePrincipalAsBot('u/a', 's&1', 'bot-token')).toEqual({ status: 'eligible' })
+    expect(await identity.lookupSpacePrincipalAsBot('u/a', 's&1', 'bot-token')).toEqual({ status: 'eligible', principalType: 'human' })
     expect(fetchMock).toHaveBeenCalledWith(
       'http://octo.test/v1/bot/space/principals/u%2Fa?space_id=s%261',
       { headers: { Authorization: 'Bearer bot-token' } },
@@ -70,7 +70,7 @@ describe('HttpOctoIdentity.lookupSpacePrincipalAsBot — exact bearer lookup', (
       principal_type: principalType,
     }), { status: 200 })))
     const identity = new HttpOctoIdentity('http://octo.test')
-    expect(await identity.lookupSpacePrincipalAsBot('u', 's', 'tok')).toEqual({ status: 'eligible' })
+    expect(await identity.lookupSpacePrincipalAsBot('u', 's', 'tok')).toEqual({ status: 'eligible', principalType })
   })
 
   it('rejects app_bot as outside the approved User Bot scope', async () => {

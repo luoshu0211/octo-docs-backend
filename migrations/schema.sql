@@ -102,6 +102,21 @@ CREATE TABLE doc_member (
   KEY idx_doc_role (doc_id, role)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- Durable in-product reminder emitted when a Human is directly added to a doc.
+-- One row per recipient principal + document; re-adding after removal refreshes
+-- the event and clears read_at so unread state follows the user across devices.
+CREATE TABLE doc_member_notification (
+  recipient_uid      VARCHAR(64) NOT NULL,
+  recipient_space_id VARCHAR(64) NOT NULL,
+  doc_id             VARCHAR(64) NOT NULL,
+  granted_by         VARCHAR(64) NOT NULL,
+  role               TINYINT NOT NULL,
+  event_at           DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  read_at            DATETIME(3) NULL,
+  PRIMARY KEY (recipient_uid, recipient_space_id, doc_id),
+  KEY idx_member_notification_unread (recipient_uid, recipient_space_id, read_at, event_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 -- 链接邀请（v2.0 新增）：一个 token 携带授予 role，仅【已注册 octo 用户】可接受（见 §4.6 接受流程）。
 CREATE TABLE doc_invite (
   invite_token  VARCHAR(64)  NOT NULL,            -- 邀请 token（高熵随机串，进 URL）

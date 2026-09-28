@@ -13,6 +13,7 @@ vi.mock("../src/api/guard.js", () => ({
 vi.mock("../src/db/repos/docMemberRepo.js", () => ({
   docMemberRepo: {
     upsertDirect: vi.fn(async () => {}),
+    upsertDirectWithNotification: vi.fn(async () => ({ created: true })),
     updateExistingDirect: vi.fn(async () => true),
   },
 }));
