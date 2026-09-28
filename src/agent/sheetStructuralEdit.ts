@@ -59,6 +59,7 @@ export type SheetStructuralEditErrorCode =
   | 'sheet_column_out_of_bounds'
   | 'sheet_column_limit_exceeded'
   | 'sheet_formula_unsupported'
+  | 'sheet_conditional_format_unsupported'
 
 export class SheetStructuralEditError extends Error {
   constructor(readonly code: SheetStructuralEditErrorCode) {
@@ -591,6 +592,9 @@ export function prepareSheetStructuralEdit(
   doc: Y.Doc,
   edit: SheetStructuralEdit,
 ): SheetStructuralEditPlan {
+  if (Array.from(doc.getMap('sheetConditionalFormats').keys()).some((key) => key.startsWith(`${edit.logicalId}!`))) {
+    throw new SheetStructuralEditError('sheet_conditional_format_unsupported')
+  }
   if (edit.kind === 'rows.insert') {
     const rowInsertPlan = prepareSheetRowInsert(doc, edit)
     return {

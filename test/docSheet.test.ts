@@ -516,7 +516,7 @@ describe('paginated sheet read', () => {
   it('first page counts sheetDims against the byte cap so cells+dims stay within it (P1-b)', async () => {
     // Small cap; a chunky dims map eats most of it. Before the fix the cells
     // budget ignored dims, so the first page (cells + dims) could exceed the cap.
-    config.sheetRead.maxCellBytes = 500
+    config.sheetRead.maxCellBytes = 500 + Buffer.byteLength(',"sheetConditionalFormats":{}')
     const dims: Record<string, number> = {}
     for (let c = 0; c < 20; c++) dims[`c${c}`] = 120 + c
     vi.mocked(readLiveSheet).mockResolvedValue(liveSheet(tenRowSheet(), dims))
@@ -593,6 +593,7 @@ describe('paginated sheet read', () => {
       sheetFreeze: {},
       sheetFilters: {},
       sheetDataValidations: {},
+      sheetConditionalFormats: {},
     }
     config.sheetRead.maxCellBytes = Buffer.byteLength(JSON.stringify(oneCellPage))
     expect(Buffer.byteLength(JSON.stringify({
@@ -710,6 +711,7 @@ describe('paginated sheet read', () => {
       sheetFreeze: {},
       sheetFilters: {},
       sheetDataValidations: {},
+      sheetConditionalFormats: {},
     }
     config.sheetRead.maxCellBytes = Buffer.byteLength(JSON.stringify(metadataWithoutValidations)) + 10
     expect(Buffer.byteLength(JSON.stringify({
@@ -735,7 +737,7 @@ describe('paginated sheet read', () => {
   })
 
   it('shrinks a checkbox first page before asking the caller to delete valid metadata', async () => {
-    config.sheetRead.maxCellBytes = 500
+    config.sheetRead.maxCellBytes = 500 + Buffer.byteLength(',"sheetConditionalFormats":{}')
     const doc = new Y.Doc()
     for (let row = 0; row < 20; row++) {
       doc.getMap<unknown>(SHEET_YMAP_FIELD).set(`default!${row}:0`, { v: `row-${row}` })
@@ -763,7 +765,7 @@ describe('paginated sheet read', () => {
       nextCursor: expect.any(String),
       sheetDataValidations: { default: [expect.any(Object)] },
     })
-    expect(Buffer.byteLength(JSON.stringify(res.body))).toBeLessThanOrEqual(500)
+    expect(Buffer.byteLength(JSON.stringify(res.body))).toBeLessThanOrEqual(config.sheetRead.maxCellBytes)
   })
 
   it('does not offer checkbox deletion when other first-page metadata already exceeds the cap', async () => {
@@ -854,6 +856,7 @@ describe('paginated sheet read', () => {
       sheetFreeze: {},
       sheetFilters: {},
       sheetDataValidations: {},
+      sheetConditionalFormats: {},
     }
     config.sheetRead.maxCellBytes = Buffer.byteLength(JSON.stringify(minimalPageWithoutValidations))
     expect(Buffer.byteLength(JSON.stringify({
@@ -906,6 +909,7 @@ describe('paginated sheet read', () => {
       sheetFreeze: {},
       sheetFilters: {},
       sheetDataValidations: {},
+      sheetConditionalFormats: {},
     }
     config.sheetRead.maxCellBytes = Buffer.byteLength(JSON.stringify(repairedTerminalPage))
     const staleOneCellProbe = {
@@ -964,6 +968,7 @@ describe('paginated sheet read', () => {
       sheetFreeze: {},
       sheetFilters: {},
       sheetDataValidations: {},
+      sheetConditionalFormats: {},
     }
     config.sheetRead.maxCellBytes = Buffer.byteLength(JSON.stringify(oneCellPageWithoutValidations))
     expect(Buffer.byteLength(JSON.stringify({
@@ -999,7 +1004,7 @@ describe('paginated sheet read', () => {
     // their bytes — it gets the whole cap for cells. Use a sheet large enough that
     // the byte budget (not the cell supply) bounds BOTH pages, so the comparison
     // reflects the budget difference rather than the sheet running out.
-    config.sheetRead.maxCellBytes = 500
+    config.sheetRead.maxCellBytes = 500 + Buffer.byteLength(',"sheetConditionalFormats":{}')
     const cells: Record<string, SheetCell> = {}
     for (let r = 0; r < 40; r++) cells[`default!${r}:0`] = { v: `row-${r}` }
     const dims: Record<string, number> = {}

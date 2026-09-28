@@ -24,6 +24,7 @@
  */
 import { transaction, type Tx } from '../../db/pool.js'
 import * as Y from 'yjs'
+import type { ConditionalFormatChanges } from '../../agent/sheetConditionalFormatting.js'
 import { yjsDocumentRepo } from '../../db/repos/yjsDocumentRepo.js'
 import { docVersionRepo, KIND_RESTORE_MARKER } from '../../db/repos/docVersionRepo.js'
 import { docMemberRepo } from '../../db/repos/docMemberRepo.js'
@@ -96,6 +97,7 @@ export interface EditDocSheetInput {
   dataValidations?: SheetDataValidationResourceChanges
   /** Internal structural operation used by the row/column insert/delete routes. */
   structuralEdit?: SheetStructuralEdit
+  conditionalFormats?: ConditionalFormatChanges
   /** permission_epoch observed when the request was authorized (TOCTOU baseline). */
   authorizedEpoch: number
   /**
@@ -189,7 +191,7 @@ function mapEditError(err: unknown): {
   }
   if (err instanceof SheetStructuralEditError) {
     if (err.code === 'sheet_not_found') return { status: 404, error: err.code }
-    if (err.code === 'sheet_formula_unsupported') return { status: 409, error: err.code }
+    if (err.code === 'sheet_formula_unsupported' || err.code === 'sheet_conditional_format_unsupported') return { status: 409, error: err.code }
     return { status: 422, error: err.code }
   }
   // Pre-mutation refusal (nothing applied / broadcast), so it belongs in this set: the caller's
@@ -275,6 +277,7 @@ export async function editDocSheet(input: EditDocSheetInput): Promise<EditDocShe
   const freeze = input.freeze ?? {}
   const filters = input.filters ?? {}
   const dataValidations = input.dataValidations ?? {}
+  const conditionalFormats = input.conditionalFormats ?? {}
   const validationDeletionOnly =
     Object.keys(dataValidations).length > 0 &&
     Object.values(dataValidations).every((value) => value === null || (Array.isArray(value) && value.length === 0)) &&
@@ -286,7 +289,7 @@ export async function editDocSheet(input: EditDocSheetInput): Promise<EditDocShe
     Object.keys(input.sheets).length === 0 &&
     Object.keys(freeze).length === 0 &&
     Object.keys(filters).length === 0 &&
-    input.structuralEdit === undefined
+    input.structuralEdit === undefined && Object.keys(conditionalFormats).length === 0
 
   // cheap pre-compare: fail most GET<->PATCH conflicts before a snapshot row.
   if (!stateVectorsEqual(input.clientBaseVersion, baseSV)) {
@@ -326,6 +329,7 @@ export async function editDocSheet(input: EditDocSheetInput): Promise<EditDocShe
           maxRules: config.sheetWrite.maxDataValidations,
           maxBytes: config.sheetWrite.maxDataValidationBytes,
         },
+        conditionalFormats,
       )
     docBytes = measured.docBytes
     payloadBytes = measured.payloadBytes
@@ -435,6 +439,7 @@ export async function editDocSheet(input: EditDocSheetInput): Promise<EditDocShe
       dataValidations,
       txResult.isAdmin,
       input.structuralEdit,
+      conditionalFormats,
     )
     bytes = committed.bytes
     newSV = committed.newSV

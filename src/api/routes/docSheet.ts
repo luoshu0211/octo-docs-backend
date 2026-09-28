@@ -67,8 +67,61 @@ import {
   InvalidSheetCursorError,
 } from '../services/sheetPagination.js'
 import { config } from '../../config/env.js'
+import { decodeConditionalFormats } from '../../agent/sheetConditionalFormatting.js'
+import { cleanDocSheet } from '../services/cleanDocSheet.js'
 
 export const docSheetRouter: ExpressRouter = Router()
+
+docSheetRouter.post('/:docId/sheet/split', splitDocSheetHandler)
+docSheetRouter.post('/:docId/sheet/deduplicate', deduplicateDocSheetHandler)
+
+export async function splitDocSheetHandler(req: Request, res: Response): Promise<void> {
+  await cleanDocSheetHandler(req, res, 'split')
+}
+
+export async function deduplicateDocSheetHandler(req: Request, res: Response): Promise<void> {
+  await cleanDocSheetHandler(req, res, 'deduplicate')
+}
+
+async function cleanDocSheetHandler(req: Request, res: Response, mode: 'split' | 'deduplicate'): Promise<void> {
+  const guard = await requireDocRole(req, res, req.params.docId!, 'writer')
+  if (!guard || !requireSheetDocType(res, guard.meta.doc_type)) return
+  const body = req.body as Record<string, unknown> | undefined
+  const baseVersion = readBaseVersion(req)
+  if (!body || typeof body !== 'object' || Array.isArray(body) || !baseVersion ||
+    ['preview', 'overwrite', 'header', 'caseSensitive'].some((key) => body[key] !== undefined && typeof body[key] !== 'boolean') ||
+    mode === 'split' && (typeof body.delimiter !== 'string' || !body.delimiter || body.delimiter.length > 16)) {
+    res.status(400).json({ error: 'invalid_body' })
+    return
+  }
+  let logicalId: string
+  let range: ReturnType<typeof validateSheetRange>
+  try {
+    logicalId = validateResourceLogicalId(body.logicalId, 'cleaning logicalId')
+    range = validateSheetRange(body.range, 'cleaning range')
+  } catch {
+    res.status(400).json({ error: 'invalid_body' })
+    return
+  }
+  try {
+    const result = await cleanDocSheet({
+      uid: req.uid!, docId: guard.meta.doc_id, documentName: guard.meta.document_name,
+      principalSpaceId: req.principalSpaceId!, clientBaseVersion: parseBaseVersion(baseVersion),
+      authorizedEpoch: guard.meta.permission_epoch, isBot: req.botToken !== undefined, token: req.octoToken,
+      isAdmin: guard.role === 'admin', logicalId, range, mode,
+      delimiter: body.delimiter as string | undefined, header: body.header === true,
+      caseSensitive: body.caseSensitive === true, preview: body.preview !== false, overwrite: body.overwrite === true,
+    })
+    const { ok, ...payload } = result
+    if (ok) res.status(200).json({ docId: guard.meta.doc_id, ...payload })
+    else {
+      const { status, ...errorBody } = payload as { status: number; error: string }
+      res.status(status).json(errorBody)
+    }
+  } catch {
+    res.status(500).json({ error: 'internal_error' })
+  }
+}
 
 /**
  * The only doc_type this sheet-content surface accepts. A 'doc' (rich text) or a
@@ -143,6 +196,7 @@ export async function getDocSheetHandler(req: Request, res: Response): Promise<v
     const sheetFreeze = decodeSheetFreezeSnapshot(state)
     const sheetFilters = decodeSheetFiltersSnapshot(state)
     const sheetDataValidations = decodeSheetDataValidationsSnapshot(state)
+    const sheetConditionalFormats = decodeConditionalFormats(state)
 
     if (paginated) {
       await respondPaginatedSheet(res, {
@@ -155,6 +209,7 @@ export async function getDocSheetHandler(req: Request, res: Response): Promise<v
         sheetFreeze,
         sheetFilters,
         sheetDataValidations,
+        sheetConditionalFormats,
         baseVersion,
         limitRaw,
         cursorRaw,
@@ -184,6 +239,7 @@ export async function getDocSheetHandler(req: Request, res: Response): Promise<v
       sheetFreeze,
       sheetFilters,
       sheetDataValidations,
+      sheetConditionalFormats,
     }))
     if (payloadBytes > config.sheetRead.maxCellBytes) {
       res.status(413).json({
@@ -205,6 +261,7 @@ export async function getDocSheetHandler(req: Request, res: Response): Promise<v
       sheetFreeze,
       sheetFilters,
       sheetDataValidations,
+      sheetConditionalFormats,
       // The live state vector, base64. Carried so a later write can guard on it
       // for optimistic concurrency (Stage2); this read does not reuse a historic
       // versions snapshot.
@@ -336,6 +393,7 @@ async function respondPaginatedSheet(
     sheetFreeze: Record<string, StoredFreeze>
     sheetFilters: Record<string, StoredFilter>
     sheetDataValidations: Record<string, StoredDataValidationRule[]>
+    sheetConditionalFormats: Record<string, Record<string, unknown>>
     baseVersion: string
     limitRaw: string | undefined
     cursorRaw: string | undefined
@@ -408,6 +466,7 @@ async function respondPaginatedSheet(
   if (isFirstPage) body.sheetFilters = args.sheetFilters
   // Validation rules describe the whole grid; return once, on page one.
   if (isFirstPage) body.sheetDataValidations = args.sheetDataValidations
+  if (isFirstPage) body.sheetConditionalFormats = args.sheetConditionalFormats
   const validationKeys = Object.entries(args.sheetDataValidations).flatMap(([logicalId, rules]) =>
     rules.map((rule) => `${logicalId}!${rule.uid}`),
   )
@@ -944,6 +1003,7 @@ export async function patchDocSheetHandler(req: Request, res: Response): Promise
   const freeze = body.freeze === undefined ? {} : body.freeze
   const filters = body.filters === undefined ? {} : body.filters
   const dataValidations = body.dataValidations === undefined ? {} : body.dataValidations
+  const conditionalFormats = body.conditionalFormats === undefined ? {} : body.conditionalFormats
   if (
     !validateCellsShape(cells) ||
     !validateDimsShape(dims) ||
@@ -953,7 +1013,8 @@ export async function patchDocSheetHandler(req: Request, res: Response): Promise
     !validateSheetsShape(sheets) ||
     !validateObjectResourceShape<StoredFreeze>(freeze) ||
     !validateObjectResourceShape<StoredFilter>(filters) ||
-    !validateDataValidationsShape(dataValidations)
+    !validateDataValidationsShape(dataValidations) ||
+    !validateObjectResourceShape<Record<string, unknown>>(conditionalFormats)
   ) {
     res.status(400).json({ error: 'invalid_body' })
     return
@@ -970,7 +1031,7 @@ export async function patchDocSheetHandler(req: Request, res: Response): Promise
     Object.keys(sheets).length === 0 &&
     Object.keys(freeze).length === 0 &&
     Object.keys(filters).length === 0 &&
-    Object.keys(dataValidations).length === 0
+    Object.keys(dataValidations).length === 0 && Object.keys(conditionalFormats).length === 0
   ) {
     res.status(400).json({ error: 'invalid_body' })
     return
@@ -985,7 +1046,7 @@ export async function patchDocSheetHandler(req: Request, res: Response): Promise
     checkSheetsBounds(sheets) ??
     checkResourceBounds(freeze) ??
     checkResourceBounds(filters) ??
-    checkDataValidationsBounds(dataValidations)
+    checkDataValidationsBounds(dataValidations) ?? checkResourceBounds(conditionalFormats)
   if (bounds) {
     res.status(bounds.status).json({ error: bounds.error })
     return
@@ -1007,6 +1068,7 @@ export async function patchDocSheetHandler(req: Request, res: Response): Promise
       freeze,
       filters,
       dataValidations,
+      conditionalFormats,
       authorizedEpoch: guard.meta.permission_epoch,
       isBot: req.botToken !== undefined,
       token: req.octoToken,

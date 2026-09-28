@@ -15,6 +15,7 @@
  * in lockstep or bot edits land in a Y.Map the clients never read.
  */
 import * as Y from 'yjs'
+import { prepareConditionalFormatChanges, readConditionalFormats, SHEET_CONDITIONAL_FORMATS_FIELD, type ConditionalFormatChanges } from './sheetConditionalFormatting.js'
 import { isDeepStrictEqual } from 'node:util'
 import { persistedByteLength } from '../collab/persistedEncoding.js'
 import { config } from '../config/env.js'
@@ -2615,6 +2616,7 @@ export function measureSheetAfterEdit(
   filters: Record<string, StoredFilter | null> = {},
   dataValidations: SheetDataValidationResourceChanges = {},
   dataValidationStorageLimits: SheetDataValidationStorageLimits = configuredSheetDataValidationStorageLimits(),
+  conditionalFormats: ConditionalFormatChanges = {},
 ): {
   docBytes: number
   payloadBytes: number | null
@@ -2649,7 +2651,7 @@ export function measureSheetAfterEdit(
     Object.keys(cells).length === 0 && Object.keys(dims).length === 0 &&
     Object.keys(drawings).length === 0 && Object.keys(hyperlinks).length === 0 &&
     Object.keys(merges).length === 0 && Object.keys(sheets).length === 0 &&
-    Object.keys(freeze).length === 0 && Object.keys(filters).length === 0
+    Object.keys(freeze).length === 0 && Object.keys(filters).length === 0 && Object.keys(conditionalFormats).length === 0
   let previousPayloadBytes: number | null = null
   try {
     previousPayloadBytes = measureSheetReadPayloadBytes(scratch)
@@ -2668,6 +2670,7 @@ export function measureSheetAfterEdit(
   const nextLogicalIds = sheetLogicalIdsWithLegacyDefault(listMap.keys())
   for (const key of listBatch.toDelete) nextLogicalIds.delete(key)
   for (const [key] of listBatch.toSet) nextLogicalIds.add(key)
+  const conditionalBatch = prepareConditionalFormatChanges(scratch, conditionalFormats, nextLogicalIds, listBatch.toDelete)
   const repairBatch = validationDeletionOnly
     ? validateSheetDataValidationResourceDeletionRepairBatch(validationMap.entries(), dataValidations)
     : null
@@ -2693,6 +2696,9 @@ export function measureSheetAfterEdit(
     for (const [key, value] of filterBatch.toSet) filterMap.set(key, value)
     for (const key of validationBatch.toDelete) validationMap.delete(key)
     for (const [key, rule] of validationBatch.toSet) validationMap.set(key, rule)
+    const conditionalMap = scratch.getMap(SHEET_CONDITIONAL_FORMATS_FIELD)
+    for (const key of conditionalBatch.toDelete) conditionalMap.delete(key)
+    for (const [key, value] of conditionalBatch.toSet) conditionalMap.set(key, value)
   })
   const docBytes = persistedByteLength(scratch)
   // Decode + validate the READ maps exactly as GET does (decodeSheetSnapshot /
@@ -2717,6 +2723,7 @@ export function measureSheetAfterEdit(
 
 /** Measure the decoded GET payload for one already-hydrated sheet document. */
 export function measureSheetReadPayloadBytes(doc: Y.Doc): number {
+  const sheetConditionalFormats = readConditionalFormats(doc)
   const rawCells: Record<string, unknown> = {}
   for (const [key, val] of doc.getMap(SHEET_YMAP_FIELD).entries()) rawCells[key] = val
   const rawDims: Record<string, unknown> = {}
@@ -2753,5 +2760,6 @@ export function measureSheetReadPayloadBytes(doc: Y.Doc): number {
     sheetFreeze,
     sheetFilters,
     sheetDataValidations,
+    sheetConditionalFormats,
   }))
 }
