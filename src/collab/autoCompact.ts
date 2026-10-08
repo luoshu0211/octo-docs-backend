@@ -47,7 +47,7 @@
  * worse than before" measured the merge in the v1 encoding — under v2 the saving
  * survives. That correction is what makes automation defensible.)
  */
-import { config } from '../config/env.js'
+import { storageByteLimit } from './storageCodec.js'
 import {
   compactDocument,
   ClusterStateUnknownError,
@@ -105,7 +105,7 @@ export async function maybeCompactOnUnload(
 ): Promise<AutoCompactOutcome> {
   try {
     const bytes = await deps.storedBytes(documentName)
-    if (bytes === null || bytes < config.maxDocBytes * COMPACT_ABOVE_RATIO) {
+    if (bytes === null || bytes < storageByteLimit() * COMPACT_ABOVE_RATIO) {
       return { ran: false, reason: 'below-threshold' }
     }
 

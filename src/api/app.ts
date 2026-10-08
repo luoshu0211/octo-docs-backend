@@ -67,6 +67,7 @@
  */
 import express, { type Express, Router, type Request, type Response, type NextFunction } from 'express'
 import { config } from '../config/env.js'
+import { StorageBudgetError } from '../collab/storageCodec.js'
 import { corsMiddleware } from './cors.js'
 import { attachmentBlobGateway, localBlobGatewayEnabled, isSignedBlobRequest } from './routes/attachmentBlob.js'
 import { authMiddleware } from './middleware/auth.js'
@@ -415,6 +416,10 @@ export function createApp(
   // central error handler — unexpected errors => 500 (§8.4 error table).
   app.use((err: unknown, req: Request, res: Response, _next: NextFunction) => {
     if (res.headersSent) return
+    if (err instanceof StorageBudgetError) {
+      res.status(413).json({ error: 'doc_too_large', dimension: err.dimension, bytes: err.bytes, limit: err.limit })
+      return
+    }
     // Body-parser (express.json) failures arrive here as typed errors. Map them
     // to their contract codes instead of letting them bubble to a 500 (defect ③):
     //   - malformed JSON body  -> 400 invalid_body

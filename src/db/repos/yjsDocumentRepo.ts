@@ -13,6 +13,9 @@
  * which is exactly what the column's DEFAULT 1 records.
  */
 import { query, type Tx } from '../pool.js'
+import { decodeStorageState, encodeStorageState } from '../../collab/storageCodec.js'
+
+export { UnknownEncodingError } from '../../collab/storageCodec.js'
 
 /** Yjs update format of a persisted `state` blob. */
 export type YjsEncoding = 1 | 2
@@ -21,37 +24,6 @@ export type YjsEncoding = 1 | 2
 export interface StoredYjsState {
   state: Uint8Array
   encoding: YjsEncoding
-}
-
-/**
- * Narrow the DB's TINYINT to a format this process can decode.
- *
- * An unrecognised value means the row was written by a NEWER deploy than the one
- * reading it (mixed-version rollout, or a rollback). We must not decode it — the
- * two encodings are not interchangeable and feeding v2 bytes to the v1 decoder
- * yields an empty document rather than an error (verified against yjs directly).
- *
- * We must not report it as "no row" either, tempting as that is: the caller then
- * loads an empty document, and the first edit persists that empty state straight
- * over the row via the UPSERT below — turning an unreadable row into a destroyed
- * one. Throwing keeps the document unavailable but intact, which is the only
- * recoverable outcome of the three.
- */
-function toEncoding(raw: unknown, documentName: string): YjsEncoding {
-  if (raw == null || raw === 1) return 1
-  if (raw === 2) return 2
-  throw new UnknownEncodingError(documentName, raw)
-}
-
-/** A persisted row whose `encoding` this build does not understand. */
-export class UnknownEncodingError extends Error {
-  constructor(documentName: string, raw: unknown) {
-    super(
-      `refusing to decode ${documentName}: unknown yjs_document.encoding ${String(raw)} ` +
-        '(row written by a newer deploy — do not let this build overwrite it)',
-    )
-    this.name = 'UnknownEncodingError'
-  }
 }
 
 export const yjsDocumentRepo = {
@@ -65,7 +37,7 @@ export const yjsDocumentRepo = {
     )
     const row = rows[0]
     if (!row) return null
-    return { state: new Uint8Array(row.state), encoding: toEncoding(row.encoding, documentName) }
+    return decodeStorageState(new Uint8Array(row.state), row.encoding, documentName)
   },
 
   /** SELECT ... FOR UPDATE inside the store transaction (§3.2 step 1). */
@@ -76,7 +48,7 @@ export const yjsDocumentRepo = {
     )
     const row = rows[0]
     if (!row) return null
-    return { state: new Uint8Array(row.state), encoding: toEncoding(row.encoding, documentName) }
+    return decodeStorageState(new Uint8Array(row.state), row.encoding, documentName)
   },
 
   /** UPSERT the single authoritative row (§3.2 step 3). */
@@ -86,6 +58,7 @@ export const yjsDocumentRepo = {
     state: Buffer,
     encoding: YjsEncoding,
   ): Promise<void> {
+    const stored = encodeStorageState(state, encoding)
     await tx.query(
       `INSERT INTO yjs_document (document_name, state, size_bytes, encoding, updated_at)
        VALUES (?, ?, ?, ?, NOW(3))
@@ -93,7 +66,7 @@ export const yjsDocumentRepo = {
                                size_bytes = VALUES(size_bytes),
                                encoding = VALUES(encoding),
                                updated_at = NOW(3)`,
-      [documentName, state, state.length, encoding],
+      [documentName, stored.state, stored.state.length, stored.encoding],
     )
   },
 }

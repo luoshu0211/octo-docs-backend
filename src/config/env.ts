@@ -753,6 +753,8 @@ export const config = {
 
   // §9.5 single-document Yjs state hard cap.
   maxDocBytes: num('MAX_DOC_BYTES', 10 * 1024 * 1024),
+  maxDocStorageBytes: num('MAX_DOC_STORAGE_BYTES', 0),
+  yjsStorageGzip: strictBool('YJS_STORAGE_GZIP', true),
 
   // Write persisted Yjs state as the v2 update format (see
   // collab/persistedEncoding.ts and the 2026-08-21-yjs-document-encoding-v2

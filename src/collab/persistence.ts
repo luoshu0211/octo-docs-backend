@@ -15,6 +15,7 @@ import { config } from '../config/env.js'
 import { clearOversized, clearOverCapResolved, markOversized, resolvePendingUnrestored, resolveDurableUnrestored } from './oversizeGuard.js'
 import { clearOverCapShared, resolveUnrestoredOverCap, type StateVectorMap } from './compactionNotice.js'
 import { encodeForPersistence } from './persistedEncoding.js'
+import { encodeStorageState, StorageBudgetError } from './storageCodec.js'
 
 /**
  * Flatten a document's Yjs state vector to plain JSON (`clientId -> clock`) for
@@ -177,31 +178,40 @@ export const persistence = {
       )
     }
 
-    await transaction(async (tx) => {
-      // 1. lock + take the latest row (read-modify-write 2nd-layer defense).
-      const existing = await yjsDocumentRepo.selectForUpdateTx(tx, documentName)
+    try {
+      encodeStorageState(incoming, encoding)
+      await transaction(async (tx) => {
+        // 1. lock + take the latest row (read-modify-write 2nd-layer defense).
+        const existing = await yjsDocumentRepo.selectForUpdateTx(tx, documentName)
 
-      // 2. merge-on-write + diffUpdate bypass, in the encoding we are writing.
-      const { finalState } = computeFinalState(existing, liveDoc, incoming, encoding)
+        // 2. merge-on-write + diffUpdate bypass, in the encoding we are writing.
+        const { finalState } = computeFinalState(existing, liveDoc, incoming, encoding)
+        encodeStorageState(finalState, encoding)
 
-      // 3. UPSERT single authoritative row, recording the encoding that produced
-      //    `finalState` — never a hardcoded 2. A mislabelled row is unreadable
-      //    (or worse, silently decodes empty), so the label must come from the
-      //    same decision that produced the bytes.
-      await yjsDocumentRepo.upsertStateTx(tx, documentName, finalState, encoding)
+        // 3. UPSERT single authoritative row, recording the encoding that produced
+        //    `finalState` — never a hardcoded 2. A mislabelled row is unreadable
+        //    (or worse, silently decodes empty), so the label must come from the
+        //    same decision that produced the bytes.
+        await yjsDocumentRepo.upsertStateTx(tx, documentName, finalState, encoding)
 
-      // doc_meta.updated_at + updated_by (updated_by from context.user.id, §4.1).
-      // A read-only direct connection (SYSTEM_STORE_UID) flushes a store on
-      // disconnect but must NEVER be recorded as the last editor: skip the
-      // metadata stamp so a GET /scene or a PATCH pre-flight read cannot pollute
-      // updated_by/updated_at. Only a real editor's write updates it.
-      if (context?.user?.id !== SYSTEM_STORE_UID) {
-        await tx.query('UPDATE doc_meta SET updated_at = NOW(3), updated_by = ? WHERE document_name = ?', [
-          context?.user?.id ?? null,
-          documentName,
-        ])
+        // doc_meta.updated_at + updated_by (updated_by from context.user.id, §4.1).
+        // A read-only direct connection (SYSTEM_STORE_UID) flushes a store on
+        // disconnect but must NEVER be recorded as the last editor: skip the
+        // metadata stamp so a GET /scene or a PATCH pre-flight read cannot pollute
+        // updated_by/updated_at. Only a real editor's write updates it.
+        if (context?.user?.id !== SYSTEM_STORE_UID) {
+          await tx.query('UPDATE doc_meta SET updated_at = NOW(3), updated_by = ? WHERE document_name = ?', [
+            context?.user?.id ?? null,
+            documentName,
+          ])
+        }
+      })
+    } catch (error) {
+      if (error instanceof StorageBudgetError) {
+        markOversized(documentName, error.bytes, error.limit, stateVectorMap(liveDoc))
       }
-    })
+      throw error
+    }
 
     // The document fits again (it may have been marked on an earlier attempt and
     // then shrunk — e.g. the owner deleted rows). Lift the write guard so the
