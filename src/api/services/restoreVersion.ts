@@ -22,6 +22,7 @@
  * force the union fallback in persistence.store, duplicating the restored
  * content — so it is deliberately omitted.
  */
+import * as Y from 'yjs'
 import { transaction, type Tx } from '../../db/pool.js'
 import { yjsDocumentRepo } from '../../db/repos/yjsDocumentRepo.js'
 import { storedStateAsV1 } from '../../collab/collabDatabase.js'
@@ -41,6 +42,7 @@ import {
 import { applyRestoreToLiveDoc, applyBoardRestoreToLiveDoc } from '../../collab/liveRestore.js'
 import { readLiveDocState } from '../../collab/liveDocRead.js'
 import { config } from '../../config/env.js'
+import { encodeStorageState } from '../../collab/storageCodec.js'
 import { roleAtLeast } from '../../permission/role.js'
 
 export type RestoreResult =
@@ -184,9 +186,12 @@ export async function restoreVersion(input: RestoreInput): Promise<RestoreResult
       }
       throw err
     }
-    if (validated.length > config.maxDocBytes) {
+    const encoding = config.yjsWriteV2 ? 2 : 1
+    const persistenceState = encoding === 2 ? Y.convertUpdateFormatV1ToV2(validated) : validated
+    if (persistenceState.length > config.maxDocBytes) {
       return { ok: false as const, status: 413, error: 'doc_too_large' }
     }
+    encodeStorageState(persistenceState, encoding)
 
     // 6. Auto safety snapshot of the CURRENT LIVE state (undo for the restore),
     //    recorded only after the reconcile + size check have passed. Sourced from

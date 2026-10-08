@@ -47,6 +47,7 @@
 import * as Y from 'yjs'
 import { config } from '../config/env.js'
 import type { YjsEncoding } from '../db/repos/yjsDocumentRepo.js'
+import { encodeStorageState } from './storageCodec.js'
 
 /** The encoding this process writes. Read side dispatches per row, not on this. */
 export function persistedEncoding(): YjsEncoding {
@@ -54,10 +55,8 @@ export function persistedEncoding(): YjsEncoding {
 }
 
 /**
- * Encode `doc` exactly as it will be persisted, and report which encoder did it
- * so the caller can record it on the row. The size cap MUST be applied to the
- * returned bytes — that is the whole point of encoding here rather than at the
- * call site.
+ * Encode the logical Yjs state before the repository's optional storage codec.
+ * MAX_DOC_BYTES bounds this decoded representation independently of disk bytes.
  */
 export function encodeForPersistence(doc: Y.Doc): { state: Uint8Array; encoding: YjsEncoding } {
   return config.yjsWriteV2
@@ -66,10 +65,10 @@ export function encodeForPersistence(doc: Y.Doc): { state: Uint8Array; encoding:
 }
 
 /**
- * What `doc` will cost on disk, in the encoding this process actually writes.
- * The pre-flight gates compare this against `config.maxDocBytes`, so a gate and
- * the store cap can never again disagree about the dimension being capped.
+ * Measure the decoded Yjs budget and preflight the independent storage budget.
  */
 export function persistedByteLength(doc: Y.Doc): number {
-  return encodeForPersistence(doc).state.length
+  const { state, encoding } = encodeForPersistence(doc)
+  if (state.length <= config.maxDocBytes) encodeStorageState(state, encoding)
+  return state.length
 }
