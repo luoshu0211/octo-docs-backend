@@ -26,6 +26,7 @@ import { overcapUnrestoredRepo } from './db/repos/overcapUnrestoredRepo.js'
 import type { Server } from 'node:http'
 import { config } from './config/env.js'
 import { createServer, setEpochWatermark } from './collab/server.js'
+import { storeWorkerPool } from './collab/storeWorkerPool.js'
 import { createApp } from './api/app.js'
 import { attachBindGuard } from './api/bindGuard.js'
 import { createPptRelay } from './ppt/relay/index.js'
@@ -261,6 +262,7 @@ async function main(): Promise<void> {
       stopOverCapHeartbeat()
       await withdrawNode()
       await hocuspocus.destroy() // flushes in-memory docs (triggers onStoreDocument)
+      await storeWorkerPool.close() // drain accepted CPU jobs before closing SQL
       // MR98-006: one last in-memory retry drain before Redis closes below. This
       // is explicitly SECONDARY, not the durability mechanism: a rejection's
       // vector is already written to the durable DB store at rejection time

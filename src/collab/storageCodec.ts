@@ -4,6 +4,18 @@ import type { StoredYjsState, YjsEncoding } from '../db/repos/yjsDocumentRepo.js
 
 export type StorageEncoding = 1 | 2 | 3 | 4
 
+export interface StorageCodecOptions {
+  maxDocBytes: number
+  maxDocStorageBytes: number
+  yjsStorageGzip: boolean
+}
+
+export interface EncodedStorageState {
+  state: Uint8Array
+  encoding: StorageEncoding
+  decodedBytes: number
+}
+
 export class StorageBudgetError extends Error {
   constructor(
     readonly dimension: 'decoded' | 'stored',
@@ -25,8 +37,8 @@ export class UnknownEncodingError extends Error {
   }
 }
 
-export function storageByteLimit(): number {
-  return config.maxDocStorageBytes || config.maxDocBytes
+export function storageByteLimit(options: StorageCodecOptions = config): number {
+  return options.maxDocStorageBytes || options.maxDocBytes
 }
 
 function assertSize(dimension: 'decoded' | 'stored', bytes: number, limit: number): void {
@@ -36,18 +48,19 @@ function assertSize(dimension: 'decoded' | 'stored', bytes: number, limit: numbe
 export function encodeStorageState(
   state: Uint8Array,
   encoding: YjsEncoding,
+  options: StorageCodecOptions = config,
 ): { state: Buffer; encoding: StorageEncoding } {
-  assertSize('decoded', state.length, config.maxDocBytes)
+  assertSize('decoded', state.length, options.maxDocBytes)
   let output = Buffer.from(state)
   let storageEncoding: StorageEncoding = encoding
-  if (config.yjsStorageGzip) {
+  if (options.yjsStorageGzip) {
     const compressed = gzipSync(output, { level: 6 })
     if (compressed.length < output.length) {
       output = compressed
       storageEncoding = encoding === 1 ? 3 : 4
     }
   }
-  assertSize('stored', output.length, storageByteLimit())
+  assertSize('stored', output.length, storageByteLimit(options))
   return { state: output, encoding: storageEncoding }
 }
 
@@ -55,6 +68,7 @@ export function decodeStorageState(
   state: Uint8Array,
   rawEncoding: unknown,
   documentName: string,
+  options: StorageCodecOptions = config,
 ): StoredYjsState {
   const encoding = rawEncoding == null ? 1 : rawEncoding
   if (encoding !== 1 && encoding !== 2 && encoding !== 3 && encoding !== 4) {
@@ -63,6 +77,15 @@ export function decodeStorageState(
   if (encoding === 1 || encoding === 2) {
     return { state, encoding }
   }
-  const decoded = gunzipSync(state, { maxOutputLength: config.maxDocBytes })
+  const decoded = gunzipSync(state, { maxOutputLength: options.maxDocBytes })
   return { state: decoded, encoding: encoding === 3 ? 1 : 2 }
+}
+
+/** Cheap final checks for bytes already encoded and validated on a worker. */
+export function assertEncodedStorageState(stored: EncodedStorageState): void {
+  if (![1, 2, 3, 4].includes(stored.encoding) || !Number.isSafeInteger(stored.decodedBytes) || stored.decodedBytes < 0) {
+    throw new Error('invalid prepared Yjs storage state')
+  }
+  assertSize('decoded', stored.decodedBytes, config.maxDocBytes)
+  assertSize('stored', stored.state.length, storageByteLimit())
 }

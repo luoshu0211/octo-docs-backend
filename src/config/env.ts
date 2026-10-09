@@ -755,6 +755,9 @@ export const config = {
   maxDocBytes: num('MAX_DOC_BYTES', 10 * 1024 * 1024),
   maxDocStorageBytes: num('MAX_DOC_STORAGE_BYTES', 0),
   yjsStorageGzip: strictBool('YJS_STORAGE_GZIP', true),
+  // Incremental main-thread extraction; full merge/encoding/gzip on a worker.
+  // SQL and wire formats are unchanged. False selects the synchronous fallback.
+  yjsBackgroundStore: strictBool('YJS_BACKGROUND_STORE', true),
 
   // Write persisted Yjs state as the v2 update format (see
   // collab/persistedEncoding.ts and the 2026-08-21-yjs-document-encoding-v2
