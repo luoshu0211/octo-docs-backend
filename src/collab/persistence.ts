@@ -3,7 +3,7 @@
  *
  * Authoritative store is the Y.Doc binary (§3.1). Single-row authoritative
  * merged-state model (§3.3): UPSERT into yjs_document, merge-on-write with a
- * diffUpdate fast-path bypass (P1-D), inside SELECT ... FOR UPDATE.
+ * incremental extraction and a background merge, inside SELECT ... FOR UPDATE.
  *
  * store() also writes doc_meta.updated_by from context.user.id (P2-A) in the
  * same transaction.
@@ -13,23 +13,10 @@ import { transaction } from '../db/pool.js'
 import { yjsDocumentRepo, type StoredYjsState, type YjsEncoding } from '../db/repos/yjsDocumentRepo.js'
 import { config } from '../config/env.js'
 import { clearOversized, clearOverCapResolved, markOversized, resolvePendingUnrestored, resolveDurableUnrestored } from './oversizeGuard.js'
-import { clearOverCapShared, resolveUnrestoredOverCap, type StateVectorMap } from './compactionNotice.js'
-import { encodeForPersistence } from './persistedEncoding.js'
+import { clearOverCapShared, resolveUnrestoredOverCap } from './compactionNotice.js'
 import { encodeStorageState, StorageBudgetError } from './storageCodec.js'
-
-/**
- * Flatten a document's Yjs state vector to plain JSON (`clientId -> clock`) for
- * the durable over-cap interlock. Cheap: a state vector is one entry per client,
- * not proportional to the document size, so this adds nothing measurable next to
- * the full encode `store` already paid for.
- */
-function stateVectorMap(doc: Y.Doc): StateVectorMap {
-  const out: StateVectorMap = {}
-  for (const [client, clock] of Y.decodeStateVector(Y.encodeStateVector(doc))) {
-    out[String(client)] = clock
-  }
-  return out
-}
+import { captureStoreUpdate, recordStoreCheckpoint } from './storeCheckpoint.js'
+import { storeWorkerPool } from './storeWorkerPool.js'
 
 /**
  * An empty Yjs v1 update encodes as two zero bytes (no structs, empty delete
@@ -101,12 +88,13 @@ export function computeFinalState(
   liveDoc: Y.Doc,
   liveEncoded: Uint8Array,
   liveEncoding: YjsEncoding,
+  capturedStateVector = Y.encodeStateVector(liveDoc),
 ): { finalState: Buffer; usedUnion: boolean } {
   if (!existing) {
     return { finalState: Buffer.from(liveEncoded), usedUnion: false }
   }
 
-  const liveStateVector = Y.encodeStateVector(liveDoc)
+  const liveStateVector = capturedStateVector
   const surplus =
     existing.encoding === 2
       ? Y.diffUpdateV2(existing.state, liveStateVector)
@@ -130,6 +118,7 @@ export function computeFinalState(
 }
 
 export const persistence = {
+  loaded: recordStoreCheckpoint,
   /**
    * fetch(documentName): the persisted state plus the encoder that produced it,
    * or null (§3.2). documentName is the canonical persistence key, not doc_id.
@@ -146,8 +135,9 @@ export const persistence = {
    * (union) is the correctness fallback; the diffUpdate bypass skips the
    * redundant union re-encode on the normal single-writer path.
    *
-   * Takes the LIVE document rather than pre-encoded bytes so the state is
-   * encoded exactly once, in the format we actually persist. The size cap is
+   * The default path extracts a delta from the LIVE document; a worker builds
+   * and caps the full authoritative snapshot. The synchronous fallback uses
+   * the same persisted format. The size cap is
    * therefore measured against what goes to disk, and the three REST pre-flight
    * gates measure the SAME dimension via persistedByteLength — that shared
    * measure is what keeps the "byte-accurate gate" contract true rather than
@@ -156,7 +146,9 @@ export const persistence = {
    * not be saved at all saves normally.
    */
   async store(documentName: string, liveDoc: Y.Doc, context?: StoreContext): Promise<void> {
-    const { state: incoming, encoding } = encodeForPersistence(liveDoc)
+    const background = config.yjsBackgroundStore
+    let captured = captureStoreUpdate(documentName, liveDoc, background)
+    const { state: incoming, encoding } = captured
 
     // §9.5 single-document hard size cap: reject oversized writes (a runaway
     // doc would block the event loop in decode/encode under the row lock).
@@ -172,27 +164,48 @@ export const persistence = {
       // carries this exact state (or an explicit reconcile) may lift it, so an
       // unrelated small store on another connection can no longer dissolve the
       // protection for a client whose edits are still unpersisted (MR98-004).
-      markOversized(documentName, incoming.length, config.maxDocBytes, stateVectorMap(liveDoc))
+      markOversized(documentName, incoming.length, config.maxDocBytes, captured.stateMap)
       throw new Error(
         `document ${documentName} exceeds max size ${config.maxDocBytes} bytes (got ${incoming.length})`,
       )
     }
 
     try {
-      encodeStorageState(incoming, encoding)
+      if (!background) encodeStorageState(incoming, encoding)
       await transaction(async (tx) => {
-        // 1. lock + take the latest row (read-modify-write 2nd-layer defense).
-        const existing = await yjsDocumentRepo.selectForUpdateTx(tx, documentName)
+        if (background) {
+          const existing = await yjsDocumentRepo.selectRawForUpdateTx(tx, documentName)
+          const prepare = () => storeWorkerPool.run({
+            documentName, existing, update: captured.state, encoding: captured.encoding,
+            baseVector: captured.baseVector, targetVector: captured.vector,
+            codec: { maxDocBytes: config.maxDocBytes, maxDocStorageBytes: config.maxDocStorageBytes, yjsStorageGzip: config.yjsStorageGzip },
+          })
+          let result = await prepare()
+          if (result.kind === 'needs-full-state') {
+            // The durable base was replaced/compacted. Re-capture a FULL update
+            // and its matching vector while still holding the same row lock.
+            captured = captureStoreUpdate(documentName, liveDoc, false)
+            if (captured.state.length > config.maxDocBytes) {
+              throw new StorageBudgetError('decoded', captured.state.length, config.maxDocBytes)
+            }
+            result = await prepare()
+          }
+          if (result.kind !== 'stored') throw new Error('Yjs full-state fallback could not prepare a snapshot')
+          await yjsDocumentRepo.upsertEncodedStateTx(tx, documentName, result.stored)
+        } else {
+          // 1. lock + take the latest row (read-modify-write 2nd-layer defense).
+          const existing = await yjsDocumentRepo.selectForUpdateTx(tx, documentName)
 
-        // 2. merge-on-write + diffUpdate bypass, in the encoding we are writing.
-        const { finalState } = computeFinalState(existing, liveDoc, incoming, encoding)
-        encodeStorageState(finalState, encoding)
+          // 2. merge-on-write + diffUpdate bypass, in the encoding we are writing.
+          const { finalState } = computeFinalState(existing, liveDoc, incoming, encoding, captured.vector)
+          encodeStorageState(finalState, encoding)
 
-        // 3. UPSERT single authoritative row, recording the encoding that produced
-        //    `finalState` — never a hardcoded 2. A mislabelled row is unreadable
-        //    (or worse, silently decodes empty), so the label must come from the
-        //    same decision that produced the bytes.
-        await yjsDocumentRepo.upsertStateTx(tx, documentName, finalState, encoding)
+          // 3. UPSERT single authoritative row, recording the encoding that produced
+          //    `finalState` — never a hardcoded 2. A mislabelled row is unreadable
+          //    (or worse, silently decodes empty), so the label must come from the
+          //    same decision that produced the bytes.
+          await yjsDocumentRepo.upsertStateTx(tx, documentName, finalState, encoding)
+        }
 
         // doc_meta.updated_at + updated_by (updated_by from context.user.id, §4.1).
         // A read-only direct connection (SYSTEM_STORE_UID) flushes a store on
@@ -208,10 +221,13 @@ export const persistence = {
       })
     } catch (error) {
       if (error instanceof StorageBudgetError) {
-        markOversized(documentName, error.bytes, error.limit, stateVectorMap(liveDoc))
+        markOversized(documentName, error.bytes, error.limit, captured.stateMap)
       }
       throw error
     }
+
+    // Advance only AFTER COMMIT, never after queueing, preparing, or UPSERT.
+    recordStoreCheckpoint(documentName, liveDoc, captured.vector)
 
     // The document fits again (it may have been marked on an earlier attempt and
     // then shrunk — e.g. the owner deleted rows). Lift the write guard so the
@@ -236,19 +252,19 @@ export const persistence = {
     // the marker standing, so the interlock survives until A's bytes genuinely
     // land or the condition is explicitly reconciled (MR98-004). The replica
     // retraction above is not sufficient evidence and never was.
-    void resolveUnrestoredOverCap(documentName, stateVectorMap(liveDoc))
+    void resolveUnrestoredOverCap(documentName, captured.stateMap)
     // Same dominance evidence, applied to the IN-MEMORY retry queue (MR98-006):
     // a record that never reached Redis (blip at rejection time) lives only in
     // that queue, so a genuine recovery must clear it there too — otherwise the
     // over-cap heartbeat would resurrect a phantom durable marker after the
     // state was already recovered. Synchronous and local; leaves an undominated
     // entry standing, exactly as `resolveUnrestoredOverCap` leaves the marker.
-    resolvePendingUnrestored(documentName, stateVectorMap(liveDoc))
+    resolvePendingUnrestored(documentName, captured.stateMap)
     // And the DURABLE DB record (MR98-006): the record persisted at rejection
     // time outlives replica death, so a dominating recovery must clear it there
     // too, or a later reconcile would rebuild a phantom Redis marker for state
     // that already landed. Fire-and-forget with the SAME dominance evidence; an
     // undominated store leaves the row standing (fail closed).
-    void resolveDurableUnrestored(documentName, stateVectorMap(liveDoc))
+    void resolveDurableUnrestored(documentName, captured.stateMap)
   },
 }

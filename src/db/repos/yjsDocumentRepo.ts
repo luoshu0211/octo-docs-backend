@@ -13,7 +13,7 @@
  * which is exactly what the column's DEFAULT 1 records.
  */
 import { query, type Tx } from '../pool.js'
-import { decodeStorageState, encodeStorageState } from '../../collab/storageCodec.js'
+import { assertEncodedStorageState, decodeStorageState, encodeStorageState, type EncodedStorageState } from '../../collab/storageCodec.js'
 
 export { UnknownEncodingError } from '../../collab/storageCodec.js'
 
@@ -26,7 +26,31 @@ export interface StoredYjsState {
   encoding: YjsEncoding
 }
 
+/** Physical row, before decompression. Only the background store consumes this. */
+export interface RawYjsState {
+  state: Uint8Array
+  encoding: number | null
+}
+
 export const yjsDocumentRepo = {
+  async selectRawForUpdateTx(tx: Tx, documentName: string): Promise<RawYjsState | null> {
+    const rows = await tx.query<{ state: Buffer; encoding: number | null }>(
+      'SELECT state, encoding FROM yjs_document WHERE document_name = ? FOR UPDATE',
+      [documentName],
+    )
+    return rows[0] ?? null
+  },
+
+  async upsertEncodedStateTx(tx: Tx, documentName: string, stored: EncodedStorageState): Promise<void> {
+    assertEncodedStorageState(stored)
+    await tx.query(
+      `INSERT INTO yjs_document (document_name, state, size_bytes, encoding, updated_at)
+       VALUES (?, ?, ?, ?, NOW(3))
+       ON DUPLICATE KEY UPDATE state = VALUES(state), size_bytes = VALUES(size_bytes),
+                               encoding = VALUES(encoding), updated_at = NOW(3)`,
+      [documentName, Buffer.from(stored.state), stored.state.length, stored.encoding],
+    )
+  },
   /** Fetch state bytes + the encoding that produced them (§3.2 fetch). */
   async fetchState(documentName: string): Promise<StoredYjsState | null> {
     // db.query returns []; must index [0] before reading state, else

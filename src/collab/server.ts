@@ -298,6 +298,7 @@ export function createServer(redis = createCollabRedis(config.redis)) {
       // (see collabDatabase.ts / the 2026-08-21-yjs-document-encoding-v2 migration).
       new CollabDatabase({
         fetch: (documentName) => persistence.fetch(documentName),
+        loaded: (documentName, doc) => persistence.loaded(documentName, doc),
         // lastContext flows through so store can write doc_meta.updated_by (P2-A).
         store: (documentName, doc, context) => persistence.store(documentName, doc, context),
       }),

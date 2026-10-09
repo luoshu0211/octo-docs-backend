@@ -27,6 +27,11 @@
     "test/persistence.test.ts",
     "test/persistenceV2.test.ts",
     "test/persistenceOversizeGuard.test.ts",
+    "test/storeWorker.test.ts",
+    "test/backgroundPersistence.test.ts",
+    "test/storagePersistence.test.ts",
+    "test/readPollution.test.ts",
+    "test/exportReadPollution.test.ts",
     "test/compactionWorker.test.ts",
     "test/compactDocumentWiring.test.ts",
     "test/compactionCluster.test.ts"

@@ -36,7 +36,7 @@ vi.mock('../src/collab/oversizeGuard.js', () => ({
 }))
 vi.mock('../src/collab/compactionNotice.js', () => ({ clearOverCapShared: vi.fn(), resolveUnrestoredOverCap: vi.fn() }))
 
-const original = { maxDocBytes: config.maxDocBytes, maxDocStorageBytes: config.maxDocStorageBytes, yjsStorageGzip: config.yjsStorageGzip, yjsWriteV2: config.yjsWriteV2 }
+const original = { maxDocBytes: config.maxDocBytes, maxDocStorageBytes: config.maxDocStorageBytes, yjsStorageGzip: config.yjsStorageGzip, yjsWriteV2: config.yjsWriteV2, yjsBackgroundStore: config.yjsBackgroundStore }
 const documents: Y.Doc[] = []
 function branch(prefix: string): Y.Doc {
   const doc = new Y.Doc()
@@ -59,7 +59,8 @@ afterEach(() => {
   for (const doc of documents.splice(0)) doc.destroy()
 })
 
-describe('authoritative merged-state storage budgets', () => {
+describe.each([false, true])('authoritative merged-state storage budgets (background: %s)', background => {
+  beforeEach(() => Object.assign(config, { yjsBackgroundStore: background }))
   it.each([1, 2] as const)('compresses a legacy V%i row larger than the new stored budget', async (encoding) => {
     const doc = branch('legacy-large')
     const raw = encoding === 1 ? Y.encodeStateAsUpdate(doc) : Y.encodeStateAsUpdateV2(doc)

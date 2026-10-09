@@ -34,6 +34,8 @@ vi.mock('../src/db/repos/yjsDocumentRepo.js', () => ({
     fetchState: vi.fn(async () => null),
     selectForUpdateTx: vi.fn(async () => null),
     upsertStateTx: vi.fn(async () => {}),
+    selectRawForUpdateTx: vi.fn(async () => null),
+    upsertEncodedStateTx: vi.fn(async () => {}),
   },
 }))
 
@@ -81,7 +83,7 @@ describe('persistence.store — read-only sentinel does not touch doc_meta (defe
     await persistence.store(DOC, smallDoc(), { user: { id: SYSTEM_STORE_UID } })
     // The authoritative row is still upserted (idempotent for a read)...
     const { yjsDocumentRepo } = await import('../src/db/repos/yjsDocumentRepo.js')
-    expect(yjsDocumentRepo.upsertStateTx).toHaveBeenCalledTimes(1)
+    expect(yjsDocumentRepo.upsertEncodedStateTx).toHaveBeenCalledTimes(1)
     // ...but the ownership metadata is never stamped.
     expect(cap.queries.some((q) => /UPDATE doc_meta/i.test(q.sql))).toBe(false)
   })

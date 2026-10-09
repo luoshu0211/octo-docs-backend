@@ -2,17 +2,15 @@
  * Compaction worker: every expensive, synchronous step of a rebuild, off the
  * event loop.
  *
- * WHY A WORKER IS POSSIBLE HERE AND NOWHERE ELSE
+ * WHY THIS WORK CAN RUN ON A WORKER
  *
- * The collab hot path cannot be moved to a worker: a live Y.Doc is an object
- * graph that only exists in the heap that built it, and handing it across a
- * thread boundary would mean encoding it — the very cost we would be trying to
- * escape.
+ * A live Y.Doc cannot be transferred between heaps. Background persistence
+ * therefore captures a delta on the collaboration thread and merges it with
+ * durable bytes on a worker; compaction starts directly from durable bytes.
  *
  * Compaction has no such problem. It is bytes in, bytes out: a persisted state
  * goes in, a rebuilt state and a backup blob come out, and nothing in between
- * needs to be shared with the main thread. That makes it the one place in this
- * service where a worker actually buys something.
+ * needs to be shared with the main thread.
  *
  * WHY IT IS NOT OPTIONAL
  *
