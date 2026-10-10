@@ -22,8 +22,12 @@ import { getDocSheetHandler } from '../src/api/routes/docSheet.js'
 import { requireDocRole } from '../src/api/guard.js'
 import { readLiveSheet } from '../src/collab/liveSheetWrite.js'
 import { encodeBaseVersion } from '../src/collab/docBodyEdit.js'
-import { encodeSheetCursor } from '../src/api/services/sheetPagination.js'
+import { encodeSheetCursor, sheetVersionFingerprint } from '../src/api/services/sheetPagination.js'
 import { config } from '../src/config/env.js'
+
+function pageCursor(baseVersion: string, key: string): string {
+  return encodeSheetCursor({ t: 2, v: sheetVersionFingerprint(baseVersion), d: 'd_1', s: null, k: key })
+}
 
 // ── mock req/res ────────────────────────────────────────────────────────────
 interface MockRes {
@@ -452,7 +456,7 @@ describe('paginated sheet read', () => {
   it('a large sheet is paginated instead of 413 (the read wall is lifted)', async () => {
     // Same oversized grid that the whole-sheet read rejects with 413 — under a
     // small cap, paginated mode serves it a page at a time with a 200.
-    config.sheetRead.maxCellBytes = 400
+    config.sheetRead.maxCellBytes = 500
     const cells: Record<string, SheetCell> = {}
     for (let r = 0; r < 40; r++) cells[`default!${r}:0`] = { v: `row-${r}-value` }
     vi.mocked(readLiveSheet).mockResolvedValue(liveSheet(cells))
@@ -516,7 +520,7 @@ describe('paginated sheet read', () => {
   it('first page counts sheetDims against the byte cap so cells+dims stay within it (P1-b)', async () => {
     // Small cap; a chunky dims map eats most of it. Before the fix the cells
     // budget ignored dims, so the first page (cells + dims) could exceed the cap.
-    config.sheetRead.maxCellBytes = 500 + Buffer.byteLength(',"sheetConditionalFormats":{}')
+    config.sheetRead.maxCellBytes = 600 + Buffer.byteLength(',"sheetConditionalFormats":{}')
     const dims: Record<string, number> = {}
     for (let c = 0; c < 20; c++) dims[`c${c}`] = 120 + c
     vi.mocked(readLiveSheet).mockResolvedValue(liveSheet(tenRowSheet(), dims))
@@ -585,7 +589,7 @@ describe('paginated sheet read', () => {
       sheetCells: { [firstKey]: cells[firstKey] },
       baseVersion,
       hasMore: true,
-      nextCursor: encodeSheetCursor({ v: baseVersion, k: firstKey }),
+      nextCursor: pageCursor(baseVersion, firstKey),
       sheetDims: {},
       sheetHyperLinks: {},
       sheetMerges: {},
@@ -602,7 +606,7 @@ describe('paginated sheet read', () => {
         [firstKey]: cells[firstKey],
         'default!1:0': cells['default!1:0'],
       },
-      nextCursor: encodeSheetCursor({ v: baseVersion, k: 'default!1:0' }),
+      nextCursor: pageCursor(baseVersion, 'default!1:0'),
     }))).toBeGreaterThan(config.sheetRead.maxCellBytes)
     vi.mocked(readLiveSheet).mockResolvedValue(view)
 
@@ -618,7 +622,7 @@ describe('paginated sheet read', () => {
     const cells = {
       'default!0:0': { v: 'a'.repeat(100) },
       'default!1:0': { v: 'b'.repeat(100) },
-      'default!2:0': { v: 'c'.repeat(100) },
+      'default!2:0': { v: 'c'.repeat(200) },
     }
     const view = liveSheet(cells)
     const baseVersion = encodeBaseVersion(view.baseSV)
@@ -629,7 +633,7 @@ describe('paginated sheet read', () => {
       sheetCells: { [secondKey]: cells[secondKey] },
       baseVersion,
       hasMore: true,
-      nextCursor: encodeSheetCursor({ v: baseVersion, k: secondKey }),
+      nextCursor: pageCursor(baseVersion, secondKey),
     }
     config.sheetRead.maxCellBytes = Buffer.byteLength(JSON.stringify(oneCellPage))
     expect(Buffer.byteLength(JSON.stringify({
@@ -737,7 +741,7 @@ describe('paginated sheet read', () => {
   })
 
   it('shrinks a checkbox first page before asking the caller to delete valid metadata', async () => {
-    config.sheetRead.maxCellBytes = 500 + Buffer.byteLength(',"sheetConditionalFormats":{}')
+    config.sheetRead.maxCellBytes = 600 + Buffer.byteLength(',"sheetConditionalFormats":{}')
     const doc = new Y.Doc()
     for (let row = 0; row < 20; row++) {
       doc.getMap<unknown>(SHEET_YMAP_FIELD).set(`default!${row}:0`, { v: `row-${row}` })
@@ -916,7 +920,7 @@ describe('paginated sheet read', () => {
       ...repairedTerminalPage,
       sheetCells: { [firstKey]: cells[firstKey] },
       hasMore: true,
-      nextCursor: encodeSheetCursor({ v: baseVersion, k: firstKey }),
+      nextCursor: pageCursor(baseVersion, firstKey),
     }
     expect(Buffer.byteLength(JSON.stringify(staleOneCellProbe))).toBeGreaterThan(
       config.sheetRead.maxCellBytes,
@@ -960,7 +964,7 @@ describe('paginated sheet read', () => {
       sheetCells: { [firstKey]: cells[firstKey] },
       baseVersion,
       hasMore: true,
-      nextCursor: encodeSheetCursor({ v: baseVersion, k: firstKey }),
+      nextCursor: pageCursor(baseVersion, firstKey),
       sheetDims: {},
       sheetHyperLinks: {},
       sheetMerges: {},
@@ -977,7 +981,7 @@ describe('paginated sheet read', () => {
         [firstKey]: cells[firstKey],
         'default!1:0': cells['default!1:0'],
       },
-      nextCursor: encodeSheetCursor({ v: baseVersion, k: 'default!1:0' }),
+      nextCursor: pageCursor(baseVersion, 'default!1:0'),
     }))).toBeGreaterThan(config.sheetRead.maxCellBytes)
     expect(Buffer.byteLength(JSON.stringify({
       ...oneCellPageWithoutValidations,
@@ -1004,7 +1008,7 @@ describe('paginated sheet read', () => {
     // their bytes — it gets the whole cap for cells. Use a sheet large enough that
     // the byte budget (not the cell supply) bounds BOTH pages, so the comparison
     // reflects the budget difference rather than the sheet running out.
-    config.sheetRead.maxCellBytes = 500 + Buffer.byteLength(',"sheetConditionalFormats":{}')
+    config.sheetRead.maxCellBytes = 600 + Buffer.byteLength(',"sheetConditionalFormats":{}')
     const cells: Record<string, SheetCell> = {}
     for (let r = 0; r < 40; r++) cells[`default!${r}:0`] = { v: `row-${r}` }
     const dims: Record<string, number> = {}
