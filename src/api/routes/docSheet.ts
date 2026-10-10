@@ -34,16 +34,6 @@ import { editDocSheet } from '../services/editDocSheet.js'
 import { replaceDocSheet, type SheetFindBy } from '../services/replaceDocSheet.js'
 import { encodeBaseVersion, parseBaseVersion } from '../../collab/docBodyEdit.js'
 import {
-  decodeSheetSnapshot,
-  decodeSheetDimsSnapshot,
-  decodeSheetHyperLinksSnapshot,
-  decodeSheetMergesSnapshot,
-  decodeSheetListSnapshot,
-  decodeSheetFreezeSnapshot,
-  decodeSheetFiltersSnapshot,
-  decodeSheetDataValidationsSnapshot,
-} from '../../collab/versionRestore.js'
-import {
   SheetDataValidationInspectionBudgetError,
   SHEET_MAX_COLUMNS,
   SHEET_MAX_ROWS,
@@ -61,13 +51,14 @@ import {
 } from '../../agent/sheetConversion.js'
 import type { SheetStructuralEdit } from '../../agent/sheetStructuralEdit.js'
 import {
-  decodeSheetCursor,
   encodeSheetCursor,
   paginateSheetCells,
   InvalidSheetCursorError,
+  type CompactSheetCursor,
+  type SheetCursor,
 } from '../services/sheetPagination.js'
+import { SheetReadSnapshot, SheetReadError, parseSheetSelection, parseSheetReadCursor } from '../services/sheetRead.js'
 import { config } from '../../config/env.js'
-import { decodeConditionalFormats } from '../../agent/sheetConditionalFormatting.js'
 import { cleanDocSheet } from '../services/cleanDocSheet.js'
 
 export const docSheetRouter: ExpressRouter = Router()
@@ -145,6 +136,29 @@ function requireSheetDocType(res: Response, docType: string): boolean {
 
 // ── GET /:docId/sheet — read the live sheet (reader) ──────────────────────────
 docSheetRouter.get('/:docId/sheet', getDocSheetHandler)
+docSheetRouter.get('/:docId/sheets', listDocSheetsHandler)
+
+export async function listDocSheetsHandler(req: Request, res: Response): Promise<void> {
+  const guard = await requireDocRole(req, res, req.params.docId!, 'reader')
+  if (!guard || !requireSheetDocType(res, guard.meta.doc_type)) return
+  let snapshot: SheetReadSnapshot | undefined
+  try {
+    const { state } = await readLiveSheet(guard.meta.document_name)
+    snapshot = new SheetReadSnapshot(state)
+    const body = { docId: guard.meta.doc_id, items: snapshot.directory() }
+    if (Buffer.byteLength(JSON.stringify(body)) > config.sheetRead.maxCellBytes) {
+      res.status(413).json({ error: 'sheet_too_large', hint: 'worksheet directory exceeds the read limit' })
+      return
+    }
+    res.status(200).json(body)
+  } catch (error) {
+    res.status(error instanceof SheetSnapshotInvalidError ? 409 : 500).json({
+      error: error instanceof SheetSnapshotInvalidError ? 'sheet_snapshot_invalid' : 'internal_error',
+    })
+  } finally {
+    snapshot?.destroy()
+  }
+}
 
 /** A single query value, taking the first when Express parsed a repeated param. */
 function firstQueryValue(v: unknown): string | undefined {
@@ -181,22 +195,22 @@ export async function getDocSheetHandler(req: Request, res: Response): Promise<v
   const paginated = limitRaw !== undefined || cursorRaw !== undefined
 
   let readBaseVersion: string | undefined
+  let snapshot: SheetReadSnapshot | undefined
   try {
+    const selection = parseSheetSelection(req.query.sheetId, req.query.sheetName)
+    const cursor = parseSheetReadCursor(req.query.cursor)
     // Read the live authoritative state + its state vector, then decode with the
     // SAME validated primitives the version-restore preview uses (decodeSheet*),
     // so the read path and the preview path never drift on the {v,f,s} contract.
     const { state, baseSV } = await readLiveSheet(guard.meta.document_name)
     const baseVersion = encodeBaseVersion(baseSV)
     readBaseVersion = baseVersion
-    const sheetCells = decodeSheetSnapshot(state) as Record<string, SheetCell>
-    const sheetDims = decodeSheetDimsSnapshot(state)
-    const sheetHyperLinks = decodeSheetHyperLinksSnapshot(state) as Record<string, StoredHyperLink>
-    const sheetMerges = decodeSheetMergesSnapshot(state) as Record<string, boolean>
-    const sheetList = decodeSheetListSnapshot(state) as Record<string, StoredSheetMeta>
-    const sheetFreeze = decodeSheetFreezeSnapshot(state)
-    const sheetFilters = decodeSheetFiltersSnapshot(state)
-    const sheetDataValidations = decodeSheetDataValidationsSnapshot(state)
-    const sheetConditionalFormats = decodeConditionalFormats(state)
+    snapshot = new SheetReadSnapshot(state)
+    const { sheetId, cursorTemplate } = snapshot.resolveSelection(selection, cursor, guard.meta.doc_id, baseVersion)
+    const {
+      sheetCells, sheetDims, sheetHyperLinks, sheetMerges, sheetList,
+      sheetFreeze, sheetFilters, sheetDataValidations, sheetConditionalFormats,
+    } = snapshot.read(sheetId)
 
     if (paginated) {
       await respondPaginatedSheet(res, {
@@ -212,7 +226,8 @@ export async function getDocSheetHandler(req: Request, res: Response): Promise<v
         sheetConditionalFormats,
         baseVersion,
         limitRaw,
-        cursorRaw,
+        cursor,
+        cursorTemplate,
       })
       return
     }
@@ -253,6 +268,7 @@ export async function getDocSheetHandler(req: Request, res: Response): Promise<v
 
     res.status(200).json({
       docId: guard.meta.doc_id,
+      ...(sheetId !== null ? { sheetId } : {}),
       sheetCells,
       sheetDims,
       sheetHyperLinks,
@@ -268,6 +284,14 @@ export async function getDocSheetHandler(req: Request, res: Response): Promise<v
       baseVersion,
     })
   } catch (err) {
+    if (err instanceof SheetReadError) {
+      res.status(err.status).json({ error: err.code, ...(err.candidates ? { candidates: err.candidates } : {}) })
+      return
+    }
+    if (err instanceof InvalidSheetCursorError) {
+      res.status(400).json({ error: 'invalid_cursor' })
+      return
+    }
     if (err instanceof SheetDataValidationInspectionBudgetError) {
       // Do not return a partial winner set: the aggregate inspection stopped at the budget wall.
       // The state vector and one exact raw-map key are enough for an authorized writer to perform
@@ -295,6 +319,8 @@ export async function getDocSheetHandler(req: Request, res: Response): Promise<v
       return
     }
     res.status(500).json({ error: 'internal_error' })
+  } finally {
+    snapshot?.destroy()
   }
 }
 
@@ -331,7 +357,7 @@ function firstPageCellBudget(
 function fitPaginatedSheetBody(
   body: Record<string, unknown>,
   cells: Record<string, SheetCell>,
-  baseVersion: string,
+  cursorTemplate: Omit<CompactSheetCursor, 'k'>,
 ): Record<string, unknown> | null {
   if (Buffer.byteLength(JSON.stringify(body)) <= config.sheetRead.maxCellBytes) return body
 
@@ -343,7 +369,6 @@ function fitPaginatedSheetBody(
     hasMore: true,
     nextCursor: '',
   }))
-  const emptyCursorJsonBytes = Buffer.byteLength(JSON.stringify({ v: baseVersion, k: '' }))
   const pageKeys = Object.keys(cells)
   let cellBytes = 0
   let fittingCount = 0
@@ -351,8 +376,7 @@ function fitPaginatedSheetBody(
     const keyJson = JSON.stringify(key)
     const cellJson = JSON.stringify(cells[key])
     cellBytes += (index === 0 ? 0 : 1) + Buffer.byteLength(keyJson) + 1 + Buffer.byteLength(cellJson)
-    const cursorJsonBytes = emptyCursorJsonBytes - 2 + Buffer.byteLength(keyJson)
-    const cursorBytes = Math.floor((cursorJsonBytes * 4 + 2) / 3)
+    const cursorBytes = encodeSheetCursor({ ...cursorTemplate, k: key }).length
     if (framedBytes + cellBytes + cursorBytes <= config.sheetRead.maxCellBytes) fittingCount = index + 1
   }
   if (fittingCount === 0) return null
@@ -363,7 +387,7 @@ function fitPaginatedSheetBody(
     ...body,
     sheetCells: Object.fromEntries(fittingKeys.map((key) => [key, cells[key]!])),
     hasMore: true,
-    nextCursor: encodeSheetCursor({ v: baseVersion, k: lastKey }),
+    nextCursor: encodeSheetCursor({ ...cursorTemplate, k: lastKey }),
   }
 }
 
@@ -373,7 +397,7 @@ function fitPaginatedSheetBody(
  * both the caller's ?limit and the per-page byte cap (maxCellBytes) so no page
  * exceeds the whole-sheet cap.
  *
- * Snapshot consistency: the cursor embeds the baseVersion the walk opened on.
+ * Snapshot consistency: new cursors fingerprint the baseVersion the walk opened on.
  * A cursor whose token no longer matches the live baseVersion means a write
  * landed mid-walk — reject with 409 sheet_changed so the caller restarts from
  * page one against a single consistent snapshot (the read-side mirror of the
@@ -396,7 +420,8 @@ async function respondPaginatedSheet(
     sheetConditionalFormats: Record<string, Record<string, unknown>>
     baseVersion: string
     limitRaw: string | undefined
-    cursorRaw: string | undefined
+    cursor: SheetCursor | null
+    cursorTemplate: Omit<CompactSheetCursor, 'k'>
   },
 ): Promise<void> {
   const parsedLimit = parsePageLimit(args.limitRaw)
@@ -405,28 +430,8 @@ async function respondPaginatedSheet(
     return
   }
 
-  let afterKey: string | null = null
-  let isFirstPage = true
-  if (args.cursorRaw !== undefined && args.cursorRaw !== '') {
-    let cursor
-    try {
-      cursor = decodeSheetCursor(args.cursorRaw)
-    } catch (err) {
-      if (err instanceof InvalidSheetCursorError) {
-        res.status(400).json({ error: 'invalid_cursor' })
-        return
-      }
-      throw err
-    }
-    // Drift guard: the snapshot the walk started on must still be live, or the
-    // pages would stitch together inconsistent snapshots.
-    if (cursor.v !== args.baseVersion) {
-      res.status(409).json({ error: 'sheet_changed' })
-      return
-    }
-    afterKey = cursor.k
-    isFirstPage = false
-  }
+  const afterKey = args.cursor?.k ?? null
+  const isFirstPage = args.cursor === null
 
   const page = paginateSheetCells(
     args.sheetCells,
@@ -445,10 +450,11 @@ async function respondPaginatedSheet(
   )
   const nextCursor =
     page.hasMore && page.lastKey !== null
-      ? encodeSheetCursor({ v: args.baseVersion, k: page.lastKey })
+      ? encodeSheetCursor({ ...args.cursorTemplate, k: page.lastKey })
       : null
   const body: Record<string, unknown> = {
     docId: args.docId,
+    ...(args.cursorTemplate.s !== null ? { sheetId: args.cursorTemplate.s } : {}),
     sheetCells: page.cells,
     baseVersion: args.baseVersion,
     hasMore: page.hasMore,
@@ -482,7 +488,7 @@ async function respondPaginatedSheet(
     metadataWithoutValidationBytes = Buffer.byteLength(JSON.stringify(metadataWithoutValidations))
   }
 
-  const fittedBody = fitPaginatedSheetBody(body, page.cells, args.baseVersion)
+  const fittedBody = fitPaginatedSheetBody(body, page.cells, args.cursorTemplate)
   if (fittedBody !== null) {
     res.status(200).json(fittedBody)
     return
@@ -506,7 +512,7 @@ async function respondPaginatedSheet(
       ),
     )
     const repairedNextCursor = repairedPage.hasMore && repairedPage.lastKey !== null
-      ? encodeSheetCursor({ v: args.baseVersion, k: repairedPage.lastKey })
+      ? encodeSheetCursor({ ...args.cursorTemplate, k: repairedPage.lastKey })
       : null
     const pageWithoutValidations = {
       ...body,
@@ -515,7 +521,7 @@ async function respondPaginatedSheet(
       nextCursor: repairedNextCursor,
       sheetDataValidations: {},
     }
-    if (fitPaginatedSheetBody(pageWithoutValidations, repairedPage.cells, args.baseVersion) !== null) {
+    if (fitPaginatedSheetBody(pageWithoutValidations, repairedPage.cells, args.cursorTemplate) !== null) {
       repairDataValidationKey = validationKeys.sort().at(-1)!
     }
   }

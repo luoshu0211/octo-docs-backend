@@ -220,6 +220,9 @@ Set `TYPST_EXPORT_BINARY` if the binary is not on `PATH`; tune
 
 ## Sheet size dimensions (read payload vs storage)
 
+See [Worksheet discovery and scoped reads](docs/SHEET_READ.md) for the directory
+endpoint, worksheet selectors, compact cursors, compatibility and validation.
+
 A spreadsheet (`doc_type = 'sheet'`) is bounded by **two independent byte
 dimensions**. They measure different serializations of the same sheet, use
 different caps, and are NOT comparable — mixing them up is the source of the
