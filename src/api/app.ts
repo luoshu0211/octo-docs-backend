@@ -87,6 +87,7 @@ import { invitesRouter, acceptInviteRouter, botAcceptInviteRouter } from './rout
 import { attachmentsRouter } from './routes/attachments.js'
 import { linkCardRouter } from './routes/linkCard.js'
 import { htmlCommentsRouter } from './routes/htmlComments.js'
+import { commentTasksRouter } from './routes/commentTasks.js'
 import { commentsRouter } from './routes/comments.js'
 import { versionsRouter } from './routes/versions.js'
 import { docContentRouter } from './routes/docContent.js'
@@ -305,6 +306,7 @@ export function createApp(
   // (严格两段),而 /html/:slug/comments 是三段,永不匹配 —— 实测把两者顺序反过来,
   // /html/x/comments 仍命中本路由。此处保持相邻只是可读性。
   api.use(htmlCommentsRouter) // /html/:slug/comments (转发到 octo-docs-html + Bot 任务上报)
+  api.use(commentTasksRouter)
   api.use(commentsRouter) // /:docId/comments , /:docId/comments/:id
   api.use(versionsRouter) // /:docId/versions ... (snapshot + restore, §4 #4)
   api.use(docContentRouter) // /:docId/content (bot incremental body edit + live read)
@@ -362,6 +364,7 @@ export function createApp(
   botApi.use(invitesRouter)
   botApi.use(attachmentsRouter)
   botApi.use(linkCardRouter)
+  botApi.use(commentTasksRouter)
   botApi.use(commentsRouter)
   botApi.use(versionsRouter)
   botApi.use(docContentRouter)

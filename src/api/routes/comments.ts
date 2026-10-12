@@ -1,3 +1,4 @@
+import { trackCommentTask } from '../services/commentTaskTracking.js'
 /**
  * Inline-comment endpoints (feature #3 — doc_comment).
  *   GET    /api/v1/docs/{docId}/comments        (reader)  list thread roots + replies
@@ -147,7 +148,7 @@ function parseOccurrence(raw: unknown): number | undefined | typeof INVALID_DISA
  */
 function fireBotMentionReport(params: Parameters<typeof reportBotMentions>[0]): void {
   void Promise.resolve()
-    .then(() => reportBotMentions(params))
+    .then(() => reportBotMentions(params, { onTask: trackCommentTask }))
     .catch(() => {
       // Swallowed by contract: the comment is committed and the response is sent.
       // reportBotMentions already logs its own failures with safe metadata.

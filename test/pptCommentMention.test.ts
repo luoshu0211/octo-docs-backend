@@ -8,6 +8,7 @@ vi.mock('../src/auth/octoIdentity.js', () => ({ getOctoIdentity: () => ({ ownedB
 vi.mock('../src/api/ppt/pptDocGuard.js', () => ({ loadPptDocForRead: state.guard }))
 vi.mock('../src/agent/botIdentity.js', () => ({ resolveBotDocAccess: state.access, BOT_DOC_ACCESS_MIN_ROLE: 'writer' }))
 vi.mock('../src/ppt/comments.js', () => ({ getPptComment: state.comment }))
+vi.mock('../src/api/services/commentTaskTracking.js', () => ({ trackCommentTask: vi.fn(async () => {}) }))
 import { reportPptCommentMention } from '../src/api/services/pptCommentMention.js'
 import { buildIdempotencyKey } from '../src/api/services/botMention.js'
 const principal = { docId: 'deck', uid: 'human', spaceId: 'viewer-space', authorizedEpoch: 7 }
