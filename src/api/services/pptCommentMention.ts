@@ -1,3 +1,4 @@
+import { trackCommentTask } from './commentTaskTracking.js'
 import { getOctoIdentity } from '../../auth/octoIdentity.js'
 import { resolveBotDocAccess } from '../../agent/botIdentity.js'
 import { roleAtLeast } from '../../permission/role.js'
@@ -30,7 +31,7 @@ export async function reportPptCommentMention(principal: PptPrincipal, id: numbe
         if (comment.deleted || root.deleted || root.resolved || comment.body !== input.body) return false
         return (await resolveBotDocAccess(principal.docId, botUid, principal.spaceId)).allowed
       },
-    })
+    }, { onTask: trackCommentTask })
   } catch {
     // Metadata only: neither comment text nor identity/service tokens may leak.
     // eslint-disable-next-line no-console

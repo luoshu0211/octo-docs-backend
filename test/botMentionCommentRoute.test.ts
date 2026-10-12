@@ -197,6 +197,7 @@ describe('bot-mention reporting never breaks comment creation', () => {
         body: 'hi @[user:bot-1:A]',
         isBotCaller: false,
       }),
+      { onTask: expect.any(Function) },
     )
   })
 
@@ -238,6 +239,7 @@ describe('bot-mention reporting never breaks comment creation', () => {
     expect(res.statusCode).toBe(201)
     expect(reportBotMentions).toHaveBeenCalledWith(
       expect.objectContaining({ isBotCaller: true, ownedBots: [] }),
+      { onTask: expect.any(Function) },
     )
   })
 
