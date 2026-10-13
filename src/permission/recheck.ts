@@ -9,20 +9,23 @@ import type { ResolvedRole } from './role.js'
 
 const RECHECK_TTL_MS = 3_000
 const sf = new Singleflight<ResolvedRole>()
-const cache = new TtlCache<ResolvedRole>(RECHECK_TTL_MS)
+const cache = new TtlCache<{ role: ResolvedRole; permissionEpoch: number | undefined }>(RECHECK_TTL_MS)
 
 export async function recheckCurrentRoleCached(
   documentName: string,
   uid: string,
   principalSpaceId: string,
   spaceMember = false,
+  permissionEpoch?: number,
 ): Promise<ResolvedRole> {
   const key = `${documentName}\x00${uid}\x00${principalSpaceId}\x00${spaceMember ? 1 : 0}`
   const cached = cache.get(key)
-  if (cached !== undefined) return cached
-  return sf.do(key, async () => {
+  // Invalidation must bypass both a cached role AND an in-flight read for an
+  // earlier epoch. Keep only one cache entry per principal, not one per epoch.
+  if (cached !== undefined && cached.permissionEpoch === permissionEpoch) return cached.role
+  return sf.do(`${key}\x00${permissionEpoch ?? 'unversioned'}`, async () => {
     const role = await recheckDb(documentName, uid, principalSpaceId, spaceMember)
-    cache.set(key, role)
+    cache.set(key, { role, permissionEpoch })
     return role
   })
 }

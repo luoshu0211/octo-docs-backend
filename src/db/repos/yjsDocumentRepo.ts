@@ -22,6 +22,7 @@ export type YjsEncoding = 1 | 2
 
 /** A persisted state blob together with the encoder that produced it. */
 export interface StoredYjsState {
+  generation?: string | null
   state: Uint8Array
   encoding: YjsEncoding
 }

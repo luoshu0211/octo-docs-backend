@@ -1,3 +1,6 @@
+import { stateGenerationRepo } from '../db/repos/stateGenerationRepo.js'
+import { parseGenerationToken, stateGenerationOf } from './stateGeneration.js'
+import { durableReceipt } from './durableReceipt.js'
 /**
  * Hocuspocus Server instance (§2.1 / §2.2 / §4.1 / §5.1).
  *
@@ -50,6 +53,30 @@ const repairDisposers = new Map<string, () => void>()
 export function setEpochWatermark(documentName: string, epoch: number): void {
   const cur = epochWatermark.get(documentName) ?? 0
   if (epoch > cur) epochWatermark.set(documentName, epoch)
+}
+
+/** Never authorize a message using a role read invalidated while it was pending. */
+async function recheckWritePermission(
+  documentName: string,
+  ctx: AuthContext,
+  connection: { readOnly: boolean },
+): Promise<void> {
+  try {
+    for (;;) {
+      const watermark = epochWatermark.get(documentName) ?? ctx.permission_epoch
+      if (ctx.permission_epoch >= watermark) return // current: no role lookup
+      const role = await recheckCurrentRoleCached(
+        documentName, ctx.user.id, ctx.principal_space_id, ctx.space_member, watermark,
+      )
+      if ((epochWatermark.get(documentName) ?? watermark) > watermark) continue
+      if (role === 'none' || !roleAtLeast(role, 'writer')) throw new Error('Forbidden')
+      ctx.permission_epoch = watermark
+      return
+    }
+  } catch (error) {
+    connection.readOnly = true
+    throw error
+  }
 }
 
 const COLOR_RE = /^#[0-9a-fA-F]{6}$/
@@ -307,18 +334,56 @@ export function createServer(redis = createCollabRedis(config.redis)) {
 
     // §4.1 onAuthenticate
     async onAuthenticate(data) {
+      const envelope = parseGenerationToken(data.token)
       const ctx = await authenticate({
-        token: data.token,
+        token: envelope.token,
         documentName: data.documentName,
         connectionConfig: data.connectionConfig,
       })
+      ctx.stateGeneration = await stateGenerationRepo.ensureSheet(data.documentName)
+      ctx.cacheGeneration = envelope.generation
+      if (ctx.stateGeneration && ctx.cacheGeneration !== ctx.stateGeneration) data.connectionConfig.readOnly = true
       return ctx
+    },
+
+    async beforeSync(data) {
+      const ctx = data.context as AuthContext | undefined
+      if (!ctx) return
+      const generation = stateGenerationOf(data.document)
+      if (!generation) return
+      try {
+        for (;;) {
+          await recheckWritePermission(data.documentName, ctx, data.connection)
+          const current = ctx.cacheGeneration === generation
+            ? await stateGenerationRepo.current(data.documentName)
+            : null
+          // SQL is the last IO before apply. An invalidation during it restarts
+          // authorization AND the generation read, so neither check can go stale
+          // while waiting for the other. Permission cache/singleflight is epoch-bound.
+          if (ctx.permission_epoch < (epochWatermark.get(data.documentName) ?? ctx.permission_epoch)) continue
+          if (current !== generation || stateGenerationOf(data.document) !== generation) {
+            data.connection.readOnly = true
+            data.connection.sendStateless(JSON.stringify({ type: 'doc.generation-stale', generation }))
+          }
+          return
+        }
+      } catch (error) {
+        data.connection.readOnly = true
+        throw error
+      }
     },
 
     // register the connection in the cross-node registry (§4.5 step 2)
     async connected(data) {
       const ctx = data.context as AuthContext
       setEpochWatermark(data.documentName, ctx.permission_epoch)
+      const generation = stateGenerationOf(data.connection.document)
+      if (generation && ctx.cacheGeneration !== generation) {
+        data.connection.readOnly = true
+        data.connection.sendStateless(JSON.stringify({ type: 'doc.generation-stale', generation }))
+      }
+      const receipt = durableReceipt(data.connection.document)
+      if (receipt) data.connection.sendStateless(receipt)
 
       // A document already over the cap has to tell THIS connection so, on its
       // way in — see noticeOversizeOnJoin for why the broadcast alone is not
@@ -389,26 +454,10 @@ export function createServer(redis = createCollabRedis(config.redis)) {
       // interchangeable: read-only still serves document CONTENT, which is
       // exactly what a revoked principal must no longer receive. Enforcement
       // order is authorization first, capacity second.
-      const capped = applyOversizeDecision(data.documentName, data.connection)
-
-      const watermark = epochWatermark.get(data.documentName) ?? ctx.permission_epoch
-      if (ctx.permission_epoch >= watermark) return // not stale => allow (no IO)
-
-      // Stale: recheck this uid's CURRENT role (singleflight + short-TTL cache).
-      // #64: pass the token-carried space_member claim so a narrowed
-      // anyone_in_space scope is honored on the already-connected socket.
-      const role = await recheckCurrentRoleCached(data.documentName, ctx.user.id, ctx.principal_space_id, ctx.space_member)
-      if (role === 'none' || !roleAtLeast(role, 'writer')) {
-        // role actually dropped / revoked => reject this write & flip the conn.
-        data.connection.readOnly = true
-        throw new Error('Forbidden')
-      }
-      // Authorization held. NOW the capacity guard applies: a capped document
-      // takes no further writes, but the connection stays open and readable.
-      if (capped) return
-      // Role not lowered (epoch advanced only due to someone else's change):
-      // refresh the connection's epoch view in place and allow (P1-B).
-      ctx.permission_epoch = watermark
+      applyOversizeDecision(data.documentName, data.connection)
+      // Preserve the capacity read-only state; authorization may refresh only
+      // the epoch and never re-enable writes on a capped/stale-generation socket.
+      await recheckWritePermission(data.documentName, ctx, data.connection)
     },
 
     // §8.3.1 awareness identity + field validation (MUST-level).

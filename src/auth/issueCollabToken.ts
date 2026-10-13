@@ -1,3 +1,4 @@
+import { stateGenerationRepo } from '../db/repos/stateGenerationRepo.js'
 /**
  * collab-token issuance service (§4.4).
  *
@@ -155,6 +156,7 @@ export async function issueCollabToken(
     current_space_verified: true,
     current_space_id: currentSpace,
   })
+  if (meta.doc_type === 'sheet') result.stateGeneration = (await stateGenerationRepo.ensureSheet(documentName)) ?? undefined
   await attachCompactedAt(result, documentName)
   return { ok: true, result }
 }
@@ -302,6 +304,7 @@ export async function issueCollabTokenByDocId(
     currentSpaceVerified: true,
     currentSpaceId: currentSpace,
   })
+  if (meta.doc_type === 'sheet') result.stateGeneration = (await stateGenerationRepo.ensureSheet(meta.document_name)) ?? undefined
   await attachCompactedAt(result, meta.document_name)
   return { ok: true, result }
 }

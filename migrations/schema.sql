@@ -544,3 +544,10 @@ CREATE TABLE IF NOT EXISTS doc_comment_task_event (
   event JSON NOT NULL,
   PRIMARY KEY (task_key, attempt_id, seq)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
+-- Persistent identity of rebuilt sheet CRDT state (independent of permission_epoch).
+CREATE TABLE doc_state_generation (
+  document_name VARCHAR(256) NOT NULL,
+  generation CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  PRIMARY KEY (document_name)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

@@ -22,6 +22,9 @@
   "include": [
     "src",
     "test/redis*.test.ts",
+    "test/stateGeneration.test.ts",
+    "test/beforeSyncAuthorization.test.ts",
+    "test/benchmarkStorageDocument.test.ts",
     "test/botDocDelete.test.ts",
     "test/botMentionAuthorGate.test.ts",
     "test/persistence.test.ts",
