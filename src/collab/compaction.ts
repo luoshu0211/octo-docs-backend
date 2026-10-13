@@ -40,6 +40,7 @@
  * Nothing is deleted. The pre-compaction state is written to `doc_version`
  * first, so the operation is reversible through the existing restore path.
  */
+import { stateGenerationRepo } from '../db/repos/stateGenerationRepo.js'
 import { config } from '../config/env.js'
 import { transaction } from '../db/pool.js'
 import { runCompactionOffThread } from './compactionRunner.js'
@@ -270,6 +271,7 @@ export async function compactDocument(documentName: string): Promise<CompactionR
       // The label must come from the same decision that produced the bytes — a
       // hardcoded 2 here would mislabel a v1 rebuild, and a mislabelled row
       // decodes to an empty document rather than failing loudly.
+      await stateGenerationRepo.rotateTx(tx, documentName)
       await yjsDocumentRepo.upsertStateTx(tx, documentName, Buffer.from(after), writeEncoding)
 
       return {

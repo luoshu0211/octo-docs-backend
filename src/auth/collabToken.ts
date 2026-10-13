@@ -101,6 +101,7 @@ export interface CollabClaimsV2 {
 }
 
 export interface CollabTokenResult {
+  stateGeneration?: string
   token: string
   expiresAt: string // ISO8601
   role: Role

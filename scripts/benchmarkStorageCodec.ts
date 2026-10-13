@@ -12,6 +12,7 @@ import { applyStoredState } from '../src/collab/collabDatabase.js'
 import { yjsDocumentRepo } from '../src/db/repos/yjsDocumentRepo.js'
 import { applySheetCellsToYMap, type SheetCell } from '../src/agent/sheetConversion.js'
 import { encodeStorageState, StorageBudgetError } from '../src/collab/storageCodec.js'
+import { loadBenchmarkSheet } from './benchmarkStorageDocument.js'
 
 const mode = process.argv[2] ?? 'write'
 const scenario = process.argv[3] ?? 'sequence'
@@ -83,11 +84,10 @@ async function run(): Promise<void> {
       const compressed = encodeStorageState(Y.encodeStateAsUpdateV2(doc), 2)
       assert(state.length > compressed.state.length)
       Object.assign(config, { maxDocStorageBytes: compressed.state.length })
-      const restored = new Y.Doc()
-      applyStoredState(restored, (await yjsDocumentRepo.fetchState(name))!)
+      await registerDocument(name)
+      const restored = await loadBenchmarkSheet(name)
       assert.equal(restored.getText('text').toString(), doc.getText('text').toString())
       assert.equal((await rowInfo(name)).encoding, encoding)
-      await registerDocument(name)
       await persistence.store(name, restored, { user: { id: 'codec-test' } })
       assert.equal((await rowInfo(name)).encoding, 4)
       assert.equal((await rowInfo(name)).physical_bytes, compressed.state.length)
@@ -100,14 +100,11 @@ async function run(): Promise<void> {
   }
   if (mode === 'concurrency') {
     await registerDocument(documentName)
-    const base = new Y.Doc()
+    const base = await loadBenchmarkSheet(documentName)
     for (let index = 0; index < 10000; index++) base.getMap('sheet').set(keyAt(index), { v: index, t: 2 })
     await persistence.store(documentName, base, { user: { id: 'codec-test' } })
-    const left = new Y.Doc()
-    const right = new Y.Doc()
-    const state = Y.encodeStateAsUpdateV2(base)
-    Y.applyUpdateV2(left, state)
-    Y.applyUpdateV2(right, state)
+    const left = await loadBenchmarkSheet(documentName)
+    const right = await loadBenchmarkSheet(documentName)
     left.getMap('sheet').set(keyAt(0), { v: 'left', t: 1 })
     right.getMap('sheet').set(keyAt(1), { v: 'right', t: 1 })
     right.getMap('sheet').delete(keyAt(2))
@@ -153,7 +150,7 @@ async function run(): Promise<void> {
   }
   assert.equal(mode, 'write')
   await registerDocument(documentName)
-  const doc = new Y.Doc()
+  const doc = await loadBenchmarkSheet(documentName)
   doc.getMap('benchmark').set('seed', true)
   await persistence.store(documentName, doc, { user: { id: 'codec-test' } })
   const previous = await rowInfo()

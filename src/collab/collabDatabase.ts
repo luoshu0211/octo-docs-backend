@@ -19,6 +19,8 @@
  */
 import type { Extension, onLoadDocumentPayload, onStoreDocumentPayload } from '@hocuspocus/server'
 import * as Y from 'yjs'
+import { bindStateGeneration } from './stateGeneration.js'
+import { captureDurableSnapshot, recordDurableReceipt } from './durableReceipt.js'
 import type { StoredYjsState } from '../db/repos/yjsDocumentRepo.js'
 
 export interface CollabDatabaseConfiguration {
@@ -44,8 +46,10 @@ export class CollabDatabase implements Extension {
   async onLoadDocument(data: onLoadDocumentPayload): Promise<void> {
     const stored = await this.configuration.fetch(data.documentName)
     if (stored) {
+      bindStateGeneration(data.document, stored.generation ?? null)
       applyStoredState(data.document, stored)
       this.configuration.loaded?.(data.documentName, data.document)
+      recordDurableReceipt(data.document, captureDurableSnapshot(data.document))
     }
   }
 

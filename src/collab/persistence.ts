@@ -9,6 +9,9 @@
  * same transaction.
  */
 import * as Y from 'yjs'
+import { stateGenerationRepo } from '../db/repos/stateGenerationRepo.js'
+import { assertStateGeneration } from './stateGeneration.js'
+import { captureDurableSnapshot, recordDurableReceipt, durableReceipt } from './durableReceipt.js'
 import { transaction } from '../db/pool.js'
 import { yjsDocumentRepo, type StoredYjsState, type YjsEncoding } from '../db/repos/yjsDocumentRepo.js'
 import { config } from '../config/env.js'
@@ -125,7 +128,12 @@ export const persistence = {
    * The caller MUST decode with the matching decoder — see collabDatabase.ts.
    */
   async fetch(documentName: string): Promise<StoredYjsState | null> {
-    return yjsDocumentRepo.fetchState(documentName)
+    return transaction(async tx => {
+      const stored = await yjsDocumentRepo.selectForUpdateTx(tx, documentName)
+      const generation = await stateGenerationRepo.ensureSheetTx(tx, documentName)
+      if (!stored && !generation) return null
+      return { ...(stored ?? { state: Y.encodeStateAsUpdateV2(new Y.Doc()), encoding: 2 as const }), generation }
+    })
   },
 
   /**
@@ -147,6 +155,7 @@ export const persistence = {
    */
   async store(documentName: string, liveDoc: Y.Doc, context?: StoreContext): Promise<void> {
     const background = config.yjsBackgroundStore
+    let receipt = captureDurableSnapshot(liveDoc)
     let captured = captureStoreUpdate(documentName, liveDoc, background)
     const { state: incoming, encoding } = captured
 
@@ -175,6 +184,7 @@ export const persistence = {
       await transaction(async (tx) => {
         if (background) {
           const existing = await yjsDocumentRepo.selectRawForUpdateTx(tx, documentName)
+          assertStateGeneration(liveDoc, await stateGenerationRepo.readTx(tx, documentName))
           const prepare = () => storeWorkerPool.run({
             documentName, existing, update: captured.state, encoding: captured.encoding,
             baseVector: captured.baseVector, targetVector: captured.vector,
@@ -184,6 +194,7 @@ export const persistence = {
           if (result.kind === 'needs-full-state') {
             // The durable base was replaced/compacted. Re-capture a FULL update
             // and its matching vector while still holding the same row lock.
+            receipt = captureDurableSnapshot(liveDoc)
             captured = captureStoreUpdate(documentName, liveDoc, false)
             if (captured.state.length > config.maxDocBytes) {
               throw new StorageBudgetError('decoded', captured.state.length, config.maxDocBytes)
@@ -195,6 +206,7 @@ export const persistence = {
         } else {
           // 1. lock + take the latest row (read-modify-write 2nd-layer defense).
           const existing = await yjsDocumentRepo.selectForUpdateTx(tx, documentName)
+          assertStateGeneration(liveDoc, await stateGenerationRepo.readTx(tx, documentName))
 
           // 2. merge-on-write + diffUpdate bypass, in the encoding we are writing.
           const { finalState } = computeFinalState(existing, liveDoc, incoming, encoding, captured.vector)
@@ -228,6 +240,17 @@ export const persistence = {
 
     // Advance only AFTER COMMIT, never after queueing, preparing, or UPSERT.
     recordStoreCheckpoint(documentName, liveDoc, captured.vector)
+    recordDurableReceipt(liveDoc, receipt)
+    const notification = durableReceipt(liveDoc)
+    // A receipt is emitted only after COMMIT, and describes the captured state, never later edits.
+    if (notification && 'broadcastStateless' in liveDoc) {
+      try {
+        (liveDoc as Y.Doc & { broadcastStateless(payload: string): void }).broadcastStateless(notification)
+      } catch (error) {
+        // Delivery is best-effort. A failed socket must not turn COMMIT into a failed store.
+        console.error('[collab-generation] durable receipt delivery failed', error)
+      }
+    }
 
     // The document fits again (it may have been marked on an earlier attempt and
     // then shrunk — e.g. the owner deleted rows). Lift the write guard so the

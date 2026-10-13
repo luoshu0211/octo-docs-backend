@@ -6,9 +6,12 @@ import { persistence } from '../src/collab/persistence.js'
 import { captureStoreUpdate } from '../src/collab/storeCheckpoint.js'
 import { storeWorkerPool } from '../src/collab/storeWorkerPool.js'
 import { decodeStorageState, encodeStorageState } from '../src/collab/storageCodec.js'
+import { bindStateGeneration } from '../src/collab/stateGeneration.js'
+import { durableReceipt } from '../src/collab/durableReceipt.js'
 
 const db = vi.hoisted(() => ({
   row: null as null | { state: Buffer; encoding: number },
+  generation: null as string | null,
   failCommit: false, beforeSelect: undefined as (() => void) | undefined,
   mark: vi.fn(), resolve: vi.fn(), metadata: [] as unknown[][],
 }))
@@ -18,6 +21,7 @@ vi.mock('../src/db/pool.js', () => ({
     let next = db.row
     const tx = { query: async (sql: string, args: unknown[] = []) => {
       if (sql.startsWith('SELECT state')) { db.beforeSelect?.(); return db.row ? [db.row] : [] }
+      if (sql.startsWith('SELECT generation')) return db.generation ? [{ generation: db.generation }] : []
       if (sql.startsWith('INSERT INTO yjs_document')) next = { state: args[1] as Buffer, encoding: args[3] as number }
       if (sql.startsWith('UPDATE doc_meta')) db.metadata.push(args)
       return []
@@ -42,8 +46,57 @@ function read() {
 }
 beforeEach(() => {
   Object.assign(config, { yjsBackgroundStore: true, yjsStorageGzip: true, maxDocBytes: 1048576, maxDocStorageBytes: 1048576 })
-  db.row = null; db.failCommit = false; db.beforeSelect = undefined; db.metadata = []
+  db.row = null; db.generation = null; db.failCommit = false; db.beforeSelect = undefined; db.metadata = []
   db.mark.mockClear(); db.resolve.mockClear()
+})
+
+describe.each([false, true])('generation and commit receipts (background: %s)', background => {
+  beforeEach(() => { Object.assign(config, { yjsBackgroundStore: background, yjsWriteV2: true }); db.generation = 'generation-one' })
+  function sheet() { const d = doc(); bindStateGeneration(d, db.generation); return Object.assign(d, { broadcastStateless: vi.fn() }) }
+
+  it('rejects a stale loaded document before a full-state fallback can restore its old identities', async () => {
+    const d = sheet(); d.getMap('m').set('base', 1); await persistence.store('doc', d)
+    const row = db.row, ack = durableReceipt(d)
+    db.generation = 'generation-two'; d.getMap('m').set('offline', 2)
+    await expect(persistence.store('doc', d)).rejects.toThrow('state generation changed')
+    expect(db.row).toBe(row); expect(durableReceipt(d)).toBe(ack)
+    expect(d.broadcastStateless).toHaveBeenCalledTimes(1)
+  })
+
+  it('checks generation after acquiring the row lock, including a rotation during the await', async () => {
+    const d = sheet(); db.beforeSelect = () => { db.generation = 'generation-two' }
+    await expect(persistence.store('doc', d)).rejects.toThrow('state generation changed')
+    expect(db.row).toBeNull(); expect(d.broadcastStateless).not.toHaveBeenCalled()
+  })
+
+  it('emits no new receipt when COMMIT fails, including delete-only writes', async () => {
+    const d = sheet(); d.getMap('m').set('a', 1); await persistence.store('doc', d)
+    const ack = durableReceipt(d); d.getMap('m').delete('a'); db.failCommit = true
+    await expect(persistence.store('doc', d)).rejects.toThrow('commit failed')
+    expect(durableReceipt(d)).toBe(ack); expect(d.broadcastStateless).toHaveBeenCalledTimes(1)
+    db.failCommit = false; await persistence.store('doc', d)
+    expect(read().getMap('m').has('a')).toBe(false)
+    expect(Y.decodeSnapshot(Buffer.from(JSON.parse(durableReceipt(d)!).snapshot, 'base64')).ds.clients.size).toBe(1)
+  })
+
+  it('does not acknowledge edits made during an asynchronous save', async () => {
+    const d = sheet(); d.getMap('m').set('first', 1)
+    const captured = Y.snapshot(d)
+    db.beforeSelect = () => { d.getMap('m').delete('first'); d.getMap('m').set('later', 2) }
+    await persistence.store('doc', d)
+    const saved = Y.decodeSnapshot(Buffer.from(JSON.parse(durableReceipt(d)!).snapshot, 'base64'))
+    expect(Y.equalSnapshots(saved, captured)).toBe(true)
+    expect(Y.equalSnapshots(saved, Y.snapshot(d))).toBe(false)
+    expect(read().getMap('m').toJSON()).toEqual({ first: 1 })
+  })
+
+  it('keeps a committed store successful if receipt delivery throws', async () => {
+    const d = sheet(); d.getMap('m').set('saved', 1)
+    d.broadcastStateless.mockImplementation(() => { throw new Error('socket closed') })
+    await expect(persistence.store('doc', d)).resolves.toBeUndefined()
+    expect(read().getMap('m').get('saved')).toBe(1)
+    expect(durableReceipt(d)).toBeDefined()
+  })
 })
 afterEach(() => { Object.assign(config, original); for (const d of docs.splice(0)) d.destroy() })
 afterAll(() => storeWorkerPool.close())

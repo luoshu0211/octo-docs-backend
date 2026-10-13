@@ -34,6 +34,10 @@ vi.mock('../src/db/pool.js', () => ({
 
 const selectForUpdateTx = vi.fn()
 const upsertStateTx = vi.fn()
+const rotateGenerationTx = vi.fn(async (..._a: unknown[]) => 'new-generation')
+vi.mock('../src/db/repos/stateGenerationRepo.js', () => ({
+  stateGenerationRepo: { rotateTx: (...a: unknown[]) => rotateGenerationTx(...a) },
+}))
 vi.mock('../src/db/repos/yjsDocumentRepo.js', () => ({
   yjsDocumentRepo: {
     selectForUpdateTx: (...a: unknown[]) => selectForUpdateTx(...a),
@@ -104,6 +108,7 @@ function healthyRow(): void {
 function expectNothingWritten(): void {
   expect(upsertStateTx).not.toHaveBeenCalled()
   expect(createTx).not.toHaveBeenCalled()
+  expect(rotateGenerationTx).not.toHaveBeenCalled()
 }
 
 describe('compactDocument — the fleet-wide guards are actually wired in', () => {
@@ -363,6 +368,15 @@ describe('compactDocument — the cache-invalidation stamp', () => {
     expect(upsertStateTx).toHaveBeenCalledTimes(1)
     expect(markCompacted).toHaveBeenCalledTimes(1)
     expect(markCompacted).toHaveBeenCalledWith(DOC, expect.any(Number))
+    expect(rotateGenerationTx).toHaveBeenCalledWith(upsertStateTx.mock.calls[0]?.[0], DOC)
+    expect(rotateGenerationTx.mock.invocationCallOrder[0]).toBeLessThan(upsertStateTx.mock.invocationCallOrder[0]!)
+  })
+
+  it('refuses the state rewrite if rotating its durable generation fails', async () => {
+    rotateGenerationTx.mockRejectedValueOnce(new Error('generation write failed'))
+    await expect(compactDocument(DOC)).rejects.toThrow('generation write failed')
+    expect(upsertStateTx).not.toHaveBeenCalled()
+    expect(markCompacted).not.toHaveBeenCalled()
   })
 
   it('does NOT stamp when the saving was too small to write', async () => {
