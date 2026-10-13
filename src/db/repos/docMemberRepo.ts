@@ -34,6 +34,21 @@ export const SOURCE_INVITE = 2
  */
 const roleRankSql = (col: string): string => `FIELD(${col}, 1, 4, 2, 3)`
 
+/** Retry only rolled-back database transactions; never replay external side effects. */
+async function memberTransaction<R>(fn: (tx: Tx) => Promise<R>): Promise<R> {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await transaction(fn)
+    } catch (error) {
+      const lock = error as { errno?: number; code?: string } | null
+      const transient = lock && (lock.errno === 1213 || lock.errno === 1205 ||
+        lock.code === 'ER_LOCK_DEADLOCK' || lock.code === 'ER_LOCK_WAIT_TIMEOUT')
+      if (!transient || attempt >= 6) throw error
+      await new Promise((resolve) => setTimeout(resolve, attempt * 4 + Math.floor(Math.random() * 6)))
+    }
+  }
+}
+
 export const docMemberRepo = {
   /** Read a single member row's role (§4.2 resolveRole). Returns undefined if no row. */
   async getRole(docId: string, uid: string, principalSpaceId: string): Promise<Role | undefined> {
@@ -66,6 +81,45 @@ export const docMemberRepo = {
        ON DUPLICATE KEY UPDATE role = VALUES(role), granted_by = VALUES(granted_by)`,
       [params.docId, params.uid, params.principalSpaceId, params.roleNum, params.grantedBy],
     )
+  },
+
+  /**
+   * Direct member grant with a durable Human-recipient notification.
+   *
+   * The exact Space-qualified member row is locked before the upsert so a
+   * role edit remains silent while a first add (or an add after removal)
+   * atomically creates/resets the unread notification.
+   */
+  async upsertDirectWithNotification(params: {
+    docId: string
+    uid: string
+    principalSpaceId: string
+    roleNum: number
+    grantedBy: string
+    notifyRecipient: boolean
+  }): Promise<{ created: boolean }> {
+    return memberTransaction(async (tx) => {
+      const existing = await tx.query<{ present: number }>(
+        `SELECT 1 AS present FROM doc_member
+         WHERE doc_id = ? AND uid = ? AND principal_space_id = ?
+         LIMIT 1 FOR UPDATE`,
+        [params.docId, params.uid, params.principalSpaceId],
+      )
+      await this.upsertDirectTx(tx, params)
+      const created = existing.length === 0
+      if (created && params.notifyRecipient) {
+        await tx.query(
+          `INSERT INTO doc_member_notification
+             (recipient_uid, recipient_space_id, doc_id, granted_by, role, event_at, read_at)
+           VALUES (?, ?, ?, ?, ?, NOW(3), NULL)
+           ON DUPLICATE KEY UPDATE
+             granted_by = VALUES(granted_by), role = VALUES(role),
+             event_at = VALUES(event_at), read_at = NULL`,
+          [params.uid, params.principalSpaceId, params.docId, params.grantedBy, params.roleNum],
+        )
+      }
+      return { created }
+    })
   },
 
   /**
@@ -105,11 +159,16 @@ export const docMemberRepo = {
     principalSpaceId: string
     uid: string
   }): Promise<{ changed: boolean; removedUids: string[]; newEpoch?: number }> {
-    return transaction(async (tx) => {
+    return memberTransaction(async (tx) => {
       const present = await tx.query<{ uid: string }>(
         `SELECT uid FROM doc_member
          WHERE doc_id = ? AND uid = ? AND principal_space_id = ?
          FOR UPDATE`,
+        [params.docId, params.uid, params.principalSpaceId],
+      )
+      // Clean historical reminders even when the member was already removed.
+      await tx.query(
+        'DELETE FROM doc_member_notification WHERE doc_id = ? AND recipient_uid = ? AND recipient_space_id = ?',
         [params.docId, params.uid, params.principalSpaceId],
       )
       if (present.length === 0) return { changed: false, removedUids: [] }
@@ -146,7 +205,7 @@ export const docMemberRepo = {
     botUids: string[]
   }): Promise<{ changed: boolean; removedUids: string[]; newEpoch?: number }> {
     const uids = [...new Set([params.uid, ...params.botUids].filter((uid) => uid !== ''))]
-    return transaction(async (tx) => {
+    return memberTransaction(async (tx) => {
       const placeholders = uids.map(() => '?').join(', ')
       const present = await tx.query<{ uid: string }>(
         `SELECT uid FROM doc_member
@@ -155,6 +214,11 @@ export const docMemberRepo = {
         [params.docId, params.principalSpaceId, ...uids],
       )
       const removedUids = [...new Set(present.map((row) => row.uid))]
+      await tx.query(
+        `DELETE FROM doc_member_notification
+         WHERE doc_id = ? AND recipient_space_id = ? AND recipient_uid IN (${placeholders})`,
+        [params.docId, params.principalSpaceId, ...uids],
+      )
       if (removedUids.length === 0) return { changed: false, removedUids: [] }
 
       const removedPlaceholders = removedUids.map(() => '?').join(', ')

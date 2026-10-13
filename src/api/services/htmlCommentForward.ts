@@ -1,3 +1,4 @@
+import { trackCommentTask } from './commentTaskTracking.js'
 // HTML 文档评论的转发 + Bot 任务上报。
 //
 // ── 为什么是「转发」而不是「自己存」 ────────────────────────────────────────────
@@ -277,6 +278,7 @@ export function fireHtmlBotMentionReport(params: {
             return access.allowed
           },
         },
+        { onTask: trackCommentTask },
       )
     } catch (err) {
       // 只记日志。这里抛出去会变成未处理的 rejection,而它跟调用方的成功响应毫无关系。

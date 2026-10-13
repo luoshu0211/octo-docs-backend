@@ -5,7 +5,7 @@ import { PptApiError } from '../api/ppt/envelope.js'
 import type { BentoDoc } from './bentoDoc.js'
 
 export const PPT_MEDIA_PREFIX = 'ppt-media:'
-export const PPT_MEDIA_MIMES = new Set(['image/png','image/jpeg','image/webp','image/gif','image/avif','image/bmp','video/mp4','video/webm','video/ogg','video/quicktime','audio/mpeg','audio/mp4','audio/webm','audio/ogg','audio/wav','audio/x-wav','audio/flac'])
+export const PPT_MEDIA_MIMES = new Set(['image/svg+xml','image/png','image/jpeg','image/webp','image/gif','image/avif','image/bmp','video/mp4','video/webm','video/ogg','video/quicktime','audio/mpeg','audio/mp4','audio/webm','audio/ogg','audio/wav','audio/x-wav','audio/flac'])
 export const pptMediaLimit = () => Math.min(config.attachments.maxFileSizeBytes, 50 * 1024 * 1024)
 export async function getPptMedia(docId: string, id: string) {
   const row = await docAttachmentRepo.getById(id)

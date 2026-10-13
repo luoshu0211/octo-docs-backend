@@ -35,6 +35,7 @@ import * as Y from 'yjs'
 import { query, transaction, closePool } from '../src/db/pool.js'
 import { yjsDocumentRepo } from '../src/db/repos/yjsDocumentRepo.js'
 import { applyStoredState, storedStateAsV1 } from '../src/collab/collabDatabase.js'
+import { decodeStorageState } from '../src/collab/storageCodec.js'
 import { parseDocumentName } from '../src/permission/documentName.js'
 import {
   findLegacyIllegalIndices,
@@ -74,10 +75,7 @@ async function scanVictims(): Promise<Victim[]> {
     // does not throw — it yields an empty document, which here would silently
     // report "no illegal indices" and skip a board that does need repairing.
     const doc = new Y.Doc()
-    applyStoredState(doc, {
-      state: new Uint8Array(row.state),
-      encoding: row.encoding === 2 ? 2 : 1,
-    })
+    applyStoredState(doc, decodeStorageState(row.state, row.encoding, row.document_name))
     const elementIds = findLegacyIllegalIndices(Y.encodeStateAsUpdate(doc))
     if (elementIds.length > 0) {
       victims.push({ documentName: row.document_name, elementIds })

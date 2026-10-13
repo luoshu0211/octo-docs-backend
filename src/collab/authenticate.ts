@@ -35,6 +35,8 @@ const unauthorized = () => new AuthError(4401, 'Unauthorized')
 const forbidden = () => new AuthError(4403, 'Forbidden')
 
 export interface AuthContext {
+  stateGeneration?: string | null
+  cacheGeneration?: string | null
   user: { id: string; name?: string }
   role: Role
   permission_epoch: number

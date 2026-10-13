@@ -19,11 +19,14 @@
  */
 import type { Extension, onLoadDocumentPayload, onStoreDocumentPayload } from '@hocuspocus/server'
 import * as Y from 'yjs'
+import { bindStateGeneration } from './stateGeneration.js'
+import { captureDurableSnapshot, recordDurableReceipt } from './durableReceipt.js'
 import type { StoredYjsState } from '../db/repos/yjsDocumentRepo.js'
 
 export interface CollabDatabaseConfiguration {
   fetch(documentName: string): Promise<StoredYjsState | null>
   store(documentName: string, doc: Y.Doc, context?: { user?: { id?: string } }): Promise<void>
+  loaded?(documentName: string, doc: Y.Doc): void
 }
 
 /**
@@ -42,13 +45,18 @@ export class CollabDatabase implements Extension {
 
   async onLoadDocument(data: onLoadDocumentPayload): Promise<void> {
     const stored = await this.configuration.fetch(data.documentName)
-    if (stored) applyStoredState(data.document, stored)
+    if (stored) {
+      bindStateGeneration(data.document, stored.generation ?? null)
+      applyStoredState(data.document, stored)
+      this.configuration.loaded?.(data.documentName, data.document)
+      recordDurableReceipt(data.document, captureDurableSnapshot(data.document))
+    }
   }
 
   async onStoreDocument(data: onStoreDocumentPayload): Promise<void> {
     // Hand over the live document, not an encoding of it: `persistence.store`
-    // encodes once, in the format it persists, and measures the size cap against
-    // those exact bytes.
+    // captures an incremental update and validates the complete snapshot on
+    // the background worker before committing it.
     await this.configuration.store(
       data.documentName,
       data.document,

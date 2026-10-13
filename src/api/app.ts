@@ -67,6 +67,7 @@
  */
 import express, { type Express, Router, type Request, type Response, type NextFunction } from 'express'
 import { config } from '../config/env.js'
+import { StorageBudgetError } from '../collab/storageCodec.js'
 import { corsMiddleware } from './cors.js'
 import { attachmentBlobGateway, localBlobGatewayEnabled, isSignedBlobRequest } from './routes/attachmentBlob.js'
 import { authMiddleware } from './middleware/auth.js'
@@ -78,6 +79,7 @@ import { docsRouter, documentResourceRouter, spaceCollectionRouter } from './rou
 import { internalHtmlRegistrationRouter } from './routes/internalHtmlRegistration.js'
 import { internalDocRoleRouter } from './routes/internalDocRole.js'
 import { membersRouter } from './routes/members.js'
+import { memberNotificationsRouter } from './routes/memberNotifications.js'
 import { forwardGrantRouter } from './routes/forwardGrant.js'
 import { accessRequestsRouter } from './routes/accessRequests.js'
 import { cardActionDecideHandler, CARD_ACTION_DECIDE_PATH } from './routes/cardActionDecide.js'
@@ -85,6 +87,7 @@ import { invitesRouter, acceptInviteRouter, botAcceptInviteRouter } from './rout
 import { attachmentsRouter } from './routes/attachments.js'
 import { linkCardRouter } from './routes/linkCard.js'
 import { htmlCommentsRouter } from './routes/htmlComments.js'
+import { commentTasksRouter } from './routes/commentTasks.js'
 import { commentsRouter } from './routes/comments.js'
 import { versionsRouter } from './routes/versions.js'
 import { docContentRouter } from './routes/docContent.js'
@@ -283,6 +286,7 @@ export function createApp(
   //     DocumentResourceRouter so the fixed paths (`/`, `/search`, `/recent`,
   //     `/recent/creators`) are never shadowed by the router's `/:docId`.
   api.use(spaceCollectionRouter)
+  api.use(memberNotificationsRouter)
 
   // 4b. DocumentResourceRouter (remove-sp §6): every single-document operation,
   //     located by path docId with NO spaceContextMiddleware — open-context, the
@@ -302,6 +306,7 @@ export function createApp(
   // (严格两段),而 /html/:slug/comments 是三段,永不匹配 —— 实测把两者顺序反过来,
   // /html/x/comments 仍命中本路由。此处保持相邻只是可读性。
   api.use(htmlCommentsRouter) // /html/:slug/comments (转发到 octo-docs-html + Bot 任务上报)
+  api.use(commentTasksRouter)
   api.use(commentsRouter) // /:docId/comments , /:docId/comments/:id
   api.use(versionsRouter) // /:docId/versions ... (snapshot + restore, §4 #4)
   api.use(docContentRouter) // /:docId/content (bot incremental body edit + live read)
@@ -359,6 +364,7 @@ export function createApp(
   botApi.use(invitesRouter)
   botApi.use(attachmentsRouter)
   botApi.use(linkCardRouter)
+  botApi.use(commentTasksRouter)
   botApi.use(commentsRouter)
   botApi.use(versionsRouter)
   botApi.use(docContentRouter)
@@ -413,6 +419,10 @@ export function createApp(
   // central error handler — unexpected errors => 500 (§8.4 error table).
   app.use((err: unknown, req: Request, res: Response, _next: NextFunction) => {
     if (res.headersSent) return
+    if (err instanceof StorageBudgetError) {
+      res.status(413).json({ error: 'doc_too_large', dimension: err.dimension, bytes: err.bytes, limit: err.limit })
+      return
+    }
     // Body-parser (express.json) failures arrive here as typed errors. Map them
     // to their contract codes instead of letting them bubble to a 500 (defect ③):
     //   - malformed JSON body  -> 400 invalid_body

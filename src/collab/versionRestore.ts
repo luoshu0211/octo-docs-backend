@@ -12,6 +12,7 @@
  * (reconciled ⊇ live) and store() takes the direct-write bypass — no union.
  */
 import * as Y from 'yjs'
+import { SHEET_CONDITIONAL_FORMATS_FIELD, validateConditionalFormat } from '../agent/sheetConditionalFormatting.js'
 import { prosemirrorToYXmlFragment, yDocToProsemirrorJSON } from 'y-prosemirror'
 import { Node as PMNode } from 'prosemirror-model'
 import { buildSchema, COLLAB_FIELD, SCHEMA_VERSION } from '../schema/index.js'
@@ -365,6 +366,8 @@ function processSheetMapReconcile(liveDoc: Y.Doc, targetState: Uint8Array, apply
   const liveFilters = liveDoc.getMap(SHEET_FILTERS_FIELD)
   const targetValidations = targetYDoc.getMap(SHEET_DATA_VALIDATIONS_FIELD)
   const liveValidations = liveDoc.getMap(SHEET_DATA_VALIDATIONS_FIELD)
+  const targetConditionalFormats = targetYDoc.getMap(SHEET_CONDITIONAL_FORMATS_FIELD)
+  const liveConditionalFormats = liveDoc.getMap(SHEET_CONDITIONAL_FORMATS_FIELD)
   if (
     targetSheet.size === 0 && liveSheet.size === 0 &&
     targetDims.size === 0 && liveDims.size === 0 &&
@@ -374,7 +377,8 @@ function processSheetMapReconcile(liveDoc: Y.Doc, targetState: Uint8Array, apply
     targetSheets.size === 0 && liveSheets.size === 0 &&
     targetFreeze.size === 0 && liveFreeze.size === 0 &&
     targetFilters.size === 0 && liveFilters.size === 0 &&
-    targetValidations.size === 0 && liveValidations.size === 0
+    targetValidations.size === 0 && liveValidations.size === 0 &&
+    targetConditionalFormats.size === 0 && liveConditionalFormats.size === 0
   ) {
     return false // pure text doc — untouched
   }
@@ -410,6 +414,10 @@ function processSheetMapReconcile(liveDoc: Y.Doc, targetState: Uint8Array, apply
   // Also exercise deterministic winner selection before mutation. Restore persists every valid
   // candidate (including overlap losers), while read paths expose only the effective winners.
   validateSheetDataValidations(rawValidations, allowedValidationLogicalIds, true)
+  const validatedConditionalFormats = new Map<string, Record<string, unknown>>()
+  for (const [key, value] of targetConditionalFormats.entries()) {
+    validatedConditionalFormats.set(key, validateConditionalFormat(key, value, allowedValidationLogicalIds))
+  }
   if (!apply) return true
   // Cells: make live equal target (delete live-only, set/overwrite target).
   for (const key of [...liveSheet.keys()]) {
@@ -475,6 +483,10 @@ function processSheetMapReconcile(liveDoc: Y.Doc, targetState: Uint8Array, apply
   for (const [key, val] of Object.entries(validatedValidationCandidates)) {
     liveValidations.set(key, val)
   }
+  for (const key of [...liveConditionalFormats.keys()]) {
+    if (!validatedConditionalFormats.has(key)) liveConditionalFormats.delete(key)
+  }
+  for (const [key, value] of validatedConditionalFormats) liveConditionalFormats.set(key, value)
   return true
 }
 

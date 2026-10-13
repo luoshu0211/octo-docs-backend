@@ -36,18 +36,14 @@
  *
  * WHAT IF A STALE CLIENT COMES BACK
  *
- * Measured against the real incident document: a client reconnecting with the
- * pre-compaction state merges both histories, giving
- *
- *     9.06 MB original -> 3.46 MB compacted -> 6.96 MB after the stale merge
- *
- * with ZERO content differences across all 103,680 cells. The bad case costs
- * part of the saving, never correctness, and still lands below where it started;
- * the next unload compacts again. (An earlier reading of this as "11.46 MB,
- * worse than before" measured the merge in the v1 encoding — under v2 the saving
- * survives. That correction is what makes automation defensible.)
+ * Rebuilding mints fresh Yjs identities. Unioning an old browser cache into that
+ * state can restore obsolete history and exceed the decoded-state limit even
+ * without a new edit. Sheet compaction therefore rotates a durable generation
+ * together with the replacement row. The sheet frontend retains old caches as
+ * recovery sources; socket, Redis and SQL gates prevent cross-generation reflow.
+ * See docs/sheet-state-generation.md for the coordinated rollout requirement.
  */
-import { config } from '../config/env.js'
+import { storageByteLimit } from './storageCodec.js'
 import {
   compactDocument,
   ClusterStateUnknownError,
@@ -105,7 +101,7 @@ export async function maybeCompactOnUnload(
 ): Promise<AutoCompactOutcome> {
   try {
     const bytes = await deps.storedBytes(documentName)
-    if (bytes === null || bytes < config.maxDocBytes * COMPACT_ABOVE_RATIO) {
+    if (bytes === null || bytes < storageByteLimit() * COMPACT_ABOVE_RATIO) {
       return { ran: false, reason: 'below-threshold' }
     }
 

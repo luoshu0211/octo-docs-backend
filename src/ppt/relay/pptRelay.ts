@@ -52,6 +52,7 @@ import {
   type RefusedCode,
   type ServerFrame,
   type AckCtl,
+  type AuthCtl,
 } from './frames.js'
 import {
   canonicalPayloadHash,
@@ -283,6 +284,9 @@ interface Conn {
   connectionId: string
   heartbeatTimer?: ReturnType<typeof setInterval>
   presenceSubscribed: boolean
+  liveAuth?: boolean
+  /** Replay finished but its buffered cutover is waiting for fresh authority. */
+  cutoverPending?: boolean
   presenceReady: boolean
   actor?: string
   initialSnapshotSent?: boolean
@@ -853,21 +857,16 @@ export class PptRelay {
     // stale ticket is rejected so the client re-mints a fresh one. A ticket at
     // the current epoch is trusted as-is (its authority is still fresh).
     let role: ResolvedRole = claims.role
-    const spaceMember = claims.space_member === true
+    // A membership proof is scoped to its issuance epoch, just like the role.
+    // Stale tickets may retain direct grants, but cannot revive a Space share.
+    const spaceMember = claims.permission_epoch === liveEpoch && claims.space_member === true
     if (claims.permission_epoch !== liveEpoch) {
       if (!this.roleProvider) {
         socket.close(CLOSE_UNAUTHORIZED, 'stale ticket epoch')
         return
       }
-      // At CONNECT the ticket's `space_member` claim is the FRESHEST membership
-      // signal available (minted seconds ago at issuance, within the short ticket
-      // TTL), so it is trusted as-is here — a legitimate `anyone_in_space` share
-      // writer whose epoch bumped between issuance and connect must re-resolve to
-      // writer, not be revoked (B6 / P1-7). The P1-6 fail-closed membership recheck
-      // applies only LATER, once the claim has aged across an epoch bump (see
-      // {@link refreshRoleDownOnly} / {@link applyEpochBump}): there the client can
-      // re-mint to refresh the claim, whereas failing closed at connect would
-      // deadlock a share writer that just presented a valid fresh ticket.
+      // Re-resolve without the stale membership claim. Share-only users must
+      // present a ticket minted after the change; a short TTL is not live proof.
       try {
         role = await this.roleProvider({
           uid: claims.uid,
@@ -1078,7 +1077,7 @@ export class PptRelay {
         }
       }
     }
-    const sends: Promise<void>[] = []
+    const sends: Promise<boolean>[] = []
     for (const peer of this.rooms.get(docId) ?? []) {
       if (!peer.presenceSubscribed || !peer.presenceReady || !this.canPushRead(peer)) continue
       // Recompute at send time: a queued roster must not retain departed/revoked users.
@@ -1131,6 +1130,17 @@ export class PptRelay {
 
   private sendFrame(conn: Conn, frame: ServerFrame): Promise<void> {
     return this.enqueueOutbound(conn, () => send(conn.socket, frame))
+  }
+
+  private sendAuth(conn: Conn, frame: AuthCtl): Promise<void> {
+    const generation = conn.authGeneration
+    return this.enqueueOutbound(conn, () => {
+      // A newer ACL update can supersede this queued notification. Do not send
+      // stale authority or close a socket merely because the next proof is pending.
+      if (conn.authGeneration !== generation || this.terminalRefusal(conn) !== null) return
+      if (frame.ctl === 'auth-updated' && !this.canPushRead(conn)) return
+      send(conn.socket, frame)
+    })
   }
 
   /**
@@ -1229,8 +1239,9 @@ export class PptRelay {
   /**
    * The SINGLE shared delivery-stability predicate (XIN-1759 Part A). A connection
    * is delivery-stable when its first replay has reached a stable boundary
-   * (`caughtUp`), no replay is streaming to it (`!replayInFlight`), and no catch-up
-   * buffer drain is in progress (`flushDepth === 0`). Every site that must decide
+   * (`caughtUp`), no replay is streaming to it (`!replayInFlight`), no catch-up
+   * drain is in progress (`flushDepth === 0`), and no unsent frame remains in its
+   * buffer. Every site that must decide
    * "is this socket in a settled state where a live op can be delivered / a fresh
    * authored write is a true observation / a new replay may start" reads THIS
    * predicate instead of restating the three-part busy check — the round-19 P0 was
@@ -1238,7 +1249,7 @@ export class PptRelay {
    * omitting `!replayInFlight` and diverging from the others.
    */
   private isDeliveryStable(conn: Conn): boolean {
-    return conn.caughtUp && !conn.replayInFlight && conn.flushDepth === 0
+    return conn.caughtUp && !conn.replayInFlight && conn.flushDepth === 0 && conn.liveBuffer.length === 0
   }
 
   /**
@@ -1286,12 +1297,10 @@ export class PptRelay {
       await this.closeConn(peer, terminal?.code ?? CLOSE_FORBIDDEN, terminal?.reason ?? 'read authorization invalidated')
       return
     }
-    if (!this.isDeliveryStable(peer)) {
-      await this.bufferLiveFrame(peer, frame)
-      return
-    }
-    await this.gatedSend(peer, frame)
-    if (frame.ctl === 'op' && peer.socket.readyState === WebSocket.OPEN) this.markDeliveredThrough(peer, frame.q)
+    // Keep even currently-live sends in the ordered buffer until delivery is
+    // confirmed. A proof freeze may land after enqueueing on the outbound chain.
+    await this.bufferLiveFrame(peer, frame)
+    await this.resumeReadDelivery(peer)
   }
 
   private async bufferLiveFrame(peer: Conn, frame: ServerFrame): Promise<void> {
@@ -1325,28 +1334,30 @@ export class PptRelay {
    * `deliveredThrough`), so an op buffered during replay that the replay also
    * streamed is delivered exactly once (P1-4).
    *
-   * Drains in BATCHES until the buffer is empty (XIN-1739 P1-2): while flushing,
-   * `deliver` keeps buffering new broadcasts (the `flushDepth` gate), so a
-   * batch can grow the buffer; each new batch is drained in receipt order until
-   * none remain. Because the outbound chain is the sole socket-order owner, order
-   * is preserved within and across batches. The caller raises `flushDepth`
-   * around this call and only marks `caughtUp` once it returns with an empty buffer.
+   * Retain each head until its send succeeds; a proof pause leaves the head and
+   * all later broadcasts in receipt order. The caller raises `flushDepth`
+   * throughout the drain and only establishes cutover after the buffer empties.
    */
   private async flushLiveBuffer(conn: Conn): Promise<void> {
     while (conn.liveBuffer.length > 0) {
-      const buffered = conn.liveBuffer
-      conn.liveBuffer = []
-      conn.liveBufferBytes = 0
-      for (const frame of buffered) {
-        if (!this.canPushRead(conn)) {
-          const terminal = conn.auth.terminalClose
-          await this.closeConn(conn, terminal?.code ?? CLOSE_FORBIDDEN, terminal?.reason ?? 'read authorization invalidated')
+      const frame = conn.liveBuffer[0]!
+      if (!this.canPushRead(conn)) {
+        if (conn.liveAuth && conn.auth.pendingReauth && !conn.auth.terminalClose) return
+        const terminal = conn.auth.terminalClose
+        await this.closeConn(conn, terminal?.code ?? CLOSE_FORBIDDEN, terminal?.reason ?? 'read authorization invalidated')
+        return
+      }
+      if (!(frame.ctl === 'op' && frame.q <= conn.deliveredThrough)) {
+        if (!(await this.gatedSend(conn, frame))) {
+          if (this.canPushRead(conn)) continue
           return
         }
-        if (frame.ctl === 'op' && frame.q <= conn.deliveredThrough) continue
-        await this.gatedSend(conn, frame)
-        if (frame.ctl === 'op' && conn.socket.readyState === WebSocket.OPEN) this.markDeliveredThrough(conn, frame.q)
+        if (frame.ctl === 'op') this.markDeliveredThrough(conn, frame.q)
       }
+      // Overflow can close the socket and clear the queue during the await.
+      if (conn.liveBuffer[0] !== frame) return
+      conn.liveBuffer.shift()
+      conn.liveBufferBytes -= Buffer.byteLength(JSON.stringify(frame), 'utf8')
     }
   }
 
@@ -1377,6 +1388,7 @@ export class PptRelay {
    * only once it reaches the head of the chain.
    */
   private chainedDrain(conn: Conn, markCaughtUp = false): Promise<void> {
+    if (markCaughtUp) conn.cutoverPending = true
     conn.flushDepth++
     const body = async (): Promise<void> => {
       try {
@@ -1384,9 +1396,18 @@ export class PptRelay {
         // Set `caughtUp` synchronously right after the buffer empties (no await
         // between), so no broadcast can slip in unbuffered before the flag flips
         // (XIN-1739 P1-2 cutover invariant).
-        if (markCaughtUp) conn.caughtUp = true
+        if (conn.cutoverPending && this.canPushRead(conn) && conn.liveBuffer.length === 0) {
+          conn.caughtUp = true
+          conn.cutoverPending = false
+        }
       } finally {
         conn.flushDepth--
+        // Proof may complete while this drain is unwinding. Do not lose that
+        // wakeup just because its caller observed flushDepth > 0.
+        if (!this.isReplayOrDrainBusy(conn) && this.canPushRead(conn) &&
+            (conn.liveBuffer.length > 0 || conn.cutoverPending)) {
+          queueMicrotask(() => { void this.resumeReadDelivery(conn) })
+        }
       }
     }
     const run = conn.drainChain.then(body, body)
@@ -1400,9 +1421,11 @@ export class PptRelay {
    * unbounded backlog (XIN-1693 P1-3). Bounded by the drain timeout so a
    * wedged client cannot stall replay forever; on a closed socket it is a no-op.
    */
-  private async gatedSend(conn: Conn, frame: ServerFrame | (() => ServerFrame)): Promise<void> {
+  private async gatedSend(conn: Conn, frame: ServerFrame | (() => ServerFrame)): Promise<boolean> {
+    let sent = false
     await this.enqueueOutbound(conn, async () => {
       if (!this.canPushRead(conn)) {
+        if (conn.liveAuth && conn.auth.pendingReauth && !conn.auth.terminalClose) return
         const terminal = conn.auth.terminalClose
         conn.socket.close(terminal?.code ?? CLOSE_FORBIDDEN, terminal?.reason ?? 'read authorization invalidated')
         this.removeFromRoom(conn)
@@ -1420,6 +1443,7 @@ export class PptRelay {
       }
       if (socket.readyState !== WebSocket.OPEN) return
       if (!this.canPushRead(conn)) {
+        if (conn.liveAuth && conn.auth.pendingReauth && !conn.auth.terminalClose) return
         const terminal = conn.auth.terminalClose
         conn.socket.close(terminal?.code ?? CLOSE_FORBIDDEN, terminal?.reason ?? 'read authorization invalidated')
         this.removeFromRoom(conn)
@@ -1431,7 +1455,9 @@ export class PptRelay {
         return
       }
       send(socket, typeof frame === 'function' ? frame() : frame)
+      sent = true
     })
+    return sent
   }
 
   /**
@@ -1523,13 +1549,16 @@ export class PptRelay {
     switch (frame.t) {
       case 'hello':
         if (this.enforceEphemeralLimits(conn, rawBytes)) return
-        if (!(await this.refreshReadAuth(conn, 'hello'))) return
+        // Negotiate synchronously: ACL events can run during the first read gate.
+        conn.liveAuth = frame.liveAuth === true
         conn.presenceSubscribed = frame.presence === true
+        // Replay owns the read gate and remembers the request if proof is pending.
         this.requestReplay(conn, typeof frame.since === 'number' ? frame.since : 0, /* ready */ true)
         return
       case 'need':
         if (this.enforceEphemeralLimits(conn, rawBytes)) return
-        if (!(await this.refreshReadAuth(conn, 'need'))) return
+        // Replay owns its authorization gate and retains this cursor while fresh
+        // proof is pending, including when this request discovers a missed bump.
         this.requestReplay(conn, typeof frame.since === 'number' ? frame.since : 0, /* ready */ false)
         return
       case 'p':
@@ -1555,7 +1584,7 @@ export class PptRelay {
         // freshly-minted ticket on the EXISTING socket so a share-derived writer
         // refreshes membership without a full disconnect/replay.
         if (this.enforceEphemeralLimits(conn, rawBytes)) return
-        await this.handleReauth(conn, (frame as ReauthFrame).ticket)
+        await this.handleReauth(conn, (frame as ReauthFrame).ticket, (frame as ReauthFrame).requestId)
         return
       case 'ops':
         // Serialize per room so the assigned seq order is also the broadcast
@@ -1622,6 +1651,7 @@ export class PptRelay {
 
   private async expireShareMembership(conn: Conn): Promise<void> {
     if (!conn.spaceMember || conn.socket.readyState !== WebSocket.OPEN || !this.rooms.get(conn.docId)?.has(conn)) return
+    if (conn.auth.pendingReauth || conn.auth.terminalClose) return
     // Capture the reauth generation BEFORE the roleProvider await (XIN-1739 P1-1):
     // an in-place `reauth` that completes while we await replaces the connection's
     // authority and re-arms this timer, so a resume that ignored it would clobber a
@@ -1629,6 +1659,7 @@ export class PptRelay {
     // this method already nulled `shareExpiryTimer`, so `handleReauth`'s clearTimeout
     // cannot cancel this in-flight body — the generation guard is what stops it.
     const generation = conn.reauthGeneration
+    const authGeneration = conn.authGeneration
     let directRole: ResolvedRole = 'none'
     if (this.roleProvider) {
       try {
@@ -1645,7 +1676,10 @@ export class PptRelay {
     }
     // A reauth (or another expiry cycle) intervened while awaiting → this callback
     // is stale; bail without touching the connection's now-fresh authority.
-    if (conn.reauthGeneration !== generation) return
+    // Epoch changes and terminal withdrawals also invalidate the old lookup,
+    // even without a completed reauth. Never clear their freeze/close state.
+    if (conn.reauthGeneration !== generation || conn.authGeneration !== authGeneration
+      || conn.auth.pendingReauth || conn.auth.terminalClose) return
     if (!conn.spaceMember || conn.socket.readyState !== WebSocket.OPEN || !this.rooms.get(conn.docId)?.has(conn)) return
     if (roleRank(directRole) >= roleRank(conn.role)) {
       // Direct role covers the connection independent of the expired membership
@@ -1677,7 +1711,8 @@ export class PptRelay {
    * bounded re-verify window instead of an immediate disconnect).
    */
   private armReauthGrace(conn: Conn): void {
-    if (conn.reauthGraceTimer) clearTimeout(conn.reauthGraceTimer)
+    // Repeated checks/epoch notifications must not extend an unproved session.
+    if (conn.reauthGraceTimer) return
     conn.reauthGraceTimer = setTimeout(() => {
       conn.reauthGraceTimer = undefined
       if (conn.auth.pendingReauth === true && conn.socket.readyState === WebSocket.OPEN && this.rooms.get(conn.docId)?.has(conn)) {
@@ -1697,7 +1732,7 @@ export class PptRelay {
    * Enforces the same short-ticket security bound by RE-VERIFYING in place rather
    * than forcing a full reconnect + replay.
    */
-  private async handleReauth(conn: Conn, ticket: string): Promise<void> {
+  private async handleReauth(conn: Conn, ticket: string, requestId?: string): Promise<void> {
     // Terminal-window guard (XIN-1835 P1-5): if this socket is already condemned —
     // a `terminalClose` set with its close QUEUED on the outbound chain (e.g. the
     // share-expiry grace timer fired, or role was revoked) — an in-place reauth must
@@ -1762,15 +1797,15 @@ export class PptRelay {
       }
     }
     // Re-resolve the LIVE role from the fresh authority exactly as connect does:
-    // trust the ticket's role at the current epoch, else re-resolve with the fresh
-    // `space_member` claim; fail closed to `none` if re-resolution is impossible.
+    // trust claims at the current epoch, else resolve only claim-independent
+    // grants. An unused but old ticket is not fresh membership proof.
     let liveEpoch: number
     try {
       liveEpoch = await this.epochProvider(conn.documentName)
     } catch {
       return this.failReauth(conn, 'document unavailable')
     }
-    const freshSpaceMember = claims.space_member === true
+    const freshSpaceMember = claims.permission_epoch === liveEpoch && claims.space_member === true
     let role: ResolvedRole = claims.role
     if (claims.permission_epoch !== liveEpoch) {
       if (!this.roleProvider) return this.failReauth(conn, 'stale reauth ticket epoch')
@@ -1790,6 +1825,8 @@ export class PptRelay {
     if (conn.authGeneration !== gen) return
     // Success: adopt the fresh authority in place, re-arm the share-expiry timer
     // from the fresh ticket's expiry, clear pending reauth, and flush via cutover.
+    // Older epoch checks captured the previous membership/role context.
+    conn.authGeneration++
     if (conn.reauthGraceTimer) {
       clearTimeout(conn.reauthGraceTimer)
       conn.reauthGraceTimer = undefined
@@ -1808,8 +1845,9 @@ export class PptRelay {
     }
     this.armShareExpiry(conn, claims.exp)
     conn.auth = { readAllowed: roleAtLeast(role, 'reader'), invalidated: false }
+    if (conn.liveAuth) await this.sendAuth(conn, { ctl: 'auth-updated', role, epoch: liveEpoch, requestId })
     this.schedulePresence(conn.docId)
-    if (conn.caughtUp) await this.drainLiveBuffer(conn)
+    await this.resumeReadDelivery(conn)
   }
 
   private failReauth(conn: Conn, reason: string): void {
@@ -1853,6 +1891,7 @@ export class PptRelay {
       await this.closeConn(conn, CLOSE_NOT_FOUND, 'document unavailable')
       return false
     }
+    if (conn.liveAuth && conn.auth.pendingReauth) return false
     if (conn.roleEpoch !== live) {
       const closed = await this.refreshRoleDownOnly(conn, live)
       if (closed) return false
@@ -1898,17 +1937,34 @@ export class PptRelay {
     // starting a fresh replay mid-drain could interleave replay ops with the
     // buffered live frames and reorder them (XIN-1739 P1-2). Coalesce to the
     // latest cursor and let the current cutover finish first.
-    if (this.isReplayOrDrainBusy(conn)) {
-      conn.replayPending = { since, ready }
+    if (this.isReplayOrDrainBusy(conn) || (conn.liveAuth && conn.auth.pendingReauth)) {
+      conn.replayPending = { since, ready: ready || conn.replayPending?.ready === true }
       return
     }
     conn.replayInFlight = true
     void this.runReplay(conn, since, ready)
   }
 
+  /** Resume a proof-paused replay only after authority is restored. */
+  private resumeReplay(conn: Conn): void {
+    if (!this.canPushRead(conn) || this.isReplayOrDrainBusy(conn)) return
+    const pending = this.takePendingReplay(conn)
+    if (pending) this.requestReplay(conn, pending.since, pending.ready)
+  }
+
+  /** A resumed replay owns its cutover drain; never launch a second sender. */
+  private async resumeReadDelivery(conn: Conn): Promise<void> {
+    this.resumeReplay(conn)
+    if (!this.canPushRead(conn) || this.isReplayOrDrainBusy(conn) || (!conn.caughtUp && !conn.cutoverPending)) return
+    await this.drainLiveBuffer(conn)
+    // Requests received during the drain were coalesced, not discarded.
+    this.resumeReplay(conn)
+  }
+
   /** Drive one replay, then either run a coalesced pending one or, once none
    * remains, drain the live buffer to empty and mark the connection caught up. */
   private async runReplay(conn: Conn, since: number, ready: boolean): Promise<void> {
+    const generation = conn.authGeneration
     let ok = false
     try {
       ok = await this.replay(conn, since, ready)
@@ -1916,6 +1972,13 @@ export class PptRelay {
       ok = false
     }
     conn.replayInFlight = false
+    // A freeze can land during a queued snapshot/op/ready send. Preserve the
+    // cursor without advancing it for a frame that was not actually delivered.
+    if (!ok && conn.liveAuth && (conn.auth.pendingReauth || conn.authGeneration !== generation) && !conn.auth.terminalClose) {
+      conn.replayPending = { since: conn.replayPending?.since ?? since, ready: ready || conn.replayPending?.ready === true }
+      this.resumeReplay(conn)
+      return
+    }
     const pending = this.takePendingReplay(conn)
     if (pending && conn.socket.readyState === WebSocket.OPEN) {
       conn.replayInFlight = true
@@ -1938,11 +2001,7 @@ export class PptRelay {
     await this.chainedDrain(conn, /* markCaughtUp */ true)
     // A replay requested DURING the drain was coalesced (flushing counted as busy);
     // run it now so the freshly caught-up socket does not sit on a stale cursor.
-    const next = this.takePendingReplay(conn)
-    if (next && conn.socket.readyState === WebSocket.OPEN) {
-      conn.replayInFlight = true
-      void this.runReplay(conn, next.since, next.ready)
-    }
+    this.resumeReplay(conn)
   }
 
   /** Atomically read and clear the coalesced pending replay request. */
@@ -2024,7 +2083,7 @@ export class PptRelay {
         // joiner can deterministically apply the ops that follow (XIN-1759 Part B).
         if (snapshot && (effectiveSince < snapshot.coveredSeq || (conn.actor && !conn.initialSnapshotSent))) {
           if (!this.canPushRead(conn)) return false
-          await this.gatedSend(conn, { ctl: 'snapshot', snapshotVersion: snapshot.snapshotVersion, doc: snapshot.doc, state: snapshot.state })
+          if (!(await this.gatedSend(conn, { ctl: 'snapshot', snapshotVersion: snapshot.snapshotVersion, doc: snapshot.doc, state: snapshot.state }))) return false
           conn.initialSnapshotSent = true
           fromSeq = snapshot.coveredSeq
           readySeq = snapshot.coveredSeq
@@ -2043,7 +2102,7 @@ export class PptRelay {
           for (const op of ops) {
             if (op.seq <= fromSeq) continue
             if (!this.canPushRead(conn)) return false
-            await this.gatedSend(conn, { ctl: 'op', q: op.seq, frame: op.frame })
+            if (!(await this.gatedSend(conn, { ctl: 'op', q: op.seq, frame: op.frame }))) return false
             this.markDeliveredThrough(conn, op.seq)
             delivered = conn.deliveredThrough
             readySeq = op.seq
@@ -2067,13 +2126,14 @@ export class PptRelay {
             /* keep replay usable with the last-known epoch; mutation re-checks */
           }
           if (!this.canPushRead(conn)) return false
-          await this.gatedSend(conn, {
+          if (!(await this.gatedSend(conn, () => ({
             ctl: 'ready',
             q: readySeq,
             snapshotVersion: snapshot?.snapshotVersion ?? 0,
-            epoch,
+            epoch: Math.max(epoch, conn.roleEpoch),
             role: conn.role,
-          })
+            ...(conn.liveAuth ? { liveAuth: true } : {}),
+          })))) return false
           conn.presenceReady = this.canPushRead(conn)
           this.schedulePresence(conn.docId)
         }
@@ -2301,8 +2361,8 @@ export class PptRelay {
    * closed to `none` when no roleProvider is wired or the lookup throws, so a
    * mutation can never ride a role that predates the live epoch. Stamps
    * `roleEpoch = live` so a settled connection re-resolves at most once per epoch
-   * change. Returns true when it CLOSED the socket because the frozen
-   * space-membership claim became load-bearing and unverifiable (P1-6).
+   * change. Returns true when the caller must refuse: authority changed during
+   * the check, or fresh membership proof is required (pending or closed).
    */
   private async refreshRoleDownOnly(conn: Conn, live: number): Promise<boolean> {
     // Capture the withdrawal generation BEFORE the roleProvider await (XIN-1840 P1-1).
@@ -2314,18 +2374,28 @@ export class PptRelay {
       principalSpaceId: conn.principalSpaceId,
       spaceMember: conn.spaceMember,
     })
-    if (outcome.kind === 'close-membership') {
-      conn.role = 'none'
-      conn.auth = { readAllowed: false, invalidated: false, terminalClose: { code: CLOSE_FORBIDDEN, reason: 'membership recheck required' } }
-      void this.closeConn(conn, CLOSE_FORBIDDEN, 'membership recheck required')
-      return true
-    }
     // A DIFFERENT withdrawal condemned this socket, EITHER during our own `recheckRole`
     // await (generation moved) OR during the CALLER's earlier awaits before it invoked us
     // (a `terminalClose` is already set — our generation capture is too late to see that
     // one). In both cases its close is QUEUED; do NOT rebuild a live `conn.auth` over it
     // (the P1-1 laundering). Report CLOSED so the caller refuses (XIN-1840 P1-1).
     if (conn.authGeneration !== gen || conn.auth.terminalClose) return true
+    if (outcome.kind === 'close-membership') {
+      if (conn.liveAuth) {
+        if (!conn.auth.pendingReauth) {
+          conn.authGeneration++
+          conn.auth = { readAllowed: false, invalidated: false, pendingReauth: true }
+          this.schedulePresence(conn.docId)
+          this.armReauthGrace(conn)
+          void this.sendAuth(conn, { ctl: 'auth-refresh', role: conn.role, epoch: Math.max(live, conn.roleEpoch) })
+        }
+        return true
+      }
+      conn.role = 'none'
+      conn.auth = { readAllowed: false, invalidated: false, terminalClose: { code: CLOSE_FORBIDDEN, reason: 'membership recheck required' } }
+      void this.closeConn(conn, CLOSE_FORBIDDEN, 'membership recheck required')
+      return true
+    }
     if (roleRank(outcome.role) < roleRank(conn.role)) conn.role = outcome.role
     conn.roleEpoch = live
     // Preserve a sticky pendingReauth here too (XIN-1739 P0-1): a downgrade-only
@@ -2966,6 +3036,21 @@ export class PptRelay {
    */
   async applyEpochBump(documentName: string): Promise<void> {
     this.docStatusCache.clear()
+    // Invalidation withdraws authority synchronously, before ANY external lookup.
+    // Otherwise a slow deletion-status check could keep serving a revoked reader.
+    // Without a role provider this method only sweeps deletions; do not leave
+    // those connections in a freeze that no role lookup can subsequently clear.
+    const frozenGen = new Map<Conn, number>()
+    if (this.roleProvider) {
+      for (const room of this.rooms.values()) {
+        for (const conn of room) {
+          if (conn.documentName !== documentName || conn.auth.terminalClose) continue
+          conn.authGeneration++
+          conn.auth = { readAllowed: false, invalidated: false, pendingReauth: true }
+          frozenGen.set(conn, conn.authGeneration)
+        }
+      }
+    }
     // Deletion takes precedence: a doc that is now gone closes 4404, not 4403.
     // (This also covers the case where deletion is the only reason for the bump.)
     if (this.docStatusProvider) {
@@ -2990,30 +3075,6 @@ export class PptRelay {
     }
 
     if (!this.roleProvider) return
-    // Freeze every matching socket into `pendingReauth` ONLY now that we know a
-    // `roleProvider` is present to re-resolve (and thereby clear) it below. Setting
-    // this sticky flag before the early return above would wedge sockets on a doc
-    // with no injected `roleProvider`: nothing on that path re-resolves authority or
-    // prompts a `reauth`, so `readAllowed:false, pendingReauth:true` would never be
-    // cleared and every live socket would stall until reconnect (XIN-1739 P2). The
-    // deletion sweep above needs no freeze — a deleted doc's sockets are closed
-    // outright regardless of auth state.
-    const frozenGen = new Map<Conn, number>()
-    for (const room of this.rooms.values()) {
-      for (const conn of room) {
-        if (conn.documentName === documentName) {
-          // Freezing to pendingReauth withdraws live authority — bump the withdrawal
-          // generation so a gate parked mid-await refuses on resume (XIN-1840 P1-1).
-          conn.authGeneration++
-          conn.auth = { readAllowed: false, invalidated: false, pendingReauth: true }
-          // Remember the generation as of OUR freeze. Any later bump (a concurrent
-          // `closeRoomForDeleted` / another epoch bump firing during the `epochProvider`
-          // or `recheckRole` awaits below) makes it differ, so we skip the live-authority
-          // rebuild for that socket rather than laundering the withdrawal (XIN-1840 P1-1).
-          frozenGen.set(conn, conn.authGeneration)
-        }
-      }
-    }
     let newEpoch = 0
     let epochOk = false
     try {
@@ -3026,6 +3087,7 @@ export class PptRelay {
       for (const conn of [...room]) {
         if (conn.documentName !== documentName) continue
         const gen = frozenGen.get(conn)
+        if (gen === undefined || conn.authGeneration !== gen) continue
         const outcome = await this.recheckRole({
           uid: conn.uid,
           docId: conn.docId,
@@ -3033,7 +3095,18 @@ export class PptRelay {
           principalSpaceId: conn.principalSpaceId,
           spaceMember: conn.spaceMember,
         })
+        // Discard stale outcomes BEFORE any role, epoch or terminal mutation.
+        if (conn.authGeneration !== gen) continue
         if (outcome.kind === 'close-membership') {
+          if (conn.liveAuth && gen !== undefined && conn.authGeneration === gen) {
+            // A fresh membership proof can be supplied on this same socket.
+            // Reads/writes stay frozen until verified; timeout still fails closed.
+            this.armReauthGrace(conn)
+            // A failed epoch lookup must not send 0 below the client's confirmed
+            // watermark. This only requests proof; authority remains frozen.
+            void this.sendAuth(conn, { ctl: 'auth-refresh', role: conn.role, epoch: Math.max(newEpoch, conn.roleEpoch) })
+            continue
+          }
           // The frozen space-membership claim became load-bearing and cannot be
           // re-verified on a live socket — fail closed (P1-6). The client re-mints
           // a ticket carrying fresh membership.
@@ -3081,8 +3154,12 @@ export class PptRelay {
         if (gen === undefined || conn.authGeneration !== gen) continue
         conn.auth = { readAllowed: roleAtLeast(conn.role, 'reader'), invalidated: false }
         this.schedulePresence(conn.docId)
-        if (downgraded) void this.gatedSend(conn, { ctl: 'role-changed', role: conn.role, epoch: newEpoch })
-        if (roleAtLeast(conn.role, 'reader') && conn.caughtUp) void this.drainLiveBuffer(conn)
+        if (conn.liveAuth && epochOk) {
+          // No privilege increase without fresh authority. Same/lower roles can
+          // adopt the authoritative epoch without replaying document state.
+          void this.sendAuth(conn, { ctl: roleRank(role) > roleRank(conn.role) ? 'auth-refresh' : 'auth-updated', role: conn.role, epoch: newEpoch })
+        } else if (downgraded) void this.gatedSend(conn, { ctl: 'role-changed', role: conn.role, epoch: newEpoch })
+        void this.resumeReadDelivery(conn)
       }
     }
   }

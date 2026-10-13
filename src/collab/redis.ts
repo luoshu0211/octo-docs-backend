@@ -1,3 +1,4 @@
+import { fenceRedisGenerations } from './generationRedis.js'
 import { Redis } from 'ioredis'
 import { Redis as HocuspocusRedis } from '@hocuspocus/extension-redis'
 import type { RedisConnectionConfig } from '../config/redis.js'
@@ -20,5 +21,6 @@ export function createCollabRedis(config: RedisConnectionConfig & { prefix: stri
   Object.assign(extension.redlock.settings, { db: config.db })
   observeRedisErrors(extension.pub, 'collab-pub')
   observeRedisErrors(extension.sub, 'collab-sub')
+  fenceRedisGenerations(extension)
   return extension
 }

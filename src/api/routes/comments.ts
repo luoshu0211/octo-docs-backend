@@ -1,3 +1,4 @@
+import { trackCommentTask } from '../services/commentTaskTracking.js'
 /**
  * Inline-comment endpoints (feature #3 — doc_comment).
  *   GET    /api/v1/docs/{docId}/comments        (reader)  list thread roots + replies
@@ -147,7 +148,7 @@ function parseOccurrence(raw: unknown): number | undefined | typeof INVALID_DISA
  */
 function fireBotMentionReport(params: Parameters<typeof reportBotMentions>[0]): void {
   void Promise.resolve()
-    .then(() => reportBotMentions(params))
+    .then(() => reportBotMentions(params, { onTask: trackCommentTask }))
     .catch(() => {
       // Swallowed by contract: the comment is committed and the response is sent.
       // reportBotMentions already logs its own failures with safe metadata.
@@ -155,7 +156,7 @@ function fireBotMentionReport(params: Parameters<typeof reportBotMentions>[0]): 
 }
 
 function notifyCommentCreated(req: Request, guard: import('../guard.js').DocGuard, id: number, body: string, parentId?: number) {
-  void notifyDocMentioned({ docId: guard.meta.doc_id, spaceId: guard.meta.space_id,
+  void notifyDocMentioned({ docId: guard.meta.doc_id, spaceId: guard.meta.space_id, principalSpaceId: req.principalSpaceId!,
     title: guard.meta.title, authorUid: req.uid!, body })
   if (guard.meta.doc_type === 'html_ppt') {
     void reportPptCommentMention(pptPrincipalFromGuard(req, guard), id,

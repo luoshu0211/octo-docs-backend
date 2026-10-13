@@ -26,9 +26,9 @@ import { getOctoIdentity } from '../../auth/octoIdentity.js'
 import { docMemberRepo } from '../../db/repos/docMemberRepo.js'
 import { docMetaRepo } from '../../db/repos/docMetaRepo.js'
 import { docAccessNotifyCardRepo, type NotifyCardCoord } from '../../db/repos/docAccessNotifyCardRepo.js'
-import { ROLE_ADMIN } from '../../permission/role.js'
+import { ROLE_ADMIN, roleFromNumber } from '../../permission/role.js'
 import { formatCardTimestamp } from '../../util/cardTime.js'
-import { SHARE_SCOPE_ANYONE } from '../../permission/shareScope.js'
+import { SHARE_SCOPE_ANYONE, SHARE_SCOPE_AUTHENTICATED } from '../../permission/shareScope.js'
 
 const INTERNAL_NOTIFY_PATH = '/v1/internal/notify'
 const INTERNAL_TOKEN_HEADER = 'X-Internal-Token'
@@ -212,38 +212,18 @@ async function resolveApprovers(
   return [...principals.values()]
 }
 
-/**
- * P0 recipient authorization for mention notifications. The mention uids come
- * straight from an attacker-controllable comment body (any reader can comment),
- * so before notifying we MUST intersect them with who can actually READ the doc —
- * otherwise a reader on a restricted doc could leak its title + comment excerpt
- * to a same-space user who is not a doc member (octo-server only filters by SPACE
- * membership, not per-doc access).
- *
- * Read-access mirrors the effective-role model (§4.2 + #64 shareScope):
- *   - restricted doc (default): only owner + doc_member rows can read →
- *     intersect targets with {owner} ∪ {doc_member uids}.
- *   - anyone_in_space doc: every space member can read → we cannot enumerate
- *     space members server-side here, so we pass targets through and rely on
- *     octo-server's `not_space_member` space-level filter (which IS the correct
- *     boundary in this case). Non-space-members are dropped downstream.
- *
- * Returns the subset of `targets` allowed to be notified. Fails CLOSED: if the
- * doc row is missing, returns [].
- */
-async function filterMentionRecipientsByReadAccess(docId: string, targets: string[]): Promise<string[]> {
-  if (targets.length === 0) return []
+async function resolveMentionReaders(docId: string, principalSpaceId: string, targets: string[]): Promise<Set<string> | null> {
   const meta = await docMetaRepo.getByDocId(docId)
-  if (!meta) return [] // fail closed: no doc row => notify no one
-  // anyone_in_space: doc is readable by any space member; defer to octo-server's
-  // space-level filter (we have no local space-membership source).
-  if (meta.share_scope === SHARE_SCOPE_ANYONE) return targets
-  // restricted (default): only owner + explicit doc_member rows can read.
+  if (!meta || meta.status === 0) return null
+  if (meta.share_scope === SHARE_SCOPE_AUTHENTICATED ||
+      (meta.share_scope === SHARE_SCOPE_ANYONE && principalSpaceId === meta.space_id)) return new Set(targets)
   const members = await docMemberRepo.list(docId)
   const readers = new Set<string>()
-  if (meta.owner_id) readers.add(meta.owner_id)
-  for (const m of members) readers.add(m.uid)
-  return targets.filter((uid) => readers.has(uid))
+  if (meta.owner_id && meta.owner_space_id === principalSpaceId) readers.add(meta.owner_id)
+  for (const member of members) {
+    if (member.principal_space_id === principalSpaceId && roleFromNumber(Number(member.role))) readers.add(member.uid)
+  }
+  return readers
 }
 
 /**
@@ -426,6 +406,7 @@ export async function notifyDocAccessRequested(p: AccessRequestNotifyParams): Pr
 export interface MentionNotifyParams {
   docId: string
   spaceId: string
+  principalSpaceId: string
   title: string
   /** The comment author — used as the actor and excluded from recipients (no self-notify). */
   authorUid: string
@@ -441,21 +422,14 @@ export interface MentionNotifyParams {
  */
 export async function notifyDocMentioned(p: MentionNotifyParams): Promise<number> {
   const { docsToken } = config.notify
-  if (!docsToken) return 0
 
   try {
     const mentioned = mentionedUserUids(p.body, p.authorUid)
     if (mentioned.length === 0) return 0
-
-    // P0: only notify uids that can actually READ this doc. Mention uids are
-    // attacker-controllable (any reader can comment), and octo-server filters by
-    // SPACE membership only — not per-doc access — so a restricted doc could
-    // otherwise leak its title + excerpt to a same-space non-member.
-    const authorized = await filterMentionRecipientsByReadAccess(p.docId, mentioned)
-    if (authorized.length === 0) return 0
+    if (!docsToken || !p.principalSpaceId) return 0
 
     // P1: cap the fan-out so a token-stuffed body can't trigger unbounded POSTs.
-    let targets = authorized
+    let targets = mentioned
     if (targets.length > MAX_MENTION_RECIPIENTS) {
       // eslint-disable-next-line no-console
       console.warn('[octo-docs] docs-notify mention recipients capped', {
@@ -466,6 +440,9 @@ export async function notifyDocMentioned(p: MentionNotifyParams): Promise<number
       targets = targets.slice(0, MAX_MENTION_RECIPIENTS)
     }
 
+    const readers = await resolveMentionReaders(p.docId, p.principalSpaceId, targets)
+    if (!readers) return 0
+
     let actorName = ''
     try {
       const user = await getOctoIdentity().getUser(p.authorUid)
@@ -474,20 +451,25 @@ export async function notifyDocMentioned(p: MentionNotifyParams): Promise<number
       actorName = ''
     }
 
-    const docsCard: DocsCardBody = {
+    const redactedCard: DocsCardBody = {
       doc_id: p.docId,
       request_id: '', // commented kind: no approval CAS key
       kind: KIND_COMMENTED,
-      title: p.title,
+      title: '你在一篇文档中被提及',
       actor_uid: p.authorUid,
       actor_name: actorName,
-      excerpt: toExcerpt(p.body),
+      excerpt: '你暂时没有访问权限，打开文档后可申请访问。',
       updated_at: formatCardTimestamp(new Date()),
+    }
+    const readableCard: DocsCardBody = {
+      ...redactedCard,
+      title: p.title.trim() || '无标题文档',
+      excerpt: toExcerpt(p.body),
     }
 
     // P1: bounded concurrency instead of Promise.all over the whole list.
     const results = await mapWithConcurrency(targets, NOTIFY_CONCURRENCY, (uid) =>
-      postNotify(p.spaceId, uid, docsCard, docsToken),
+      postNotify(p.principalSpaceId, uid, readers.has(uid) ? readableCard : redactedCard, docsToken),
     )
     // commented kind has no request_id, so no card ledger is kept; only the
     // delivered count matters here (postNotify now returns {delivered, card}).

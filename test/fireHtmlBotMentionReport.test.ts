@@ -38,11 +38,17 @@ vi.mock('../src/config/env.js', () => ({
 }))
 
 const perm = vi.hoisted(() => ({
+  trackCommentTask: vi.fn(async () => {}),
   getByOctoDocSlug:
     vi.fn<(slug: string, spaceId: string) => Promise<{ doc_id: string; status: number } | null>>(),
   resolveRole: vi.fn<(uid: string, docId: string) => Promise<string>>(),
   resolveBotDocAccess:
     vi.fn<(docId: string, botUid: string) => Promise<{ allowed: boolean; reason: string }>>(),
+}))
+// Keep the real dispatch/permission path, but isolate its persistence observer.
+// The observer's database contract is covered by commentTaskTracking/Repo tests.
+vi.mock('../src/api/services/commentTaskTracking.js', () => ({
+  trackCommentTask: perm.trackCommentTask,
 }))
 vi.mock('../src/db/repos/docMetaRepo.js', () => ({
   docMetaRepo: { getByOctoDocSlug: perm.getByOctoDocSlug },
@@ -76,6 +82,7 @@ const baseParams = {
 }
 
 beforeEach(() => {
+  perm.trackCommentTask.mockReset()
   // 默认全放行 + 文档 active,各用例只翻它要考察的那一环。
   perm.getByOctoDocSlug.mockResolvedValue({ doc_id: 'd_1', status: 1 })
   perm.resolveRole.mockResolvedValue('writer')
@@ -83,7 +90,7 @@ beforeEach(() => {
   vi.spyOn(console, 'warn').mockImplementation(() => {})
   vi.spyOn(console, 'error').mockImplementation(() => {})
   global.fetch = vi.fn(async () =>
-    new Response(JSON.stringify({ code: 0 }), {
+    new Response(JSON.stringify({ accepted: true }), {
       status: 200,
       headers: { 'content-type': 'application/json' },
     }),
@@ -99,12 +106,27 @@ function fetchCalls(): number {
 }
 
 describe('fireHtmlBotMentionReport — 放行基线', () => {
+  it.each(['prepare', 'delivery'] as const)('dispatches when the %s tracking observer throws', async phase => {
+    if (phase === 'delivery') perm.trackCommentTask.mockResolvedValueOnce(undefined)
+    perm.trackCommentTask.mockRejectedValueOnce(new Error('tracking unavailable'))
+    fireHtmlBotMentionReport(baseParams)
+    await drain()
+    expect(fetchCalls()).toBe(1)
+    expect(perm.trackCommentTask).toHaveBeenCalledTimes(2)
+    expect(perm.trackCommentTask).toHaveBeenLastCalledWith(expect.any(Object), 'bot_1', { kind: 'accepted', replay: false })
+    expect(console.warn).toHaveBeenCalledWith('[octo-docs] bot-mention tracking unavailable', expect.objectContaining({ phase }))
+  })
+
   it('作者 writer + Bot writer + 文档 active ⇒ 真的发出上报', async () => {
     // 这条是**基线**,不是凑数:下面每条拒绝用例都只有在「其它条件下会放行」时才有意义。
     // 没有它,一个把 fetch 整个拆掉的改动会让所有拒绝用例继续全绿。
     fireHtmlBotMentionReport(baseParams)
     await drain()
     expect(fetchCalls()).toBe(1)
+    const task = expect.objectContaining({ docId: 'slug_1', commentId: 'c_1', docKind: 'html', spaceId: 'sp_1' })
+    expect(perm.trackCommentTask).toHaveBeenCalledTimes(2)
+    expect(perm.trackCommentTask).toHaveBeenNthCalledWith(1, task, 'bot_1')
+    expect(perm.trackCommentTask).toHaveBeenNthCalledWith(2, task, 'bot_1', expect.objectContaining({ kind: 'accepted' }))
   })
 })
 
@@ -116,6 +138,7 @@ describe('fireHtmlBotMentionReport — 作者侧闸门(评审要求的那条)', 
     fireHtmlBotMentionReport(baseParams)
     await drain()
     expect(fetchCalls()).toBe(0)
+    expect(perm.trackCommentTask).not.toHaveBeenCalled()
   })
 
   it('作者 reader ⇒ 零外发', async () => {
@@ -139,6 +162,7 @@ describe('fireHtmlBotMentionReport — Bot 侧闸门', () => {
     fireHtmlBotMentionReport(baseParams)
     await drain()
     expect(fetchCalls()).toBe(0)
+    expect(perm.trackCommentTask).not.toHaveBeenCalled()
   })
 })
 

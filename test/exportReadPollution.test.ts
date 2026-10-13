@@ -37,6 +37,8 @@ vi.mock('../src/db/repos/yjsDocumentRepo.js', () => ({
     fetchState: vi.fn(async () => null),
     selectForUpdateTx: vi.fn(async () => null),
     upsertStateTx: vi.fn(async () => {}),
+    selectRawForUpdateTx: vi.fn(async () => null),
+    upsertEncodedStateTx: vi.fn(async () => {}),
   },
 }))
 // No images in this scene → listByDoc returns []; object store untouched.
@@ -151,7 +153,7 @@ describe('GET /:docId/export — read must not pollute doc_meta (XIN-749 B1)', (
     expect(srv.opts.at(-1)).toEqual({ user: { id: SYSTEM_STORE_UID } })
     // ...the disconnect store flush still upserted the Y.Doc row (idempotent)...
     const { yjsDocumentRepo } = await import('../src/db/repos/yjsDocumentRepo.js')
-    expect(yjsDocumentRepo.upsertStateTx).toHaveBeenCalled()
+    expect(yjsDocumentRepo.upsertEncodedStateTx).toHaveBeenCalled()
     // ...but doc_meta ownership metadata was NEVER rewritten by the read.
     expect(cap.queries.some((q) => /UPDATE doc_meta/i.test(q.sql))).toBe(false)
   })

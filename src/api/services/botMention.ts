@@ -79,6 +79,7 @@ export const BOT_MENTION_MIN_ROLE: ResolvedRole = 'writer'
 export interface BotMentionDeps {
   sleep?: (ms: number) => Promise<void>
   now?: () => number
+  onTask?: (params: BotMentionParams, botUid: string, outcome?: BotMentionOutcome) => Promise<void>
 }
 
 const defaultSleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
@@ -702,6 +703,21 @@ export async function reportBotMentions(
     // retry chain. Bounded by `cap`, so a flat Promise.all is already bounded.
     const outcomes = await Promise.all(
       bots.map(async (botUid) => {
+        // Tracking is observational. Its DB/cache failures must not prevent an
+        // already-authorized mention from dispatching or change its outcome.
+        const observe = async (outcome?: BotMentionOutcome): Promise<void> => {
+          try {
+            if (outcome) await deps.onTask?.(p, botUid, outcome)
+            else await deps.onTask?.(p, botUid)
+          } catch {
+            // Metadata only: never log comment text or storage error payloads.
+            // eslint-disable-next-line no-console
+            console.warn('[octo-docs] bot-mention tracking unavailable', {
+              docId: p.docId, commentId: p.commentId, botUid, phase: outcome ? 'delivery' : 'prepare',
+            })
+          }
+        }
+        await observe()
         const built = buildBotMentionRequest(p, botUid)
         if (!built.ok) {
           // eslint-disable-next-line no-console
@@ -711,7 +727,9 @@ export async function reportBotMentions(
             botUid,
             reason: built.reason,
           })
-          return { kind: 'permanent', reason: built.reason } as BotMentionOutcome
+          const outcome: BotMentionOutcome = { kind: 'permanent', reason: built.reason }
+          await observe(outcome)
+          return outcome
         }
         if (built.textTruncated) {
           // eslint-disable-next-line no-console
@@ -722,7 +740,9 @@ export async function reportBotMentions(
             maxTextBytes: MAX_TEXT_BYTES,
           })
         }
-        return deliverOne(built.json, token, { docId: p.docId, commentId: p.commentId, botUid }, deps)
+        const outcome = await deliverOne(built.json, token, { docId: p.docId, commentId: p.commentId, botUid }, deps)
+        await observe(outcome)
+        return outcome
       }),
     )
 

@@ -848,6 +848,270 @@ describe('PPT relay: snapshot + GC + offline replay (PPT-COLLAB-003 / PPT-COLLAB
   })
 })
 
+describe('PPT relay: negotiated live permissions', () => {
+  it.each(['live', 'presence', 'cutover'] as const)('preserves queued %s sends across a proof freeze', async kind => {
+    const h = await setup({ roleProvider: async ({ spaceMember }) => spaceMember ? 'reader' : 'none' })
+    const ticket = (epoch: number) => jwt.sign({ uid: 'u_queue', docId: DOC, documentName: DOCNAME,
+      role: 'reader', permission_epoch: epoch, principal_space_id: 's_1', space_member: true,
+      home_space_verified: true, current_space_verified: true, jti: randomUUID() }, config.collabToken.secret, { audience: PPT_RELAY_TICKET_AUD, expiresIn: 30 })
+    const c = await h.connect({ uid: 'u_queue', role: 'reader', ticket: ticket(0) }); await join(c)
+    const internal = h.relay as unknown as {
+      rooms: Map<string, Set<{ caughtUp: boolean; cutoverPending?: boolean; deliveredThrough: number; liveBuffer: unknown[]; flushDepth: number; replayInFlight: boolean }>>
+      enqueueOutbound: (conn: unknown, task: () => Promise<void>) => Promise<void>
+      deliver: (conn: unknown, frame: unknown) => Promise<void>
+      gatedSend: (conn: unknown, frame: unknown) => Promise<boolean>
+      chainedDrain: (conn: unknown, caughtUp: boolean) => Promise<void>
+    }
+    const conn = [...internal.rooms.get(DOC)!][0]!
+    await vi.waitFor(() => expect(conn.flushDepth || conn.replayInFlight).toBeFalsy())
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    void internal.enqueueOutbound(conn, () => gate)
+    const first = OPS_FRAME(1, 'queued-first'), second = OPS_FRAME(2, 'queued-second')
+    await h.store.appendOp(DOC, first.frameId, first); await h.store.appendOp(DOC, second.frameId, second)
+    const tasks: Promise<unknown>[] = []
+    try {
+      if (kind === 'cutover') conn.caughtUp = false
+      if (kind === 'presence') tasks.push(internal.gatedSend(conn, { ctl: 'peers', users: [], total: 0 }))
+      tasks.push(internal.deliver(conn, { ctl: 'op', q: 1, frame: first }))
+      if (kind === 'cutover') tasks.push(internal.chainedDrain(conn, true))
+      await vi.waitFor(() => expect(conn.flushDepth).toBeGreaterThan(0))
+      h.setEpoch(1); await h.relay.applyEpochBump(DOCNAME)
+      tasks.push(internal.deliver(conn, { ctl: 'op', q: 2, frame: second }))
+      release(); await Promise.all(tasks)
+      expect(await c.recv()).toMatchObject({ ctl: 'auth-refresh', epoch: 1 })
+      await expect(c.recv(50)).rejects.toThrow('recv timeout')
+      expect(conn.deliveredThrough).toBe(0); expect(conn.liveBuffer).toHaveLength(2)
+      if (kind === 'cutover') { expect(conn.caughtUp).toBe(false); expect(conn.cutoverPending).toBe(true) }
+      c.send({ t: 'reauth', pv: 2, ticket: ticket(1), requestId: 'queue-proof' })
+      expect(await c.recv()).toMatchObject({ ctl: 'auth-updated', requestId: 'queue-proof' })
+      expect(await c.recv()).toMatchObject({ ctl: 'op', q: 1 })
+      expect(await c.recv()).toMatchObject({ ctl: 'op', q: 2 })
+      await expect(c.recv(50)).rejects.toThrow('recv timeout')
+      expect(conn.liveBuffer).toHaveLength(0); expect(conn.caughtUp).toBe(true)
+      expect(conn.deliveredThrough).toBe(2); expect(c.ws.readyState).toBe(WebSocket.OPEN)
+    } finally { release() }
+  })
+  it.each(['reader', 'none', 'membership'] as const)('does not apply an old %s outcome over freshly proved authority', async staleRole => {
+    let pause = false, release!: () => void, entered!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const parked = new Promise<void>(resolve => { entered = resolve })
+    const h = await setup({ roleProvider: async ({ spaceMember }) => {
+      if (pause) { pause = false; entered(); await gate; return staleRole === 'membership' ? 'writer' : staleRole }
+      return staleRole === 'membership' && !spaceMember ? 'reader' : 'writer'
+    } })
+    const ticket = (epoch: number, member: boolean) => jwt.sign({ uid: 'u_generation', docId: DOC, documentName: DOCNAME,
+      role: 'writer', permission_epoch: epoch, principal_space_id: 's_1', space_member: member,
+      home_space_verified: true, current_space_verified: true, jti: randomUUID() }, config.collabToken.secret, { audience: PPT_RELAY_TICKET_AUD, expiresIn: 30 })
+    const c = await h.connect({ uid: 'u_generation', role: 'writer', ticket: ticket(0, staleRole === 'membership') }); await join(c)
+    pause = true; h.setEpoch(1)
+    const bump = h.relay.applyEpochBump(DOCNAME)
+    try {
+      await parked
+      c.send({ t: 'reauth', pv: 2, ticket: ticket(1, true), requestId: 'new-authority' })
+      expect(await c.recv()).toMatchObject({ ctl: 'auth-updated', role: 'writer', epoch: 1, requestId: 'new-authority' })
+      release(); await bump
+      await expect(c.recv(50)).rejects.toThrow('recv timeout')
+      c.send(OPS_FRAME(1, 'fresh-authorized-write', 1))
+      expect((await c.recvUntil(f => f.ctl === 'ack')).at(-1)).toMatchObject({ ctl: 'ack' })
+      expect(c.ws.readyState).toBe(WebSocket.OPEN)
+    } finally { release(); await bump }
+  })
+  it.each(['proof', 'epoch'] as const)('resumes buffered replay exactly once after %s authority restoration', async mode => {
+    const h = await setup()
+    const c = await h.connect({ uid: 'u_live', role: 'writer' }); await join(c)
+    const internal = h.relay as unknown as {
+      rooms: Map<string, Set<{ auth: { readAllowed: boolean; invalidated: boolean; pendingReauth?: boolean }; replayPending: { since: number; ready: boolean } | null; liveBuffer: unknown[]; liveBufferBytes: number; replayInFlight: boolean; flushDepth: number }>>
+      enqueueOutbound: (conn: unknown, task: () => Promise<void>) => Promise<void>
+    }
+    const conn = [...internal.rooms.get(DOC)!][0]!
+    await vi.waitFor(() => expect(conn.replayInFlight || conn.flushDepth > 0).toBe(false))
+    conn.auth = { readAllowed: true, invalidated: false, pendingReauth: true }
+    conn.replayPending = { since: 0, ready: false }
+    const op = OPS_FRAME(1, 'buffered-after-proof')
+    const { seq: q } = await h.store.appendOp(DOC, op.frameId, op)
+    const frame = { ctl: 'op', q, frame: op }
+    conn.liveBuffer = [frame]; conn.liveBufferBytes = Buffer.byteLength(JSON.stringify(frame))
+    // Hold replay at its storage read so the former concurrent drain gets ahead.
+    const original = h.store.openReplay.bind(h.store)
+    let release!: () => void, entered!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const parked = new Promise<void>(resolve => { entered = resolve })
+    vi.spyOn(h.store, 'openReplay').mockImplementationOnce(async (...args) => { entered(); await gate; return original(...args) })
+    try {
+      if (mode === 'proof') c.send({ t: 'reauth', pv: 2, ticket: h.ticketFor({ uid: 'u_live', role: 'writer', epoch: 0 }), requestId: 'resume-buffered' })
+      else { h.setEpoch(1); await h.relay.applyEpochBump(DOCNAME) }
+      await parked
+      expect(await c.recv()).toMatchObject({ ctl: 'auth-updated' })
+      await expect(c.recv(50)).rejects.toThrow('recv timeout')
+      release()
+      expect(await c.recv()).toMatchObject({ ctl: 'op', frame: { frameId: op.frameId } })
+      await vi.waitFor(() => expect(conn.replayInFlight || conn.flushDepth > 0).toBe(false))
+      await expect(c.recv(50)).rejects.toThrow('recv timeout')
+      expect(c.ws.readyState).toBe(WebSocket.OPEN)
+    } finally { release() }
+  })
+  it.each(['downgrade', 'membership'] as const)('negotiates before a hello-time %s and completes the original replay', async kind => {
+    let epoch = 0, pause = false
+    let entered!: () => void, release!: () => void
+    const parked = new Promise<void>(resolve => { entered = resolve })
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const h = await setup({
+      epochProvider: async () => { if (pause) { pause = false; entered(); await gate } return epoch },
+      roleProvider: async ({ spaceMember }) => kind === 'membership' ? spaceMember ? 'reader' : 'none' : epoch ? 'reader' : 'writer',
+    })
+    const ticket = (value: number) => jwt.sign({ uid: 'u_hello', docId: DOC, documentName: DOCNAME,
+      role: kind === 'membership' ? 'reader' : 'writer', permission_epoch: value,
+      principal_space_id: 's_1', space_member: kind === 'membership', home_space_verified: true,
+      current_space_verified: true, jti: randomUUID() }, config.collabToken.secret, { audience: PPT_RELAY_TICKET_AUD, expiresIn: 30 })
+    await h.store.appendOp(DOC, 'initial', OPS_FRAME(1, 'initial'))
+    await h.store.saveSnapshot({ docId: DOC, coveredSeq: 1, doc: deck() })
+    const c = await h.connect({ uid: 'u_hello', role: 'writer', ticket: ticket(0) })
+    try {
+      pause = true; c.send({ t: 'hello', pv: 2, liveAuth: true }); await parked
+      epoch = 1; await h.relay.applyEpochBump(DOCNAME)
+      expect(await c.recv()).toMatchObject({ ctl: kind === 'membership' ? 'auth-refresh' : 'auth-updated', epoch: 1 })
+      release()
+      if (kind === 'membership') {
+        await expect(c.recv(50)).rejects.toThrow('recv timeout')
+        c.send({ t: 'reauth', pv: 2, ticket: ticket(1), requestId: 'hello-proof' })
+        expect(await c.recv()).toMatchObject({ ctl: 'auth-updated', requestId: 'hello-proof' })
+      }
+      const replay = await c.recvUntil(f => f.ctl === 'ready')
+      expect(replay.map(f => f.ctl)).toEqual(['snapshot', 'ready'])
+      expect(replay.at(-1)).toMatchObject({ role: 'reader', epoch: 1, liveAuth: true })
+      expect(c.ws.readyState).toBe(WebSocket.OPEN)
+    } finally { release() }
+  })
+  async function join(c: WsClient) {
+    c.send({ t: 'hello', pv: 2, liveAuth: true })
+    expect((await c.recvUntil(m => m.ctl === 'ready')).at(-1)).toMatchObject({ liveAuth: true })
+  }
+  it('pauses a queued initial snapshot for fresh proof without losing it or closing', async () => {
+    const h = await setup({ roleProvider: async ({ spaceMember }) => spaceMember ? 'reader' : 'none' })
+    const ticket = (epoch: number) => jwt.sign({ uid: 'u_share', docId: DOC, documentName: DOCNAME,
+      role: 'reader', permission_epoch: epoch, principal_space_id: 's_1', space_member: true,
+      home_space_verified: true, current_space_verified: true, jti: randomUUID() },
+      config.collabToken.secret, { audience: PPT_RELAY_TICKET_AUD, expiresIn: 30 })
+    await h.store.appendOp(DOC, 'initial', OPS_FRAME(1, 'initial'))
+    await h.store.saveSnapshot({ docId: DOC, coveredSeq: 1, doc: deck() })
+    const c = await h.connect({ uid: 'u_share', role: 'reader', ticket: ticket(0) })
+    const relay = h.relay as unknown as {
+      rooms: Map<string, Set<{ outboundDepth: number }>>
+      enqueueOutbound: (conn: unknown, task: () => Promise<void>) => Promise<void>
+    }
+    const conn = [...relay.rooms.get(DOC)!][0]
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    void relay.enqueueOutbound(conn, () => gate)
+    try {
+      c.send({ t: 'hello', pv: 2, liveAuth: true })
+      await vi.waitFor(() => expect(conn.outboundDepth).toBeGreaterThanOrEqual(2))
+      h.setEpoch(1); await h.relay.applyEpochBump(DOCNAME)
+      release()
+      expect(await c.recv()).toMatchObject({ ctl: 'auth-refresh', epoch: 1 })
+      await expect(c.recv(50)).rejects.toThrow('recv timeout')
+      expect(c.ws.readyState).toBe(WebSocket.OPEN)
+      c.send({ t: 'reauth', pv: 2, ticket: ticket(1), requestId: 'resume-initial' })
+      const frames = await c.recvUntil(f => f.ctl === 'ready')
+      expect(frames.map(f => f.ctl)).toEqual(['auth-updated', 'snapshot', 'ready'])
+      expect(frames.at(-1)).toMatchObject({ epoch: 1, role: 'reader' })
+    } finally { release() }
+  })
+  it('notifies unchanged roles and preserves the same socket across repeated epoch changes', async () => {
+    const h = await setup(); const c = await h.connect({ uid: 'u_live', role: 'writer' }); await join(c)
+    for (let epoch = 1; epoch <= 3; epoch++) {
+      h.setEpoch(epoch); await h.relay.applyEpochBump(DOCNAME)
+      expect(await c.recv()).toMatchObject({ ctl: 'auth-updated', role: 'writer', epoch })
+      c.send(OPS_FRAME(epoch, `live-${epoch}`, epoch))
+      expect((await c.recvUntil(m => m.ctl === 'ack')).at(-1)).toMatchObject({ ctl: 'ack' })
+      expect(c.ws.readyState).toBe(WebSocket.OPEN)
+    }
+  })
+  it('downgrades immediately, forbids writes, and upgrades only after correlated fresh reauth', async () => {
+    const h = await setup(); const c = await h.connect({ uid: 'u_live', role: 'writer' }); await join(c)
+    h.setRole('u_live', 'reader'); h.setEpoch(1); await h.relay.applyEpochBump(DOCNAME)
+    expect(await c.recv()).toMatchObject({ ctl: 'auth-updated', role: 'reader', epoch: 1 })
+    c.send(OPS_FRAME(1, 'forbidden', 1)); expect((await c.recv()).code).toBe('forbidden-role')
+    h.setRole('u_live', 'writer'); h.setEpoch(2); await h.relay.applyEpochBump(DOCNAME)
+    expect(await c.recv()).toMatchObject({ ctl: 'auth-refresh', role: 'reader', epoch: 2 })
+    c.send(OPS_FRAME(2, 'still-forbidden', 2)); expect((await c.recv()).code).toBe('forbidden-role')
+    c.send({ t: 'reauth', pv: 2, requestId: 'fresh-2', ticket: h.ticketFor({ uid: 'u_live', role: 'writer', epoch: 2 }) })
+    expect(await c.recv()).toMatchObject({ ctl: 'auth-updated', role: 'writer', epoch: 2, requestId: 'fresh-2' })
+    c.send(OPS_FRAME(3, 'allowed', 2)); expect((await c.recvUntil(m => m.ctl === 'ack')).at(-1)?.ctl).toBe('ack')
+    h.setRole('u_live', 'none'); h.setEpoch(3); await h.relay.applyEpochBump(DOCNAME)
+    expect((await c.closed).code).toBe(4403)
+  })
+  it('requires fresh membership on the existing socket and closes on timeout', async () => {
+    const h = await setup({ roleProvider: async ({ spaceMember }) => spaceMember ? 'reader' : 'none', limits: { reauthGraceMs: 100 } })
+    const ticket = jwt.sign({ uid: 'u_share', docId: DOC, documentName: DOCNAME, role: 'reader', permission_epoch: 0,
+      principal_space_id: 's_1', space_member: true, home_space_verified: true, current_space_verified: true, jti: randomUUID() },
+      config.collabToken.secret, { audience: PPT_RELAY_TICKET_AUD, expiresIn: 30 })
+    const c = await h.connect({ uid: 'u_share', role: 'reader', ticket }); await join(c)
+    h.setEpoch(1); await h.relay.applyEpochBump(DOCNAME)
+    expect(await c.recv()).toMatchObject({ ctl: 'auth-refresh', epoch: 1 })
+    expect(c.ws.readyState).toBe(WebSocket.OPEN)
+    expect((await c.closed).code).toBe(4403)
+  })
+  it('refreshes a load-bearing Space proof in place without sending another snapshot', async () => {
+    const h = await setup({ roleProvider: async ({ spaceMember }) => spaceMember ? 'reader' : 'none' })
+    const ticket = (epoch: number) => jwt.sign({ uid: 'u_share', docId: DOC, documentName: DOCNAME, role: 'reader', permission_epoch: epoch,
+      principal_space_id: 's_1', space_member: true, home_space_verified: true, current_space_verified: true, jti: randomUUID() },
+      config.collabToken.secret, { audience: PPT_RELAY_TICKET_AUD, expiresIn: 30 })
+    const c = await h.connect({ uid: 'u_share', role: 'reader', ticket: ticket(0) }); await join(c)
+    for (let epoch = 1; epoch <= 3; epoch++) {
+      h.setEpoch(epoch); await h.relay.applyEpochBump(DOCNAME)
+      expect(await c.recv()).toMatchObject({ ctl: 'auth-refresh', epoch })
+      c.send({ t: 'reauth', pv: 2, ticket: ticket(epoch), requestId: `proof-${epoch}` })
+      expect(await c.recv()).toMatchObject({ ctl: 'auth-updated', role: 'reader', epoch, requestId: `proof-${epoch}` })
+      expect(c.ws.readyState).toBe(WebSocket.OPEN)
+    }
+  })
+  it.each(['fresh proof', 'timeout', 'invalid proof'] as const)('keeps a usable proof epoch after lookup failure: %s', async mode => {
+    let epoch = 5, failNext = false
+    const h = await setup({ limits: { reauthGraceMs: 200 },
+      epochProvider: async () => { if (failNext) { failNext = false; throw Error('transient epoch read') } return epoch },
+      roleProvider: async ({ spaceMember }) => spaceMember ? 'reader' : 'none',
+    })
+    const ticket = (value: number) => jwt.sign({ uid: 'u_epoch', docId: DOC, documentName: DOCNAME, role: 'reader', permission_epoch: value,
+      principal_space_id: 's_1', space_member: true, home_space_verified: true, current_space_verified: true, jti: randomUUID() },
+      config.collabToken.secret, { audience: PPT_RELAY_TICKET_AUD, expiresIn: 30 })
+    const c = await h.connect({ uid: 'u_epoch', role: 'reader', ticket: ticket(epoch) }); await join(c)
+    failNext = true; await h.relay.applyEpochBump(DOCNAME)
+    expect(await c.recv()).toMatchObject({ ctl: 'auth-refresh', epoch: 5 })
+    if (mode === 'timeout') { expect((await c.closed).code).toBe(4403); return }
+    if (mode === 'invalid proof') {
+      c.send({ t: 'reauth', pv: 2, ticket: 'invalid', requestId: 'bad' })
+      expect((await c.closed).code).toBe(4403); return
+    }
+    // A later epoch can supersede the fallback while its ticket is being fetched.
+    epoch = 6; await h.relay.applyEpochBump(DOCNAME)
+    expect(await c.recv()).toMatchObject({ ctl: 'auth-refresh', epoch: 6 })
+    c.send({ t: 'reauth', pv: 2, ticket: ticket(epoch), requestId: 'recovered' })
+    expect(await c.recv()).toMatchObject({ ctl: 'auth-updated', epoch: 6, role: 'reader', requestId: 'recovered' })
+    await expect(c.recv(250)).rejects.toThrow('recv timeout')
+    expect(c.ws.readyState).toBe(WebSocket.OPEN)
+    expect(await h.store.currentSeq(DOC)).toBe(0)
+  })
+  it('drops superseded queued auth notifications without closing the live socket', async () => {
+    const h = await setup(); const c = await h.connect({ uid: 'u_live', role: 'writer' }); await join(c)
+    const relay = h.relay as unknown as {
+      rooms: Map<string, Set<unknown>>
+      enqueueOutbound: (conn: unknown, task: () => Promise<void>) => Promise<void>
+    }
+    const conn = [...relay.rooms.get(DOC)!][0]
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    void relay.enqueueOutbound(conn, () => gate)
+    h.setEpoch(1); await h.relay.applyEpochBump(DOCNAME)
+    h.setEpoch(2); await h.relay.applyEpochBump(DOCNAME)
+    release()
+    expect(await c.recv()).toMatchObject({ ctl: 'auth-updated', epoch: 2 })
+    expect(c.ws.readyState).toBe(WebSocket.OPEN)
+    c.send(OPS_FRAME(1, 'latest-epoch', 2)); expect((await c.recvUntil(m => m.ctl === 'ack')).at(-1)?.ctl).toBe('ack')
+  })
+})
+
 describe('PPT relay: permission epoch (PPT-EPOCH-001 / 002 / 003)', () => {
   it('downgrade: role-changed is delivered and old-epoch ops are refused stale-epoch', async () => {
     const h = await setup()
@@ -1195,7 +1459,7 @@ describe('PPT relay: share-aware role re-resolution (B6 / P1-7)', () => {
     return ctx.spaceMember ? 'writer' : 'none'
   }
 
-  it('a stale-epoch ticket for a share writer re-resolves to writer (not revoked) when space_member is carried', async () => {
+  it('a stale-epoch membership claim cannot restore a removed share writer at connect', async () => {
     const h = await setup({ roleProvider: shareResolver })
     h.setEpoch(1) // live epoch advanced past the ticket's epoch 0
     // A legitimate ticket minted before the bump, carrying the space_member claim.
@@ -1211,11 +1475,8 @@ describe('PPT relay: share-aware role re-resolution (B6 / P1-7)', () => {
       spaceMember: true,
     }).ticket
     const c = await h.connect({ uid: 'u_share', role: 'writer', ticket })
-    const { ready } = await helloReady(c)
-    expect(ready.role).toBe('writer') // re-resolved via the share path, not revoked
-    // And it can actually mutate at the live epoch.
-    c.send(OPS_FRAME(1, 'sh1', 1))
-    expect(await c.recv()).toMatchObject({ ctl: 'ack', q: 1 })
+    expect((await c.closed).code).toBe(4403)
+    expect(await h.store.currentSeq(DOC)).toBe(0)
   })
 
   it('a stale-epoch ticket for a non-member fails closed (4403)', async () => {
@@ -1234,6 +1495,190 @@ describe('PPT relay: share-aware role re-resolution (B6 / P1-7)', () => {
     }).ticket
     const c = await h.connect({ uid: 'u_out', role: 'writer', ticket })
     expect((await c.closed).code).toBe(4403)
+  })
+})
+
+describe('PPT relay: fresh membership proof after a missed epoch signal', () => {
+  const ticket = (epoch: number) => issuePptCollabToken({
+    uid: 'u_share', docId: DOC, documentName: DOCNAME, role: 'writer',
+    permission_epoch: epoch, principalSpaceId: 's_1', snapshotVersion: 0,
+    homeSpaceVerified: true, currentSpaceVerified: true, spaceMember: true,
+  }).ticket
+  const shareRole = async ({ spaceMember }: { spaceMember: boolean }): Promise<ResolvedRole> => spaceMember ? 'writer' : 'none'
+  const join = async (h: Harness) => {
+    const c = await h.connect({ uid: 'u_share', role: 'writer', ticket: ticket(0) })
+    c.send({ t: 'hello', pv: 2, liveAuth: true })
+    await c.recvUntil(f => f.ctl === 'ready')
+    return c
+  }
+
+  it('rejects an unused old membership ticket at reauth after revocation', async () => {
+    const h = await setup({ roleProvider: shareRole })
+    const old = ticket(0)
+    const c = await join(h)
+    h.setEpoch(1)
+    c.send({ t: 'reauth', pv: 2, ticket: old, requestId: 'stale-proof' })
+    expect((await c.closed).code).toBe(4403)
+    expect(await h.store.currentSeq(DOC)).toBe(0)
+  })
+
+  it.each(['need', 'presence', 'mutation', 'timer'] as const)('requests in-place proof on %s without replaying or allowing writes while frozen', async path => {
+    const h = await setup({ roleProvider: shareRole, limits: { authRefreshMs: path === 'timer' ? 50 : 60_000 } })
+    const c = await join(h)
+    h.setEpoch(1)
+    if (path === 'need') c.send({ t: 'need', pv: 2, since: 0 })
+    if (path === 'presence') c.send({ t: 'p', pv: 2, presence: { cursor: 1 } })
+    if (path === 'mutation') c.send(OPS_FRAME(1, 'missed-epoch', 1))
+    const frames = await c.recvUntil(f => f.ctl === 'auth-refresh')
+    expect(frames.at(-1)).toMatchObject({ epoch: 1 })
+    expect(frames.every(f => ['auth-refresh', 'refused'].includes(String(f.ctl)))).toBe(true)
+    expect(c.ws.readyState).toBe(WebSocket.OPEN)
+    c.send(OPS_FRAME(2, 'frozen-write', 1))
+    await c.recvUntil(f => f.ctl === 'refused' && f.k === 2)
+    expect(await h.store.currentSeq(DOC)).toBe(0)
+    c.send({ t: 'reauth', pv: 2, ticket: ticket(1), requestId: 'fresh-proof' })
+    expect((await c.recvUntil(f => f.ctl === 'auth-updated')).at(-1)).toMatchObject({ epoch: 1, role: 'writer' })
+    c.send(OPS_FRAME(3, 'after-proof', 1))
+    expect((await c.recvUntil(f => f.ctl === 'ack')).at(-1)).toMatchObject({ q: 1 })
+    expect(c.ws.readyState).toBe(WebSocket.OPEN)
+  })
+
+  it('does not extend the proof deadline when repeated epoch bumps arrive', async () => {
+    const h = await setup({ roleProvider: shareRole, limits: { reauthGraceMs: 200, authRefreshMs: 60_000 } })
+    const c = await join(h)
+    h.setEpoch(1)
+    c.send({ t: 'need', pv: 2, since: 0 })
+    await c.recvUntil(f => f.ctl === 'auth-refresh')
+    const internal = h.relay as unknown as { rooms: Map<string, Set<{ reauthGraceTimer: unknown }>> }
+    const conn = [...internal.rooms.get(DOC)!][0]!
+    const deadline = conn.reauthGraceTimer
+    h.setEpoch(2); await h.relay.applyEpochBump(DOCNAME)
+    expect(conn.reauthGraceTimer).toBe(deadline)
+    expect((await c.closed).code).toBe(4403)
+  })
+
+  it('retains a need cursor across proof refresh and serves it only after reauth', async () => {
+    const h = await setup({ roleProvider: shareRole, limits: { authRefreshMs: 60_000 } })
+    const c = await join(h)
+    await h.store.appendOp(DOC, 'missed-op', OPS_FRAME(1, 'missed-op'))
+    h.setEpoch(1)
+    c.send({ t: 'need', pv: 2, since: 0 })
+    await c.recvUntil(f => f.ctl === 'auth-refresh')
+    await expect(c.recv(50)).rejects.toThrow('recv timeout')
+    c.send({ t: 'reauth', pv: 2, ticket: ticket(1) })
+    const resumed = await c.recvUntil(f => f.ctl === 'op')
+    expect(resumed.map(f => f.ctl)).toEqual(['auth-updated', 'op'])
+    expect(resumed.at(-1)).toMatchObject({ q: 1, frame: { frameId: 'missed-op' } })
+    await expect(c.recv(50)).rejects.toThrow('recv timeout')
+  })
+
+  it.each(['connect', 'reauth'] as const)('retains only a direct reader grant from a stale share-writer ticket at %s', async path => {
+    const h = await setup({ roleProvider: async ({ spaceMember }) => spaceMember ? 'writer' : 'reader' })
+    const old = ticket(0)
+    let c: WsClient
+    if (path === 'reauth') {
+      c = await join(h); h.setEpoch(1)
+      c.send({ t: 'reauth', pv: 2, ticket: old })
+      expect((await c.recvUntil(f => f.ctl === 'auth-updated')).at(-1)).toMatchObject({ role: 'reader', epoch: 1 })
+    } else {
+      h.setEpoch(1)
+      c = await h.connect({ uid: 'u_share', role: 'writer', ticket: old })
+      expect((await helloReady(c)).ready).toMatchObject({ role: 'reader', epoch: 1 })
+    }
+    c.send(OPS_FRAME(1, 'no-stale-share-writes', 1))
+    expect((await c.recvUntil(f => f.ctl === 'refused')).at(-1)).toMatchObject({ code: 'forbidden-role' })
+    expect(await h.store.currentSeq(DOC)).toBe(0)
+  })
+
+  it('discards a stale per-frame membership outcome after fresh reauth', async () => {
+    let pause = false, entered!: () => void, release!: () => void
+    const parked = new Promise<void>(r => { entered = r })
+    const gate = new Promise<void>(r => { release = r })
+    const h = await setup({ roleProvider: async ctx => {
+      if (pause) { pause = false; entered(); await gate }
+      return shareRole(ctx)
+    } })
+    const c = await join(h)
+    const internal = h.relay as unknown as { rooms: Map<string, Set<unknown>>; refreshRoleDownOnly: (conn: unknown, epoch: number) => Promise<boolean> }
+    h.setEpoch(1); pause = true
+    const refresh = internal.refreshRoleDownOnly([...internal.rooms.get(DOC)!][0], 1)
+    try {
+      await parked
+      c.send({ t: 'reauth', pv: 2, ticket: ticket(1), requestId: 'new-proof' })
+      await c.recvUntil(f => f.ctl === 'auth-updated')
+      release(); await refresh
+      c.send(OPS_FRAME(1, 'not-closed-by-old-check', 1))
+      expect((await c.recvUntil(f => f.ctl === 'ack')).at(-1)).toMatchObject({ q: 1 })
+    } finally { release(); await refresh }
+  })
+
+  it('an old expiry lookup cannot unfreeze an epoch change or expose buffered peer edits', async () => {
+    let pause = false, entered!: () => void, release!: () => void
+    const parked = new Promise<void>(r => { entered = r })
+    const gate = new Promise<void>(r => { release = r })
+    const h = await setup({ roleProvider: async ctx => {
+      if (pause && !ctx.spaceMember) { pause = false; entered(); await gate; return 'writer' }
+      return shareRole(ctx)
+    }, limits: { authRefreshMs: 60_000 } })
+    const c = await join(h)
+    const internal = h.relay as unknown as {
+      rooms: Map<string, Set<{ auth: { pendingReauth?: boolean }; liveBuffer: unknown[] }>>
+      expireShareMembership: (conn: unknown) => Promise<void>
+      deliver: (conn: unknown, frame: unknown) => Promise<void>
+    }
+    const conn = [...internal.rooms.get(DOC)!][0]!
+    pause = true
+    const expiry = internal.expireShareMembership(conn)
+    try {
+      await parked
+      h.setEpoch(1); await h.relay.applyEpochBump(DOCNAME)
+      await c.recvUntil(f => f.ctl === 'auth-refresh')
+      release(); await expiry
+      expect(conn.auth.pendingReauth).toBe(true)
+      const frame = OPS_FRAME(1, 'peer-during-proof', 1)
+      await h.store.appendOp(DOC, frame.frameId, frame)
+      await internal.deliver(conn, { ctl: 'op', q: 1, frame })
+      await expect(c.recv(50)).rejects.toThrow('recv timeout')
+      expect(conn.liveBuffer).toHaveLength(1)
+      c.send({ t: 'reauth', pv: 2, ticket: ticket(1) })
+      expect((await c.recvUntil(f => f.ctl === 'op')).at(-1)).toMatchObject({ q: 1, frame: { frameId: frame.frameId } })
+      expect(conn.liveBuffer).toHaveLength(0)
+    } finally { release(); await expiry }
+  })
+
+  it.each(['live', 'deleted'] as const)('freezes delivery before the epoch-event status lookup resolves to %s', async status => {
+    let pause = false, entered!: () => void, release!: () => void
+    const parked = new Promise<void>(r => { entered = r })
+    const gate = new Promise<void>(r => { release = r })
+    const h = await setup({ roleProvider: shareRole, docStatusProvider: async () => {
+      if (pause) { pause = false; entered(); await gate; return status }
+      return 'live'
+    }, limits: { authRefreshMs: 60_000 } })
+    const c = await join(h)
+    const internal = h.relay as unknown as {
+      rooms: Map<string, Set<{ auth: { pendingReauth?: boolean }; liveBuffer: unknown[] }>>
+      deliver: (conn: unknown, frame: unknown) => Promise<void>
+    }
+    const conn = [...internal.rooms.get(DOC)!][0]!
+    h.setEpoch(1); pause = true
+    const bump = h.relay.applyEpochBump(DOCNAME)
+    try {
+      await parked
+      const frame = OPS_FRAME(1, 'during-status-lookup', 1)
+      await h.store.appendOp(DOC, frame.frameId, frame)
+      await internal.deliver(conn, { ctl: 'op', q: 1, frame })
+      await expect(c.recv(50)).rejects.toThrow('recv timeout')
+      expect(conn.auth.pendingReauth).toBe(true)
+      expect(conn.liveBuffer).toHaveLength(1)
+      release(); await bump
+      if (status === 'deleted') {
+        expect((await c.closed).code).toBe(4404)
+      } else {
+        await c.recvUntil(f => f.ctl === 'auth-refresh')
+        c.send({ t: 'reauth', pv: 2, ticket: ticket(1) })
+        expect((await c.recvUntil(f => f.ctl === 'op')).at(-1)).toMatchObject({ q: 1 })
+      }
+    } finally { release(); await bump }
   })
 })
 
@@ -2885,10 +3330,10 @@ describe('PPT relay: round-19 P0 (XIN-1759) — deliveredThrough single-source p
     expect(asAny.canAdvanceDeliveredThroughFromAuthor(peer, false)).toBe(false)
     expect(peer.deliveredThrough).toBe(5) // unchanged: the authored write did not advance it
 
-    // Sanity: once the replay finishes, an authored write WOULD be a true observation.
+    // Finishing replay is not enough while an earlier peer op is still buffered.
     peer.replayInFlight = false
-    expect(asAny.isDeliveryStable(peer)).toBe(true)
-    expect(asAny.canAdvanceDeliveredThroughFromAuthor(peer, false)).toBe(true)
+    expect(asAny.isDeliveryStable(peer)).toBe(false)
+    expect(asAny.canAdvanceDeliveredThroughFromAuthor(peer, false)).toBe(false)
 
     // Cutover: the replay finished; flush the buffer. The peer op q=6 (> deliveredThrough
     // 5) is delivered exactly once — NOT dedup-dropped. On a45ba1e the authored write had
@@ -2896,12 +3341,14 @@ describe('PPT relay: round-19 P0 (XIN-1759) — deliveredThrough single-source p
     await asAny.flushLiveBuffer(peer)
     expect(sent.map((m) => (m as { q?: number }).q)).toEqual([6])
     expect(peer.deliveredThrough).toBe(6)
+    expect(asAny.isDeliveryStable(peer)).toBe(true)
+    expect(asAny.canAdvanceDeliveredThroughFromAuthor(peer, false)).toBe(true)
     relay.close()
   })
 
   it('a duplicate re-ack never advances deliveredThrough even when delivery-stable', () => {
     const relay = new PptRelay({ store: new InMemoryPptRelayStore(), epochProvider: async () => 0 })
-    const stable = { caughtUp: true, replayInFlight: false, flushDepth: 0, deliveredThrough: 3, auth: { readAllowed: true, invalidated: false }, socket: { readyState: WebSocket.OPEN } }
+    const stable = { caughtUp: true, replayInFlight: false, flushDepth: 0, liveBuffer: [], deliveredThrough: 3, auth: { readAllowed: true, invalidated: false }, socket: { readyState: WebSocket.OPEN } }
     const asAny = relay as unknown as { canAdvanceDeliveredThroughFromAuthor: (c: unknown, dup: boolean) => boolean }
     expect(asAny.canAdvanceDeliveredThroughFromAuthor(stable, false)).toBe(true)
     expect(asAny.canAdvanceDeliveredThroughFromAuthor(stable, true)).toBe(false) // duplicate re-ack

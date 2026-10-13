@@ -70,7 +70,7 @@ interface RawResponse {
 }
 
 /** One SSRF-pinned GET to a single validated IP, streaming with a hard size cap. */
-function getOnce(target: URL, validatedIps: string[], timeoutMs: number, maxBytes: number): Promise<RawResponse> {
+function getOnce(target: URL, validatedIps: string[], timeoutMs: number, maxBytes: number, accept: string): Promise<RawResponse> {
   return new Promise<RawResponse>((resolve, reject) => {
     const isHttps = target.protocol === 'https:'
     const mod = isHttps ? https : http
@@ -83,7 +83,7 @@ function getOnce(target: URL, validatedIps: string[], timeoutMs: number, maxByte
       headers: {
         Host: target.host,
         'User-Agent': config.og.userAgent,
-        Accept: 'image/*',
+        Accept: accept,
       },
       lookup: staticLookup(validatedIps[0]!),
       timeout: timeoutMs,
@@ -96,6 +96,7 @@ function getOnce(target: URL, validatedIps: string[], timeoutMs: number, maxByte
     const fail = (e: Error): void => {
       if (settled) return
       settled = true
+      clearTimeout(timer)
       req.destroy()
       reject(e)
     }
@@ -104,17 +105,19 @@ function getOnce(target: URL, validatedIps: string[], timeoutMs: number, maxByte
       const status = res.statusCode ?? 0
       if (status >= 300 && status < 400) {
         const loc = res.headers.location
-        res.resume()
+        res.destroy()
         if (!settled) {
           settled = true
+          clearTimeout(timer)
           resolve({ status, headers: res.headers, location: Array.isArray(loc) ? loc[0] : loc })
         }
         return
       }
       if (status < 200 || status >= 300) {
-        res.resume()
+        res.destroy()
         if (!settled) {
           settled = true
+          clearTimeout(timer)
           resolve({ status, headers: res.headers })
         }
         return
@@ -132,12 +135,16 @@ function getOnce(target: URL, validatedIps: string[], timeoutMs: number, maxByte
       res.on('end', () => {
         if (settled) return
         settled = true
+        clearTimeout(timer)
         resolve({ status, headers: res.headers, bytes: Buffer.concat(chunks) })
       })
       res.on('error', (e) => fail(new LinkCardError('fetch_failed', e.message)))
     })
     req.on('timeout', () => fail(new LinkCardError('fetch_failed', 'request timeout')))
     req.on('error', (e) => fail(new LinkCardError('fetch_failed', e.message)))
+    // A socket inactivity timeout alone does not stop a slow continuous stream.
+    const timer = setTimeout(() => fail(new LinkCardError('fetch_failed', 'request timeout')), timeoutMs)
+    timer.unref()
     req.end()
   })
 }
@@ -148,6 +155,15 @@ function getOnce(target: URL, validatedIps: string[], timeoutMs: number, maxByte
  * The returned bytes are unvalidated; the caller MUST sniff the magic number before storing.
  */
 export async function fetchExternalImage(rawUrl: string, maxBytes: number): Promise<FetchedImage> {
+  return fetchExternalBytes(rawUrl, maxBytes, 'image/*')
+}
+
+/** Same SSRF and deadline policy as images; no caller credentials are forwarded. */
+export async function fetchExternalMedia(rawUrl: string, maxBytes: number): Promise<FetchedImage> {
+  return fetchExternalBytes(rawUrl, maxBytes, 'image/*,audio/*,video/*,application/octet-stream')
+}
+
+async function fetchExternalBytes(rawUrl: string, maxBytes: number, accept: string): Promise<FetchedImage> {
   let current: URL
   try {
     current = new URL(rawUrl)
@@ -159,11 +175,20 @@ export async function fetchExternalImage(rawUrl: string, maxBytes: number): Prom
 
   for (let hop = 0; hop <= maxHops; hop++) {
     assertSchemeAndPort(current)
-    const { validatedIps } = await resolveAndValidate(current.hostname)
+    const dnsBudget = deadline - Date.now()
+    if (dnsBudget <= 0) throw new LinkCardError('fetch_failed', 'timeout')
+    let dnsTimer: ReturnType<typeof setTimeout> | undefined
+    const { validatedIps } = await Promise.race([
+      resolveAndValidate(current.hostname),
+      new Promise<never>((_resolve, reject) => {
+        dnsTimer = setTimeout(() => reject(new LinkCardError('fetch_failed', 'dns timeout')), dnsBudget)
+        dnsTimer.unref()
+      }),
+    ]).finally(() => clearTimeout(dnsTimer))
     const remaining = deadline - Date.now()
     if (remaining <= 0) throw new LinkCardError('fetch_failed', 'timeout')
 
-    const resp = await getOnce(current, validatedIps, remaining, maxBytes)
+    const resp = await getOnce(current, validatedIps, remaining, maxBytes, accept)
     if (resp.status >= 300 && resp.status < 400) {
       if (hop === maxHops) throw new LinkCardError('fetch_failed', 'too many redirects')
       if (!resp.location) throw new LinkCardError('fetch_failed', 'redirect without location')

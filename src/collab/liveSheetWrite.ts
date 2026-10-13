@@ -14,6 +14,7 @@
  */
 import type { Document } from '@hocuspocus/server'
 import * as Y from 'yjs'
+import { prepareConditionalFormatChanges, SHEET_CONDITIONAL_FORMATS_FIELD, type ConditionalFormatChanges } from '../agent/sheetConditionalFormatting.js'
 import { getCollabServer } from './server.js'
 import {
   validateSheetCellBatch,
@@ -136,6 +137,7 @@ export async function commitLiveSheetEdit(
    */
   isAdmin = false,
   structuralEdit?: SheetStructuralEdit,
+  conditionalFormats: ConditionalFormatChanges = {},
 ): Promise<{ newSV: Uint8Array; bytes: number }> {
   // Compatibility with !124's short-lived positional signature, where the
   // argument now named `freeze` carried flat checkbox changes and `filters`
@@ -171,7 +173,7 @@ export async function commitLiveSheetEdit(
         Object.keys(cells).length === 0 && Object.keys(dims).length === 0 &&
         Object.keys(drawings).length === 0 && Object.keys(hyperlinks).length === 0 &&
         Object.keys(merges).length === 0 && Object.keys(sheets).length === 0 &&
-        Object.keys(freeze).length === 0 && Object.keys(filters).length === 0 && structuralEdit === undefined
+        Object.keys(freeze).length === 0 && Object.keys(filters).length === 0 && structuralEdit === undefined && Object.keys(conditionalFormats).length === 0
       const requestedListBatch = validateSheetListBatch(sheets)
       const listBatch = prepareSheetListBatchForWrite(
         listMap.entries(),
@@ -191,6 +193,7 @@ export async function commitLiveSheetEdit(
       const nextLogicalIds = sheetLogicalIdsWithLegacyDefault(listMap.keys())
       for (const key of listBatch.toDelete) nextLogicalIds.delete(key)
       for (const [key] of listBatch.toSet) nextLogicalIds.add(key)
+      const conditionalBatch = prepareConditionalFormatChanges(doc, conditionalFormats, nextLogicalIds, listBatch.toDelete)
       const validationBatch = validationDeletionOnly
         ? validateSheetDataValidationResourceDeletionRepairBatch(validationMap.entries(), dataValidations)
         : validateSheetDataValidationResourceBatch(
@@ -209,6 +212,7 @@ export async function commitLiveSheetEdit(
         if (rule.type === 'checkbox') protectedCheckboxChanges[key] = rule
       }
       const resourceSheets = new Set([...Object.keys(freeze), ...Object.keys(filters)])
+      for (const key of Object.keys(conditionalFormats)) resourceSheets.add(key.split('!')[0]!)
       for (const key of Object.keys(dataValidations)) {
         if (!key.includes('!')) resourceSheets.add(key)
       }
@@ -274,6 +278,9 @@ export async function commitLiveSheetEdit(
       for (const [key, value] of filterBatch.toSet) filterMap.set(key, value)
       for (const key of validationBatch.toDelete) validationMap.delete(key)
       for (const [key, rule] of validationBatch.toSet) validationMap.set(key, rule)
+      const conditionalMap = doc.getMap(SHEET_CONDITIONAL_FORMATS_FIELD)
+      for (const key of conditionalBatch.toDelete) conditionalMap.delete(key)
+      for (const [key, value] of conditionalBatch.toSet) conditionalMap.set(key, value)
       if (structuralEditPlan) applySheetStructuralEditPlan(doc, structuralEditPlan)
       // (3) Advance the edit-version counter so a delete-only batch also moves
       //     the state vector forward; the token is read AFTER this bump.

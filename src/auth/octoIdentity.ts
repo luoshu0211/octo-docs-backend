@@ -35,7 +35,7 @@ export interface OctoSpaceMember {
 }
 
 export type OctoSpacePrincipalLookup =
-  | { status: 'eligible' }
+  | { status: 'eligible'; principalType: 'human' | 'user_bot' }
   | { status: 'not_eligible' }
   | { status: 'not_found' }
   | { status: 'forbidden' }
@@ -565,7 +565,7 @@ export class HttpOctoIdentity implements OctoIdentity {
       const principal = body as { uid?: unknown; principal_type?: unknown }
       if (principal.uid !== uid) return { status: 'unavailable' }
       if (principal.principal_type === 'human' || principal.principal_type === 'user_bot') {
-        return { status: 'eligible' }
+        return { status: 'eligible', principalType: principal.principal_type }
       }
       if (principal.principal_type === 'app_bot') return { status: 'not_eligible' }
       return { status: 'unavailable' }

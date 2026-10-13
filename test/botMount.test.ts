@@ -26,6 +26,7 @@ vi.mock('../src/db/repos/docMetaRepo.js', () => ({
 vi.mock('../src/db/repos/docMemberRepo.js', () => ({
   docMemberRepo: {
     upsertDirect: vi.fn(async () => {}),
+    upsertDirectWithNotification: vi.fn(async () => ({ created: true })),
     updateExistingDirect: vi.fn(async () => true),
     removePrincipalExact: vi.fn(async () => ({
       changed: true,
@@ -57,6 +58,7 @@ const getByDocId = vi.mocked(docMetaRepo.getByDocId)
 const setShareSettings = vi.mocked(docMetaRepo.setShareSettings)
 const resolveDocRole = vi.mocked(resolveRole)
 const upsertDirect = vi.mocked(docMemberRepo.upsertDirect)
+const upsertDirectWithNotification = vi.mocked(docMemberRepo.upsertDirectWithNotification)
 const updateExistingDirect = vi.mocked(docMemberRepo.updateExistingDirect)
 const bumpEpochMock = vi.mocked(bumpEpoch)
 const removePrincipalExact = vi.mocked(docMemberRepo.removePrincipalExact)
@@ -120,6 +122,7 @@ beforeEach(() => {
   })
   resolveDocRole.mockReset().mockResolvedValue('reader')
   upsertDirect.mockClear()
+  upsertDirectWithNotification.mockReset().mockResolvedValue({ created: true })
   updateExistingDirect.mockClear()
   bumpEpochMock.mockClear()
   removePrincipalExact.mockClear()
@@ -293,7 +296,7 @@ describe('bot mount /v1/bot/docs (§ v4.3)', () => {
   })
 
   it('defaults an omitted principalSpaceId to the bearer Space, not the document Home Space', async () => {
-    const lookupSpacePrincipalAsBot = vi.fn(async () => ({ status: 'eligible' as const }))
+    const lookupSpacePrincipalAsBot = vi.fn(async () => ({ status: 'eligible' as const, principalType: 'human' as const }))
     setOctoIdentity(stub({
       verifyBot: async () => ({ uid: 'bot_1', spaceId: 's_real' }),
       lookupSpacePrincipalAsBot,
@@ -307,15 +310,47 @@ describe('bot mount /v1/bot/docs (§ v4.3)', () => {
     })
 
     expect(res.status).toBe(200)
-    expect(await res.json()).toEqual({ ok: true })
+    expect(await res.json()).toEqual({ ok: true, created: true, notified: true })
     expect(lookupSpacePrincipalAsBot).toHaveBeenCalledWith('u_target', 's_real', 'bot-secret')
-    expect(upsertDirect).toHaveBeenCalledWith(expect.objectContaining({
-      docId: 'd_bot', uid: 'u_target', principalSpaceId: 's_real', grantedBy: 'bot_1',
+    expect(upsertDirectWithNotification).toHaveBeenCalledWith(expect.objectContaining({
+      docId: 'd_bot', uid: 'u_target', principalSpaceId: 's_real', grantedBy: 'bot_1', notifyRecipient: true,
     }))
   })
 
+  it('keeps a Bot recipient silent while preserving the direct grant', async () => {
+    setOctoIdentity(stub({
+      verifyBot: async () => ({ uid: 'bot_1', spaceId: 's_real' }),
+      lookupSpacePrincipalAsBot: async () => ({ status: 'eligible', principalType: 'user_bot' }),
+    }))
+    resolveDocRole.mockResolvedValue('admin')
+    const res = await fetch(`${base}/v1/bot/docs/d_bot/members`, {
+      method: 'PUT', headers: { authorization: 'Bearer bot-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({ uid: 'bot_target', role: 'writer' }),
+    })
+    expect(res.status).toBe(200)
+    expect(await res.json()).toEqual({ ok: true })
+    expect(upsertDirectWithNotification).not.toHaveBeenCalled()
+    expect(upsertDirect).toHaveBeenCalledWith(expect.objectContaining({ uid: 'bot_target' }))
+  })
+
+  it('does not notify again when a Bot updates an existing Human grant', async () => {
+    setOctoIdentity(stub({
+      verifyBot: async () => ({ uid: 'bot_1', spaceId: 's_real' }),
+      lookupSpacePrincipalAsBot: async () => ({ status: 'eligible', principalType: 'human' }),
+    }))
+    resolveDocRole.mockResolvedValue('admin')
+    upsertDirectWithNotification.mockResolvedValueOnce({ created: false })
+    const res = await fetch(`${base}/v1/bot/docs/d_bot/members`, {
+      method: 'PUT', headers: { authorization: 'Bearer bot-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({ uid: 'u_target', role: 'reader' }),
+    })
+    expect(res.status).toBe(200)
+    expect(await res.json()).toEqual({ ok: true, created: false, notified: false })
+    expect(upsertDirect).not.toHaveBeenCalled()
+  })
+
   it('updates an existing explicitly selected foreign-Space row without revalidating current eligibility', async () => {
-    const lookupSpacePrincipalAsBot = vi.fn(async () => ({ status: 'eligible' as const }))
+    const lookupSpacePrincipalAsBot = vi.fn(async () => ({ status: 'eligible' as const, principalType: 'human' as const }))
     setOctoIdentity(stub({
       verifyBot: async () => ({ uid: 'bot_1', spaceId: 's_bot' }),
       lookupSpacePrincipalAsBot,
@@ -339,7 +374,7 @@ describe('bot mount /v1/bot/docs (§ v4.3)', () => {
   })
 
   it('cannot mint a missing explicitly selected foreign-Space row without directory lookup', async () => {
-    const lookupSpacePrincipalAsBot = vi.fn(async () => ({ status: 'eligible' as const }))
+    const lookupSpacePrincipalAsBot = vi.fn(async () => ({ status: 'eligible' as const, principalType: 'human' as const }))
     setOctoIdentity(stub({
       verifyBot: async () => ({ uid: 'bot_1', spaceId: 's_bot' }),
       lookupSpacePrincipalAsBot,
@@ -361,7 +396,7 @@ describe('bot mount /v1/bot/docs (§ v4.3)', () => {
   })
 
   it('upserts its own Space on a foreign-Home document after exact lookup', async () => {
-    const lookupSpacePrincipalAsBot = vi.fn(async () => ({ status: 'eligible' as const }))
+    const lookupSpacePrincipalAsBot = vi.fn(async () => ({ status: 'eligible' as const, principalType: 'human' as const }))
     setOctoIdentity(stub({
       verifyBot: async () => ({ uid: 'bot_1', spaceId: 's_bot' }),
       lookupSpacePrincipalAsBot,
@@ -376,7 +411,7 @@ describe('bot mount /v1/bot/docs (§ v4.3)', () => {
 
     expect(res.status).toBe(200)
     expect(lookupSpacePrincipalAsBot).toHaveBeenCalledWith('u_target', 's_bot', 'bot-secret')
-    expect(upsertDirect).toHaveBeenCalledWith(expect.objectContaining({
+    expect(upsertDirectWithNotification).toHaveBeenCalledWith(expect.objectContaining({
       uid: 'u_target', principalSpaceId: 's_bot',
     }))
     expect(updateExistingDirect).not.toHaveBeenCalled()
@@ -529,7 +564,15 @@ describe('human mount /api/v1/docs stays unchanged', () => {
 
     expect(res.status).toBe(200)
     expect(spaceMembers).toHaveBeenCalledWith('s_real', 'human-session-token')
-    expect(upsertDirect).toHaveBeenCalledTimes(1)
+    expect(upsertDirectWithNotification).toHaveBeenCalledWith({
+      docId: 'd_bot',
+      uid: 'u_target',
+      principalSpaceId: 's_real',
+      roleNum: 1,
+      grantedBy: 'u_admin',
+      notifyRecipient: true,
+    })
+    expect(upsertDirect).not.toHaveBeenCalled()
   })
 
   it('threads the Human session token into the member-delete identity lookup', async () => {

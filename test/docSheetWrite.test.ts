@@ -21,7 +21,7 @@ vi.mock('../src/collab/liveSheetWrite.js', () => ({
   commitLiveSheetEdit: vi.fn(),
 }))
 
-import { patchDocSheetHandler } from '../src/api/routes/docSheet.js'
+import { patchDocSheetHandler, insertDocSheetRowsHandler, deleteDocSheetRowsHandler, insertDocSheetColumnsHandler, deleteDocSheetColumnsHandler } from '../src/api/routes/docSheet.js'
 import { requireDocRole } from '../src/api/guard.js'
 import { transaction } from '../src/db/pool.js'
 import { readLiveSheet, commitLiveSheetEdit } from '../src/collab/liveSheetWrite.js'
@@ -62,6 +62,33 @@ const writerGuard = {
   meta: { doc_id: 'd_1', document_name: 'octo:s1:f_default:d_1', doc_type: 'sheet', permission_epoch: 7 },
   role: 'writer',
 } as never
+
+describe('conditional-format structural edit refusal', () => {
+  it.each([
+    { handler: insertDocSheetRowsHandler, body: { logicalId: 'default', afterRow: 0, count: 1 } },
+    { handler: deleteDocSheetRowsHandler, body: { logicalId: 'default', startRow: 0, count: 1 } },
+    { handler: insertDocSheetColumnsHandler, body: { logicalId: 'default', afterColumn: 0, count: 1 } },
+    { handler: deleteDocSheetColumnsHandler, body: { logicalId: 'default', startColumn: 0, count: 1 } },
+  ])('returns a stable 409 without writing or creating a safety snapshot', async ({ handler, body }) => {
+    const doc = new Y.Doc()
+    doc.getMap('sheetConditionalFormats').set('default!one', { priority: 0, rule: { cfId: 'one', stopIfTrue: false,
+      ranges: [{ startRow: 0, endRow: 1, startColumn: 0, endColumn: 1 }],
+      rule: { type: 'highlightCell', subType: 'duplicateValues', style: {} },
+    } })
+    const state = Y.encodeStateAsUpdate(doc)
+    const baseSV = Y.encodeStateVector(doc)
+    vi.mocked(requireDocRole).mockResolvedValue(writerGuard)
+    vi.mocked(readLiveSheet).mockResolvedValue({ state, baseSV })
+    const response = mockRes()
+    await handler(req({ docId: 'd_1' }, { body, headers: { 'if-match': encodeBaseVersion(baseSV) } }), response as never)
+    expect(response.statusCode).toBe(409)
+    expect(response.body).toEqual({ error: 'sheet_conditional_format_unsupported' })
+    expect(commitLiveSheetEdit).not.toHaveBeenCalled()
+    expect(transaction).not.toHaveBeenCalled()
+    expect(Y.encodeStateAsUpdate(doc)).toEqual(state)
+    doc.destroy()
+  })
+})
 
 /** A live sheet ({state, baseSV}) built from raw cell + dims maps. */
 function liveSheet(

@@ -440,6 +440,29 @@ describe('parseRetryAfterMs', () => {
 })
 
 describe('reportBotMentions — end-to-end per response row', () => {
+  it.each(['prepare', 'delivery', 'both'] as const)('preserves dispatch and accepted outcomes when %s tracking fails', async phase => {
+    vi.stubGlobal('fetch', fetchMock(resp(200, { accepted: true })))
+    const result = await reportBotMentions(params({ ownedBots: ['bot-1', 'bot-2'], body: '@[user:bot-1:One] @[user:bot-2:Two]' }), {
+      sleep: noSleep,
+      onTask: async (_params, _bot, outcome) => {
+        if (phase === 'both' || (outcome ? 'delivery' : 'prepare') === phase) throw new Error('tracking unavailable')
+      },
+    })
+    expect(result).toEqual({ accepted: 2, skipped: 0, failed: 0 })
+    expect(fetch).toHaveBeenCalledTimes(2)
+  })
+
+  it('prepares tracking before enqueue and records the actual transport outcome afterward', async () => {
+    const order: string[] = []
+    vi.stubGlobal('fetch', vi.fn(async () => { order.push('enqueue'); return resp(200, { accepted: true }) }))
+    const result = await reportBotMentions(params(), {
+      sleep: noSleep,
+      onTask: async (_params, _bot, outcome) => { order.push(outcome ? outcome.kind : 'prepared') },
+    })
+    expect(result.accepted).toBe(1)
+    expect(order).toEqual(['prepared', 'enqueue', 'accepted'])
+  })
+
   it('200 accepted=true: one POST, counted as accepted', async () => {
     vi.stubGlobal('fetch', fetchMock(resp(200, { accepted: true })))
     const r = await reportBotMentions(params(), { sleep: noSleep })

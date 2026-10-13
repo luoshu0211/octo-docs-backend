@@ -21,12 +21,13 @@
  *
  * SNAPSHOT CONSISTENCY across pages: each page is served from a fresh live read
  * (readLiveSheet), so a concurrent write between pages would otherwise stitch two
- * inconsistent snapshots together. The cursor embeds the baseVersion token of the
- * read that opened the walk; a page request whose embedded token no longer
- * matches the live baseVersion is rejected (the route maps it to 409
+ * inconsistent snapshots together. New cursors embed a fingerprint of the opening
+ * baseVersion; legacy cursors embed that token directly. A page request whose
+ * version no longer matches the live read is rejected (the route maps it to 409
  * sheet_changed) so the caller restarts from page one against a single snapshot —
  * the read-side mirror of the write path's If-Match optimistic-concurrency guard.
  */
+import { createHash } from 'node:crypto'
 import type { SheetCell } from '../../agent/sheetConversion.js'
 
 /** Decoded cell key parts, for canonical ordering. */
@@ -98,11 +99,26 @@ export function sortedCellKeys(cells: Record<string, SheetCell>): string[] {
  * cell key emitted so far. Encoded as base64url(JSON) so a caller treats it as
  * a single opaque token (never hand-constructs it).
  */
-export interface SheetCursor {
+interface LegacySheetCursor {
   /** baseVersion token of the snapshot the walk started on (drift guard). */
   v: string
   /** Last cell key emitted; the next page starts strictly after it. */
   k: string
+  t?: undefined
+}
+
+export interface CompactSheetCursor {
+  t: 2
+  v: string
+  k: string
+  d: string
+  s: string | null
+}
+
+export type SheetCursor = LegacySheetCursor | CompactSheetCursor
+
+export function sheetVersionFingerprint(baseVersion: string): string {
+  return createHash('sha256').update(baseVersion, 'utf8').digest('base64url')
 }
 
 /** Encode a cursor to the opaque base64url token returned as `nextCursor`. */
@@ -130,6 +146,7 @@ export class InvalidSheetCursorError extends Error {
  * never be silently treated as "start from the beginning".
  */
 export function decodeSheetCursor(raw: string): SheetCursor {
+  if (!/^[A-Za-z0-9_-]+$/.test(raw)) throw new InvalidSheetCursorError('not base64url')
   let json: string
   try {
     json = Buffer.from(raw, 'base64url').toString('utf8')
@@ -148,6 +165,18 @@ export function decodeSheetCursor(raw: string): SheetCursor {
   const rec = parsed as Record<string, unknown>
   if (typeof rec.v !== 'string' || rec.v === '' || typeof rec.k !== 'string' || rec.k === '') {
     throw new InvalidSheetCursorError('missing v/k')
+  }
+  if (rec.t !== undefined) {
+    if (
+      rec.t !== 2 || !/^[A-Za-z0-9_-]{43}$/.test(rec.v) ||
+      typeof rec.d !== 'string' || rec.d.length === 0 || rec.d.length > 128 ||
+      !(rec.s === null || (typeof rec.s === 'string' && /^[^\p{Cc}:!]{1,64}$/u.test(rec.s))) ||
+      !parseCellKey(rec.k) || rec.k.length > 128 ||
+      (rec.s !== null && !rec.k.startsWith(`${rec.s}!`))
+    ) {
+      throw new InvalidSheetCursorError('invalid compact cursor')
+    }
+    return { t: 2, v: rec.v, k: rec.k, d: rec.d, s: rec.s }
   }
   return { v: rec.v, k: rec.k }
 }
