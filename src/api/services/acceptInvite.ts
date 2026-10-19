@@ -12,6 +12,7 @@
  */
 import { transaction } from '../../db/pool.js'
 import { getOctoIdentity } from '../../auth/octoIdentity.js'
+import { IdentityUnavailableError } from '../../auth/identityUnavailable.js'
 import { docInviteRepo, INVITE_STATUS_EXPIRED, INVITE_STATUS_EXHAUSTED, INVITE_STATUS_ACTIVE } from '../../db/repos/docInviteRepo.js'
 import { docInviteRedemptionRepo } from '../../db/repos/docInviteRedemptionRepo.js'
 import { docMemberRepo } from '../../db/repos/docMemberRepo.js'
@@ -23,7 +24,7 @@ import { confirmSpaceMembership } from '../../permission/spaceMembership.js'
 
 export type AcceptResult =
   | { ok: true; status: 200; body: { docId?: string; documentName?: string; role: string; principalSpaceId: string } }
-  | { ok: false; status: 400 | 401 | 404 | 410; error: string }
+  | { ok: false; status: 400 | 401 | 404 | 410 | 503; error: string }
 
 interface DocMetaTxRow {
   doc_id: string
@@ -56,7 +57,13 @@ export async function acceptInvite(
   nowMs: number = Date.now(),
 ): Promise<AcceptResult> {
   // step 1: verify octo identity -> trusted uid (HARD CONSTRAINT). 401 if not.
-  const identity = await getOctoIdentity().verifyToken(octoToken)
+  let identity
+  try {
+    identity = await getOctoIdentity().verifyToken(octoToken)
+  } catch (err) {
+    if (err instanceof IdentityUnavailableError) return { ok: false, status: 503, error: 'identity_unavailable' }
+    throw err
+  }
   if (!identity) return { ok: false, status: 401, error: 'login_required' }
   const currentSpace = typeof principalSpaceId === 'string' ? principalSpaceId.trim() : ''
   if (currentSpace === '') return { ok: false, status: 400, error: 'space_required' }

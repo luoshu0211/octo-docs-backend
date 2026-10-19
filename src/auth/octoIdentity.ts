@@ -15,6 +15,8 @@ import { createHash } from 'node:crypto'
 import { config } from '../config/env.js'
 import { Singleflight, TtlCache } from '../util/singleflight.js'
 import { parseOwnedBotUidsStrict } from '../util/botUids.js'
+import { identityUnavailable } from './identityUnavailable.js'
+import { requestIdentityVerification, reuseRequestIdentityVerification, type IdentityVerificationResponse } from './identityVerificationScope.js'
 
 export interface OctoUser {
   uid: string;
@@ -154,6 +156,9 @@ export interface OctoIdentity {
   /**
    * (a) Resolve an octo session token to a trusted uid. Returns null when the
    * token is missing/invalid (caller => 401 / login_required).
+   * Throws IdentityUnavailableError when the authority is unavailable or its
+   * response cannot establish an identity. Callers must deny access with a
+   * service error, without invalidating the user's session.
    *
    * `ownedBots` is octo-server's `owned_bots`: the uids of the bots this human
    * user owns (robot.creator_uid == uid). Surfaced so "my documents" can also
@@ -269,7 +274,7 @@ export interface OctoIdentity {
    *
    * FAIL-CLOSED: any transport failure / non-200 / malformed body / a response
    * that did not carry space context returns `false` (treated as NOT a member),
-   * mirroring verifyToken / verifyBot returning null on failure. A transient
+   * without treating an unavailable authority as an expired login. A transient
    * octo-server outage therefore TIGHTENS access (denies share-derived
    * reads/writes), never loosens it.
    */
@@ -365,12 +370,38 @@ export class HttpOctoIdentity implements OctoIdentity {
     private readonly baseUrl: string = config.octoIdentity.serverBaseUrl,
   ) {}
 
+  // No positive login cache between completed requests: logout/revocation
+  // remains authoritative at the next lookup. Concurrent requests for the SAME
+  // token share only the in-flight call; distinct sessions/instances never do.
+  private readonly verificationSf = new Singleflight<IdentityVerificationResponse>()
+
+  private verifyContext(token: string): Promise<IdentityVerificationResponse> {
+    const key = tokenFingerprint(token)
+    return reuseRequestIdentityVerification(this, key, () => this.verificationSf.do(key, async () => {
+      const res = await fetch(`${this.baseUrl}/v1/auth/verify?include=context`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token }),
+        // Includes response-body consumption and releases an in-flight entry
+        // when the authority stalls; never retain an unbounded pending lookup.
+        signal: AbortSignal.timeout(5000),
+      })
+      if (!res.ok) {
+        await res.body?.cancel()
+        return { ok: false, status: res.status, body: null }
+      }
+      const body: unknown = await res.json().catch(() => null)
+      return { ok: true, status: res.status, body }
+    }))
+  }
+
   /**
-   * Per-{uid,spaceId} coalescing + short-TTL cache for isSpaceMember (#64,
+   * Per-{uid,spaceId,session} coalescing + short-TTL cache for isSpaceMember (#64,
    * design §4.4). Bounds the extra octo-server QPS on hot anyone_in_space docs;
    * only positive/negative membership answers are cached, never a fail-closed
    * transport error (so a transient outage does not pin a `false` for the whole
-   * TTL — the next call retries).
+   * TTL — the next call retries). HTTP requests prefer the current context
+   * already retrieved by their authentication step over this fallback cache.
    */
   private readonly membershipSf = new Singleflight<boolean>();
   private readonly membershipCache = new TtlCache<boolean>(
@@ -397,24 +428,22 @@ export class HttpOctoIdentity implements OctoIdentity {
 
   async verifyToken(token: string): Promise<{ uid: string; name?: string; ownedBots?: string[] } | null> {
     if (!token) return null
-    let res: Response
+    let res: IdentityVerificationResponse
     try {
-      res = await fetch(`${this.baseUrl}/v1/auth/verify`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ token }),
-      });
+      res = await this.verifyContext(token);
     } catch {
-      // Authoritative identity source unreachable => treat as unverified.
-      return null;
+      throw identityUnavailable('transport_error');
     }
-    if (!res.ok) return null;
-    const body = (await res.json().catch(() => null)) as {
+    if (res.status === 401 || res.status === 403) return null;
+    if (!res.ok) throw identityUnavailable('non_ok_response', res.status);
+    const body = res.body as {
       uid?: string;
       name?: string;
       owned_bots?: Array<{ uid?: string } | string>;
     } | null;
-    if (!body || typeof body.uid !== "string" || body.uid === "") return null;
+    if (!body || typeof body.uid !== "string" || body.uid.trim() === "") {
+      throw identityUnavailable('malformed_response');
+    }
     // octo-server sends `owned_bots` (snake_case) as an OBJECT array
     // [{uid,name},...] (authVerifyTokenResp.ownedBot); older/other shapes may
     // send a bare uid string. Accept both, extracting the bot uid. FAIL-CLOSED:
@@ -783,19 +812,15 @@ export class HttpOctoIdentity implements OctoIdentity {
     // A missing principal/space can own no admissible bots, and an absent token
     // cannot authorize the verify call. Short out before any IO (fail-closed).
     if (!uid || !spaceId || !token) return [];
-    let res: Response;
+    let res: IdentityVerificationResponse;
     try {
-      res = await fetch(`${this.baseUrl}/v1/auth/verify?include=context`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ token }),
-      });
+      res = await this.verifyContext(token);
     } catch {
       // Authoritative source unreachable => cannot confirm ownership => [].
       return [];
     }
     if (!res.ok) return [];
-    const body = (await res.json().catch(() => null)) as {
+    const body = res.body as {
       uid?: unknown;
       context_included?: unknown;
       owned_bots_by_space?: unknown;
@@ -828,7 +853,12 @@ export class HttpOctoIdentity implements OctoIdentity {
     // absent caller token cannot authorize a verify call; short out before any
     // IO (also avoids caching a degenerate key).
     if (!uid || !spaceId || !token) return false;
-    const key = `${uid} ${spaceId}`;
+    // The auth step already retrieved current context for this request. Prefer
+    // it over an older membership-cache entry, including after a Space removal.
+    if (requestIdentityVerification(this, tokenFingerprint(token))) {
+      return (await this.fetchIsSpaceMember(uid, spaceId, token)) ?? false;
+    }
+    const key = `${uid} ${spaceId} ${tokenFingerprint(token)}`;
     const cached = this.membershipCache.get(key);
     if (cached !== undefined) return cached;
     return this.membershipSf.do(key, async () => {
@@ -859,13 +889,9 @@ export class HttpOctoIdentity implements OctoIdentity {
     spaceId: string,
     token: string,
   ): Promise<boolean | null> {
-    let res: Response;
+    let res: IdentityVerificationResponse;
     try {
-      res = await fetch(`${this.baseUrl}/v1/auth/verify?include=context`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ token }),
-      });
+      res = await this.verifyContext(token);
     } catch (err) {
       // Authoritative source unreachable => cannot confirm => fail-closed.
       this.warnMembershipVerificationFailure("transport_error", {
@@ -879,7 +905,7 @@ export class HttpOctoIdentity implements OctoIdentity {
       });
       return null;
     }
-    const body = (await res.json().catch(() => null)) as {
+    const body = res.body as {
       uid?: unknown;
       context_included?: unknown;
       spaces?: unknown;

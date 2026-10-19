@@ -20,6 +20,7 @@ import { stateGenerationRepo } from '../db/repos/stateGenerationRepo.js'
 import { confirmSpaceMembership } from '../permission/spaceMembership.js'
 import { signCollabToken, signCollabTokenV2, type CollabTokenResult } from './collabToken.js'
 import { getOctoIdentity } from './octoIdentity.js'
+import { IdentityUnavailableError } from './identityUnavailable.js'
 import { compactedAt, isOverCapAnywhere } from '../collab/compactionNotice.js'
 import { getOversized, mayInvalidateClientCaches } from '../collab/oversizeGuard.js'
 import { parseDocumentName, isDocTypeConsistentWithName } from '../permission/documentName.js'
@@ -31,7 +32,7 @@ import { HTML_DOC_TYPE, HTML_PPT_DOC_TYPE } from '../db/docType.js'
 
 export type IssueResult =
   | { ok: true; result: CollabTokenResult }
-  | { ok: false; status: 401 | 403 | 404 | 409 | 422; error: string }
+  | { ok: false; status: 401 | 403 | 404 | 409 | 422 | 503; error: string }
 
 /**
  * Issue a collab token for (octoToken, documentName).
@@ -51,7 +52,13 @@ export async function issueCollabToken(
   viewerSpaceId: string,
 ): Promise<IssueResult> {
   // Layer-1: octo identity -> trusted uid (never trust a client-supplied uid).
-  const identity = await getOctoIdentity().verifyToken(octoToken)
+  let identity
+  try {
+    identity = await getOctoIdentity().verifyToken(octoToken)
+  } catch (err) {
+    if (err instanceof IdentityUnavailableError) return { ok: false, status: 503, error: 'identity_unavailable' }
+    throw err
+  }
   if (!identity) return { ok: false, status: 401, error: 'login_required' }
   const uid = identity.uid
   const currentSpace = typeof viewerSpaceId === 'string' ? viewerSpaceId.trim() : ''
