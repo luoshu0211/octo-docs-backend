@@ -9,6 +9,7 @@
  */
 import type { Request, Response, NextFunction } from 'express'
 import { getOctoIdentity } from '../../auth/octoIdentity.js'
+import { IdentityUnavailableError } from '../../auth/identityUnavailable.js'
 
 declare global {
   // eslint-disable-next-line @typescript-eslint/no-namespace
@@ -48,7 +49,18 @@ export function extractOctoToken(req: Request): string {
  */
 export async function authMiddleware(req: Request, res: Response, next: NextFunction): Promise<void> {
   const token = extractOctoToken(req)
-  const identity = await getOctoIdentity().verifyToken(token)
+  let identity
+  try {
+    identity = await getOctoIdentity().verifyToken(token)
+  } catch (err) {
+    if (err instanceof IdentityUnavailableError) {
+      res.status(503).json({ error: 'identity_unavailable' })
+      return
+    }
+    // Express 4 does not forward rejected async middleware automatically.
+    next(err)
+    return
+  }
   if (!identity) {
     res.status(401).json({ error: 'unauthorized' })
     return

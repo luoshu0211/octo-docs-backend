@@ -16,6 +16,7 @@
  */
 import type { Request, Response, NextFunction } from 'express'
 import { getOctoIdentity } from '../../auth/octoIdentity.js'
+import { IdentityUnavailableError } from '../../auth/identityUnavailable.js'
 import { confirmSpaceMembership } from '../../permission/spaceMembership.js'
 import { extractOctoToken } from '../middleware/auth.js'
 import { PptApiError } from './envelope.js'
@@ -37,7 +38,9 @@ export async function pptAuthMiddleware(req: Request, _res: Response, next: Next
     req.octoToken = token
     next()
   } catch (err) {
-    next(err)
+    next(err instanceof IdentityUnavailableError
+      ? new PptApiError('UPSTREAM_UNAVAILABLE', 'identity service unavailable')
+      : err)
   }
 }
 
