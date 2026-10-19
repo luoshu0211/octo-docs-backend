@@ -14,9 +14,9 @@
  * CALLER'S OWN session token — `isSpaceMember` resolves it through octo-server's
  * `POST /v1/auth/verify?include=context` and tests `spaceId ∈ spaces`. A spoofed
  * `X-Space-Id` cannot influence that lookup; it can only be the value being
- * tested. Results are coalesced + short-TTL cached per `{uid, spaceId}` (default
- * 30 s, `SPACE_MEMBERSHIP_CACHE_TTL_SECONDS`, confirmed answers only), so this
- * costs at most one octo-server call per caller per space per TTL.
+ * tested. HTTP requests reuse the current context fetched during login
+ * verification. Other callers use a per-`{uid, spaceId, session}` short-TTL cache
+ * (default 30 s, `SPACE_MEMBERSHIP_CACHE_TTL_SECONDS`, confirmed answers only).
  *
  * Fail-closed, and containing BOTH failure shapes is the point:
  *   - a REJECTED lookup (identity service down / non-2xx), and

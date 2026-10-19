@@ -71,6 +71,7 @@ import { StorageBudgetError } from '../collab/storageCodec.js'
 import { corsMiddleware } from './cors.js'
 import { attachmentBlobGateway, localBlobGatewayEnabled, isSignedBlobRequest } from './routes/attachmentBlob.js'
 import { authMiddleware } from './middleware/auth.js'
+import { identityVerificationScope } from '../auth/identityVerificationScope.js'
 import { verifyBotMiddleware } from './middleware/verifyBot.js'
 import { humanDocSpaceScopeMiddleware } from './middleware/docSpaceScope.js'
 import { createRateLimiter, type RateLimiterOptions } from './middleware/rateLimit.js'
@@ -108,6 +109,7 @@ export function createApp(
   opts: { rateLimit?: RateLimiterOptions; trustProxy?: boolean | number | string; surface?: AppSurface } = {},
 ): Express {
   const app = express()
+  app.use(identityVerificationScope)
   const surface: AppSurface = opts.surface ?? 'all'
   const servePublic = surface !== 'internal'
   const serveInternal = surface !== 'public'
