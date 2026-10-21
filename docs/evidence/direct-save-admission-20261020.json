@@ -1,0 +1,91 @@
+{
+  "date": "2026-10-20",
+  "reviewedHead": "42b98eabcbcb2f37f905af26bd5608b73846b4cb",
+  "base": "08b446875e7678003e62d4052af7573b527909ed",
+  "reviewNote": "https://codex.mlamp.cn/dmwork/octo-docs-backend/-/merge_requests/181#note_77377",
+  "node": "v22.23.1",
+  "layer": "Real Hocuspocus, CollabDatabase, persistence, save child; mocked SQL transactions and notice side channels.",
+  "baseline": {
+    "command": "node node_modules/vitest/vitest.mjs run test/directSaveAdmission.test.ts --maxWorkers=1 --minWorkers=1",
+    "exitCode": 1,
+    "tests": 4,
+    "failed": 4,
+    "reason": "disconnect resolved before any victim SQL commit on queue saturation and expiry, both background modes"
+  },
+  "fixedFocused": {
+    "command": "node node_modules/vitest/vitest.mjs run test/directSaveAdmission.test.ts test/capacityAdmission.test.ts test/backgroundPersistence.test.ts --maxWorkers=1 --minWorkers=1",
+    "exitCode": 0,
+    "files": 3,
+    "passed": 41,
+    "failed": 0,
+    "skipped": 0
+  },
+  "mutation": {
+    "change": "Only restore persistence.store from runRetained to the old run admission",
+    "exitCode": 1,
+    "tests": 4,
+    "failed": 4,
+    "reason": "disconnect must not acknowledge an uncommitted edit",
+    "restoredByteForByte": true
+  },
+  "fullSuite": {
+    "command": "node node_modules/vitest/vitest.mjs run --maxWorkers=2 --minWorkers=1",
+    "exitCode": 0,
+    "files": 311,
+    "passedFiles": 302,
+    "skippedFiles": 9,
+    "passed": 4547,
+    "failed": 0,
+    "skipped": 58,
+    "durationSeconds": 74.13,
+    "skipsByFile": {
+      "sharingMysql.integration.test.ts": 8,
+      "pptCanonicalId.mysql.test.ts": 4,
+      "pptMediaIngest.test.ts": 1,
+      "redisAuth.integration.test.ts": 13,
+      "typstService.test.ts": 10,
+      "pptBudget.mysql.test.ts": 2,
+      "compaction.test.ts": 1,
+      "docxMedia.test.ts": 1,
+      "memberNotificationsMysql.integration.test.ts": 8,
+      "xlsxImportFidelity.test.ts": 3,
+      "sheetReadHttp.test.ts": 1,
+      "commentTaskRepo.integration.test.ts": 2,
+      "overcapUnrestoredConcurrentPut.integration.test.ts": 2,
+      "canonicalHtmlMysql.integration.test.ts": 2
+    }
+  },
+  "typecheck": {
+    "command": "npm run typecheck",
+    "exitCode": 0
+  },
+  "build": {
+    "command": "npm run build",
+    "exitCode": 0
+  },
+  "lint": {
+    "command": "node node_modules/eslint/bin/eslint.js src/collab/capacityLane.ts src/collab/persistence.ts test/directSaveAdmission.test.ts test/capacityAdmission.test.ts",
+    "exitCode": 0
+  },
+  "assertions": [
+    "No successful disconnect, destroy, victim snapshot SQL or release of the document save mutex while admission is blocked.",
+    "Concurrent direct edit/delete during wait persists on recovery.",
+    "Holding COMMIT after queue recovery still keeps disconnect pending.",
+    "After commit, unload and direct reopen restore final content.",
+    "Overflow waits on actual completion without polling; active-operation errors are not retried."
+  ],
+  "limitations": [
+    "Waiting flushes retain already-loaded documents and can increase request latency; the execution queue bound is not a bound on resident documents or pending requests.",
+    "Only admission rejection is retried before work starts; SQL, child-process, storage-budget and generation failures keep their existing error semantics.",
+    "No fresh real MySQL/Redis, browser/authentication, capacity matrix or deployment verification in this CR fix.",
+    "Document/cell limits remain unchanged; historical OOM and large-document helper failures remain release limitations."
+  ],
+  "rawLogSha256": {
+    "octo-mr181-direct-baseline.log": "437b3e0c33c59d8cbf9001af5dd851bc1a17e8008e5c51189261a898a29e8a7a",
+    "octo-mr181-direct-mutation.log": "b4763388a3ad0417624f0d832039c9609e45a2e96455372131141a777e9c1b9f",
+    "octo-mr181-direct-fixed.log": "6b93fc9cb82b70385bbffb062ddc1b01fe04432d0fcd857da12e66ba80734e0f",
+    "octo-mr181-cr-full.log": "ae202af334096e3b2706838060e3a127a275395c13933119538803df0ef56908",
+    "octo-mr181-cr-typecheck.log": "9cccd7ca2af93420f5458750698b2d5519ed3d2238698aa6c475882e1ec38724",
+    "octo-mr181-cr-build.log": "bf5e9856540ff94ca7f2bb5d1e0b9cfc80806a6a1b0f388c58b8b06dd134f7aa"
+  }
+}

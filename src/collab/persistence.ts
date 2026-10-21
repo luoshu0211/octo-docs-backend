@@ -20,6 +20,9 @@ import { clearOverCapShared, resolveUnrestoredOverCap } from './compactionNotice
 import { encodeStorageState, StorageBudgetError } from './storageCodec.js'
 import { captureStoreUpdate, recordStoreCheckpoint } from './storeCheckpoint.js'
 import { storeWorkerPool } from './storeWorkerPool.js'
+import { CapacityLane } from './capacityLane.js'
+
+const storeAdmission = new CapacityLane()
 
 /**
  * An empty Yjs v1 update encodes as two zero bytes (no structs, empty delete
@@ -112,12 +115,14 @@ export function computeFinalState(
   // applied with ITS OWN decoder, and the result is re-encoded in the encoding
   // this build persists — not unconditionally v2.
   const merged = new Y.Doc()
-  if (liveEncoding === 2) Y.applyUpdateV2(merged, liveEncoded)
-  else Y.applyUpdate(merged, liveEncoded)
-  if (existing.encoding === 2) Y.applyUpdateV2(merged, existing.state)
-  else Y.applyUpdate(merged, existing.state)
-  const union = liveEncoding === 2 ? Y.encodeStateAsUpdateV2(merged) : Y.encodeStateAsUpdate(merged)
-  return { finalState: Buffer.from(union), usedUnion: true }
+  try {
+    if (liveEncoding === 2) Y.applyUpdateV2(merged, liveEncoded)
+    else Y.applyUpdate(merged, liveEncoded)
+    if (existing.encoding === 2) Y.applyUpdateV2(merged, existing.state)
+    else Y.applyUpdate(merged, existing.state)
+    const union = liveEncoding === 2 ? Y.encodeStateAsUpdateV2(merged) : Y.encodeStateAsUpdate(merged)
+    return { finalState: Buffer.from(union), usedUnion: true }
+  } finally { merged.destroy() }
 }
 
 export const persistence = {
@@ -154,6 +159,15 @@ export const persistence = {
    * not be saved at all saves normally.
    */
   async store(documentName: string, liveDoc: Y.Doc, context?: StoreContext): Promise<void> {
+    // DirectConnection.disconnect awaits this flush but Hocuspocus swallows
+    // store-hook errors before unloading. Queue pressure must keep the flush
+    // pending; otherwise an accepted REST edit can be acknowledged and lost.
+    return storeAdmission.runRetained(() => storeSnapshot(documentName, liveDoc, context))
+  },
+}
+
+/** Only the admitted save captures buffers and acquires a database row lock. */
+async function storeSnapshot(documentName: string, liveDoc: Y.Doc, context?: StoreContext): Promise<void> {
     const background = config.yjsBackgroundStore
     let receipt = captureDurableSnapshot(liveDoc)
     let captured = captureStoreUpdate(documentName, liveDoc, background)
@@ -248,7 +262,7 @@ export const persistence = {
         (liveDoc as Y.Doc & { broadcastStateless(payload: string): void }).broadcastStateless(notification)
       } catch (error) {
         // Delivery is best-effort. A failed socket must not turn COMMIT into a failed store.
-        console.error('[collab-generation] durable receipt delivery failed', error)
+        console.error('[collab-generation] durable receipt delivery failed', error) // eslint-disable-line no-console -- best-effort delivery after COMMIT
       }
     }
 
@@ -289,5 +303,4 @@ export const persistence = {
     // that already landed. Fire-and-forget with the SAME dominance evidence; an
     // undominated store leaves the row standing (fail closed).
     void resolveDurableUnrestored(documentName, captured.stateMap)
-  },
 }
