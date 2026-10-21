@@ -52,6 +52,7 @@ RUN apk add --no-cache --virtual .typst-fetch curl=8.22.0-r0 tar=1.35-r5 xz=5.8.
     && typst --version
 
 COPY package.json package-lock.json ./
+COPY scripts/patchYjsContentAny.mjs ./scripts/patchYjsContentAny.mjs
 RUN npm ci
 
 COPY tsconfig.json ./

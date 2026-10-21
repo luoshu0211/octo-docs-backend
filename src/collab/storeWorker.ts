@@ -1,5 +1,4 @@
 /** Stateless CPU worker: decode, merge, enforce both budgets, then compress once. */
-import { parentPort } from 'node:worker_threads'
 import * as Y from 'yjs'
 import type { RawYjsState, YjsEncoding } from '../db/repos/yjsDocumentRepo.js'
 import { decodeStorageState, encodeStorageState, StorageBudgetError, type EncodedStorageState, type StorageCodecOptions } from './storageCodec.js'
@@ -67,25 +66,17 @@ export function prepareStoredState(job: StoreJob): StoreResult {
   }
 }
 
-if (parentPort) {
-  const port = parentPort
-  port.on('message', ({ id, job }: { id: number; job: StoreJob }) => {
-    try {
-      const result = prepareStoredState(job)
-      // Copy into an owned, exactly-sized allocation before transfer: a Node
-      // Buffer can share a slab with unrelated data and must not be detached.
-      if (result.kind === 'stored') result.stored.state = Uint8Array.from(result.stored.state)
-      port.postMessage({ id, ok: true, result } satisfies StoreReply,
-        result.kind === 'stored' ? [result.stored.state.buffer as ArrayBuffer] : [])
-    } catch (error) {
-      const failure: StoreWorkerFailure = {
-        name: error instanceof Error ? error.name : 'Error',
-        message: error instanceof Error ? error.message : String(error),
-      }
-      if (error instanceof StorageBudgetError) {
-        Object.assign(failure, { dimension: error.dimension, bytes: error.bytes, limit: error.limit })
-      }
-      port.postMessage({ id, ok: false, error: failure } satisfies StoreReply)
+export function prepareStoreReply(id: number, job: StoreJob): StoreReply {
+  try {
+    return { id, ok: true, result: prepareStoredState(job) }
+  } catch (error) {
+    const failure: StoreWorkerFailure = {
+      name: error instanceof Error ? error.name : 'Error',
+      message: error instanceof Error ? error.message : String(error),
     }
-  })
+    if (error instanceof StorageBudgetError) {
+      Object.assign(failure, { dimension: error.dimension, bytes: error.bytes, limit: error.limit })
+    }
+    return { id, ok: false, error: failure }
+  }
 }

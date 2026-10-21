@@ -1,0 +1,83 @@
+{
+  "date": "2026-10-19",
+  "deliveryBase": "08b446875e7678003e62d4052af7573b527909ed",
+  "benchmarkBase": "2bce77be9ec80233fde981a2b495185dd2bf59a6",
+  "branch": "perf/yjs-memory-20261019",
+  "node": "v22.23.1",
+  "freshInstall": {
+    "command": "npm ci --no-audit --no-fund",
+    "exitCode": 0
+  },
+  "tests": {
+    "command": "node node_modules/vitest/vitest.mjs run --maxWorkers=2 --minWorkers=1 --reporter=json --outputFile=<audit>/tests.json",
+    "exitCode": 0,
+    "files": 310,
+    "passed": 4540,
+    "failed": 0,
+    "skipped": 58,
+    "skipsByFile": {
+      "canonicalHtmlMysql.integration.test.ts": 2,
+      "commentTaskRepo.integration.test.ts": 2,
+      "compaction.test.ts": 1,
+      "docxMedia.test.ts": 1,
+      "memberNotificationsMysql.integration.test.ts": 8,
+      "overcapUnrestoredConcurrentPut.integration.test.ts": 2,
+      "pptBudget.mysql.test.ts": 2,
+      "pptCanonicalId.mysql.test.ts": 4,
+      "pptMediaIngest.test.ts": 1,
+      "redisAuth.integration.test.ts": 13,
+      "sharingMysql.integration.test.ts": 8,
+      "sheetReadHttp.test.ts": 1,
+      "typstService.test.ts": 10,
+      "xlsxImportFidelity.test.ts": 3
+    }
+  },
+  "typecheck": {
+    "command": "npm run typecheck",
+    "exitCode": 0,
+    "newTestsIncludedInTsconfig": true
+  },
+  "touchedFileEslint": {
+    "exitCode": 0
+  },
+  "packaging": {
+    "preFix": {
+      "target": "deps",
+      "exitCode": 1,
+      "reason": "Cannot find module '/app/scripts/patchYjsContentAny.mjs'"
+    },
+    "postFix": {
+      "dockerfile": "Dockerfile.ci",
+      "builderExitCode": 0,
+      "productionDependenciesExitCode": 0,
+      "baseImageOverride": "octo-memory-node22-base:20261019",
+      "baseNote": "Local Node 22.23.2 image derived from the preserved benchmark runtime with NODE_ENV=development; not the private CI base.",
+      "images": {
+        "octo-memory-node22-base:20261019": "sha256:0c383f3ca63d6d5b7074ac823a247722801b4589ebeb9ad1996232af8c5a4466",
+        "octo-memory-mr-builder:20261019": "sha256:abbaf76ceff76a6d32495dd788e1ce17945c2ab6b9cb97b90d3a8a9f2efcedf7",
+        "octo-memory-mr-prod-deps:20261019": "sha256:b2c024ebd3ce0fb9377e1c0f4692499fb01209504be9dd7f68747441428011c4",
+        "octo-memory-mr-smoke:20261019": "sha256:549798b1ec38f76b819440e38ed5422a5d3d55a7607745fd159a6912b6af3d81"
+      },
+      "runtimeSmoke": {
+        "verified": true,
+        "node": "v22.23.2",
+        "developmentDependenciesAbsent": true,
+        "allThreeYjsEntrypointsPatched": true,
+        "compiledSaveAndRestore": true,
+        "helperHeapLimitBytes": 549453824
+      }
+    },
+    "notVerified": [
+      "private CI base image",
+      "Typst/font fetch and final runner stage",
+      "authenticated full product",
+      "deployment"
+    ]
+  },
+  "knownLimits": [
+    "Historical 2 GiB / 1536 MiB heap case with three 32.22 MiB documents still OOMKilled on save (exit 137).",
+    "49.29 MiB and 104.29 MiB helper saves fail.",
+    "Current delivery does not change document or cell limits.",
+    "Capacity measurements are from 2026-10-16; not rerun on this delivery base."
+  ]
+}

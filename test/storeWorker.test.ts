@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import { Worker } from 'node:worker_threads'
+import { EventEmitter, once } from 'node:events'
+import { execFileSync } from 'node:child_process'
 import * as Y from 'yjs'
 import { prepareStoredState, type StoreJob, type StoreResult } from '../src/collab/storeWorker.js'
 import { createStoreWorker, StoreWorkerPool } from '../src/collab/storeWorkerPool.js'
@@ -71,6 +73,68 @@ describe.each([1, 2] as const)('background merge writes V%i', encoding => {
 })
 
 describe('worker isolation and lifecycle', () => {
+  it('finishes shutdown in a standalone process with no other event-loop handles', () => {
+    const output = execFileSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', `
+      import { StoreWorkerPool } from './src/collab/storeWorkerPool.ts';
+      import * as Y from 'yjs';
+      const pool = new StoreWorkerPool(); const doc = new Y.Doc();
+      await pool.run({ documentName:'shutdown', existing:null, update:Y.encodeStateAsUpdate(doc), encoding:1,
+        baseVector:null, targetVector:Y.encodeStateVector(doc), codec:{maxDocBytes:1000,maxDocStorageBytes:0,yjsStorageGzip:false} });
+      await pool.close(); doc.destroy(); process.stdout.write('closed');
+    `], { encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'pipe'] })
+    expect(output).toBe('closed')
+  })
+
+  it('keeps the 512 MiB heap boundary when the parent requests 4 GiB', async () => {
+    const previous = process.env.NODE_OPTIONS
+    process.env.NODE_OPTIONS = '--max-old-space-size=4096'
+    const worker = createStoreWorker()
+    try {
+      const limit = await new Promise<number>((resolve, reject) => {
+        worker.on('ready', resolve); worker.on('error', reject)
+      })
+      // V8 adds its young generation to the 512 MiB old-space budget.
+      expect(limit).toBeGreaterThan(512 * 1024 * 1024)
+      expect(limit).toBeLessThanOrEqual(576 * 1024 * 1024)
+    } finally {
+      await worker.terminate()
+      if (previous === undefined) delete process.env.NODE_OPTIONS
+      else process.env.NODE_OPTIONS = previous
+    }
+  })
+
+  it('holds the slot and byte reservation until the timed-out process has actually exited', async () => {
+    let finishExit!: (code: number) => void
+    class SlowExit extends EventEmitter {
+      postMessage(): void { /* intentionally unresponsive */ }
+      ref(): void { /* test handle */ }
+      unref(): void { /* test handle */ }
+      terminate(): Promise<number> {
+        this.emit('terminating')
+        return new Promise(resolve => { finishExit = resolve })
+      }
+    }
+    const slow = new SlowExit()
+    let starts = 0
+    const input = job(doc())
+    const bytes = input.update.byteLength + input.targetVector.byteLength
+    const p = pool({ maxBytes: bytes * 2, timeoutMs: 20,
+      workerFactory: () => ++starts === 1 ? slow : createStoreWorker() })
+    const terminating = once(slow, 'terminating')
+    const first = p.run(input).catch(error => error)
+    const second = p.run(input).catch(error => error)
+    await terminating
+    try {
+      expect(starts).toBe(1)
+      await expect(p.run(input)).rejects.toThrow('capacity exceeded')
+    } finally { finishExit(1) }
+    expect(await first).toMatchObject({ message: 'Yjs store worker timed out' })
+    // The second may time out on startup under this deliberately tiny deadline,
+    // but must never start before the first process released its memory.
+    await second
+    expect(starts).toBe(2)
+  })
+
   it('does the expensive work off the event loop after the worker is already warm', async () => {
     const p = pool(); await p.run(job(doc()))
     const d = doc()

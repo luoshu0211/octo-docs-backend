@@ -1,19 +1,8 @@
-import { Worker } from 'node:worker_threads'
-import { existsSync } from 'node:fs'
-import { fileURLToPath } from 'node:url'
+import { createStoreProcess, type StoreWorkerHandle } from './storeProcessHandle.js'
 import { StorageBudgetError, UnknownEncodingError } from './storageCodec.js'
 import type { StoreJob, StoreReply, StoreResult } from './storeWorker.js'
 
-export function createStoreWorker(): Worker {
-  const compiled = new URL('./storeWorker.js', import.meta.url)
-  const limits = { maxOldGenerationSizeMb: 512 }
-  if (existsSync(fileURLToPath(compiled))) return new Worker(compiled, { execArgv: [], resourceLimits: limits })
-  // tsx's hook must be registered before importing the TS worker's .js imports.
-  const source = new URL('./storeWorker.ts', import.meta.url)
-  return new Worker(`import { register } from 'tsx/esm/api'; register(); await import(${JSON.stringify(source.href)})`, {
-    eval: true, execArgv: [], resourceLimits: limits,
-  })
-}
+export const createStoreWorker = createStoreProcess
 
 interface PendingJob {
   id: number
@@ -22,7 +11,7 @@ interface PendingJob {
   resolve(result: StoreResult): void
   reject(error: Error): void
 }
-interface Slot { worker: Worker | null; job: PendingJob | null; timer?: NodeJS.Timeout }
+interface Slot { worker: StoreWorkerHandle | null; job: PendingJob | null; timer?: NodeJS.Timeout; stopping?: Promise<void> }
 
 /** Bounded, reused workers; no live Y.Doc or unbounded mirror cache is retained. */
 export class StoreWorkerPool {
@@ -36,7 +25,7 @@ export class StoreWorkerPool {
 
   constructor(private readonly options: {
     workers?: number; maxJobs?: number; maxBytes?: number; timeoutMs?: number
-    workerFactory?: () => Worker
+    workerFactory?: () => StoreWorkerHandle
   } = {}) {
     this.slots = Array.from({ length: options.workers ?? 1 }, () => ({ worker: null, job: null }))
   }
@@ -58,7 +47,7 @@ export class StoreWorkerPool {
 
   private dispatch(): void {
     for (const slot of this.slots) {
-      if (slot.job || !this.queue.length) continue
+      if (slot.job || slot.stopping || !this.queue.length) continue
       const job = this.queue.shift()!
       slot.job = job
       try {
@@ -66,7 +55,7 @@ export class StoreWorkerPool {
           const worker = (this.options.workerFactory ?? createStoreWorker)()
           slot.worker = worker
           worker.on('message', (reply: StoreReply) => {
-            if (slot.worker !== worker || slot.job?.id !== reply.id) return
+            if (slot.worker !== worker || slot.stopping || slot.job?.id !== reply.id) return
             if (reply.ok) this.finish(slot, undefined, reply.result)
             else {
               const e = reply.error
@@ -94,11 +83,17 @@ export class StoreWorkerPool {
     }
   }
 
-  private failedWorker(slot: Slot, worker: Worker, error: Error): void {
-    if (slot.worker !== worker) return
-    slot.worker = null
-    void worker.terminate()
-    if (slot.job) this.finish(slot, error)
+  private failedWorker(slot: Slot, worker: StoreWorkerHandle, error: Error): void {
+    if (slot.worker !== worker || slot.stopping) return
+    clearTimeout(slot.timer)
+    // Keep the slot and its byte reservation until the OS confirms exit. Starting
+    // a replacement while the old decoder is alive defeats the memory bound.
+    slot.stopping = worker.terminate().then(() => {
+      slot.worker = null
+      slot.stopping = undefined
+      if (slot.job) this.finish(slot, error)
+      else this.dispatch()
+    })
   }
 
   private finish(slot: Slot, error?: Error, result?: StoreResult): void {
@@ -119,6 +114,7 @@ export class StoreWorkerPool {
     this.closePromise = (async () => {
       if (this.queue.length || this.slots.some(s => s.job)) await new Promise<void>(resolve => { this.drained = resolve })
       await Promise.all(this.slots.map(async slot => {
+        await slot.stopping
         const worker = slot.worker
         slot.worker = null
         if (worker) await worker.terminate()

@@ -9,6 +9,7 @@
     "node": ">=22"
   },
   "scripts": {
+    "postinstall": "node scripts/patchYjsContentAny.mjs",
     "build": "tsc -p tsconfig.json",
     "dev": "tsx watch src/index.ts",
     "migrate": "node dist/db/migrate.js",
@@ -57,7 +58,7 @@
     "y-prosemirror": "^1.2.12",
     "y-protocols": "^1.0.6",
     "yauzl": "^3.4.0",
-    "yjs": "^13.6.31"
+    "yjs": "13.6.31"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.4",
