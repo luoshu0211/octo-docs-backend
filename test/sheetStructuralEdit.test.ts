@@ -300,7 +300,7 @@ describe('structural sheet row/column edits', () => {
       kind: 'columns.delete', logicalId: 'default', startColumn: 9, count: 2,
     })).toThrowError(new SheetStructuralEditError('sheet_column_out_of_bounds'))
     expect(() => prepareSheetStructuralEdit(doc, {
-      kind: 'columns.insert', logicalId: 'default', afterColumn: 9, count: 91,
+      kind: 'columns.insert', logicalId: 'default', afterColumn: 9, count: 400_000,
     })).toThrowError(new SheetStructuralEditError('sheet_column_limit_exceeded'))
   })
 

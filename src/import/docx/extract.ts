@@ -58,6 +58,7 @@ export class DocxUnsafeError extends Error {
       | 'too-many-entries'
       | 'entry-too-large'
       | 'total-too-large'
+      | 'content-too-large'
       | 'ratio-too-high'
       | 'too-many-media'
       | 'timeout'
@@ -143,6 +144,7 @@ export function extractDocx(buffer: Buffer): Promise<ExtractedDocx> {
       const warnings: string[] = []
       let entryCount = 0
       let totalUncompressed = 0
+      let contentUncompressed = 0
 
       const overDeadline = (): boolean => Date.now() > deadline
 
@@ -187,6 +189,12 @@ export function extractDocx(buffer: Buffer): Promise<ExtractedDocx> {
           return
         }
 
+        const image = /^(?:word\/media\/[^/]+|docprops\/thumbnail)\.(?:png|jpe?g|gif|svg|webp|bmp|tiff?|emf|wmf|avif|heic|ico)$/.test(name)
+        if (!image) contentUncompressed += uncompressed
+        if (contentUncompressed > config.maxDocBytes) {
+          finish(new DocxUnsafeError('document content exceeds limit excluding images', 'content-too-large'))
+          return
+        }
         const wanted = isWantedPart(name)
         const mediaEntry = isMedia(name)
 

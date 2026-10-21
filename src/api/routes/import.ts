@@ -37,7 +37,8 @@ import {
 import type { MediaUploadCtx } from '../../import/docx/media.js'
 import { parseMarkdownToPmDoc } from '../../import/markdown/markdown.js'
 import { resolveGitHubEmoji } from '../../import/markdown/emoji.js'
-import { parseXlsx, XlsxParseError } from '../../import/xlsx/parse.js'
+import { XlsxParseError } from '../../import/xlsx/parse.js'
+import { parseXlsxIsolated } from '../../import/xlsx/parseIsolated.js'
 import { xlsxWorkbookToSheetBatch } from '../../import/xlsx/toSheetBatch.js'
 import { readLiveSheet } from '../../collab/liveSheetWrite.js'
 import { decodeSheetSnapshot, decodeSheetDimsSnapshot, decodeSheetDrawingsSnapshot, decodeSheetHyperLinksSnapshot, decodeSheetMergesSnapshot, decodeSheetListSnapshot, decodeOwnedSheetDataValidationKeysSnapshot } from '../../collab/versionRestore.js'
@@ -635,10 +636,9 @@ export async function importDocxHandler(req: Request, res: Response): Promise<vo
 
 /**
  * Hard ceiling on an uploaded Markdown request body. Markdown is plain text and
- * much smaller than a .docx zip; reuse the docx cap until a markdown-specific
- * config field exists so the two bounds can be tuned independently.
+ * bounded by the same 20 MiB document-content budget.
  */
-const MAX_MD_UPLOAD_BYTES = config.docxImport.maxUploadBytes
+const MAX_MD_UPLOAD_BYTES = config.maxDocBytes
 
 /**
  * express.raw scoped to the markdown route: accept text/markdown, text/plain,
@@ -786,18 +786,67 @@ export async function importXlsxHandler(req: Request, res: Response): Promise<vo
   let importedDrawings: Record<string, StoredDrawing>
   let importedHyperlinks: Record<string, StoredHyperLink>
   let importedSheetName: string | undefined
+  let importedRows = 1
+  let importedColumns = 1
+  const importedAttachIds: string[] = []
+  let importCommitted = false
   let importWarnings: string[]
   try {
-    const workbook = await parseXlsx(buffer)
+    const abort = new AbortController()
+    const cancel = () => { if (!res.writableEnded) abort.abort() }
+    req.once('aborted', cancel)
+    res.once('close', cancel)
+    let workbook
+    try { workbook = await parseXlsxIsolated(buffer, abort.signal) }
+    finally { req.off('aborted', cancel); res.off('close', cancel) }
     importedSheetName = workbook.sheets[0]?.name
+    importedRows = workbook.sheets[0]?.rowCount ?? 1
+    importedColumns = workbook.sheets[0]?.columnCount ?? 1
+    for (const cell of workbook.sheets[0]?.cells ?? []) {
+      importedRows = Math.max(importedRows, cell.row + 1)
+      importedColumns = Math.max(importedColumns, cell.col + 1)
+    }
     const batch = xlsxWorkbookToSheetBatch(workbook)
     importedCells = batch.cells
     importedDims = batch.dims
     importedDrawings = batch.drawings
     importedHyperlinks = batch.hyperlinks
     importWarnings = batch.warnings
+    // Use the same durable attachment identity as the browser image service. Binary data must
+    // never enter the Y.Doc or consume the document-content budget.
+    for (const image of workbook.sheets[0]?.drawings ?? []) {
+      const key = `default!${image.id}`
+      const drawing = importedDrawings[key]
+      if (!drawing) continue
+      const attachId = newAttachId()
+      const fileName = `${image.id}.${image.mime.split('/')[1]!.replace('svg+xml', 'svg')}`
+      const objectKey = `${docId}/${attachId}/${fileName}`
+      await getObjectStore().upload(objectKey, image.mime, new Uint8Array(image.bytes), { signal: AbortSignal.timeout(config.docxImport.timeoutMs) })
+      try {
+        await docAttachmentRepo.register({ attachId, docId, objectKey, mime: image.mime, sizeBytes: image.bytes.length, fileName, createdBy: req.uid })
+      } catch (error) {
+        await getObjectStore().delete(objectKey).catch(() => {})
+        throw error
+      }
+      importedAttachIds.push(attachId)
+      delete importedDrawings[key]
+      importedDrawings[`default!${attachId}`] = {
+        ...drawing, drawingId: attachId, octoAttachId: attachId, imageSourceType: 'URL',
+        source: getObjectStore().presignGet(objectKey, config.attachments.readUrlTtlSeconds, { responseContentType: image.mime }),
+      }
+    }
   } catch (err) {
+    await Promise.allSettled(importedAttachIds.map((id) => cleanupCopiedAttachment(id)))
     if (err instanceof XlsxParseError) {
+      if (err.reason === 'resource-limit' || err.reason === 'busy' || err.reason === 'cancelled') {
+        res.status(err.reason === 'busy' ? 503 : err.reason === 'cancelled' ? 408 : 413)
+          .json({ error: err.reason === 'busy' ? 'import_busy' : err.reason === 'cancelled' ? 'import_cancelled' : 'xlsx_expansion_limit' })
+        return
+      }
+      if (err.reason === 'content-too-large' || err.reason === 'cell-limit') {
+        res.status(413).json({ error: err.reason === 'cell-limit' ? 'sheet_cell_limit_exceeded' : 'doc_too_large' })
+        return
+      }
       // eslint-disable-next-line no-console
       console.warn('[import:xlsx] unreadable/empty upload for doc %s: %s', docId, err.reason)
       // empty workbook or unreadable bytes are both the document's fault, not ours.
@@ -842,7 +891,7 @@ export async function importXlsxHandler(req: Request, res: Response): Promise<vo
     for (const key of Object.keys(existingMerges)) merges[key] = null
     const sheets: Record<string, StoredSheetMeta | null> = {}
     for (const key of Object.keys(existingSheets)) sheets[key] = null
-    sheets.default = { name: importedSheetName?.trim() || 'Sheet1', order: 0 }
+    sheets.default = { name: importedSheetName?.trim() || 'Sheet1', order: 0, rowCount: importedRows, columnCount: importedColumns }
     const dataValidations: Record<string, StoredDataValidation | null> = Object.create(null)
     for (const key of existingDataValidationKeys) dataValidations[key] = null
     const result = await editDocSheet({
@@ -873,10 +922,13 @@ export async function importXlsxHandler(req: Request, res: Response): Promise<vo
       res.status(result.status).json(errBody)
       return
     }
+    importCommitted = true
     res.status(200).json({ baseVersion: result.baseVersion, warnings: importWarnings })
   } catch (err) {
     // eslint-disable-next-line no-console
     console.error('[import:xlsx] write failed for doc %s:', docId, err)
     res.status(500).json({ error: 'internal_error' })
+  } finally {
+    if (!importCommitted) await Promise.allSettled(importedAttachIds.map((id) => cleanupCopiedAttachment(id)))
   }
 }

@@ -994,10 +994,10 @@ describe('cell contract validation', () => {
     expect(res.body).toEqual({ error: 'sheet_cell_invalid' })
   })
 
-  it('422 sheet_cell_invalid on rowCount or a cell row beyond the 10000-row ceiling', async () => {
+  it('422 sheet_cell_invalid on rowCount or a cell row beyond any possible 4-million-cell grid', async () => {
     for (const body of [
-      { sheets: { default: { name: 'Sheet1', order: 0, rowCount: 10_001 } } },
-      { cells: { 'default!10000:0': { v: 'hidden' } } },
+      { sheets: { default: { name: 'Sheet1', order: 0, rowCount: 4_000_001 } } },
+      { cells: { 'default!4000000:0': { v: 'hidden' } } },
     ]) {
       const view = liveSheet({}, {}, true)
       vi.mocked(readLiveSheet).mockResolvedValue(view)

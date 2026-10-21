@@ -10,6 +10,7 @@ import {
   SHEET_LEGACY_COLUMNS,
   SHEET_LEGACY_ROWS,
   SHEET_LIST_FIELD,
+  SHEET_MAX_CELLS,
   SHEET_MAX_COLUMNS,
   SHEET_MAX_ROWS,
   SHEET_MERGES_FIELD,
@@ -397,7 +398,7 @@ function prepareAxisEdit(
     throw new SheetStructuralEditError(fields.limitExceeded)
   }
   const start = mode === 'insert' ? anchor + 1 : anchor
-  if (mode === 'insert' && currentSize + edit.count > fields.max) {
+  if (mode === 'insert' && currentSize + edit.count > Math.floor(SHEET_MAX_CELLS / (axis === 'row' ? currentColumns : currentRows))) {
     throw new SheetStructuralEditError(fields.limitExceeded)
   }
   if (mode === 'delete' && (start + edit.count > currentSize || currentSize - edit.count < 1)) {
