@@ -1,5 +1,5 @@
 import * as Y from 'yjs'
-import { SHEET_MAX_COLUMNS, SHEET_MAX_ROWS, SheetSnapshotInvalidError, validateResourceLogicalId } from './sheetConversion.js'
+import { SHEET_MAX_CELLS, SHEET_MAX_COLUMNS, SHEET_MAX_ROWS, SheetSnapshotInvalidError, validateResourceLogicalId } from './sheetConversion.js'
 
 export const SHEET_CONDITIONAL_FORMATS_FIELD = 'sheetConditionalFormats'
 export type ConditionalFormatChanges = Record<string, Record<string, unknown> | null>
@@ -34,7 +34,7 @@ export function validateConditionalFormat(key: string, value: unknown, logicalId
   for (const range of rule!.ranges as Array<{ startRow: number; endRow: number; startColumn: number; endColumn: number }>) {
     if (!range || ![range.startRow, range.endRow, range.startColumn, range.endColumn].every(Number.isSafeInteger) ||
       range.startRow < 0 || range.startColumn < 0 || range.endRow < range.startRow || range.endColumn < range.startColumn ||
-      range.endRow >= SHEET_MAX_ROWS || range.endColumn >= SHEET_MAX_COLUMNS) invalid()
+      range.endRow >= SHEET_MAX_ROWS || range.endColumn >= SHEET_MAX_COLUMNS || (range.endRow + 1) > Math.floor(SHEET_MAX_CELLS / (range.endColumn + 1))) invalid()
   }
   const config = rule!.rule as Record<string, unknown> | undefined
   if (!config || !['highlightCell', 'colorScale', 'dataBar', 'iconSet'].includes(String(config.type))) invalid()

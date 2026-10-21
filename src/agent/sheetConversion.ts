@@ -83,10 +83,21 @@ export const SHEET_FILTERS_FIELD = 'sheetFilters'
 /** Fresh sheets are intentionally compact; legacy entries without counts retain the old size. */
 export const SHEET_DEFAULT_ROWS = 200
 export const SHEET_LEGACY_ROWS = 1000
-export const SHEET_MAX_ROWS = 10_000
+export const SHEET_MAX_CELLS = 4_000_000
+// Coordinate bounds only; every allocated grid must also satisfy the product budget.
+export const SHEET_MAX_ROWS = SHEET_MAX_CELLS
 export const SHEET_DEFAULT_COLUMNS = 20
 export const SHEET_LEGACY_COLUMNS = 100
-export const SHEET_MAX_COLUMNS = 100
+export const SHEET_MAX_COLUMNS = SHEET_MAX_CELLS
+
+/** No independent row/column ceiling: either axis may consume the whole budget. */
+export function assertSheetGridCapacity(rows: unknown, columns: unknown): void {
+  if (typeof rows !== 'number' || typeof columns !== 'number' ||
+      !Number.isSafeInteger(rows) || !Number.isSafeInteger(columns) ||
+      rows < 1 || columns < 1 || rows > Math.floor(SHEET_MAX_CELLS / columns)) {
+    throw new SheetSnapshotInvalidError('sheet_cell_limit_exceeded: rowCount × columnCount must not exceed 4000000')
+  }
+}
 
 export const SHEET_DATA_VALIDATIONS_FIELD = 'sheetDataValidations'
 
@@ -145,7 +156,8 @@ const DATA_VALIDATION_OPERATORS = new Set([
 const DATA_VALIDATION_STRING_FIELDS = ['formula1', 'formula2', 'error', 'errorTitle', 'prompt', 'promptTitle'] as const
 const DATA_VALIDATION_BOOLEAN_FIELDS = ['allowBlank', 'showDropDown', 'showErrorMessage', 'showInputMessage'] as const
 const MAX_CHECKBOX_RANGES_PER_RULE = 100_000
-const MAX_CHECKBOX_VALIDATION_CELLS = 1_000_000
+const MAX_CHECKBOX_VALIDATION_CELLS = SHEET_MAX_CELLS
+// Independent CPU inspection budget: a tall one-column range may hit this before the grid cap.
 const MAX_CHECKBOX_BITMAP_WORD_VISITS_PER_RULE = 1_000_000
 const MAX_CHECKBOX_BITMAP_WORD_VISITS_PER_SHEET = 2_000_000
 export interface SheetDataValidationStorageLimits {
@@ -202,7 +214,8 @@ export function validateSheetDataValidation(key: unknown, value: unknown): Store
     const endColumn = range.endColumn as number
     if (
       startRow < 0 || startColumn < 0 || endRow < startRow || endColumn < startColumn ||
-      endRow >= SHEET_MAX_ROWS || endColumn >= SHEET_MAX_COLUMNS
+      endRow >= SHEET_MAX_ROWS || endColumn >= SHEET_MAX_COLUMNS ||
+      (endRow + 1) > Math.floor(SHEET_MAX_CELLS / (endColumn + 1))
     ) {
       throw new SheetSnapshotInvalidError(`data validation ${key}: range ${index} is outside the sheet bounds`)
     }
@@ -346,13 +359,22 @@ export function validateSheetDataValidations(
     storageLimits,
   )
   const out: Record<string, StoredDataValidation> = Object.create(null)
-  // Keys are sorted by logical id, so reuse one fixed-size bitmap and release each sheet's
-  // occupancy when the next sheet begins. Four uint32 words cover the 100 columns per row.
+  // Size each bitmap to that worksheet's actual range extent and release it before the next sheet.
   // This bounds memory independently of an attacker-controlled sheet count and avoids the
   // per-cell Set entries that made many full-sheet rules prohibitively expensive.
-  const wordsPerRow = 4
-  const occupied = new Uint32Array(1000 * wordsPerRow)
-  const ruleBitmap = new Uint32Array(occupied.length)
+  const extents = new Map<string, { rows: number; columns: number }>()
+  for (const [key, rule] of Object.entries(candidates)) {
+    const id = key.slice(0, key.indexOf('!'))
+    const extent = extents.get(id) ?? { rows: 1, columns: 1 }
+    for (const range of rule.ranges) {
+      extent.rows = Math.max(extent.rows, range.endRow + 1)
+      extent.columns = Math.max(extent.columns, range.endColumn + 1)
+    }
+    extents.set(id, extent)
+  }
+  let wordsPerRow = 1
+  let occupied = new Uint32Array(0)
+  let ruleBitmap = new Uint32Array(0)
   const touchedWords: number[] = []
   let currentLogicalId = ''
   const countSetBits = (value: number): number => {
@@ -398,7 +420,13 @@ export function validateSheetDataValidations(
     if (logicalId !== currentLogicalId) {
       currentLogicalId = logicalId
       bitmapWordVisits = 0
-      occupied.fill(0)
+      const extent = extents.get(logicalId)!
+      if (extent.rows > Math.floor(SHEET_MAX_CELLS / extent.columns)) {
+        throw new SheetDataValidationInspectionBudgetError(key)
+      }
+      wordsPerRow = Math.ceil(extent.columns / 32)
+      occupied = new Uint32Array(extent.rows * wordsPerRow)
+      ruleBitmap = new Uint32Array(occupied.length)
     }
     touchedWords.length = 0
     const built = buildRuleBitmap(
@@ -1823,7 +1851,7 @@ const RESERVED_LOGICAL_IDS = new Set(['__proto__', 'constructor', 'prototype'])
  * This is the tab registry — a bot ADDS a tab by setting a new logicalId here, then
  * writes that tab's cells with keys `${logicalId}!row:col`.
  */
-export function validateSheetListEntry(key: unknown, value: unknown): StoredSheetMeta {
+export function validateSheetListEntry(key: unknown, value: unknown, complete = true): StoredSheetMeta {
   if (typeof key !== 'string' || !LIST_KEY_RE.test(key)) {
     throw new SheetSnapshotInvalidError(
       `sheetList key must be a logicalId (no ':', '!' or control chars): ${String(key).slice(0, 64)}`,
@@ -1862,6 +1890,9 @@ export function validateSheetListEntry(key: unknown, value: unknown): StoredShee
       `sheetList ${key}: columnCount must be an integer between 1 and ${SHEET_MAX_COLUMNS}`,
     )
   }
+  if (complete || (rec.rowCount !== undefined && rec.columnCount !== undefined)) {
+    assertSheetGridCapacity(rec.rowCount ?? SHEET_LEGACY_ROWS, rec.columnCount ?? SHEET_LEGACY_COLUMNS)
+  }
   return rec as StoredSheetMeta
 }
 
@@ -1880,7 +1911,7 @@ export function validateSheetListBatch(
       if (typeof key === 'string' && LIST_KEY_RE.test(key) && !RESERVED_LOGICAL_IDS.has(key)) toDelete.push(key)
       else throw new SheetSnapshotInvalidError(`delete: invalid sheetList key ${String(key).slice(0, 64)}`)
     } else {
-      toSet.push([key, validateSheetListEntry(key, val)])
+      toSet.push([key, validateSheetListEntry(key, val, false)])
     }
   }
   return { toDelete, toSet }
@@ -2004,16 +2035,17 @@ export function prepareSheetListBatchForWrite(
 
     // A pre-sheetList workbook has one implicit legacy `default` tab. Materialize it only when
     // a write actually needs to grow beyond the old 1000-row declaration.
-    if (existing.size === 0 && logicalId === 'default' && requiredRows > SHEET_LEGACY_ROWS) {
+    if (existing.size === 0 && logicalId === 'default' && (requiredRows > SHEET_LEGACY_ROWS || requiredColumns > SHEET_LEGACY_COLUMNS)) {
       toSet.set('default', {
         name: 'Sheet1',
         order: 0,
-        rowCount: requiredRows,
-        columnCount: SHEET_LEGACY_COLUMNS,
+        rowCount: Math.max(requiredRows, SHEET_LEGACY_ROWS),
+        columnCount: Math.max(requiredColumns, SHEET_LEGACY_COLUMNS),
       })
     }
   }
 
+  for (const meta of toSet.values()) assertSheetGridCapacity(meta.rowCount, meta.columnCount)
   return { toDelete: materialized.toDelete, toSet: Array.from(toSet.entries()) }
 }
 
@@ -2113,9 +2145,9 @@ export function validateSheetRange(value: unknown, label = 'range'): StoredSheet
   const sc = startColumn as number
   const er = endRow as number
   const ec = endColumn as number
-  if (sr < 0 || sc < 0 || er < sr || ec < sc || er >= SHEET_MAX_ROWS || ec >= SHEET_MAX_COLUMNS) {
+  if (sr < 0 || sc < 0 || er < sr || ec < sc || er >= SHEET_MAX_ROWS || ec >= SHEET_MAX_COLUMNS || (er + 1) > Math.floor(SHEET_MAX_CELLS / (ec + 1))) {
     throw new SheetSnapshotInvalidError(
-      `${label}: bounds are outside the ${SHEET_MAX_ROWS}x${SHEET_MAX_COLUMNS} grid`,
+      `${label}: bounds exceed the 4000000-cell grid budget`,
     )
   }
   return { startRow: sr, startColumn: sc, endRow: er, endColumn: ec }

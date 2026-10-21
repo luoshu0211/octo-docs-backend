@@ -1,4 +1,6 @@
-import { describe, it, expect, vi } from 'vitest'
+import { EventEmitter } from 'node:events'
+import * as isolatedParser from '../src/import/xlsx/parseIsolated.js'
+import { beforeEach, describe, it, expect, vi } from 'vitest'
 import type { Request, Response } from 'express'
 import ExcelJS from 'exceljs'
 
@@ -27,6 +29,19 @@ vi.mock('../src/api/services/editDocSheet.js', () => ({
   editDocSheet: vi.fn(),
 }))
 
+vi.mock('../src/storage/objectStore.js', () => ({ getObjectStore: () => ({
+  upload: uploadMock, delete: deleteMock, presignGet: () => 'https://objects.test/image.png',
+}) }))
+vi.mock('../src/db/repos/docAttachmentRepo.js', () => ({ docAttachmentRepo: {
+  register: registerMock, getById: getAttachmentMock, deleteById: deleteAttachmentMock,
+} }))
+const { uploadMock, deleteMock, registerMock, getAttachmentMock, deleteAttachmentMock } = vi.hoisted(() => ({
+  uploadMock: vi.fn(async (_key: string, _mime: string, _bytes: Uint8Array, _options?: unknown) => {}), deleteMock: vi.fn(async (_key: string) => {}),
+  registerMock: vi.fn(async (_value: unknown) => {}),
+  getAttachmentMock: vi.fn(async (_id: string): Promise<unknown> => undefined),
+  deleteAttachmentMock: vi.fn(async () => {}),
+}))
+
 import { importXlsxHandler } from '../src/api/routes/import.js'
 import { requireDocRole } from '../src/api/guard.js'
 import { editDocSheet } from '../src/api/services/editDocSheet.js'
@@ -42,7 +57,7 @@ interface MockRes {
   json(b: unknown): MockRes
 }
 function mockRes(): MockRes {
-  return {
+  return Object.assign(new EventEmitter(), {
     statusCode: 0,
     body: undefined,
     status(c: number) {
@@ -53,16 +68,16 @@ function mockRes(): MockRes {
       this.body = b
       return this
     },
-  }
+  })
 }
 function req(body: unknown): Request {
-  return {
+  return Object.assign(new EventEmitter(), {
     uid: 'u1',
     spaceId: 's1',
     principalSpaceId: 's1',
     params: { docId: 'd1' },
     body,
-  } as unknown as Request
+  }) as unknown as Request
 }
 function field(res: MockRes, key: string): unknown {
   return (res.body as Record<string, unknown> | undefined)?.[key]
@@ -197,5 +212,71 @@ describe('importXlsxHandler — status mapping', () => {
       repairDataValidationKey: 'default!checkbox-old',
       hint: 'delete the returned checkbox validation key with PATCH, then retry the write',
     })
+  })
+})
+
+describe('XLSX image storage', () => {
+  async function imageWorkbook() {
+    const wb = new ExcelJS.Workbook()
+    const ws = wb.addWorksheet('Images')
+    const image = wb.addImage({ buffer: Buffer.from('png-payload'), extension: 'png' })
+    ws.addImage(image, { tl: { col: 199, row: 19999 }, ext: { width: 20, height: 20 } })
+    return Buffer.from(await wb.xlsx.writeBuffer() as ArrayBuffer)
+  }
+  it('uploads bytes to object storage and saves only the durable attachment reference', async () => {
+    guard.mockResolvedValueOnce(sheetGuard())
+    edit.mockResolvedValueOnce({ ok: true, bytes: 10, baseVersion: 'bv', newDocVersionSeq: 2 })
+    const res = mockRes()
+    await run(res, await imageWorkbook())
+    expect(res.statusCode).toBe(200)
+    expect(uploadMock).toHaveBeenCalledOnce()
+    expect(Buffer.from(uploadMock.mock.calls[0]![2])).toEqual(Buffer.from('png-payload'))
+    const attachment = registerMock.mock.calls[0]![0] as { attachId: string }
+    const batch = edit.mock.calls.at(-1)![0]
+    expect(batch.sheets?.default).toMatchObject({ rowCount: 20000, columnCount: 200 })
+    const drawing = Object.values(batch.drawings!)[0]
+    expect(drawing).toMatchObject({ drawingId: attachment.attachId, octoAttachId: attachment.attachId, imageSourceType: 'URL', source: 'https://objects.test/image.png' })
+    expect(JSON.stringify(batch)).not.toContain('base64')
+    expect(deleteMock).not.toHaveBeenCalled()
+  })
+  it('cleans up the uploaded image when the document write is refused', async () => {
+    guard.mockResolvedValueOnce(sheetGuard())
+    edit.mockResolvedValueOnce({ ok: false, status: 413, error: 'sheet_too_large' })
+    getAttachmentMock.mockResolvedValueOnce({ objectKey: 'd1/uploaded/image.png' })
+    const res = mockRes()
+    await run(res, await imageWorkbook())
+    expect(res.statusCode).toBe(413)
+    expect(deleteMock).toHaveBeenCalledWith('d1/uploaded/image.png')
+    expect(deleteAttachmentMock).toHaveBeenCalledOnce()
+  })
+})
+
+describe('XLSX parser process boundary', () => {
+  beforeEach(() => { edit.mockClear(); uploadMock.mockClear() })
+  it('routes admitted uploads through the isolated parser before writing', async () => {
+    const parse = vi.spyOn(isolatedParser, 'parseXlsxIsolated')
+    try {
+      guard.mockResolvedValueOnce(sheetGuard())
+      edit.mockResolvedValueOnce({ ok: true, bytes: 10, baseVersion: 'bv', newDocVersionSeq: 2 })
+      const res = mockRes()
+      await run(res, await xlsxBuffer())
+      expect(parse).toHaveBeenCalledOnce()
+      expect(res.statusCode).toBe(200)
+    } finally { parse.mockRestore() }
+  })
+  it.each([
+    ['resource-limit', 413, 'xlsx_expansion_limit'], ['busy', 503, 'import_busy'],
+  ] as const)('returns a controlled %s without uploading or writing', async (reason, status, error) => {
+    const { XlsxParseError } = await import('../src/import/xlsx/parse.js')
+    const parse = vi.spyOn(isolatedParser, 'parseXlsxIsolated').mockRejectedValue(new XlsxParseError(reason))
+    try {
+      guard.mockResolvedValueOnce(sheetGuard())
+      const res = mockRes()
+      await run(res, await xlsxBuffer())
+      expect(res.statusCode).toBe(status)
+      expect(res.body).toEqual({ error })
+      expect(edit).not.toHaveBeenCalled()
+      expect(uploadMock).not.toHaveBeenCalled()
+    } finally { parse.mockRestore() }
   })
 })

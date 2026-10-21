@@ -5,6 +5,7 @@
 #   {{REPO_URL}}      image repository without tag or digest
 #   {{IMAGE_DIGEST}}  immutable image digest from the package job
 #   {{BRANCH}}        dev / test / prod
+#   {{REPLICAS}}      4 for prod, 2 for dev/test
 #
 # ConfigMap and Secret are intentionally not included in ArgoCD sync. The
 # Deployment references them so missing runtime config fails loudly.
@@ -29,7 +30,7 @@ spec:
   # memory, with the DB row still empty) for all three doc types — doc, sheet
   # and board. documentName-affinity routing is therefore not a prerequisite;
   # the Service stays on default round-robin.
-  replicas: 2
+  replicas: {{REPLICAS}}
   revisionHistoryLimit: 10
   selector:
     matchLabels:
@@ -77,6 +78,12 @@ spec:
           env:
             - name: NODE_ENV
               value: "production"
+            # Explicit env takes precedence over the legacy 10 MiB ConfigMap value.
+            # Images live in object storage; this caps encoded document content/references.
+            - name: MAX_DOC_BYTES
+              value: "20971520"
+            - name: SHEET_READ_MAX_CELL_BYTES
+              value: "20971520"
             - name: HOSTNAME
               valueFrom:
                 fieldRef:

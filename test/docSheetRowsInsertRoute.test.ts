@@ -66,7 +66,7 @@ describe('POST /:docId/sheet/rows/insert', () => {
     { body: { logicalId: 'default', afterRow: 9, count: 5 }, headers: {} },
     { body: { logicalId: 'default', afterRow: -1, count: 5 }, headers: { 'if-match': 'BV' } },
     { body: { logicalId: 'default', afterRow: 9, count: 0 }, headers: { 'if-match': 'BV' } },
-    { body: { logicalId: 'default', afterRow: 9, count: 10_000 }, headers: { 'if-match': 'BV' } },
+    { body: { logicalId: 'default', afterRow: 9, count: 4_000_000 }, headers: { 'if-match': 'BV' } },
     { body: { logicalId: 'bad:id', afterRow: 9, count: 5 }, headers: { 'if-match': 'BV' } },
   ])('returns 400 for a malformed request', async ({ body, headers }) => {
     vi.mocked(requireDocRole).mockResolvedValue(writerGuard)
@@ -160,7 +160,7 @@ describe('POST /:docId/sheet/rows/insert', () => {
 
   it.each([
     [deleteDocSheetRowsHandler, { logicalId: 'default', startRow: -1, count: 1 }],
-    [insertDocSheetColumnsHandler, { logicalId: 'default', afterColumn: 1, count: 100 }],
+    [insertDocSheetColumnsHandler, { logicalId: 'default', afterColumn: 1, count: 4_000_000 }],
     [deleteDocSheetColumnsHandler, { logicalId: 'default', startColumn: 1, count: 0 }],
   ])('rejects malformed structural edit bodies', async (handler, body) => {
     vi.mocked(requireDocRole).mockResolvedValue(writerGuard)
