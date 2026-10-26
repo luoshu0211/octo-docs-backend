@@ -1623,10 +1623,11 @@ describe('sheetConversion — validateSheetListEntry (fail-closed logicalId + gr
         SheetSnapshotInvalidError,
       )
     }
-    expect(validateSheetListEntry('s', { name: 'x', order: 0, rowCount: SHEET_MAX_ROWS })).toEqual({
+    expect(validateSheetListEntry('s', { name: 'x', order: 0, rowCount: SHEET_MAX_ROWS, columnCount: 1 })).toEqual({
       name: 'x',
       order: 0,
       rowCount: SHEET_MAX_ROWS,
+      columnCount: 1,
     })
   })
 
@@ -1636,10 +1637,11 @@ describe('sheetConversion — validateSheetListEntry (fail-closed logicalId + gr
         SheetSnapshotInvalidError,
       )
     }
-    expect(validateSheetListEntry('s', { name: 'x', order: 0, columnCount: SHEET_MAX_COLUMNS })).toEqual({
+    expect(validateSheetListEntry('s', { name: 'x', order: 0, columnCount: SHEET_MAX_COLUMNS, rowCount: 1 })).toEqual({
       name: 'x',
       order: 0,
       columnCount: SHEET_MAX_COLUMNS,
+      rowCount: 1,
     })
   })
 })

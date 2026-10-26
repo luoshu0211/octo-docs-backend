@@ -1046,15 +1046,20 @@ describe('paginated sheet read', () => {
 //
 // The guarantee under test: such a sheet whole-reads 413 sheet_too_large (RED),
 // yet a paginated read walks every one of its cells page by page (GREEN). No
-// cell is stranded behind the whole-read wall. Uses the REAL default 1 MB cap
-// (not a lowered one) so the payload is TRULY over maxCellBytes.
+// cell is stranded behind the whole-read wall. Pin the supported legacy 1 MiB
+// override so this pagination regression stays independent of the product default.
 describe('write-gate-bypass oversized sheet is whole-read 413 but fully paginable', () => {
-  beforeEach(() => vi.mocked(requireDocRole).mockResolvedValue(sheetGuard))
+  const original = config.sheetRead.maxCellBytes
+  beforeEach(() => {
+    vi.mocked(requireDocRole).mockResolvedValue(sheetGuard)
+    config.sheetRead.maxCellBytes = 1024 * 1024
+  })
+  afterEach(() => { config.sheetRead.maxCellBytes = original })
 
   const CELL_COUNT = 1200
   /**
    * A single-column sheet whose decoded {sheetCells, sheetDims} JSON is > 1 MB.
-   * Each value is ~1 KB, so 1200 cells clears the default maxCellBytes (1 MB)
+   * Each value is ~1 KB, so 1200 cells clears the configured maxCellBytes (1 MiB)
    * with headroom — a genuinely oversized read payload, measured for real.
    */
   function oversizedSheet(): Record<string, SheetCell> {
@@ -1067,7 +1072,7 @@ describe('write-gate-bypass oversized sheet is whole-read 413 but fully paginabl
 
   it('whole-read (no params) returns 413 sheet_too_large reporting payloadBytes over the 1 MB cap', async () => {
     const cells = oversizedSheet()
-    // Sanity: the payload is truly over the default read cap before we assert.
+    // Sanity: the payload is truly over the configured read cap before we assert.
     const realBytes = Buffer.byteLength(JSON.stringify({ sheetCells: cells, sheetDims: {} }))
     expect(realBytes).toBeGreaterThan(config.sheetRead.maxCellBytes)
 

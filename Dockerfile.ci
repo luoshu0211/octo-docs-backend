@@ -13,6 +13,7 @@ ENV npm_config_registry=${NPM_REGISTRY}
 WORKDIR /app
 
 COPY package.json package-lock.json ./
+COPY scripts/patchYjsContentAny.mjs ./scripts/patchYjsContentAny.mjs
 RUN npm ci
 
 FROM ${NODE_IMAGE} AS builder
@@ -38,6 +39,7 @@ ENV npm_config_registry=${NPM_REGISTRY}
 WORKDIR /app
 
 COPY package.json package-lock.json ./
+COPY scripts/patchYjsContentAny.mjs ./scripts/patchYjsContentAny.mjs
 RUN npm ci --omit=dev && npm cache clean --force
 
 FROM ${NODE_IMAGE} AS typst-fetch

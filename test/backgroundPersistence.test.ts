@@ -12,7 +12,7 @@ import { durableReceipt } from '../src/collab/durableReceipt.js'
 const db = vi.hoisted(() => ({
   row: null as null | { state: Buffer; encoding: number },
   generation: null as string | null,
-  failCommit: false, beforeSelect: undefined as (() => void) | undefined,
+  failCommit: false, beforeSelect: undefined as (() => void | Promise<void>) | undefined,
   mark: vi.fn(), resolve: vi.fn(), metadata: [] as unknown[][],
 }))
 vi.mock('../src/db/pool.js', () => ({
@@ -20,7 +20,7 @@ vi.mock('../src/db/pool.js', () => ({
   transaction: async (operation: (tx: Tx) => Promise<void>) => {
     let next = db.row
     const tx = { query: async (sql: string, args: unknown[] = []) => {
-      if (sql.startsWith('SELECT state')) { db.beforeSelect?.(); return db.row ? [db.row] : [] }
+      if (sql.startsWith('SELECT state')) { await db.beforeSelect?.(); return db.row ? [db.row] : [] }
       if (sql.startsWith('SELECT generation')) return db.generation ? [{ generation: db.generation }] : []
       if (sql.startsWith('INSERT INTO yjs_document')) next = { state: args[1] as Buffer, encoding: args[3] as number }
       if (sql.startsWith('UPDATE doc_meta')) db.metadata.push(args)
@@ -100,6 +100,22 @@ describe.each([false, true])('generation and commit receipts (background: %s)', 
 })
 afterEach(() => { Object.assign(config, original); for (const d of docs.splice(0)) d.destroy() })
 afterAll(() => storeWorkerPool.close())
+
+it('admits only one snapshot capture/SQL transaction before the worker lane is available', async () => {
+  let release!: () => void
+  const blocked = new Promise<void>(resolve => { release = resolve })
+  const selecting = vi.fn(() => blocked)
+  db.beforeSelect = selecting
+  const d = doc(); d.getMap('m').set('value', 'keep')
+  const jobs = Array.from({ length: 16 }, () => persistence.store('queued', d))
+  try {
+    await new Promise(resolve => setImmediate(resolve))
+    expect(selecting).toHaveBeenCalledTimes(1)
+  } finally {
+    db.beforeSelect = undefined; release(); await Promise.all(jobs)
+  }
+  expect(read().getMap('m').get('value')).toBe('keep')
+})
 
 describe.each([false, true])('background persistence (write V2: %s)', v2 => {
   beforeEach(() => { Object.assign(config, { yjsWriteV2: v2 }) })

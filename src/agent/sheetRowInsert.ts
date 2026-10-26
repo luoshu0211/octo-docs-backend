@@ -11,6 +11,7 @@ import {
   SHEET_LEGACY_ROWS,
   SHEET_LIST_FIELD,
   SHEET_MAX_ROWS,
+  SHEET_MAX_CELLS,
   SHEET_MERGES_FIELD,
   SHEET_PROTECTION_FIELD,
   SHEET_YMAP_FIELD,
@@ -251,7 +252,7 @@ export function prepareSheetRowInsert(doc: Y.Doc, raw: SheetRowInsert): SheetRow
   }
   const currentRows = currentMeta.rowCount ?? SHEET_LEGACY_ROWS
   if (raw.afterRow >= currentRows) throw new SheetRowInsertError('sheet_row_out_of_bounds')
-  if (currentRows + raw.count > SHEET_MAX_ROWS) {
+  if (currentRows + raw.count > Math.floor(SHEET_MAX_CELLS / (currentMeta.columnCount ?? SHEET_LEGACY_COLUMNS))) {
     throw new SheetRowInsertError('sheet_row_limit_exceeded')
   }
   const insertAt = raw.afterRow + 1

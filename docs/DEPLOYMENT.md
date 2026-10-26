@@ -326,7 +326,8 @@ vars (those without a fallback) **fail fast at boot** — that is intentional.
 | `DOCS_INTERNAL_TOKEN` | **yes once drive is on the docs-API path, independent of the flag** | **Inbound (drive → docs role) shared secret. docs-side authoritative**: docs generates and rotates this value; drive syncs its `docs_backend.internal_token` to match. Compared (timing-safe) on `GET /internal/docs/:docId/role` (internal listener 9090) that drive calls instead of reading `doc_meta`/`doc_member` directly. Empty => the internal role endpoint rejects every caller (fail-closed). Provisioned via `octo-docs-backend-secret` (`secretKeyRef` in `manifests/deploy.yaml`) — Secret-grade; must NOT live in the ConfigMap. Never logged. |
 | `DRIVE_INTERNAL_TOKEN` | **yes once drive is on the docs-API path, independent of the flag** | **Outbound (docs → drive derived-access) shared secret. drive-side authoritative**: drive generates and rotates this value; docs syncs it to match drive's top-level `internal_token`. Sent as `X-Internal-Token` on the outbound derived-access lookup. Empty => docs omits the header and drive returns 401, so the derived viewer degrades to `none` (fail-closed). Provisioned via `octo-docs-backend-secret` (`secretKeyRef` in `manifests/deploy.yaml`) — Secret-grade; must NOT live in the ConfigMap. Never logged. |
 | `CARD_DISPLAY_TIME_ZONE` | no (`Asia/Shanghai`) | IANA zone used to render timestamps into user-visible card copy (e.g. the access-decision time). Pinned explicitly rather than following the container's `TZ`, which the image does not set (compose defaults it to UTC) — otherwise zh-CN card copy would show a time hours off. **Validated at startup:** an unrecognised zone (`Asia/Shangai`, `UTC+8`, …) fails the process at boot rather than throwing later on the decision path. |
-| `MAX_DOC_BYTES` | no (`10485760`) | single-doc Yjs state hard cap (~10MB) |
+| `MAX_DOC_BYTES` | no (`20971520`) | encoded Yjs content hard cap (20 MiB); images are stored separately |
+| `SHEET_READ_MAX_CELL_BYTES` | no (inherits `MAX_DOC_BYTES`) | Whole-sheet JSON read budget, also checked before sheet writes and XLSX imports; deployment sets 20 MiB explicitly to override older ConfigMaps |
 | `YJS_BACKGROUND_STORE` | no (`true`) | Incremental extraction with full merge/encoding/compression on a bounded worker; SQL/wire formats unchanged. Set `false` for the synchronous fallback. See [background persistence](BACKGROUND_PERSISTENCE.md). |
 | `SHEET_WRITE_MAX_REQUEST_BYTES` | no (`3145728`) | JSON body cap for `PATCH .../:docId/sheet` only; other JSON routes remain capped at 1 MiB |
 | `SHEET_WRITE_MAX_CELLS` | no (`20000`) | maximum entries in each Sheet PATCH resource map, including set and delete operations |
@@ -922,3 +923,62 @@ that can replay old writes or lose edits. Capture a backup, stop edit traffic,
 export/read the current authoritative deck, then create a new PPT through the
 normal API and reapply explicitly reviewed permissions. Preserve the original
 for history; this is an operator-assisted migration, not automatic retirement.
+
+
+### Document and worksheet capacity
+
+The CI-rendered production Deployment runs four replicas; dev/test retain two.
+`manifests/deploy.yaml` explicitly sets `MAX_DOC_BYTES=20971520` and
+`SHEET_READ_MAX_CELL_BYTES=20971520`, overriding legacy smaller ConfigMap values.
+The latter also gates server-side XLSX writes; raising only the document cap
+would leave an otherwise admitted import blocked by the sheet-read budget.
+Roll out the backend before the new frontend so
+all replicas understand enlarged worksheet dimensions and the 20 MiB budget.
+ConfigMaps remain outside ArgoCD management. Refresh older frontend sessions before
+editing newly enlarged sheets; old bundles still enforce legacy geometry.
+
+DOCX/XLSX import counts expanded non-image archive parts against 20 MiB. Binary
+images are uploaded to the attachment object store; the Yjs document retains
+references and image layout. Both imports and saves retain the final encoded
+Yjs 20 MiB check. Archive bytes and encoded Yjs are different representations:
+passing the source gate does not override the final save gate. The whole upload
+and expanded ZIP remain bounded at 200 MiB, with existing entry, ratio, media-count
+and per-image protections. Markdown content is bounded at 20 MiB.
+
+Every worksheet has an allocated grid budget of 4,000,000 cells, including blanks:
+`rowCount * columnCount <= 4000000`. There is no independent axis cap. Clearing
+cells does not free grid capacity; deleting rows/columns does. Growth is rejected
+before local commands or REST transactions mutate the grid; unvalidated oversized
+collaboration metadata is reverted with its sibling changes. Existing stored
+worksheets retain their dimensions. This is a grid/serialization contract, not a
+claim that four million populated or styled cells fit the document byte budget
+or the runtime memory budget. The frontend's Univer core patch also extends
+engine coordinate bounds to the one-row/one-column extremes of this budget;
+ship the matching patch and lockfile so formulas and full-axis ranges recognize
+the same coordinates as the grid. XLSX export retains the file format's own bounds.
+
+
+XLSX parsing also has an independent expansion/processing budget. Before retaining
+converted cells, the parser inspects the projected cell JSON (including coordinate
+keys, capped at `MAX_DOC_BYTES`) and accounts for array slots and object/string
+allocation (128 MiB). This is conservative allocation accounting, not measured
+RSS or the final Yjs encoding. Inherited row/column styles are read without
+materializing ExcelJS blank cells; admitted imports preserve those styles, while
+excessive expansion returns HTTP 413 `xlsx_expansion_limit` before uploads or
+writes. The browser shows a dedicated reduce-formatting/split-file message.
+
+The API runs ExcelJS in a separate process with an explicit 512 MiB V8 old-space
+limit, cleared `NODE_OPTIONS`, a verified heap-limit handshake and the existing
+import timeout. Each API process permits one parser and returns 503 `import_busy`
+for concurrent attempts, with no in-memory queue. Cancellation, timeout and child
+failure release the slot only after child exit. This limits parser heap and work;
+it is not a whole-container RSS guarantee. Browser parsing uses a cancellable
+module worker with a 30-second deadline and one active import per page; it never
+falls back to the UI thread.
+
+Checkbox convergence has separate work limits: at most 1,000,000 bitmap-word
+visits per rule and 2,000,000 per worksheet. These count 32-column word visits,
+not grid cells. A 2,000,000-row × 1-column checkbox range fits the grid budget but
+exceeds a rule's inspection budget; such a rule is excluded from effective reads
+and refused on creation. Both clients and the server retain this protection.
+The 4,000,000-cell grid allowance does not promise full-grid checkbox coverage.

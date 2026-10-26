@@ -22,6 +22,7 @@ import * as Y from 'yjs'
 import { bindStateGeneration } from './stateGeneration.js'
 import { captureDurableSnapshot, recordDurableReceipt } from './durableReceipt.js'
 import type { StoredYjsState } from '../db/repos/yjsDocumentRepo.js'
+import { loadAdmission } from './loadAdmission.js'
 
 export interface CollabDatabaseConfiguration {
   fetch(documentName: string): Promise<StoredYjsState | null>
@@ -44,12 +45,23 @@ export class CollabDatabase implements Extension {
   constructor(private readonly configuration: CollabDatabaseConfiguration) {}
 
   async onLoadDocument(data: onLoadDocumentPayload): Promise<void> {
-    const stored = await this.configuration.fetch(data.documentName)
-    if (stored) {
-      bindStateGeneration(data.document, stored.generation ?? null)
-      applyStoredState(data.document, stored)
-      this.configuration.loaded?.(data.documentName, data.document)
-      recordDurableReceipt(data.document, captureDurableSnapshot(data.document))
+    try {
+      await loadAdmission.run(async () => {
+        const stored = await this.configuration.fetch(data.documentName)
+        // Fetch/decompression and concurrent saves may have consumed headroom.
+        loadAdmission.assertHeadroom()
+        if (stored) {
+          bindStateGeneration(data.document, stored.generation ?? null)
+          applyStoredState(data.document, stored)
+          this.configuration.loaded?.(data.documentName, data.document)
+          recordDurableReceipt(data.document, captureDurableSnapshot(data.document))
+        }
+      })
+    } catch (error) {
+      // Hocuspocus has not yet put a failed load in its documents map, so its
+      // normal unload path may not destroy this temporary Document.
+      if (!data.document.isDestroyed) data.document.destroy()
+      throw error
     }
   }
 

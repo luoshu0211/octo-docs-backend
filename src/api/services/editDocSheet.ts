@@ -183,7 +183,9 @@ function mapEditError(err: unknown): {
   hint?: string
 } | null {
   if (err instanceof BaseVersionStaleError) return { status: 412, error: 'base_version_stale' }
-  if (err instanceof SheetSnapshotInvalidError) return { status: 422, error: 'sheet_cell_invalid' }
+  if (err instanceof SheetSnapshotInvalidError) return err.message.includes('sheet_cell_limit_exceeded')
+    ? { status: 413, error: 'sheet_cell_limit_exceeded' }
+    : { status: 422, error: 'sheet_cell_invalid' }
   if (err instanceof SheetRowInsertError) {
     if (err.code === 'sheet_not_found') return { status: 404, error: err.code }
     if (err.code === 'sheet_formula_unsupported') return { status: 409, error: err.code }

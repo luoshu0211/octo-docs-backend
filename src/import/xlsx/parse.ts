@@ -1,15 +1,16 @@
+import { inheritedCellStyle, XlsxExpansionBudget, XlsxExpansionError } from './expansionBudget.js'
 import type ExcelJS from 'exceljs'
 import yauzl, { type Entry, type ZipFile } from 'yauzl'
-import { SHEET_MAX_ROWS } from '../../agent/sheetConversion.js'
+import { assertSheetGridCapacity, SHEET_MAX_COLUMNS, SHEET_MAX_ROWS } from '../../agent/sheetConversion.js'
 import { config } from '../../config/env.js'
 import { sanitizeSvg } from '../../util/sanitizeSvg.js'
 import { isSafeSpreadsheetFormula } from './formulaSafety.js'
 
 export const MAX_IMPORT_ROWS = SHEET_MAX_ROWS
-export const MAX_IMPORT_COLS = 100
+export const MAX_IMPORT_COLS = SHEET_MAX_COLUMNS
 export const MAX_IMPORT_IMAGES = 50
 export const MAX_IMPORT_IMAGE_BYTES = 5 * 1024 * 1024
-export const MAX_IMPORT_IMAGE_TOTAL_BYTES = 20 * 1024 * 1024
+export const MAX_IMPORT_IMAGE_TOTAL_BYTES = config.docxImport.maxTotalUncompressedBytes
 
 export interface ParsedXlsxCell {
   row: number
@@ -32,6 +33,8 @@ export interface ParsedXlsxDrawing {
   height: number
 }
 export interface ParsedXlsxSheet {
+  rowCount?: number
+  columnCount?: number
   name: string
   cells: ParsedXlsxCell[]
   merges: ParsedXlsxMerge[]
@@ -40,7 +43,7 @@ export interface ParsedXlsxSheet {
 }
 export interface ParsedXlsxWorkbook { sheets: ParsedXlsxSheet[]; truncated: boolean; warnings: string[] }
 export class XlsxParseError extends Error {
-  constructor(public readonly reason: 'empty' | 'unreadable' | 'unsafe') { super(`xlsx parse failed: ${reason}`); this.name = 'XlsxParseError' }
+  constructor(public readonly reason: 'empty' | 'unreadable' | 'unsafe' | 'content-too-large' | 'cell-limit' | 'resource-limit' | 'busy' | 'cancelled') { super(`xlsx parse failed: ${reason}`); this.name = 'XlsxParseError' }
 }
 
 /** Inspect the central directory before ExcelJS inflates any workbook part. */
@@ -51,6 +54,7 @@ export function assertSafeXlsxArchive(buffer: Buffer): Promise<void> {
     let zip: ZipFile | undefined
     let entries = 0
     let total = 0
+    let content = 0
     const finish = (err?: Error): void => {
       if (settled) return
       settled = true
@@ -68,6 +72,9 @@ export function assertSafeXlsxArchive(buffer: Buffer): Promise<void> {
         const compressed = entry.compressedSize
         const uncompressed = entry.uncompressedSize
         total += uncompressed
+        const image = /^(?:xl\/media\/[^/]+|docprops\/thumbnail)\.(?:png|jpe?g|gif|svg|webp|bmp|tiff?|emf|wmf|avif|heic|ico)$/i.test(entry.fileName.replace(/\\/g, '/'))
+        if (!image) content += uncompressed
+        if (content > config.maxDocBytes) return finish(new XlsxParseError('content-too-large'))
         if (
           entries > limits.maxEntries ||
           uncompressed > limits.maxEntryUncompressedBytes ||
@@ -145,15 +152,41 @@ export async function parseXlsx(data:Buffer|ArrayBuffer):Promise<ParsedXlsxWorkb
   await assertSafeXlsxArchive(buffer)
   const Excel=(await import('exceljs')).default; const wb=new Excel.Workbook()
   try{await wb.xlsx.load(buffer as unknown as Parameters<typeof wb.xlsx.load>[0])}catch{throw new XlsxParseError('unreadable')}
+  const budget = new XlsxExpansionBudget()
   const sheets:ParsedXlsxSheet[]=[]; const warnings:string[]=[]; let truncated=false,totalImageBytes=0,imageCount=0
   for(const ws of wb.worksheets){
     if(ws.state!=='visible')continue
-    const rows=Math.min(ws.rowCount,MAX_IMPORT_ROWS),cols=Math.min(ws.columnCount,MAX_IMPORT_COLS)
-    if(ws.rowCount>MAX_IMPORT_ROWS||ws.columnCount>MAX_IMPORT_COLS)truncated=true
+    const rows=ws.rowCount,cols=ws.columnCount
+    let allocatedRows=Math.max(1,rows),allocatedColumns=Math.max(1,cols)
+    try { assertSheetGridCapacity(Math.max(1,rows),Math.max(1,cols)) } catch { throw new XlsxParseError('cell-limit') }
     const cells:ParsedXlsxCell[]=[]
-    for(let r=1;r<=rows;r++)for(let c=1;c<=cols;c++){const x=readCell(ws.getCell(r,c),r-1,c-1);if(x)cells.push(x)}
+    const columnStyles = Array.from({ length: cols }, (_, c) => ws.getColumn(c + 1).style as Record<string, unknown>)
+    const readAt = (r: number, c: number): ParsedXlsxCell | null => {
+      const row = ws.findRow(r)
+      const existing = row?.findCell(c)
+      // Creating ws.getCell here retains every inherited blank in ExcelJS as well as our output.
+      const cell = existing ?? { value: null, ...inheritedCellStyle(
+        ((row as unknown as { style?: Record<string, unknown> })?.style ?? {}), columnStyles[c - 1] ?? {},
+      ) } as ExcelJS.Cell
+      return readCell(cell, r - 1, c - 1)
+    }
+    try {
+      budget.reserveGrid(rows, cols)
+      for (let r = 1; r <= rows; r++) for (let c = 1; c <= cols; c++) {
+        const cell = readAt(r, c)
+        // Match the persisted cell fields; parser-only row/col/value names are not document content.
+        budget.addCell(cell && { v: cell.value, f: cell.formula, s: cell.style }, r - 1, c - 1, cell)
+      }
+    } catch (error) {
+      if (error instanceof XlsxExpansionError) throw new XlsxParseError('resource-limit')
+      throw error
+    }
+    for (let r = 1; r <= rows; r++) for (let c = 1; c <= cols; c++) {
+      const cell = readAt(r, c)
+      if (cell) cells.push(cell)
+    }
     const dims:Record<string,number>={}
-    for(let r=1;r<=rows;r++){const h=ws.getRow(r).height;if(typeof h==='number'&&h>0)dims[`r${r-1}`]=h*96/72}
+    for(let r=1;r<=rows;r++){const h=ws.findRow(r)?.height;if(typeof h==='number'&&h>0)dims[`r${r-1}`]=h*96/72}
     for(let c=1;c<=cols;c++){const w=ws.getColumn(c).width;if(typeof w==='number'&&w>0)dims[`c${c-1}`]=Math.max(1,Math.floor(w*7+5))}
     const merges:ParsedXlsxMerge[]=[]
     for(const range of ws.model.merges??[]){const m=/^([A-Z]+)(\d+):([A-Z]+)(\d+)$/i.exec(range);if(!m)continue;const ci=(x:string)=>[...x.toUpperCase()].reduce((n,ch)=>n*26+ch.charCodeAt(0)-64,0)-1;merges.push({startCol:ci(m[1]!),startRow:+m[2]!-1,endCol:ci(m[3]!),endRow:+m[4]!-1})}
@@ -169,11 +202,14 @@ export async function parseXlsx(data:Buffer|ArrayBuffer):Promise<ParsedXlsxWorkb
       }
       const range=img.range as unknown as {tl:{nativeRow?:number;nativeCol?:number;nativeRowOff?:number;nativeColOff?:number};ext?:{width?:number;height?:number}}
       const row=range.tl.nativeRow??0,col=range.tl.nativeCol??0
-      if(row>=MAX_IMPORT_ROWS||col>=MAX_IMPORT_COLS){warnings.push('an image outside the import grid was skipped');continue}
+      if(!Number.isSafeInteger(row)||!Number.isSafeInteger(col)||row<0||col<0)throw new XlsxParseError('cell-limit')
+      allocatedRows=Math.max(allocatedRows,row+1);allocatedColumns=Math.max(allocatedColumns,col+1)
       imageCount++;totalImageBytes+=bytes.length
       drawings.push({id:`xlsx_img_${imageCount}`,mime,bytes,row,col,rowOffset:pxOffset(range.tl.nativeRowOff),colOffset:pxOffset(range.tl.nativeColOff),width:Math.max(1,range.ext?.width??96),height:Math.max(1,range.ext?.height??96)})
     }
-    if(cells.length||drawings.length||Object.keys(dims).length||merges.length)sheets.push({name:ws.name,cells,merges,dims,drawings})
+    for(const merge of merges){allocatedRows=Math.max(allocatedRows,merge.endRow+1);allocatedColumns=Math.max(allocatedColumns,merge.endCol+1)}
+    try { assertSheetGridCapacity(allocatedRows,allocatedColumns) } catch { throw new XlsxParseError('cell-limit') }
+    if(cells.length||drawings.length||Object.keys(dims).length||merges.length)sheets.push({name:ws.name,rowCount:allocatedRows,columnCount:allocatedColumns,cells,merges,dims,drawings})
   }
   if(!sheets.length)throw new XlsxParseError('empty')
   return {sheets,truncated,warnings}

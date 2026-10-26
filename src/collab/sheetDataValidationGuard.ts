@@ -19,6 +19,7 @@ import {
   validateSheetDataValidations,
   validateSheetFilter,
   validateSheetFreeze,
+  validateSheetListEntry,
   type SheetDataValidationStorageLimits,
 } from '../agent/sheetConversion.js'
 
@@ -248,14 +249,19 @@ export function attachSheetDataValidationGuard(
   const map = doc.getMap<unknown>(SHEET_DATA_VALIDATIONS_FIELD)
   const freezeMap = doc.getMap<unknown>(SHEET_FREEZE_FIELD)
   const filterMap = doc.getMap<unknown>(SHEET_FILTERS_FIELD)
+  const listMap = doc.getMap<unknown>(SHEET_LIST_FIELD)
   const observer = (transaction: Y.Transaction): void => {
     if (transaction.origin === SHEET_DATA_VALIDATION_GUARD_ORIGIN) return
     const changes = changesForMap(transaction, map)
     const freezeChanges = changesForMap(transaction, freezeMap)
     const filterChanges = changesForMap(transaction, filterMap)
-    if (changes.size === 0 && freezeChanges.size === 0 && filterChanges.size === 0) return
+    const listChanges = changesForMap(transaction, listMap)
+    if (changes.size === 0 && freezeChanges.size === 0 && filterChanges.size === 0 && listChanges.size === 0) return
     const allowedLogicalIds = logicalIds(doc)
     try {
+      for (const [key, change] of listChanges) {
+        if (change.action !== 'delete') validateSheetListEntry(key, listMap.get(key))
+      }
       if (!changedValuesAreValidRules(
         map,
         changes,

@@ -172,7 +172,7 @@ describe('structural sheet row insertion', () => {
       .toEqual({ v: 'wide legacy cell' })
   })
 
-  it('rejects missing sheets, out-of-bounds anchors, the 10000-row ceiling, and formulas', () => {
+  it('rejects missing sheets, out-of-bounds anchors, the cell budget, and formulas', () => {
     const doc = seededDoc()
     expect(() => prepareSheetRowInsert(doc, { logicalId: 'missing', afterRow: 0, count: 1 }))
       .toThrowError(new SheetRowInsertError('sheet_not_found'))
@@ -180,9 +180,9 @@ describe('structural sheet row insertion', () => {
       .toThrowError(new SheetRowInsertError('sheet_row_out_of_bounds'))
 
     doc.getMap<StoredSheetMeta>(SHEET_LIST_FIELD).set('default', {
-      name: 'Sheet1', order: 0, rowCount: 9_999, columnCount: 20,
+      name: 'Sheet1', order: 0, rowCount: 199_999, columnCount: 20,
     })
-    expect(() => prepareSheetRowInsert(doc, { logicalId: 'default', afterRow: 9_998, count: 2 }))
+    expect(() => prepareSheetRowInsert(doc, { logicalId: 'default', afterRow: 199_998, count: 2 }))
       .toThrowError(new SheetRowInsertError('sheet_row_limit_exceeded'))
 
     doc.getMap<StoredSheetMeta>(SHEET_LIST_FIELD).set('default', {

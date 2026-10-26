@@ -752,7 +752,7 @@ export const config = {
   },
 
   // §9.5 single-document Yjs state hard cap.
-  maxDocBytes: num('MAX_DOC_BYTES', 10 * 1024 * 1024),
+  maxDocBytes: num('MAX_DOC_BYTES', 20 * 1024 * 1024),
   maxDocStorageBytes: num('MAX_DOC_STORAGE_BYTES', 0),
   yjsStorageGzip: strictBool('YJS_STORAGE_GZIP', true),
   // Incremental main-thread extraction; full merge/encoding/gzip on a worker.
@@ -801,7 +801,9 @@ export const config = {
   // Stage1 whole-sheet behavior (backward compatible). The live Y.Doc is already
   // capped at maxDocBytes, so every decode + measure below is bounded.
   sheetRead: {
-    maxCellBytes: num('SHEET_READ_MAX_CELL_BYTES', 1024 * 1024),
+    // The same budget also gates XLSX writes; a smaller legacy default would
+    // reject admitted imports before the final Yjs document-size check.
+    maxCellBytes: num('SHEET_READ_MAX_CELL_BYTES', num('MAX_DOC_BYTES', 20 * 1024 * 1024)),
     // Cells per page when a caller opts into pagination without an explicit
     // ?limit. The byte cap above is the hard bound; this is the count default.
     defaultPageLimit: num('SHEET_READ_DEFAULT_PAGE_LIMIT', 1000),
@@ -938,7 +940,7 @@ export const config = {
   docxImport: {
     // Max size of the uploaded .docx itself (compressed). Over this the route
     // rejects before reading a byte of zip content.
-    maxUploadBytes: numMin('DOCX_IMPORT_MAX_UPLOAD_BYTES', 25 * 1024 * 1024, 1),
+    maxUploadBytes: numMin('DOCX_IMPORT_MAX_UPLOAD_BYTES', 200 * 1024 * 1024, 1),
     // Max TOTAL uncompressed bytes across all entries. The primary zip-bomb
     // ceiling (a 1MB zip can inflate to gigabytes). Sum is tracked as entries
     // inflate; the extractor aborts the instant this is crossed.

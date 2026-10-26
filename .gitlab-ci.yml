@@ -216,6 +216,9 @@ sync_code:
       cd "$DEPLOY_DIR"
 
       sed -i "s|{{BRANCH}}|${DEPLOY_ENV}|g" manifests/deploy.yaml
+      REPLICAS=2
+      if [ "$DEPLOY_ENV" = "prod" ]; then REPLICAS=4; fi
+      sed -i "s|{{REPLICAS}}|${REPLICAS}|g" manifests/deploy.yaml
       sed -i "s|{{REPO_URL}}|${CONTAINER_IMAGE}|g" manifests/deploy.yaml
       sed -i "s|{{IMAGE_DIGEST}}|${IMAGE_DIGEST}|g" manifests/deploy.yaml
 

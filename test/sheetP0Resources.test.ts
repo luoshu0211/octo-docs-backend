@@ -142,8 +142,8 @@ describe('P0 worksheet resource contract', () => {
       default: { startRow: 0, startColumn: -1, xSplit: 0, ySplit: 1 },
     })).toThrow(SheetSnapshotInvalidError)
     expect(() => validateSheetFilterBatch({
-      default: { ref: { ...range, endColumn: 100 } },
-    })).toThrow('outside the 10000x100 grid')
+      default: { ref: { ...range, endColumn: 4_000_000 } },
+    })).toThrow(SheetSnapshotInvalidError)
     expect(() => validateSheetDataValidationBatch({
       default: [{ uid: 'bad', ranges: [{ ...range, endRow: SHEET_MAX_ROWS }] }],
     })).toThrow(SheetSnapshotInvalidError)
@@ -157,7 +157,7 @@ describe('P0 worksheet resource contract', () => {
         ranges: [{
           startRow: 1000,
           startColumn: 0,
-          endRow: SHEET_MAX_ROWS - 1,
+          endRow: 39_999,
           endColumn: 0,
         }],
       }],
