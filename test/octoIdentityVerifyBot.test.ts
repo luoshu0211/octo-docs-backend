@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { HttpOctoIdentity } from '../src/auth/octoIdentity.js'
+import { IdentityUnavailableError } from '../src/auth/identityUnavailable.js'
 
 // Verify HttpOctoIdentity.verifyBot calls octo-server's existing
 // POST /v1/auth/verify-bot with a { bot_token } body and maps the response
@@ -121,7 +122,7 @@ describe('HttpOctoIdentity.verifyApiKey — /v1/auth/verify-api-key', () => {
     expect(JSON.parse(init.body as string)).toEqual({ api_key: 'uk_native_key' })
   })
 
-  it('returns null for rejected keys and responses without a bound uid or Space', async () => {
+  it('returns null for rejected keys and treats successful responses without a bound uid or Space as unavailable', async () => {
     const responses = [
       botResponse({ msg: 'invalid api key' }, false, 401),
       botResponse({ uid: 'u_reader' }),
@@ -131,7 +132,7 @@ describe('HttpOctoIdentity.verifyApiKey — /v1/auth/verify-api-key', () => {
 
     const identity = new HttpOctoIdentity('http://octo.test')
     await expect(identity.verifyApiKey('uk_rejected')).resolves.toBeNull()
-    await expect(identity.verifyApiKey('uk_missing_space')).resolves.toBeNull()
-    await expect(identity.verifyApiKey('uk_missing_uid')).resolves.toBeNull()
+    await expect(identity.verifyApiKey('uk_missing_space')).rejects.toBeInstanceOf(IdentityUnavailableError)
+    await expect(identity.verifyApiKey('uk_missing_uid')).rejects.toBeInstanceOf(IdentityUnavailableError)
   })
 })

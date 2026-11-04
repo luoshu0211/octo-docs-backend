@@ -488,14 +488,16 @@ export class HttpOctoIdentity implements OctoIdentity {
       if ([400, 401, 403].includes(res.status)) return null;
       throw identityUnavailable("non_ok_response", res.status);
     }
-    const body = (await res.json().catch(() => null)) as {
-      uid?: unknown;
-      space_id?: unknown;
-    } | null;
-    const uid = typeof body?.uid === "string" ? body.uid.trim() : "";
-    const spaceId = typeof body?.space_id === "string" ? body.space_id.trim() : "";
-    if (!uid || !spaceId) return null;
-    return { uid, spaceId };
+    let body: { uid?: unknown; space_id?: unknown } | null
+    try {
+      body = await res.json() as { uid?: unknown; space_id?: unknown } | null
+    } catch {
+      throw identityUnavailable("malformed_response")
+    }
+    const uid = typeof body?.uid === "string" ? body.uid.trim() : ""
+    const spaceId = typeof body?.space_id === "string" ? body.space_id.trim() : ""
+    if (!uid || !spaceId) throw identityUnavailable("malformed_response")
+    return { uid, spaceId }
   }
 
   async verifyBot(

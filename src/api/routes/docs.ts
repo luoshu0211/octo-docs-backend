@@ -472,10 +472,12 @@ export async function listDocsHandler(req: Request, res: Response) {
   const { total, items } = await docMetaRepo.listForUser({ uid, spaceId, principalSpaceId: req.principalSpaceId!, isSpaceMember, folderId, owner, ownedBots, includeDiscoverable, q, types, page, pageSize, sort })
   // The SQL list role may be synthetic (owned Bot) or archived; only the shared
   // read guard proves the active access required to disclose actor fields.
+  // Discoverable rows without a SQL role may still be Drive-readable.
 
   const readableDocIds = new Set<string>()
   await Promise.all(items.map(async (d) => {
-    if (!roleName(Number(d.role))) return
+    const role = roleName(Number(d.role))
+    if (!role && !includeDiscoverable) return
     const result = await resolveDocRole(req, d.doc_id, 'reader')
     if (result.ok) readableDocIds.add(d.doc_id)
   }))
@@ -483,7 +485,7 @@ export async function listDocsHandler(req: Request, res: Response) {
   const visibleItems = items.flatMap((d) => {
     const role = roleName(Number(d.role))
     if (!role && !includeDiscoverable) return []
-    const canRead = role !== undefined && readableDocIds.has(d.doc_id)
+    const canRead = readableDocIds.has(d.doc_id)
     return [{
       docId: d.doc_id,
       title: d.title,
@@ -501,7 +503,7 @@ export async function listDocsHandler(req: Request, res: Response) {
   res.status(200).json({ total, items: visibleItems })
 }
 
-docsRouter.get('/', listDocsHandler)
+docsRouter.get('/', documentAsync(listDocsHandler))
 
 const MAX_METADATA_DOC_IDS = 500
 const METADATA_ROLE_LOOKUP_CONCURRENCY = 100
@@ -540,11 +542,12 @@ async function docsMetadataHandler(req: Request, res: Response): Promise<void> {
     for (;;) {
       const index = nextIndex++
       if (index >= docIds.length) return
-      const result = await resolveDocRole(req, docIds[index]!, 'reader')
+      const docId = docIds[index]!
+      const result = await resolveDocRole(req, docId, 'reader')
       if (!result.ok) continue
       const { meta } = result.guard
       itemsByIndex[index] = {
-        docId: meta.doc_id,
+        docId,
         createdBy: meta.created_by,
         updatedBy: meta.updated_by,
         updatedAt: meta.updated_at,
@@ -1286,7 +1289,7 @@ export const spaceCollectionRouter: ExpressRouter = Router()
 // direct grants.
 spaceCollectionRouter.post('/metadata', spaceContextMiddleware, documentAsync(docsMetadataHandler))
 spaceCollectionRouter.post('/', spaceContextMiddleware, requireSpaceMembership, documentAsync(createDocHandler))
-spaceCollectionRouter.get('/', spaceContextMiddleware, requireSpaceMembership, listDocsHandler)
+spaceCollectionRouter.get('/', spaceContextMiddleware, requireSpaceMembership, documentAsync(listDocsHandler))
 spaceCollectionRouter.post('/search', spaceContextMiddleware, requireSpaceMembership, searchDocsHandler)
 spaceCollectionRouter.get('/recent', spaceContextMiddleware, requireSpaceMembership, listRecentHandler)
 spaceCollectionRouter.get('/recent/creators', spaceContextMiddleware, requireSpaceMembership, listRecentCreatorsHandler)
