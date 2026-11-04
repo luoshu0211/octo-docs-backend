@@ -2,9 +2,10 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 vi.mock('../src/auth/collabToken.js', () => ({ verifyCollabToken: vi.fn() }))
 vi.mock('../src/permission/epoch.js', () => ({ currentEpoch: vi.fn(async () => 7) }))
-vi.mock('../src/permission/recheck.js', () => ({ recheckCurrentRoleCached: vi.fn() }))
+vi.mock('../src/permission/resolveRole.js', () => ({ recheckCurrentAccess: vi.fn() }))
 
 import { verifyCollabToken } from '../src/auth/collabToken.js'
+import { recheckCurrentAccess } from '../src/permission/resolveRole.js'
 import { authenticate } from '../src/collab/authenticate.js'
 import { config } from '../src/config/env.js'
 
@@ -20,10 +21,14 @@ const claims = {
   home_space_verified: true,
   current_space_verified: true,
   current_space_id: 's_1',
+  principal_space_id: 's_1',
 }
 
 beforeEach(() => {
   vi.mocked(verifyCollabToken).mockReturnValue(claims)
+  vi.mocked(recheckCurrentAccess).mockResolvedValue({
+    role: 'writer', permissionEpoch: 7, sourceRevision: null, proofExpiresAt: null, sourceConfirmed: true,
+  })
   config.collabToken.allowLegacyWithoutHomeSpaceProof = false
 })
 

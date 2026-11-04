@@ -16,6 +16,11 @@ import { docMetaRepo } from '../db/repos/docMetaRepo.js'
 import { getRedis, rkey } from '../db/redis.js'
 import { Singleflight, TtlCache } from '../util/singleflight.js'
 
+// A local source notice is applied before its Redis publish; keep a bounded
+// marker so this node can ignore its own pub/sub echo without repeating work.
+const localSourceInvalidationEchoes = new Set<string>()
+const MAX_LOCAL_SOURCE_INVALIDATION_ECHOES = 1_000
+
 const REDIS_EPOCH_TTL_SECONDS = 30
 const LOCAL_TTL_MS = 2_000
 
@@ -31,9 +36,30 @@ export function epochInvalidateChannel(): string {
   return rkey('epoch-invalidate')
 }
 
+
+/** Mark a source notice already applied locally before its Redis publish. */
+export function rememberLocalSourceInvalidationEcho(eventId: string): void {
+  localSourceInvalidationEchoes.add(eventId)
+  if (localSourceInvalidationEchoes.size > MAX_LOCAL_SOURCE_INVALIDATION_ECHOES) {
+    const oldest = localSourceInvalidationEchoes.values().next().value
+    if (oldest !== undefined) localSourceInvalidationEchoes.delete(oldest)
+  }
+}
+
+export function forgetLocalSourceInvalidationEcho(eventId: string): void {
+  localSourceInvalidationEchoes.delete(eventId)
+}
+
+export function consumeLocalSourceInvalidationEcho(eventId: string): boolean {
+  return localSourceInvalidationEchoes.delete(eventId)
+}
 export interface InvalidateEvent {
   documentName: string
-  uid?: string // when known, nodes target this {doc, uid} connection precisely
+  type?: 'source-change'
+  eventId?: string
+  docId?: string
+  principalSpaceId?: string
+  uid?: string // when known, nodes target this binding precisely
 }
 
 /**
@@ -106,6 +132,25 @@ export async function refreshAndPublish(
   } catch {
     /* broadcast best-effort; beforeHandleMessage recheck is the backstop */
   }
+}
+
+/** Publish a Drive source-change notice without touching the Docs epoch caches. */
+export async function publishSourceInvalidation(
+  documentName: string,
+  docId: string,
+  principalSpaceId: string,
+  uid: string | undefined,
+  eventId: string,
+): Promise<void> {
+  const event: InvalidateEvent = {
+    type: 'source-change',
+    eventId,
+    documentName,
+    docId,
+    principalSpaceId,
+    ...(uid === undefined ? {} : { uid }),
+  }
+  await getRedis().publish(epochInvalidateChannel(), JSON.stringify(event))
 }
 
 /** Invalidate local + Redis cache for a doc (called on receiving an event). */

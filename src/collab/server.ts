@@ -12,6 +12,7 @@ import { durableReceipt } from './durableReceipt.js'
  * - beforeHandleAwareness validates presence identity + fields (§8.3.1).
  */
 import { Server } from '@hocuspocus/server'
+import type { Connection } from '@hocuspocus/server'
 import { CollabDatabase } from './collabDatabase.js'
 import { createCollabRedis } from './redis.js'
 import { Logger } from '@hocuspocus/extension-logger'
@@ -30,7 +31,13 @@ import {
 import { authenticate, type AuthContext } from './authenticate.js'
 import { connectionRegistry } from '../permission/connectionRegistry.js'
 import { recheckCurrentRoleCached } from '../permission/recheck.js'
-import { roleAtLeast } from '../permission/role.js'
+import { roleAtLeast, roleRank } from '../permission/role.js'
+import { recheckCurrentAccess } from '../permission/resolveRole.js'
+import {
+  registerActiveAccess,
+  renewActiveAccess,
+  type ActiveAccessParticipant,
+} from '../permission/activeAccess.js'
 import { handleAfterStore, handleBeforeUnload } from './autoSnapshot.js'
 import { parseDocumentName } from '../permission/documentName.js'
 import { enqueueDocIndex } from '../search/docIndexQueue.js'
@@ -53,6 +60,91 @@ const repairDisposers = new Map<string, () => void>()
 export function setEpochWatermark(documentName: string, epoch: number): void {
   const cur = epochWatermark.get(documentName) ?? 0
   if (epoch > cur) epochWatermark.set(documentName, epoch)
+}
+
+function gateYjsConnection(
+  connection: Connection,
+  context: AuthContext,
+): ActiveAccessParticipant {
+  const send = connection.send.bind(connection)
+  const maxPendingFrames = config.ppt.relay.maxLiveBufferFrames
+  const maxPendingBytes = config.ppt.relay.maxLiveBufferBytes
+  const pending: Uint8Array[] = []
+  let pendingBytes = 0
+  let frozen = false
+  let closed = false
+  let closing = false
+  const closeLogicalConnection = (code: 4401 | 4403, reason: string): void => {
+    if (closed) return
+    frozen = true
+    pending.length = 0
+    pendingBytes = 0
+    closed = true
+    connection.readOnly = true
+    // The constructor can send awareness before ClientConnection installs its close
+    // callbacks and routing entry. Block content now, but close after that setup so
+    // the native logical-connection cleanup removes the routing entry as well.
+    queueMicrotask(() => {
+      closing = true
+      try {
+        connection.close({ code, reason })
+      } finally {
+        closing = false
+      }
+    })
+  }
+  const queuePending = (message: Uint8Array): void => {
+    if (pending.length >= maxPendingFrames || pendingBytes + message.byteLength > maxPendingBytes) {
+      closeLogicalConnection(4401, 'Authorization could not be confirmed')
+      return
+    }
+    pending.push(message)
+    pendingBytes += message.byteLength
+  }
+  connection.send = message => {
+    if (closing) {
+      send(message)
+      return
+    }
+    if (closed) return
+    if (frozen) {
+      queuePending(message)
+      return
+    }
+    const sourceAccess = context.source_access
+    if (sourceAccess && sourceAccess.sourceRevision !== null &&
+        (sourceAccess.proofExpiresAt === null || performance.now() >= sourceAccess.proofExpiresAt)) {
+      const docId = context.doc ?? context.board
+      if (docId && renewActiveAccess({ docId, uid: context.user.id, principalSpaceId: context.principal_space_id })) {
+        queuePending(message)
+      } else closeLogicalConnection(4401, 'Authorization could not be confirmed')
+      return
+    }
+    send(message)
+  }
+  return {
+    freeze() {
+      frozen = true
+    },
+    resume(state) {
+      if (state.role === 'none') return
+      if (roleRank(state.role) < roleRank(context.role)) {
+        context.role = state.role
+        connection.readOnly = true
+      }
+      if (!roleAtLeast(state.role, 'writer')) connection.readOnly = true
+      context.permission_epoch = state.permissionEpoch
+      context.source_access = state
+      setEpochWatermark(connection.document.name, state.permissionEpoch)
+      frozen = false
+      const ready = pending.splice(0)
+      pendingBytes = 0
+      for (const message of ready) connection.send(message)
+    },
+    close(code, reason) {
+      closeLogicalConnection(code, reason)
+    },
+  }
 }
 
 /** Never authorize a message using a role read invalidated while it was pending. */
@@ -340,10 +432,16 @@ export function createServer(redis = createCollabRedis(config.redis)) {
         documentName: data.documentName,
         connectionConfig: data.connectionConfig,
       })
-      ctx.stateGeneration = await stateGenerationRepo.ensureSheet(data.documentName)
-      ctx.cacheGeneration = envelope.generation
-      if (ctx.stateGeneration && ctx.cacheGeneration !== ctx.stateGeneration) data.connectionConfig.readOnly = true
-      return ctx
+      try {
+        ctx.stateGeneration = await stateGenerationRepo.ensureSheet(data.documentName)
+        ctx.cacheGeneration = envelope.generation
+        if (ctx.stateGeneration && ctx.cacheGeneration !== ctx.stateGeneration) data.connectionConfig.readOnly = true
+        return ctx
+      } catch (error) {
+        ctx.activeAccessRegistration?.release()
+        ctx.activeAccessRegistration = null
+        throw error
+      }
     },
 
     async beforeSync(data) {
@@ -375,6 +473,9 @@ export function createServer(redis = createCollabRedis(config.redis)) {
 
     // register the connection in the cross-node registry (§4.5 step 2)
     async connected(data) {
+      // An initial-awareness send may have already scheduled a logical close.
+      // Do not race its onDisconnect cleanup by registering a closed connection.
+      if (!data.connection.document.hasConnection(data.connection)) return
       const ctx = data.context as AuthContext
       setEpochWatermark(data.documentName, ctx.permission_epoch)
       const generation = stateGenerationOf(data.connection.document)
@@ -425,6 +526,10 @@ export function createServer(redis = createCollabRedis(config.redis)) {
     async onDisconnect(data) {
       const ctx = data.context as AuthContext | undefined
       if (ctx) {
+        ctx.activeAccessRegistration?.release()
+        ctx.activeAccessRegistration = null
+        ctx.activeAccessDisposer?.()
+        ctx.activeAccessDisposer = undefined
         await connectionRegistry.unregister(data.documentName, data.socketId)
       }
     },
@@ -475,6 +580,31 @@ export function createServer(redis = createCollabRedis(config.redis)) {
     // converge any persisted illegal state. The observer scopes work to changed
     // ids and skips its own REPAIR_ORIGIN writes (anti-self-excitation gates).
     async afterLoadDocument(data) {
+      // Native Connection registers itself before sending constructor awareness.
+      // Gate each logical connection here, not in the later connected hook.
+      const addConnection = data.document.addConnection.bind(data.document)
+      data.document.addConnection = connection => {
+        addConnection(connection)
+        const ctx = connection.context as AuthContext | undefined
+        const docId = ctx?.doc ?? ctx?.board
+        if (ctx?.source_access && docId) {
+          const registration = ctx.activeAccessRegistration
+          if (registration === null) throw new Error('Active access registration lease missing')
+          ctx.activeAccessDisposer = registerActiveAccess(
+            { docId, uid: ctx.user.id, principalSpaceId: ctx.principal_space_id, documentName: data.documentName },
+            ctx.source_access.permissionEpoch ?? ctx.permission_epoch,
+            ctx.source_access,
+            () => recheckCurrentAccess(data.documentName, ctx.user.id, ctx.principal_space_id, ctx.space_member),
+            gateYjsConnection(connection, ctx),
+            registration,
+          )
+          ctx.activeAccessRegistration = null
+        } else {
+          ctx?.activeAccessRegistration?.release()
+          if (ctx) ctx.activeAccessRegistration = null
+        }
+        return data.document
+      }
       // Announce to the fleet that this replica now holds the document in
       // memory, so no other replica compacts it out from under us. Done first
       // and unconditionally: the early returns below are about whiteboard

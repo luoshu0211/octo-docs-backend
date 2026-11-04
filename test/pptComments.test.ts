@@ -11,7 +11,7 @@ vi.mock('../src/ppt/liveEdit.js', async importOriginal => ({
 }))
 vi.mock('../src/db/pool.js', () => {
   const query = async <T>(sql: string, p: unknown[] = []): Promise<T[]> => {
-    if (sql.includes('FROM doc_meta')) return [{ doc_type: 'html_ppt', status: 1, permission_epoch: db.epoch,
+    if (sql.includes('FROM doc_meta')) return [{ doc_id: p[0], doc_type: 'html_ppt', status: 1, permission_epoch: db.epoch,
       owner_id: 'owner', owner_space_id: 's1', space_id: 's1', share_scope: 0 }] as T[]
     if (sql.includes('FROM ppt_idempotency')) return [db.receipts[JSON.stringify(p)]].filter(Boolean) as T[]
     if (sql.includes('INSERT INTO ppt_idempotency')) {
@@ -55,11 +55,29 @@ vi.mock('../src/db/pool.js', () => {
 })
 
 import { createPptComment, getPptComment, listPptComments, mutatePptComment, validatePptComment } from '../src/ppt/comments.js'
+import { setDriveDerivedAccess, type DriveDerivedAccess, type DerivedRole } from '../src/drive/derivedAccessClient.js'
 
 const principal = { docId: 'd1', uid: 'u1', spaceId: 's1', authorizedEpoch: 1 }
 const input = () => validatePptComment({ body: 'Review this slide', anchor: { kind: 'slide', slideId: 'slide-1', versionSeq: null, baseRevision: 7 } })
 const create = (key = 'request-1') => createPptComment(principal, input(), key)
-beforeEach(() => { db.role = 'commenter'; db.epoch = 1; db.rows = []; db.seq = 0; db.receipts = {}; db.fail = false })
+
+function driveAccess(role: DerivedRole | ((docId: string, uid: string, principalSpaceId: string) => DerivedRole)): DriveDerivedAccess {
+  return {
+    async derivedAccess(docId, uid, principalSpaceId) {
+      const resolved = typeof role === 'function' ? role(docId, uid, principalSpaceId) : role
+      return { docId, uid, principalSpaceId, role: resolved, sourceRevision: 'sha256:test',
+        validForMs: 15_000, expiresAt: performance.now() + 15_000 }
+    },
+    async versions(bindings) {
+      return bindings.map(binding => ({ ...binding, sourceRevision: 'sha256:test',
+        validForMs: 15_000, expiresAt: performance.now() + 15_000 }))
+    },
+  }
+}
+beforeEach(() => {
+  db.role = 'commenter'; db.epoch = 1; db.rows = []; db.seq = 0; db.receipts = {}; db.fail = false
+  setDriveDerivedAccess(driveAccess('none'))
+})
 
 it('dispatches only after a new committed comment and never after rollback or replay', async () => {
   const after = vi.fn()
@@ -94,6 +112,19 @@ it.each(['reader', 'none'])('refuses %s creating, replying or deleting', async r
   await expect(create('second')).rejects.toMatchObject({ code: 'FORBIDDEN' })
   await expect(createPptComment(principal, validatePptComment({ parentId: id, body: 'Reply' }), 'reply')).rejects.toMatchObject({ code: 'FORBIDDEN' })
   await expect(mutatePptComment(principal, id, { action: 'delete', revision: 1 })).rejects.toMatchObject({ code: 'FORBIDDEN' })
+})
+it('lets a Drive-authorized reader list comments without a direct grant', async () => {
+  db.role = 'none'
+  setDriveDerivedAccess(driveAccess((docId, uid, principalSpaceId) =>
+    docId === 'd1' && uid === 'u1' && principalSpaceId === 's1' ? 'reader' : 'none'))
+  await expect(listPptComments(principal)).resolves.toMatchObject({ items: [], nextCursor: null })
+})
+it('does not let a Drive-authorized reader create comments', async () => {
+  db.role = 'none'
+  setDriveDerivedAccess(driveAccess((docId, uid, principalSpaceId) =>
+    docId === 'd1' && uid === 'u1' && principalSpaceId === 's1' ? 'reader' : 'none'))
+  await expect(createPptComment(principal, input(), 'drive-reader')).rejects.toMatchObject({ code: 'FORBIDDEN' })
+  expect(db.rows).toHaveLength(0)
 })
 it('rechecks epoch and principal Space before replay, read and author operations', async () => {
   const { id } = await create(); db.epoch = 2

@@ -13,6 +13,7 @@ import { InMemoryPptRelayStore, type PptRelayStore, RetryableStorageError, canon
 import { isRetryable, STORAGE_RETRY_BACKOFF_MS, MAX_OP_CLOCK, OP_CLOCK_SLACK } from '../src/ppt/relay/frames.js'
 import { issuePptCollabToken, PPT_RELAY_TICKET_AUD } from '../src/auth/pptCollabToken.js'
 import type { ResolvedRole, Role } from '../src/permission/role.js'
+import type { CurrentAccess } from '../src/permission/resolveRole.js'
 import type { BentoDoc } from '../src/ppt/bentoDoc.js'
 
 /**
@@ -191,6 +192,7 @@ async function setup(
     store?: PptRelayStore
     limits?: Partial<RelayLimits>
     roleProvider?: (ctx: { uid: string; docId: string; documentName: string; spaceMember: boolean }) => Promise<ResolvedRole>
+    accessProvider?: (ctx: { uid: string; docId: string; documentName: string; spaceMember: boolean }) => Promise<CurrentAccess>
     epochProvider?: (documentName: string) => Promise<number>
     docStatusProvider?: (docId: string) => Promise<'live' | 'deleted'>
     baseDocProvider?: (docId: string) => Promise<import('../src/ppt/bentoDoc.js').BentoDoc | null>
@@ -207,6 +209,7 @@ async function setup(
     store,
     epochProvider: opts.epochProvider ?? (async () => liveEpoch),
     roleProvider: opts.roleProvider ?? (async ({ uid }) => roleMap.get(uid) ?? 'writer'),
+    ...(opts.accessProvider ? { accessProvider: opts.accessProvider } : {}),
     docStatusProvider: opts.docStatusProvider ?? (async () => docStatus),
     ...(opts.baseDocProvider ? { baseDocProvider: opts.baseDocProvider } : {}),
     ...(opts.onAgedOpDrop ? { onAgedOpDrop: opts.onAgedOpDrop } : {}),
@@ -849,6 +852,34 @@ describe('PPT relay: snapshot + GC + offline replay (PPT-COLLAB-003 / PPT-COLLAB
 })
 
 describe('PPT relay: negotiated live permissions', () => {
+  it('rechecks same-epoch Drive-only tickets before admitting a reader', async () => {
+    let currentAccess: CurrentAccess = {
+      role: 'reader',
+      permissionEpoch: 0,
+      sourceRevision: 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      proofExpiresAt: performance.now() + 15_000,
+      sourceConfirmed: true,
+    }
+    const h = await setup({
+      roleProvider: async () => 'none',
+      accessProvider: async () => currentAccess,
+    })
+    const reader = await h.connect({ uid: 'u_drive', role: 'reader' })
+    expect((await helloReady(reader)).ready).toMatchObject({ role: 'reader' })
+    reader.send(OPS_FRAME(1, 'drive-reader-write'))
+    expect((await reader.recv()).code).toBe('forbidden-role')
+
+    currentAccess = {
+      role: 'none',
+      permissionEpoch: 0,
+      sourceRevision: null,
+      proofExpiresAt: null,
+      sourceConfirmed: true,
+    }
+    const oldTicket = h.ticketFor({ uid: 'u_drive', role: 'reader', epoch: 0 })
+    const revoked = await h.connect({ uid: 'u_drive', role: 'reader', ticket: oldTicket })
+    expect((await revoked.closed).code).toBe(4403)
+  })
   it.each(['live', 'presence', 'cutover'] as const)('preserves queued %s sends across a proof freeze', async kind => {
     const h = await setup({ roleProvider: async ({ spaceMember }) => spaceMember ? 'reader' : 'none' })
     const ticket = (epoch: number) => jwt.sign({ uid: 'u_queue', docId: DOC, documentName: DOCNAME,
@@ -1612,17 +1643,26 @@ describe('PPT relay: fresh membership proof after a missed epoch signal', () => 
     } finally { release(); await refresh }
   })
 
-  it('an old expiry lookup cannot unfreeze an epoch change or expose buffered peer edits', async () => {
+  it('an old expiry denial cannot override fresh epoch authority or leak a peer edit', async () => {
     let pause = false, entered!: () => void, release!: () => void
     const parked = new Promise<void>(r => { entered = r })
     const gate = new Promise<void>(r => { release = r })
-    const h = await setup({ roleProvider: async ctx => {
-      if (pause && !ctx.spaceMember) { pause = false; entered(); await gate; return 'writer' }
-      return shareRole(ctx)
-    }, limits: { authRefreshMs: 60_000 } })
+    const h = await setup({
+      roleProvider: async () => 'writer',
+      accessProvider: async ({ spaceMember }) => {
+        if (pause && !spaceMember) {
+          pause = false
+          entered()
+          await gate
+          return { role: 'none', permissionEpoch: 0, sourceRevision: null, proofExpiresAt: null, sourceConfirmed: true }
+        }
+        return { role: 'writer', permissionEpoch: 0, sourceRevision: null, proofExpiresAt: null, sourceConfirmed: true }
+      },
+      limits: { authRefreshMs: 60_000 },
+    })
     const c = await join(h)
     const internal = h.relay as unknown as {
-      rooms: Map<string, Set<{ auth: { pendingReauth?: boolean }; liveBuffer: unknown[] }>>
+      rooms: Map<string, Set<{ auth: { pendingReauth?: boolean }; roleEpoch: number; liveBuffer: unknown[] }>>
       expireShareMembership: (conn: unknown) => Promise<void>
       deliver: (conn: unknown, frame: unknown) => Promise<void>
     }
@@ -1631,18 +1671,22 @@ describe('PPT relay: fresh membership proof after a missed epoch signal', () => 
     const expiry = internal.expireShareMembership(conn)
     try {
       await parked
-      h.setEpoch(1); await h.relay.applyEpochBump(DOCNAME)
-      await c.recvUntil(f => f.ctl === 'auth-refresh')
-      release(); await expiry
-      expect(conn.auth.pendingReauth).toBe(true)
-      const frame = OPS_FRAME(1, 'peer-during-proof', 1)
+      h.setEpoch(1)
+      await h.relay.applyEpochBump(DOCNAME)
+      expect((await c.recvUntil(f => f.ctl === 'auth-updated')).at(-1)).toMatchObject({ epoch: 1 })
+      release()
+      await expiry
+      expect(conn.roleEpoch).toBe(1)
+      expect(conn.auth.pendingReauth).not.toBe(true)
+
+      const frame = OPS_FRAME(1, 'peer-after-current-epoch-proof', 1)
       await h.store.appendOp(DOC, frame.frameId, frame)
       await internal.deliver(conn, { ctl: 'op', q: 1, frame })
-      await expect(c.recv(50)).rejects.toThrow('recv timeout')
-      expect(conn.liveBuffer).toHaveLength(1)
-      c.send({ t: 'reauth', pv: 2, ticket: ticket(1) })
       expect((await c.recvUntil(f => f.ctl === 'op')).at(-1)).toMatchObject({ q: 1, frame: { frameId: frame.frameId } })
       expect(conn.liveBuffer).toHaveLength(0)
+      c.send(OPS_FRAME(2, 'still-authorized-after-stale-expiry', 1))
+      expect((await c.recvUntil(f => f.ctl === 'ack')).at(-1)).toMatchObject({ q: 2 })
+      expect(await h.store.currentSeq(DOC)).toBe(2)
     } finally { release(); await expiry }
   })
 
@@ -3174,31 +3218,35 @@ describe('PPT relay: round-18 fixes (XIN-1754)', () => {
       releaseDirect = res
     })
     let directCalls = 0
+    const access = (role: CurrentAccess['role']): CurrentAccess => ({
+      role,
+      permissionEpoch: 0,
+      sourceRevision: null,
+      proofExpiresAt: null,
+      sourceConfirmed: true,
+    })
     const h = await setup({
-      // Writer only via the space-membership claim; the direct-role resolve the
-      // expiry callback runs blocks on `directGate` the FIRST time, simulating a
-      // slow lookup that outlives the in-place reauth.
-      roleProvider: async ({ spaceMember }) => {
-        if (spaceMember) return 'writer'
+      // The expiry callback must use the same source-aware resolver as initial
+      // authentication; its direct lookup blocks to overlap the in-place reauth.
+      accessProvider: async ({ spaceMember }) => {
+        if (spaceMember) return access('writer')
         directCalls++
         if (directCalls === 1) await directGate
-        return 'none'
+        return access('none')
       },
       limits: { reauthGraceMs: 5000, authRefreshMs: 100000 },
     })
     const first = freshTicket({ uid: 'u_share', role: 'writer', spaceMember: true, ttl: 1 })
     const c = await h.connect({ uid: 'u_share', role: 'writer', ticket: first })
     await helloReady(c)
-    // Let the ~1s share-expiry timer fire and enter expireShareMembership, which
-    // blocks in the (gated) direct-role resolve.
+    // Let the ~1s share-expiry timer fire and block in the direct CurrentAccess lookup.
     await sleep(1300)
-    // Present a fresh ticket at the SAME epoch → handleReauth trusts the ticket role
-    // (no roleProvider await), succeeds, bumps the reauth generation, re-arms expiry.
+    // Reauthenticate at the same epoch; the share-member proof resolves immediately,
+    // advances the generation, and replaces the stalled expiry attempt.
     c.send({ t: 'reauth', pv: 2, ticket: freshTicket({ uid: 'u_share', role: 'writer', spaceMember: true, ttl: 30 }) })
     await sleep(80)
-    // Release the stalled callback. On 7133d0e it resumes, re-checks only liveness,
-    // sees direct='none' < writer, and shoves the FRESHLY reauthorized socket back
-    // into pendingReauth + fail-closed grace. The generation guard makes it bail.
+    // Releasing the stale lookup must not put this freshly authorized socket back
+    // into pendingReauth or otherwise replace its current authority.
     releaseDirect()
     await sleep(80)
     // The socket keeps writer authority in place: a persisted `ops` write acks (not

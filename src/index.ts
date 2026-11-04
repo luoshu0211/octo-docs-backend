@@ -30,7 +30,16 @@ import { storeWorkerPool } from './collab/storeWorkerPool.js'
 import { createApp } from './api/app.js'
 import { attachBindGuard } from './api/bindGuard.js'
 import { createPptRelay } from './ppt/relay/index.js'
-import { epochInvalidateChannel, currentEpoch, invalidateEpochCache, type InvalidateEvent } from './permission/epoch.js'
+import { invalidateActiveAccess, startActiveAccessMonitor } from './permission/activeAccess.js'
+import { invalidateDriveDerivedAccessForSpace } from './drive/derivedAccessClient.js'
+import {
+  consumeLocalSourceInvalidationEcho,
+  epochInvalidateChannel,
+  currentEpoch,
+  invalidateEpochCache,
+  type InvalidateEvent,
+} from './permission/epoch.js'
+import { invalidateCurrentRoleRecheckCacheForSource } from './permission/recheck.js'
 import { closePool, query } from './db/pool.js'
 import { assertAppendV1RoleEncoding } from './db/roleEncodingMarker.js'
 import { closeRedis, getRedis, createRedisSubscriber } from './db/redis.js'
@@ -106,12 +115,12 @@ async function main(): Promise<void> {
   // `/api/v1/ppt/collab` upgrade path is absent. See the multi-replica
   // rollout procedure in docs/DEPLOYMENT.md.
   const pptRelay = createPptRelay()
+  const stopActiveAccessMonitor = startActiveAccessMonitor()
   const stopPptPublishing = startPptRoomPublishing()
 
-  // Subscribe to epoch invalidation events (§4.5 step 3). On an event we drop
-  // caches and refresh the local watermark. Acting on individual live
-  // connections (close 4403 / flip readOnly) is the next layer; the
-  // beforeHandleMessage per-principal recheck (§4.5 step 4) is the backstop.
+  // Subscribe to epoch and Drive-source invalidation events. Source notices
+  // evict the Drive proof and revalidate matching active bindings; the 5-second
+  // active monitor catches notifications missed during a subscriber outage.
   sub.on('message', (channel: string, message: string) => {
     if (channel === epochInvalidateChannel()) void handleInvalidate(message)
     else if (channel === commentEventsChannel()) broadcastCommentMutation(message)
@@ -123,6 +132,15 @@ async function main(): Promise<void> {
     try {
       event = JSON.parse(message) as InvalidateEvent
     } catch {
+      return
+    }
+    if (event.type === 'source-change') {
+      if (event.eventId && consumeLocalSourceInvalidationEcho(event.eventId)) return
+      if (event.docId && event.principalSpaceId) {
+        invalidateDriveDerivedAccessForSpace(event.docId, event.principalSpaceId, event.uid)
+        invalidateCurrentRoleRecheckCacheForSource(event.documentName, event.principalSpaceId, event.uid)
+        invalidateActiveAccess(event.docId, event.principalSpaceId, event.uid)
+      }
       return
     }
     await invalidateEpochCache(event.documentName)
@@ -140,8 +158,6 @@ async function main(): Promise<void> {
       // eslint-disable-next-line no-console
       console.warn('[octo-docs] PPT relay epoch bump failed:', err)
     })
-    // TODO(§4.5 step 3): locate local connections via the connection registry
-    // and close(4403) revoked / flip readOnly on downgraded connections.
   }
 
   // MR98-008 / MR98-006 startup reconciliation: this replica may be REPLACING a
@@ -253,6 +269,7 @@ async function main(): Promise<void> {
   const shutdown = async (signal: string): Promise<void> => {
     // eslint-disable-next-line no-console
     console.log(`[octo-docs] ${signal} received, shutting down...`)
+    stopActiveAccessMonitor()
     try {
       // Stand down from the fleet first: once this key is gone the other
       // replicas stop honouring documents this node used to hold. Doing it
@@ -273,7 +290,6 @@ async function main(): Promise<void> {
       await flushUnrestoredRetries()
       // TODO(§5.3 / §9.4): releaseAllDocumentLocks() so a takeover node can
       // become primary writer immediately without waiting for the lock TTL.
-      stopPptPublishing()
       pptRelay.close()
       httpServer.close()
       internalServer?.close()

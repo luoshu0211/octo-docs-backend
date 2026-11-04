@@ -11,7 +11,7 @@ import { describe, it, expect, afterEach, vi } from 'vitest'
  * principal Space does not match neither grants via the share nor via drive.
  */
 import { resolveEffectiveRole } from '../src/permission/resolveEffectiveRole.js'
-import { setDriveDerivedAccess, type DriveDerivedAccess } from '../src/drive/derivedAccessClient.js'
+import { setDriveDerivedAccess, type DriveDerivedAccess, type DerivedRole } from '../src/drive/derivedAccessClient.js'
 import { setOctoIdentity } from '../src/auth/octoIdentity.js'
 import type { ResolvedRole } from '../src/permission/role.js'
 import {
@@ -23,13 +23,18 @@ import {
 const restricted = { doc_id: 'doc1', space_id: 's1', share_scope: SHARE_SCOPE_RESTRICTED, share_role: SHARE_ROLE_EDIT }
 
 /** A drive client stub that answers a fixed role and counts its calls. */
-function stubDrive(role: ResolvedRole | (() => never)): { calls: number } {
+function stubDrive(role: DerivedRole | (() => never)): { calls: number } {
   const state = { calls: 0 }
   const impl: DriveDerivedAccess = {
-    async derivedRole() {
+    async derivedAccess(docId, uid, principalSpaceId) {
       state.calls += 1
-      if (typeof role === 'function') role()
-      return role
+      const resolved = typeof role === 'function' ? role() : role
+      return { docId, uid, principalSpaceId, role: resolved, sourceRevision: 'sha256:test',
+        validForMs: 15_000, expiresAt: performance.now() + 15_000 }
+    },
+    async versions(bindings) {
+      return bindings.map(binding => ({ ...binding, sourceRevision: 'sha256:test',
+        validForMs: 15_000, expiresAt: performance.now() + 15_000 }))
     },
   }
   setDriveDerivedAccess(impl)
