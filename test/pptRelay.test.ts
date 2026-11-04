@@ -1645,24 +1645,27 @@ describe('PPT relay: fresh membership proof after a missed epoch signal', () => 
 
   it('an old expiry denial cannot override fresh epoch authority or leak a peer edit', async () => {
     let pause = false, entered!: () => void, release!: () => void
+    let currentAccessEpoch = 0
+    let directChecks = 0
     const parked = new Promise<void>(r => { entered = r })
     const gate = new Promise<void>(r => { release = r })
     const h = await setup({
       roleProvider: async () => 'writer',
       accessProvider: async ({ spaceMember }) => {
+        if (!spaceMember) directChecks++
         if (pause && !spaceMember) {
           pause = false
           entered()
           await gate
-          return { role: 'none', permissionEpoch: 0, sourceRevision: null, proofExpiresAt: null, sourceConfirmed: true }
+          return { role: 'none', permissionEpoch: currentAccessEpoch, sourceRevision: null, proofExpiresAt: null, sourceConfirmed: true }
         }
-        return { role: 'writer', permissionEpoch: 0, sourceRevision: null, proofExpiresAt: null, sourceConfirmed: true }
+        return { role: 'writer', permissionEpoch: currentAccessEpoch, sourceRevision: null, proofExpiresAt: null, sourceConfirmed: true }
       },
       limits: { authRefreshMs: 60_000 },
     })
     const c = await join(h)
     const internal = h.relay as unknown as {
-      rooms: Map<string, Set<{ auth: { pendingReauth?: boolean }; roleEpoch: number; liveBuffer: unknown[] }>>
+      rooms: Map<string, Set<{ auth: { pendingReauth?: boolean }; roleEpoch: number; liveBuffer: unknown[]; activeAccessDisposer?: () => void }>>
       expireShareMembership: (conn: unknown) => Promise<void>
       deliver: (conn: unknown, frame: unknown) => Promise<void>
     }
@@ -1672,11 +1675,14 @@ describe('PPT relay: fresh membership proof after a missed epoch signal', () => 
     try {
       await parked
       h.setEpoch(1)
+      currentAccessEpoch = 1
       await h.relay.applyEpochBump(DOCNAME)
       expect((await c.recvUntil(f => f.ctl === 'auth-updated')).at(-1)).toMatchObject({ epoch: 1 })
       release()
       await expiry
       expect(conn.roleEpoch).toBe(1)
+      expect(conn.activeAccessDisposer).toBeTypeOf('function')
+      expect(directChecks).toBe(2)
       expect(conn.auth.pendingReauth).not.toBe(true)
 
       const frame = OPS_FRAME(1, 'peer-after-current-epoch-proof', 1)

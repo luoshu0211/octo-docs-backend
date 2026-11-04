@@ -431,7 +431,7 @@ function makeCurrentContext(uid: string, docId: string, state: CurrentAccess): A
       docId,
       uid,
       principalSpaceId: 'principal-space',
-    }),
+    }, 'yjs:direct'),
     space_member: false,
     kind: 'document',
     space: 'source-expiry',

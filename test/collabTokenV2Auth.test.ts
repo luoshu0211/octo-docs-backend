@@ -22,6 +22,7 @@ const claims = {
   current_space_verified: true,
   current_space_id: 's_1',
   principal_space_id: 's_1',
+  exp: 1_900_000_000,
 }
 
 beforeEach(() => {
@@ -31,6 +32,7 @@ beforeEach(() => {
   })
   config.collabToken.allowLegacyWithoutHomeSpaceProof = false
 })
+
 
 describe('v2 WebSocket identity binding (remove-sp §7.3)', () => {
   it.each([

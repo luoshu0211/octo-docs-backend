@@ -10,6 +10,7 @@
  *   'Unauthorized' -> 4401 (refreshable)
  *   'Forbidden'    -> 4403 (permanent no-access)
  */
+import { createHash } from 'node:crypto'
 import { verifyCollabToken } from '../auth/collabToken.js'
 import { currentEpoch } from '../permission/epoch.js'
 import { beginActiveAccessRegistration, type ActiveAccessRegistrationLease } from '../permission/activeAccess.js'
@@ -114,11 +115,14 @@ export async function authenticate(data: AuthInput): Promise<AuthContext> {
 
   const docId = parsed.kind === 'document' ? parsed.doc : parsed.kind === 'whiteboard' ? parsed.board : undefined
   if (docId === undefined) throw forbidden()
+  const authorityScope = claims.space_member === true
+    ? `collab:share:${createHash('sha256').update(token).digest('hex')}`
+    : 'collab:direct'
   const activeAccessRegistration = beginActiveAccessRegistration({
     docId,
     uid: claims.uid,
     principalSpaceId: claims.principal_space_id,
-  })
+  }, authorityScope)
   let registrationTransferred = false
   try {
     let currentAccess: CurrentAccess
