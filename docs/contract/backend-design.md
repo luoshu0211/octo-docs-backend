@@ -522,136 +522,27 @@ CREATE TABLE doc_attachment (
 
 ## 4. 鉴权与权限
 
-### 4.1 onAuthenticate 校验 collab token
+### 4.1 onAuthenticate 校验身份与当前授权
 
-鉴权发生在连接建立的 `onAuthenticate` 阶段，前端通过函数式 `token` getter 取到的**短期 collab token**在连接/重连时传入（collab token 的签发见 4.4）。身份与权限（role）已在签发接口计算并固化进 token claims，连接阶段不重算权限。`onAuthenticate` 的热路径为：**本地验签（CPU、无 IO）+ permission_epoch 比对（`currentEpoch` 优先走 Redis 缓存，miss 才回源 DB）+ 仅当 epoch stale 时才 `recheckCurrentRole` 查 `doc_member`**。即常态路径（epoch 命中即放行）仅一次 Redis 读、不查成员库；只有 epoch 落后（stale）的分支才回源 DB / `doc_member` 复核。换言之 onAuthenticate **不重算权限**，但并非"连接阶段零 IO/零查库"——epoch 一致性校验是必要的轻量 IO。
+协作 token 仍为短期、绑定 uid/documentName/可信 Space 的签名凭证。握手先沿现有校验器验证签名、有效期、文档类型与路由绑定，再确认当前有效角色；旧 claims.role 与相同的 Docs permission_epoch 不足以证明外部 Drive 来源仍有效。
 
-```ts
-// Hocuspocus v4：onAuthenticate 的 payload 含 connectionConfig（在其上设 readOnly）
-async onAuthenticate(data) {
-  const { token, documentName, connectionConfig } = data
+有效角色合并文档独立授权、分享与 Drive reader，具体来源版本、有限证明期和重验算法见 [Project 派生文档访问设计](../specs/2026-11-03-project-derived-access-revalidation-design.md)。无权为 4403，身份/权威事实不可确认按现有 4401 处理；独立授权不因另一个来源故障被删除。
 
-  // 1. 验 collab token：验签 + 校验未过期（exp）
-  //    验签失败 / 已过期 => 拒绝连接（前端收到 4401，静默刷新后重连）
-  const claims = verifyCollabToken(token) // { uid, documentName, role, permission_epoch, exp }；抛错 => 4401
-  if (!claims) throw new Error('Unauthorized')
+reader 设置 connectionConfig.readOnly，所有写拒绝必须发生在应用 update 之前。onChange 已在合并之后，不能当作写权限闸门。归属解析与元数据绑定沿现有统一解析器；{folder} 仅组织/路由维度，不从目录或群身份授予文档权限。
 
-  // 2. 校验 token 内 documentName 与本次连接的 documentName 一致（防 token 挪用到别的文档）
-  //    不一致 => 4403（拒绝，不刷新）
-  if (claims.documentName !== documentName) throw new Error('Forbidden')
+onAuthenticate 返回的身份和当前角色进入连接 context，onStoreDocument 继续从 lastContext 记录 updated_by。同一文档/主体/Space 的并发查权通过现有 singleflight 合并；缓存还须匹配当前文档 epoch、来源版本与有效期。来源失效须隔离旧 in-flight 结果，不能仅清 epoch 缓存。
 
-  // 3. 校验 permission_epoch：与该 {doc} 当前 epoch 比对（见 4.5）。
-  //    currentEpoch(documentName)：优先读 Redis 缓存（命中即返回，常态热路径仅此一次 Redis 读），
-  //      miss 才回源 DB（epoch 权威落 DB，Redis 仅缓存，见 §4.5 P2-E）；
-  //      ⚠️ Redis miss → DB 回源按 {doc} 维度纳入 singleflight 合并并发回源 + 进程内短 TTL 缓存（P2-E），
-  //      防止 Redis 宕机/清空时大量连接同时回源 DB 造成 epoch 读 stampede。
-  //    epoch 一致（命中）=> 直接放行，不查成员库。
-  //    epoch 落后（stale）=> 不直接拒绝，进入 stale 分支复核该 uid 对该 doc 的【当前】权限：
-  //      - recheckCurrentRole 仅在此 stale 分支调用（查 doc_member + owner），并带 singleflight + 短 TTL 缓存（见下方 thundering herd 防护）；
-  //      - 仍有权（role ∈ reader|writer|admin）=> 抛 4401（可刷新语义），前端静默刷新拿新 epoch token 重连；
-  //      - 确实无权（当前 role=none）=> 抛 4403（永久无权，前端不刷新）。
-  let epoch: number
-  try {
-    epoch = await currentEpoch(documentName) // Redis miss → DB singleflight；权威源不可确认则 throw
-  } catch {
-    throw new Error('Unauthorized') // 4401 退避（权威源不可确认 = fail-closed，P1-C）
-  }
-  if (claims.permission_epoch < epoch) {
-    let currentRole: Role
-    try {
-      currentRole = await recheckCurrentRole(documentName, claims.uid) // 仅 stale 分支查 doc_member+owner（带 singleflight+缓存）
-    } catch {
-      throw new Error('Unauthorized') // recheck 不可确认也 fail-closed（4401）
-    }
-    if (currentRole === 'none') throw new Error('Forbidden')         // 4403：彻底失权
-    throw new Error('Unauthorized')                                  // 4401：可刷新，前端刷新 token 重连
-  }
-  // ⚠️ currentEpoch / recheckCurrentRole 是异步 IO（Redis/DB），必须 await；不 await 则 `number < Promise` 恒 false、
-  //    stale 分支永不进入 → 撤销/降权静默失效（P1-C 漏洞）；权威源不可确认一律 fail-closed。
-
-  // 4. role 直接取自 token claims，无需再查库计算（reader|writer|admin）
-  const role = claims.role
-
-  // 5. 从 documentName 解析归属，供下游 hook 路由/落库使用：octo:{space}:{folder}:{doc}
-  //    ⚠️ v2.0：{folder} 仅为 docs 原生组织维度（路由/归类），【不参与权限判定】——权限完全来自 doc_member + owner（见 §4.2）。
-  //    parseDocumentName 执行可执行校验矩阵（非法直接拒绝 4403/4404，不做"尽力解析"）：
-  //      a. 按 ':' split。**白板键非对称判别**：若 parts.length === 5 且 parts[3] === 'wb'
-  //         （即 octo:{space}:{folder}:wb:{board}），识别为白板键 —— 文档后端不受理白板
-  //         （白板不共享文档 Y.Doc/通道），直接拒绝（4403/4404）；
-  //      b. 文档键必须 **exactly 4 段**：parts.length !== 4（且非上面的 5 段 wb 形式）一律拒绝（多余段/缺段拒绝）；
-  //      c. **首段必须 === 'octo'**：parts[0] !== 'octo' 拒绝；
-  //      d. **空段拒绝**：任一段为空字符串拒绝；
-  //      e. {doc} 段禁含分隔符 ':' 等非法字符、且禁等于字面量 'wb'（否则分隔歧义 → 错误归属）。
-  const parsed = parseDocumentName(documentName) // 5 段 wb / 非 4 段 / 首段非 octo / 空段 / 非法字符 => 抛错拒绝
-  if (parsed.kind !== 'document') throw new Error('Forbidden')  // 白板键（kind==='whiteboard'）文档后端不受理 => 4403
-  const { space, folder, doc } = parsed
-
-  // 6. 只读用户：v4 在 connectionConfig 上设 readOnly，Yjs 写消息会在【应用之前】被服务端拒绝
-  if (role === 'reader') {
-    connectionConfig.readOnly = true
-  }
-
-  // 7. 注入 context，向下游 hook（onLoadDocument/beforeHandleMessage/onStoreDocument）传递
-  return {
-    user: { id: claims.uid },
-    role,
-    permission_epoch: claims.permission_epoch,
-    space,
-    folder,
-    doc,
-  }
-}
-```
-
-下面给出 `parseDocumentName` 的可执行校验矩阵（伪代码，TypeScript 风格），落实 step 5 的**非对称解析**——白板键比文档键多一个字面量判别段 `wb`，故须先判 5 段 wb 形式、再判 4 段文档形式；且 `{doc}` 段**禁止等于 `'wb'`**，以防与白板前缀 `:wb:` 产生归属歧义。注意 v2.0 重定义后**解析逻辑与段数/位置判别完全不变**——只是第 3 段的语义标签由 `{group}` 改名为 `{folder}`，故白板 5 段非对称判别（`parts.length===5 && parts[3]==='wb'`）零改动：
-
-```ts
-// 非对称：白板键 5 段 octo:{space}:{folder}:wb:{board}；文档键 4 段 octo:{space}:{folder}:{doc}
-// v2.0：第 3 段为 docs 原生 {folder}（不再是 octo group_no），不参与权限判定
-function parseDocumentName(name: string) {
-  const parts = name.split(':')
-  if (parts[0] !== 'octo') throw new Error('bad ns')            // 首段必须为字面量 'octo'
-  const seg = /^[A-Za-z0-9_-]+$/                                // 各段受限字符集，禁含 ':'、空段
-  // 5 段且第 4 段为字面量 'wb' ⇒ 白板键（多一个 wb 判别段）：文档后端不受理（4403/4404）
-  if (parts.length === 5 && parts[3] === 'wb') {
-    const [, space, folder, , board] = parts
-    if (![space, folder, board].every(s => seg.test(s))) throw new Error('bad seg')
-    return { kind: 'whiteboard', space, folder, board }         // 上游据此拒绝（白板不共享文档 Y.Doc/通道）
-  }
-  // 否则必须 exactly 4 段 ⇒ 文档键
-  if (parts.length === 4) {
-    const [, space, folder, doc] = parts
-    if (![space, folder, doc].every(s => seg.test(s))) throw new Error('bad seg')
-    if (doc === 'wb') throw new Error('doc segment must not be "wb" (ambiguous with whiteboard prefix)')
-    return { kind: 'document', space, folder, doc }
-  }
-  throw new Error('bad documentName: segment count')            // 其它段数（多余/缺段）一律拒绝
-}
-```
-
-> **第 3 段 `{folder}` 与 `doc_meta.folder_id` 必须一致（非空不变量）**：`seg` 正则 `^[A-Za-z0-9_-]+$` 已禁止空段，故第 3 段**永不为空**；它就是该文档的 `doc_meta.folder_id`（非空，DDL 默认保留值 `f_default`，见 §3.4）。解析出的 `folder` **必须等于** `doc_meta(doc).folder_id`——二者由创建 API 在建文档时一并写入、键不可变（见 §8.1）；若发现不一致（数据被篡改/迁移残缺）按 4403 拒绝。**严禁出现空 folder 段**（与 `folder_id NOT NULL` 对齐，消除「DDL 允许空 / 解析拒绝空」的旧矛盾）。
-
-`onAuthenticate` 的返回值会作为 `context` 注入后续所有 hook。**`onStoreDocument` 据此记录 `updated_by`**：从 `onStoreDocument` 的 `data.context`（v4 经 `lastContext` 传入，即最后一次写入连接的 context）取 `user.id`，在 store 事务内写入 `doc_meta.updated_by`（见 §3.2；若沿用只含 `documentName + incoming` 的旧 store 签名会丢掉 context，导致 `updated_by` 永远为空）。**写拒绝必须发生在「消息应用之前」**：reader 由 `connectionConfig.readOnly` 在服务端拦截写消息（已核验：v4 `connectionConfig.readOnly` 即在应用 update 前拒写）；对自定义/直写路径，再在 `beforeHandleMessage` 复查 `role` 与 `permission_epoch`（纵深防御，见 4.5）。**不要用 `onChange` 当权限闸门**——`onChange` 在 update 已合并进内存 Y.Doc 之后才触发，此处无法拒绝写入。
-
-> **onAuthenticate 热路径的 thundering herd 防护**：当发生 **mass 成员变更，或节点重启 / LB 重均衡导致海量持旧 epoch 的 token 同时重连**时，会触发大量连接同时落入 stale 分支并发 `recheckCurrentRole`，可能压垮 `doc_member` 库。防护手段：
-> 1. **recheck 结果短 TTL 缓存**：同 `{doc, uid}` 的复核结果在短 TTL（如数秒）内复用，避免同一主体反复回源；
-> 2. **singleflight（单飞）合并并发回源**：对同一 `{doc}`（或 `{doc, uid}`）的并发 recheck 合并为一次回源、其余等待其结果，消除惊群；
-> 3. **连接级建立速率限流与退避**：在 `onConnect` / 网关层对连接建立速率限流（配合 4429 退避，见 §8.2 / §9.5），平滑重连洪峰。
-
-> **epoch 校验权威源不可确认时的 fail-closed（P1-C）**：step 3 的 epoch 比对，**当 `currentEpoch` 无法从权威源（DB）确认**（Redis miss 且 DB 也抖动/不可用），或该 `{doc}` 已知发生 **doc_member/owner 权限变更**（已收到失效广播 / epoch 已知抬升）时，**凡可能涉及权限收紧（降权/撤销）的判定一律 fail-closed**——抛 **4401（可刷新语义，前端退避后重试）**，**绝不以旧 epoch 缓存放行写权限**；宁可短暂拒绝也不开鉴权旁路。**旧 epoch 缓存容忍仅适用于不涉权限收紧的读保持**（已建立、未涉权限收紧的连接的短时读旧 epoch，窗口量级 ≤ 数秒 TTL，见 §9.2），且一旦 `{doc}` 已知 **doc_member/owner 权限变更**立即失效并转 fail-closed。
-
-> **归属解析说明（v2.0 文档自治）**：documentName 自带 `{space}`/`{folder}`/`{doc}`。**`{folder}` 是 docs 原生文件夹维度，仅用于路由与组织归类，不再是 octo group_no、也不派生任何权限**——这是本版与 v1.x 的根本差异。权限**完全来自文档自治成员关系**：`resolveRole` 只查 `doc_member`（uid 对该 doc 的直授 role）+ `doc_meta.owner_id`（owner 隐含 admin），不做任何群继承（见 §4.2）。这套 role 计算在**签发 collab token 时**完成并写入 token claims；连接阶段的 `onAuthenticate` **不再重算权限**，只做本地验签 + 校验 documentName 一致性 + permission_epoch 比对（优先 Redis 缓存、miss 回源 DB）+ 读取 claims.role；仅当 epoch stale 时才回源 `doc_member` 复核（`recheckCurrentRole`）。`docMetaRepo` 的文档存在/状态校验前移到签发接口（见 4.4）。注意：这并非"连接阶段零查库"——epoch 比对是必要的轻量 IO（常态一次 Redis 读），只是**避免了连接时重算 role 与回查成员库**（除非 stale）。
+新请求和重连重验；已打开连接通过变化提示及活跃绑定的聚合版本检查收权。完整的被动读取、PPT、故障和多副本验收以配套规格为准。
 
 ### 4.2 文档自治成员模型：doc_member + owner；三级权限
 
-> **v2.0 根本变更（老板定稿）**：权限模型由「依赖 octo 群」改为**文档自治**。删除 v1.x「群成员 = 文档权限」的群继承逻辑，以及「`{group}` = group_no 驱动权限」语义。**权限不再与 octo 群耦合**——一篇文档的成员与角色完全由文档自己的成员表 `doc_member` 决定。
+文档自身管理 owner/doc_member 和分享授权，外部 Drive 只派生读取。有效角色取各个当前有效来源的最高者：
 
-权限来源收敛为**两个、且都属于文档自身**：
+1. **独立 owner/doc_member**：owner 隐含 admin；直授/邀请接受的 doc_member 保留自身角色。
+2. **分享来源**：按现有 share_scope、资格和租户边界解析。
+3. **Drive 来源**：按受信内部接口的当前来源判定提供 reader 或 none，不授予 writer/admin；Project 归档只影响同步分量。
 
-1. **owner（拥有者）**：`doc_meta.owner_id`，创建者隐含 **admin**，不可被降级/移除（除非转移 owner）。owner 是「删除群继承后仍可管理」的兜底锚点。
-2. **doc_member（直授成员）**：`doc_member` 表中 `(doc_id, uid)` 的 role（reader/writer/admin）。成员由 owner/admin **直接按 role 添加**，或经**链接邀请**接受后落行（见 §4.6）。
-
-> **`doc_acl` 去向（设计决策：合并入 `doc_member`，不再保留 ACL 表）**：v1.x `doc_acl` 的 `principal_type=user` 行就是「对个人的直授」，与 `doc_member` 语义完全重合，故**直接以 `doc_member` 取代 `doc_acl`**（更干净：一张表、一种主体、PK `(doc_id, uid)`）。`principal_type=group` 行是被删除的群继承语义，**不再保留**。这样 `resolveRole` 从「max(群继承, ACL)」简化为「`doc_member` + owner」的单表查找。迁移见 §3.4 DDL 末尾的迁移说明。
+doc_member 继续承载个人直授和邀请落行，不恢复群 ACL 继承。Drive 来源运行时查询，不复制成 doc_member；Project owner 转让不修改文档 owner，退出不删除用户已有的独立授权。
 
 三级权限语义（不变）：
 
@@ -661,51 +552,17 @@ function parseDocumentName(name: string) {
 | 可写 | writer (2) | ✓ | ✓ | ✗ | 允许同步；元数据/成员写 API 拒绝 |
 | 管理 | admin (3) | ✓ | ✓ | ✓ | 允许同步 + 元数据/成员/邀请 API |
 
-`resolveRole` 逻辑（简化为单表 + owner，无群继承、无并集取最高）：
-
-```
-resolveRole(uid, docId):
-  if uid === doc_meta(docId).owner_id: return admin     // owner 隐含 admin，不可降级
-  memberRole = doc_member 中 (docId, uid) 的 role        // reader|writer|admin，单行
-  return memberRole ?? none                              // 无成员行 => none（无权）
-```
-
-要点：
-- 不再读 octo 群成员体系，不再做 `max(...)` 并集——一次 `doc_member` 单行查找（PK `(doc_id, uid)`）+ owner 比对即得 role。
-- `recheckCurrentRole(documentName, uid)`（§4.1 stale 分支）即调用此 `resolveRole`（按 documentName→doc_id 解析后查 `doc_member`），不再回查群/旧 ACL 库。
+基础 directRole 由 owner/doc_member 解析，统一有效角色再与分享及 Drive reader 合并。权限缓存与实时连接使用同一合并规则，不能让 HTTP、CLI、PPT 或协作握手另取一套角色。
 - **迁移注意**：删除群继承后，原本仅靠「群管理员」身份管理文档的用户将失去 admin——迁移脚本须确保每篇存量文档至少有 owner（或一名 admin）已落 `doc_member`/`doc_meta.owner_id`，避免「无人可管理」。
 
 ### 4.3 token 校验与 context 注入时序
 
-```
-Frontend Provider     签发接口 /api/v1/docs/collab-token     Hocuspocus      Octo 身份 + doc_member DB
-      │                        │                              │                    │
-      │ ① POST /collab-token   │                              │                    │
-      │   (带 Octo 登录态/token)│                              │                    │
-      │ ──────────────────────▶│ 校验 octo 身份(token→uid) ───┼───────────────────▶│
-      │                        │◀──── 可信 uid ───────────────┼────────────────────│
-      │                        │ parseDocumentName→{space,folder,doc}               │
-      │                        │ resolveRole = doc_member+owner ┼──────────────────▶│
-      │                        │◀──── role（单表查找）─────────┼────────────────────│
-      │                        │ [role=none]→HTTP 403 不发 token                    │
-      │                        │ 签发短期 collab token          │                    │
-      │◀ {token,expiresAt,role}│ claims={uid,documentName,role,permission_epoch,exp}  │
-      │                        │                              │                    │
-      │ ② WS connect           │                              │                    │
-      │   token:()=>collab token                              │                    │
-      │ ──────────────────────────────────────────────────────▶│ onConnect(限流/黑名单)
-      │                        │                              │ onAuthenticate     │
-      │                        │           verifyCollabToken 本地验签 + 校验 exp     │
-      │                        │           校验 token.documentName===连接 name      │
-      │                        │           [验签失败/过期]→4401                     │
-      │                        │           [documentName 不匹配]→4403               │
-      │                        │           role=claims.role；[reader]→readOnly      │
-      │◀──── auth ok ──────────────────────────────────────────│ return context    │
-      │                        │           onLoadDocument (注水) │                  │
-      │◀──── SyncStep / update ─────────────────────────────────│                  │
-```
+1. 签发接口验证可信身份及文档/Space 绑定，计算当前有效角色；role=none 时不签发。
+2. WebSocket 握手验证短期 token 和连接归属，再确认当前授权；reader 在同步开始前设置只读。
+3. 文档自身 ACL 变化推进 permission_epoch；外部来源变化独立失效，即使 Docs epoch 未变也必须重验。
+4. 角色/来源证明有效时才进行受控快照、replay、更新和 awareness 投递；最后来源消失后关闭连接，不能只禁止写入。
 
-鉴权失败时连接被关闭，前端 provider 收到对应的 WebSocket close code（错误码见 8.2）。role 计算（`resolveRole` = doc_member + owner，见 4.2）只在**签发阶段**做一次并写入 token claims；连接阶段的 `onAuthenticate` **不再重算 role、也不回调 octo 身份服务**，只做本地验签 + permission_epoch 比对（优先 Redis 缓存、miss 回源 DB）；仅当 epoch stale 时才回查 `doc_member` 复核当前 role（见 §4.1 step 3 / §4.5）。
+具体事件与主动版本检查、缓存寿命、跨副本传播及 generation 竞态约束见配套规格。
 
 ### 4.4 token 签发与刷新策略
 
@@ -715,7 +572,7 @@ Frontend Provider     签发接口 /api/v1/docs/collab-token     Hocuspocus     
 - **签发接口**：新增 `POST /api/v1/docs/collab-token`。
   - 入参：`{ documentName }`；用户身份从请求自带的 **octo 登录态**取（不由前端传 uid，防伪造）。**octo 登录态 = octo-web 已为每个请求注入的 `token` 请求头**（同源复用，见 §4.7 / §10.3）。
   - 身份校验（**零开发复用 octo**）：该端点**直接挂在 octo-server 既有 `AuthMiddleware` 之后**，由 octo 既有的 `CacheTokenParser` 把 `token` 解析为可信 uid（详见 §4.7（a） + 代码引用）；handler 内用 `c.GetLoginUID()` 取 uid，无需自研验签。
-  - 授权校验：从 documentName 解析 `{space, folder, doc}` → `resolveRole(uid, doc)` 查 `doc_member` + owner（见 §4.2）；无权限（role=none）直接 HTTP 403，不签发 token。
+  - 授权校验：解析可信 documentName/Space，合并当前独立、分享及 Drive reader；无权限直接 HTTP 403，不签发 token。
   - 出参：`{ token, expiresAt, role }`；collab token 的 claims 含 `{ uid, documentName, role, permission_epoch, exp }`，由 **docs 后端私钥签名（JWT）**。`permission_epoch` 取自签发时该文档的当前 epoch（见 4.5）。
 
 > **两层令牌链（least-privilege，务必区分）**：octo 登录态与 collab token 是**两层、不同性质**的凭证，不可混用，更**不可把长效 octo 令牌直接挂到 WS 上**：
@@ -723,7 +580,7 @@ Frontend Provider     签发接口 /api/v1/docs/collab-token     Hocuspocus     
 > 2. **collab token**：docs 后端签发的**分钟级短期 JWT**，最小权限、仅授权「特定 documentName + uid + role + epoch」，**仅用于 WS 握手**。
 > 链路：`octo 登录态 → POST /api/v1/docs/collab-token（带 octo token）→ 短期 collab token → WS 握手`。即便同源已持有 octo token，WS 仍坚持签发短期 collab token——以获得**按文档授权 + epoch 实时撤销 + 泄露面最小**，绝不让长效 octo 令牌直接承载 WS 鉴权。
 - **前端传递**：`HocuspocusProvider.token` 使用函数式 `() => Promise<string>`，连接/重连前先调签发接口取得最新短期 token 再握手。
-- **onAuthenticate 校验**：校验 collab token 签名 + 未过期 + token 内 documentName 与连接 documentName 一致（防 token 挪用到其它文档）；通过则把 `{uid, role}` 注入连接 context。
+- **onAuthenticate 校验**：验证 collab token 签名、有效期、文档/Space 绑定并确认当前有效角色，再把身份与角色注入 context；不因旧 token 的 Docs epoch 相同跳过 Drive 来源重验。
 - **刷新闭环**：token 过期后端返回 WS close code `4401`；前端静默刷新（重新调 `POST /api/v1/docs/collab-token` 取新 token）后自动重连（provider 内置指数退避）；`y-indexeddb` 兜底刷新/重连窗口内本地编辑不丢，重连后由 CRDT 自动合并。
 - **与业务 REST 鉴权区分**：协作 WS 连接用短期 collab token；文档元数据等业务 REST 接口仍用 octo 登录态（同源 `token` 头），两者职责分离。
 
@@ -768,10 +625,12 @@ Response 403:  # 无权限（role=none，即非 owner 且 doc_member 无行）�
    - **否则（该 uid 权限未降，epoch 落后只因他人变更）**：**就地把连接 context 的 `permission_epoch` 刷新到当前值并放行**——无关 writer 不因他人（如 U3）的 `doc_member` 变更被拒写或被迫重连。
    （纵深防御，防止广播丢失或时序竞态。）
 
+外部来源失效不要求修改 Docs permission_epoch。Drive 提示通过现有 Redis 通道传播 source-change，主动来源版本探测补齐丢通知；Yjs/PPT 的被动接收者也必须实际停止投递/关闭。新请求、来源指纹、有限证明期限和连接 generation 的现行契约见 [Project 派生文档访问设计](../specs/2026-11-03-project-derived-access-revalidation-design.md)，不能仅靠入站写消息水位检查覆盖撤销读取。
+
 显式可接受边界（写入文档）：
 
-- **新连接/重连的 token 残留窗口 ≤ 5min**：在 epoch 失效广播尚未触达、且旧 token 未过期的极短窗口内，理论上仍可能用旧 epoch 发起一次新连接；`onAuthenticate` 的 epoch 比对（4.1 step 3）会拒绝**落后** epoch 的连接，故实际窗口取决于 epoch 比对而非 token exp。对「提升权限」类变更，我们**显式接受 ≤5min 的生效延迟**（旧 token 自然过期即收敛），不做强制处理。
-- 该边界已与安全要求（§9.6）对齐：撤销/降级**实时生效**（踢连接/翻 readOnly），仅「提升」允许 ≤5min 延迟。
+- 新连接按当前有效来源重验，不把 token 5min 有效期当作授权残留窗口。运行中来源变化尽快通知，通知丢失由活跃绑定 5 秒轮次探测及有限期来源证明收敛；周期是检查频率，不是跨服务处理完成的绝对时限。
+- 后端立即落实已检测到的无权/降权，不依赖角色提示帧送达；账号状态等不推进 Project epoch 的事实受来源核验上界约束。权限提升仍沿现有刷新路径取得新角色。
 
 ### 4.6 链接邀请（doc_invite）+ 接受流程
 

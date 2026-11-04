@@ -1,0 +1,1875 @@
+{
+  "scope": "Isolated native Server, Go Drive and two Docs processes with real Yjs/PPT sessions; no deployment",
+  "doc_epoch_observation": {
+    "yjs": 3,
+    "ppt": 3,
+    "unchanged_during_source_mutations": true
+  },
+  "account_disable_injection": "Owned isolated Server user status fixture; account administration API not exercised",
+  "source_outage_injection": "Actual Go Drive process stopped; independent document grants remained usable",
+  "load_shape": {
+    "observation_seconds": 15,
+    "connections": 8,
+    "source_bindings_by_docs_node": [
+      4,
+      1
+    ],
+    "document_bindings_per_docs_node": 1,
+    "version_rpc_count": 6,
+    "version_items": 15,
+    "largest_version_batch": 4,
+    "full_source_rpc_count": 10,
+    "full_source_rpc_initial_count": 5,
+    "full_source_rpc_proof_renewal_count": 5,
+    "last_mount_epoch_queries": {
+      "yjs": 6,
+      "ppt": 6
+    },
+    "capacity_benchmark": false
+  },
+  "verification": {
+    "test_files_passed": 312,
+    "test_files_skipped": 9,
+    "tests_passed": 4609,
+    "tests_skipped": 58,
+    "typescript_projects_passed": 3
+  },
+  "cases": [
+    {
+      "at": "2026-11-03T15:22:03.082Z",
+      "scenario": "native-yjs-passive-9af472cf",
+      "sourceMode": "full-chain-server-drive",
+      "passed": true,
+      "revokedReadersClosed": [
+        "revoked-reader",
+        "revoked-reader-node-a-duplicate",
+        "revoked-reader-node-b"
+      ],
+      "postClosePublishes": 3,
+      "observers": [
+        {
+          "name": "revoked-reader",
+          "uid": "u_octo59_reader",
+          "principalSpaceId": "s_octo59_docs",
+          "expectedAfterRevocation": "closed",
+          "passiveObserver": true,
+          "passiveBaselineConfirmed": true,
+          "applicationMessagesSentAfterBaseline": 0,
+          "postBaselineApplicationSendAttempts": 0,
+          "logicalCloseReceived": true,
+          "closeReason": "Forbidden",
+          "websocketClosed": false,
+          "websocketCloseCode": null,
+          "millisecondsFromMarkerToClose": 38,
+          "permissionTermination": true,
+          "millisecondsFromMarkerToPermissionTermination": 38,
+          "syncPayloadFramesAfterLogicalClose": 0,
+          "yjsUpdateKeysReceivedAfterClose": 0,
+          "postCloseObserverKeysReceived": []
+        },
+        {
+          "name": "revoked-reader-node-a-duplicate",
+          "uid": "u_octo59_reader",
+          "principalSpaceId": "s_octo59_docs",
+          "expectedAfterRevocation": "closed",
+          "passiveObserver": true,
+          "passiveBaselineConfirmed": true,
+          "applicationMessagesSentAfterBaseline": 0,
+          "postBaselineApplicationSendAttempts": 0,
+          "logicalCloseReceived": true,
+          "closeReason": "Forbidden",
+          "websocketClosed": false,
+          "websocketCloseCode": null,
+          "millisecondsFromMarkerToClose": 38,
+          "permissionTermination": true,
+          "millisecondsFromMarkerToPermissionTermination": 38,
+          "syncPayloadFramesAfterLogicalClose": 0,
+          "yjsUpdateKeysReceivedAfterClose": 0,
+          "postCloseObserverKeysReceived": []
+        },
+        {
+          "name": "revoked-reader-node-b",
+          "uid": "u_octo59_reader",
+          "principalSpaceId": "s_octo59_docs",
+          "expectedAfterRevocation": "closed",
+          "passiveObserver": true,
+          "passiveBaselineConfirmed": true,
+          "applicationMessagesSentAfterBaseline": 0,
+          "postBaselineApplicationSendAttempts": 0,
+          "logicalCloseReceived": true,
+          "closeReason": "Forbidden",
+          "websocketClosed": false,
+          "websocketCloseCode": null,
+          "millisecondsFromMarkerToClose": 31,
+          "permissionTermination": true,
+          "millisecondsFromMarkerToPermissionTermination": 31,
+          "syncPayloadFramesAfterLogicalClose": 0,
+          "yjsUpdateKeysReceivedAfterClose": 0,
+          "postCloseObserverKeysReceived": []
+        },
+        {
+          "name": "other-space-reader",
+          "uid": "u_octo59_reader_b",
+          "principalSpaceId": "s_octo59_docs_b",
+          "expectedAfterRevocation": "active",
+          "passiveObserver": true,
+          "passiveBaselineConfirmed": true,
+          "applicationMessagesSentAfterBaseline": 0,
+          "postBaselineApplicationSendAttempts": 0,
+          "logicalCloseReceived": false,
+          "closeReason": null,
+          "websocketClosed": false,
+          "websocketCloseCode": null,
+          "millisecondsFromMarkerToClose": null,
+          "permissionTermination": false,
+          "millisecondsFromMarkerToPermissionTermination": null,
+          "syncPayloadFramesAfterLogicalClose": 0,
+          "yjsUpdateKeysReceivedAfterClose": 0,
+          "postCloseObserverKeysReceived": [
+            "639adf78-c458-4153-82bd-7cae30d69983:post:2",
+            "639adf78-c458-4153-82bd-7cae30d69983:post:3",
+            "639adf78-c458-4153-82bd-7cae30d69983:post:4"
+          ]
+        },
+        {
+          "name": "same-uid-other-space",
+          "uid": "u_octo59_reader",
+          "principalSpaceId": "s_octo59_docs_b",
+          "expectedAfterRevocation": "active",
+          "passiveObserver": true,
+          "passiveBaselineConfirmed": true,
+          "applicationMessagesSentAfterBaseline": 0,
+          "postBaselineApplicationSendAttempts": 0,
+          "logicalCloseReceived": false,
+          "closeReason": null,
+          "websocketClosed": false,
+          "websocketCloseCode": null,
+          "millisecondsFromMarkerToClose": null,
+          "permissionTermination": false,
+          "millisecondsFromMarkerToPermissionTermination": null,
+          "syncPayloadFramesAfterLogicalClose": 0,
+          "yjsUpdateKeysReceivedAfterClose": 0,
+          "postCloseObserverKeysReceived": [
+            "639adf78-c458-4153-82bd-7cae30d69983:post:2",
+            "639adf78-c458-4153-82bd-7cae30d69983:post:3",
+            "639adf78-c458-4153-82bd-7cae30d69983:post:4"
+          ]
+        },
+        {
+          "name": "same-space-other-uid",
+          "uid": "u_octo59_admin",
+          "principalSpaceId": "s_octo59_docs",
+          "expectedAfterRevocation": "active",
+          "passiveObserver": true,
+          "passiveBaselineConfirmed": true,
+          "applicationMessagesSentAfterBaseline": 0,
+          "postBaselineApplicationSendAttempts": 0,
+          "logicalCloseReceived": false,
+          "closeReason": null,
+          "websocketClosed": false,
+          "websocketCloseCode": null,
+          "millisecondsFromMarkerToClose": null,
+          "permissionTermination": false,
+          "millisecondsFromMarkerToPermissionTermination": null,
+          "syncPayloadFramesAfterLogicalClose": 0,
+          "yjsUpdateKeysReceivedAfterClose": 0,
+          "postCloseObserverKeysReceived": [
+            "639adf78-c458-4153-82bd-7cae30d69983:post:2",
+            "639adf78-c458-4153-82bd-7cae30d69983:post:3",
+            "639adf78-c458-4153-82bd-7cae30d69983:post:4"
+          ]
+        },
+        {
+          "name": "independent-writer",
+          "uid": "u_octo59_owner",
+          "principalSpaceId": "s_octo59_docs",
+          "expectedAfterRevocation": "active",
+          "passiveObserver": false,
+          "passiveBaselineConfirmed": false,
+          "applicationMessagesSentAfterBaseline": 0,
+          "postBaselineApplicationSendAttempts": 0,
+          "logicalCloseReceived": false,
+          "closeReason": null,
+          "websocketClosed": false,
+          "websocketCloseCode": null,
+          "millisecondsFromMarkerToClose": null,
+          "permissionTermination": false,
+          "millisecondsFromMarkerToPermissionTermination": null,
+          "syncPayloadFramesAfterLogicalClose": 0,
+          "yjsUpdateKeysReceivedAfterClose": 0,
+          "postCloseObserverKeysReceived": [
+            "639adf78-c458-4153-82bd-7cae30d69983:post:2",
+            "639adf78-c458-4153-82bd-7cae30d69983:post:3",
+            "639adf78-c458-4153-82bd-7cae30d69983:post:4"
+          ]
+        },
+        {
+          "name": "writer-witness",
+          "uid": "u_octo59_owner",
+          "principalSpaceId": "s_octo59_docs",
+          "expectedAfterRevocation": "active",
+          "passiveObserver": true,
+          "passiveBaselineConfirmed": true,
+          "applicationMessagesSentAfterBaseline": 0,
+          "postBaselineApplicationSendAttempts": 0,
+          "logicalCloseReceived": false,
+          "closeReason": null,
+          "websocketClosed": false,
+          "websocketCloseCode": null,
+          "millisecondsFromMarkerToClose": null,
+          "permissionTermination": false,
+          "millisecondsFromMarkerToPermissionTermination": null,
+          "syncPayloadFramesAfterLogicalClose": 0,
+          "yjsUpdateKeysReceivedAfterClose": 0,
+          "postCloseObserverKeysReceived": [
+            "639adf78-c458-4153-82bd-7cae30d69983:post:2",
+            "639adf78-c458-4153-82bd-7cae30d69983:post:3",
+            "639adf78-c458-4153-82bd-7cae30d69983:post:4"
+          ]
+        }
+      ],
+      "http_authorization_after_change": [
+        {
+          "name": "revoked-reader",
+          "status": 403,
+          "error": "forbidden",
+          "tokenIssued": false
+        },
+        {
+          "name": "revoked-reader-node-a-duplicate",
+          "status": 403,
+          "error": "forbidden",
+          "tokenIssued": false
+        },
+        {
+          "name": "revoked-reader-node-b",
+          "status": 403,
+          "error": "forbidden",
+          "tokenIssued": false
+        },
+        {
+          "name": "other-space-reader",
+          "status": 200,
+          "role": "reader",
+          "tokenIssued": true
+        },
+        {
+          "name": "same-uid-other-space",
+          "status": 200,
+          "role": "reader",
+          "tokenIssued": true
+        },
+        {
+          "name": "same-space-other-uid",
+          "status": 200,
+          "role": "reader",
+          "tokenIssued": true
+        },
+        {
+          "name": "independent-writer",
+          "status": 200,
+          "role": "admin",
+          "tokenIssued": true
+        },
+        {
+          "name": "writer-witness",
+          "status": 200,
+          "role": "admin",
+          "tokenIssued": true
+        }
+      ],
+      "post_close_observer_receipts": [
+        {
+          "name": "writer-witness",
+          "received": [
+            "639adf78-c458-4153-82bd-7cae30d69983:post:2",
+            "639adf78-c458-4153-82bd-7cae30d69983:post:3",
+            "639adf78-c458-4153-82bd-7cae30d69983:post:4"
+          ]
+        },
+        {
+          "name": "other-space-reader",
+          "received": [
+            "639adf78-c458-4153-82bd-7cae30d69983:post:2",
+            "639adf78-c458-4153-82bd-7cae30d69983:post:3",
+            "639adf78-c458-4153-82bd-7cae30d69983:post:4"
+          ]
+        },
+        {
+          "name": "same-uid-other-space",
+          "received": [
+            "639adf78-c458-4153-82bd-7cae30d69983:post:2",
+            "639adf78-c458-4153-82bd-7cae30d69983:post:3",
+            "639adf78-c458-4153-82bd-7cae30d69983:post:4"
+          ]
+        },
+        {
+          "name": "same-space-other-uid",
+          "received": [
+            "639adf78-c458-4153-82bd-7cae30d69983:post:2",
+            "639adf78-c458-4153-82bd-7cae30d69983:post:3",
+            "639adf78-c458-4153-82bd-7cae30d69983:post:4"
+          ]
+        }
+      ],
+      "stale_same_epoch_token_rejections": [
+        {
+          "client": "revoked-reader",
+          "permissionDenied": "Forbidden",
+          "closeCode": null,
+          "closeReason": null,
+          "initialSyncReceived": false
+        },
+        {
+          "client": "revoked-reader-node-a-duplicate",
+          "permissionDenied": "Forbidden",
+          "closeCode": null,
+          "closeReason": null,
+          "initialSyncReceived": false
+        },
+        {
+          "client": "revoked-reader-node-b",
+          "permissionDenied": "Forbidden",
+          "closeCode": null,
+          "closeReason": null,
+          "initialSyncReceived": false
+        }
+      ]
+    },
+    {
+      "at": "2026-11-03T15:22:25.722Z",
+      "scenario": "native-ppt-passive-ecca1df9",
+      "sourceMode": "full-chain-server-drive",
+      "passed": true,
+      "revokedReadersClosed": [
+        "revoked-reader",
+        "revoked-reader-node-a-duplicate",
+        "revoked-reader-node-b"
+      ],
+      "postClosePublishes": 3,
+      "observers": [
+        {
+          "name": "revoked-reader",
+          "uid": "u_octo59_reader",
+          "principalSpaceId": "s_octo59_docs",
+          "expectedAfterRevocation": "closed",
+          "passiveBaselineConfirmed": true,
+          "closeReason": "Forbidden",
+          "millisecondsFromMarkerToClose": 44,
+          "pptUpdateValuesReceivedAfterClose": 0
+        },
+        {
+          "name": "revoked-reader-node-a-duplicate",
+          "uid": "u_octo59_reader",
+          "principalSpaceId": "s_octo59_docs",
+          "expectedAfterRevocation": "closed",
+          "passiveBaselineConfirmed": true,
+          "closeReason": "Forbidden",
+          "millisecondsFromMarkerToClose": 44,
+          "pptUpdateValuesReceivedAfterClose": 0
+        },
+        {
+          "name": "revoked-reader-node-b",
+          "uid": "u_octo59_reader",
+          "principalSpaceId": "s_octo59_docs",
+          "expectedAfterRevocation": "closed",
+          "passiveBaselineConfirmed": true,
+          "closeReason": "Forbidden",
+          "millisecondsFromMarkerToClose": 43,
+          "pptUpdateValuesReceivedAfterClose": 0
+        },
+        {
+          "name": "other-space-reader",
+          "uid": "u_octo59_reader_b",
+          "principalSpaceId": "s_octo59_docs_b",
+          "expectedAfterRevocation": "active",
+          "passiveBaselineConfirmed": true,
+          "closeReason": null,
+          "millisecondsFromMarkerToClose": null,
+          "pptUpdateValuesReceivedAfterClose": 0
+        },
+        {
+          "name": "same-uid-other-space",
+          "uid": "u_octo59_reader",
+          "principalSpaceId": "s_octo59_docs_b",
+          "expectedAfterRevocation": "active",
+          "passiveBaselineConfirmed": true,
+          "closeReason": null,
+          "millisecondsFromMarkerToClose": null,
+          "pptUpdateValuesReceivedAfterClose": 0
+        },
+        {
+          "name": "same-space-other-uid",
+          "uid": "u_octo59_admin",
+          "principalSpaceId": "s_octo59_docs",
+          "expectedAfterRevocation": "active",
+          "passiveBaselineConfirmed": true,
+          "closeReason": null,
+          "millisecondsFromMarkerToClose": null,
+          "pptUpdateValuesReceivedAfterClose": 0
+        },
+        {
+          "name": "independent-writer",
+          "uid": "u_octo59_owner",
+          "principalSpaceId": "s_octo59_docs",
+          "expectedAfterRevocation": "active",
+          "passiveBaselineConfirmed": false,
+          "closeReason": null,
+          "millisecondsFromMarkerToClose": null,
+          "pptUpdateValuesReceivedAfterClose": 0
+        },
+        {
+          "name": "writer-witness",
+          "uid": "u_octo59_owner",
+          "principalSpaceId": "s_octo59_docs",
+          "expectedAfterRevocation": "active",
+          "passiveBaselineConfirmed": true,
+          "closeReason": null,
+          "millisecondsFromMarkerToClose": null,
+          "pptUpdateValuesReceivedAfterClose": 0
+        }
+      ],
+      "http_authorization_after_change": [
+        {
+          "name": "revoked-reader",
+          "status": 403,
+          "error": "FORBIDDEN",
+          "ticketIssued": false
+        },
+        {
+          "name": "revoked-reader-node-a-duplicate",
+          "status": 403,
+          "error": "FORBIDDEN",
+          "ticketIssued": false
+        },
+        {
+          "name": "revoked-reader-node-b",
+          "status": 403,
+          "error": "FORBIDDEN",
+          "ticketIssued": false
+        },
+        {
+          "name": "other-space-reader",
+          "status": 200,
+          "role": "reader",
+          "ticketIssued": true
+        },
+        {
+          "name": "same-uid-other-space",
+          "status": 200,
+          "role": "reader",
+          "ticketIssued": true
+        },
+        {
+          "name": "same-space-other-uid",
+          "status": 200,
+          "role": "reader",
+          "ticketIssued": true
+        },
+        {
+          "name": "independent-writer",
+          "status": 200,
+          "role": "admin",
+          "ticketIssued": true
+        },
+        {
+          "name": "writer-witness",
+          "status": 200,
+          "role": "admin",
+          "ticketIssued": true
+        }
+      ],
+      "post_close_observer_receipts": [
+        {
+          "name": "writer-witness",
+          "received": [
+            "d31b2962-767a-4d8a-9ed8-1dc52e4502bf:ppt-writer-post:2",
+            "d31b2962-767a-4d8a-9ed8-1dc52e4502bf:ppt-writer-post:3",
+            "d31b2962-767a-4d8a-9ed8-1dc52e4502bf:ppt-writer-post:4"
+          ]
+        },
+        {
+          "name": "other-space-reader",
+          "received": [
+            "d31b2962-767a-4d8a-9ed8-1dc52e4502bf:ppt-writer-post:2",
+            "d31b2962-767a-4d8a-9ed8-1dc52e4502bf:ppt-writer-post:3",
+            "d31b2962-767a-4d8a-9ed8-1dc52e4502bf:ppt-writer-post:4"
+          ]
+        },
+        {
+          "name": "same-uid-other-space",
+          "received": [
+            "d31b2962-767a-4d8a-9ed8-1dc52e4502bf:ppt-writer-post:2",
+            "d31b2962-767a-4d8a-9ed8-1dc52e4502bf:ppt-writer-post:3",
+            "d31b2962-767a-4d8a-9ed8-1dc52e4502bf:ppt-writer-post:4"
+          ]
+        },
+        {
+          "name": "same-space-other-uid",
+          "received": [
+            "d31b2962-767a-4d8a-9ed8-1dc52e4502bf:ppt-writer-post:2",
+            "d31b2962-767a-4d8a-9ed8-1dc52e4502bf:ppt-writer-post:3",
+            "d31b2962-767a-4d8a-9ed8-1dc52e4502bf:ppt-writer-post:4"
+          ]
+        }
+      ]
+    },
+    {
+      "at": "2026-11-03T15:32:35.626Z",
+      "scenario": "native-ppt-redis-loss-29b5e0e9",
+      "sourceMode": "full-chain-server-drive",
+      "passed": true,
+      "revokedReadersClosed": [
+        "revoked-reader",
+        "revoked-reader-node-a-duplicate",
+        "revoked-reader-node-b"
+      ],
+      "postClosePublishes": 3,
+      "observers": [
+        {
+          "name": "revoked-reader",
+          "uid": "u_octo59_reader",
+          "principalSpaceId": "s_octo59_docs",
+          "expectedAfterRevocation": "closed",
+          "passiveBaselineConfirmed": true,
+          "closeReason": "Forbidden",
+          "millisecondsFromMarkerToClose": 75,
+          "pptUpdateValuesReceivedAfterClose": 0
+        },
+        {
+          "name": "revoked-reader-node-a-duplicate",
+          "uid": "u_octo59_reader",
+          "principalSpaceId": "s_octo59_docs",
+          "expectedAfterRevocation": "closed",
+          "passiveBaselineConfirmed": true,
+          "closeReason": "Forbidden",
+          "millisecondsFromMarkerToClose": 76,
+          "pptUpdateValuesReceivedAfterClose": 0
+        },
+        {
+          "name": "revoked-reader-node-b",
+          "uid": "u_octo59_reader",
+          "principalSpaceId": "s_octo59_docs",
+          "expectedAfterRevocation": "closed",
+          "passiveBaselineConfirmed": true,
+          "closeReason": "Forbidden",
+          "millisecondsFromMarkerToClose": 75,
+          "pptUpdateValuesReceivedAfterClose": 0
+        },
+        {
+          "name": "other-space-reader",
+          "uid": "u_octo59_reader_b",
+          "principalSpaceId": "s_octo59_docs_b",
+          "expectedAfterRevocation": "active",
+          "passiveBaselineConfirmed": true,
+          "closeReason": null,
+          "millisecondsFromMarkerToClose": null,
+          "pptUpdateValuesReceivedAfterClose": 0
+        },
+        {
+          "name": "same-uid-other-space",
+          "uid": "u_octo59_reader",
+          "principalSpaceId": "s_octo59_docs_b",
+          "expectedAfterRevocation": "active",
+          "passiveBaselineConfirmed": true,
+          "closeReason": null,
+          "millisecondsFromMarkerToClose": null,
+          "pptUpdateValuesReceivedAfterClose": 0
+        },
+        {
+          "name": "same-space-other-uid",
+          "uid": "u_octo59_admin",
+          "principalSpaceId": "s_octo59_docs",
+          "expectedAfterRevocation": "active",
+          "passiveBaselineConfirmed": true,
+          "closeReason": null,
+          "millisecondsFromMarkerToClose": null,
+          "pptUpdateValuesReceivedAfterClose": 0
+        },
+        {
+          "name": "independent-writer",
+          "uid": "u_octo59_owner",
+          "principalSpaceId": "s_octo59_docs",
+          "expectedAfterRevocation": "active",
+          "passiveBaselineConfirmed": false,
+          "closeReason": null,
+          "millisecondsFromMarkerToClose": null,
+          "pptUpdateValuesReceivedAfterClose": 0
+        },
+        {
+          "name": "writer-witness",
+          "uid": "u_octo59_owner",
+          "principalSpaceId": "s_octo59_docs",
+          "expectedAfterRevocation": "active",
+          "passiveBaselineConfirmed": true,
+          "closeReason": null,
+          "millisecondsFromMarkerToClose": null,
+          "pptUpdateValuesReceivedAfterClose": 0
+        }
+      ],
+      "http_authorization_after_change": [
+        {
+          "name": "revoked-reader",
+          "status": 403,
+          "error": "FORBIDDEN",
+          "ticketIssued": false
+        },
+        {
+          "name": "revoked-reader-node-a-duplicate",
+          "status": 403,
+          "error": "FORBIDDEN",
+          "ticketIssued": false
+        },
+        {
+          "name": "revoked-reader-node-b",
+          "status": 403,
+          "error": "FORBIDDEN",
+          "ticketIssued": false
+        },
+        {
+          "name": "other-space-reader",
+          "status": 200,
+          "role": "reader",
+          "ticketIssued": true
+        },
+        {
+          "name": "same-uid-other-space",
+          "status": 200,
+          "role": "reader",
+          "ticketIssued": true
+        },
+        {
+          "name": "same-space-other-uid",
+          "status": 200,
+          "role": "reader",
+          "ticketIssued": true
+        },
+        {
+          "name": "independent-writer",
+          "status": 200,
+          "role": "admin",
+          "ticketIssued": true
+        },
+        {
+          "name": "writer-witness",
+          "status": 200,
+          "role": "admin",
+          "ticketIssued": true
+        }
+      ],
+      "post_close_observer_receipts": [
+        {
+          "name": "writer-witness",
+          "received": [
+            "93a69f07-2222-4bf9-86e8-f6054698a49e:ppt-writer-post:2",
+            "93a69f07-2222-4bf9-86e8-f6054698a49e:ppt-writer-post:3",
+            "93a69f07-2222-4bf9-86e8-f6054698a49e:ppt-writer-post:4"
+          ]
+        },
+        {
+          "name": "other-space-reader",
+          "received": [
+            "93a69f07-2222-4bf9-86e8-f6054698a49e:ppt-writer-post:2",
+            "93a69f07-2222-4bf9-86e8-f6054698a49e:ppt-writer-post:3",
+            "93a69f07-2222-4bf9-86e8-f6054698a49e:ppt-writer-post:4"
+          ]
+        },
+        {
+          "name": "same-uid-other-space",
+          "received": [
+            "93a69f07-2222-4bf9-86e8-f6054698a49e:ppt-writer-post:2",
+            "93a69f07-2222-4bf9-86e8-f6054698a49e:ppt-writer-post:3",
+            "93a69f07-2222-4bf9-86e8-f6054698a49e:ppt-writer-post:4"
+          ]
+        },
+        {
+          "name": "same-space-other-uid",
+          "received": [
+            "93a69f07-2222-4bf9-86e8-f6054698a49e:ppt-writer-post:2",
+            "93a69f07-2222-4bf9-86e8-f6054698a49e:ppt-writer-post:3"
+          ]
+        }
+      ]
+    },
+    {
+      "at": "2026-11-03T15:35:56.932Z",
+      "scenario": "native-yjs-last-source-1e016281",
+      "sourceMode": "full-chain-server-drive",
+      "passed": true,
+      "revokedReadersClosed": [
+        "revoked-reader",
+        "revoked-reader-node-a-duplicate",
+        "revoked-reader-node-b"
+      ],
+      "postClosePublishes": 3,
+      "observers": [
+        {
+          "name": "revoked-reader",
+          "uid": "u_octo59_reader",
+          "principalSpaceId": "s_octo59_docs",
+          "expectedAfterRevocation": "closed",
+          "passiveObserver": true,
+          "passiveBaselineConfirmed": true,
+          "applicationMessagesSentAfterBaseline": 0,
+          "postBaselineApplicationSendAttempts": 0,
+          "logicalCloseReceived": true,
+          "closeReason": "Forbidden",
+          "websocketClosed": false,
+          "websocketCloseCode": null,
+          "millisecondsFromMarkerToClose": 42,
+          "permissionTermination": true,
+          "millisecondsFromMarkerToPermissionTermination": 42,
+          "syncPayloadFramesAfterLogicalClose": 0,
+          "yjsUpdateKeysReceivedAfterClose": 0,
+          "postCloseObserverKeysReceived": []
+        },
+        {
+          "name": "revoked-reader-node-a-duplicate",
+          "uid": "u_octo59_reader",
+          "principalSpaceId": "s_octo59_docs",
+          "expectedAfterRevocation": "closed",
+          "passiveObserver": true,
+          "passiveBaselineConfirmed": true,
+          "applicationMessagesSentAfterBaseline": 0,
+          "postBaselineApplicationSendAttempts": 0,
+          "logicalCloseReceived": true,
+          "closeReason": "Forbidden",
+          "websocketClosed": false,
+          "websocketCloseCode": null,
+          "millisecondsFromMarkerToClose": 42,
+          "permissionTermination": true,
+          "millisecondsFromMarkerToPermissionTermination": 42,
+          "syncPayloadFramesAfterLogicalClose": 0,
+          "yjsUpdateKeysReceivedAfterClose": 0,
+          "postCloseObserverKeysReceived": []
+        },
+        {
+          "name": "revoked-reader-node-b",
+          "uid": "u_octo59_reader",
+          "principalSpaceId": "s_octo59_docs",
+          "expectedAfterRevocation": "closed",
+          "passiveObserver": true,
+          "passiveBaselineConfirmed": true,
+          "applicationMessagesSentAfterBaseline": 0,
+          "postBaselineApplicationSendAttempts": 0,
+          "logicalCloseReceived": true,
+          "closeReason": "Forbidden",
+          "websocketClosed": false,
+          "websocketCloseCode": null,
+          "millisecondsFromMarkerToClose": 41,
+          "permissionTermination": true,
+          "millisecondsFromMarkerToPermissionTermination": 41,
+          "syncPayloadFramesAfterLogicalClose": 0,
+          "yjsUpdateKeysReceivedAfterClose": 0,
+          "postCloseObserverKeysReceived": []
+        },
+        {
+          "name": "independent-writer",
+          "uid": "u_octo59_owner",
+          "principalSpaceId": "s_octo59_docs",
+          "expectedAfterRevocation": "active",
+          "passiveObserver": false,
+          "passiveBaselineConfirmed": false,
+          "applicationMessagesSentAfterBaseline": 0,
+          "postBaselineApplicationSendAttempts": 0,
+          "logicalCloseReceived": false,
+          "closeReason": null,
+          "websocketClosed": false,
+          "websocketCloseCode": null,
+          "millisecondsFromMarkerToClose": null,
+          "permissionTermination": false,
+          "millisecondsFromMarkerToPermissionTermination": null,
+          "syncPayloadFramesAfterLogicalClose": 0,
+          "yjsUpdateKeysReceivedAfterClose": 0,
+          "postCloseObserverKeysReceived": [
+            "29c7adac-138d-4ea5-a4dc-c91b47619431:post:2",
+            "29c7adac-138d-4ea5-a4dc-c91b47619431:post:3",
+            "29c7adac-138d-4ea5-a4dc-c91b47619431:post:4"
+          ]
+        },
+        {
+          "name": "writer-witness",
+          "uid": "u_octo59_owner",
+          "principalSpaceId": "s_octo59_docs",
+          "expectedAfterRevocation": "active",
+          "passiveObserver": true,
+          "passiveBaselineConfirmed": true,
+          "applicationMessagesSentAfterBaseline": 0,
+          "postBaselineApplicationSendAttempts": 0,
+          "logicalCloseReceived": false,
+          "closeReason": null,
+          "websocketClosed": false,
+          "websocketCloseCode": null,
+          "millisecondsFromMarkerToClose": null,
+          "permissionTermination": false,
+          "millisecondsFromMarkerToPermissionTermination": null,
+          "syncPayloadFramesAfterLogicalClose": 0,
+          "yjsUpdateKeysReceivedAfterClose": 0,
+          "postCloseObserverKeysReceived": [
+            "29c7adac-138d-4ea5-a4dc-c91b47619431:post:2",
+            "29c7adac-138d-4ea5-a4dc-c91b47619431:post:3",
+            "29c7adac-138d-4ea5-a4dc-c91b47619431:post:4"
+          ]
+        }
+      ],
+      "http_authorization_after_change": [
+        {
+          "name": "revoked-reader",
+          "status": 403,
+          "error": "forbidden",
+          "tokenIssued": false
+        },
+        {
+          "name": "revoked-reader-node-a-duplicate",
+          "status": 403,
+          "error": "forbidden",
+          "tokenIssued": false
+        },
+        {
+          "name": "revoked-reader-node-b",
+          "status": 403,
+          "error": "forbidden",
+          "tokenIssued": false
+        },
+        {
+          "name": "independent-writer",
+          "status": 200,
+          "role": "admin",
+          "tokenIssued": true
+        },
+        {
+          "name": "writer-witness",
+          "status": 200,
+          "role": "admin",
+          "tokenIssued": true
+        }
+      ],
+      "post_close_observer_receipts": [
+        {
+          "name": "writer-witness",
+          "received": [
+            "29c7adac-138d-4ea5-a4dc-c91b47619431:post:2",
+            "29c7adac-138d-4ea5-a4dc-c91b47619431:post:3",
+            "29c7adac-138d-4ea5-a4dc-c91b47619431:post:4"
+          ]
+        }
+      ],
+      "stale_same_epoch_token_rejections": [
+        {
+          "client": "revoked-reader",
+          "permissionDenied": "Forbidden",
+          "closeCode": null,
+          "closeReason": null,
+          "initialSyncReceived": false
+        },
+        {
+          "client": "revoked-reader-node-a-duplicate",
+          "permissionDenied": "Forbidden",
+          "closeCode": null,
+          "closeReason": null,
+          "initialSyncReceived": false
+        },
+        {
+          "client": "revoked-reader-node-b",
+          "permissionDenied": "Forbidden",
+          "closeCode": null,
+          "closeReason": null,
+          "initialSyncReceived": false
+        }
+      ]
+    },
+    {
+      "at": "2026-11-03T15:36:19.563Z",
+      "scenario": "native-ppt-last-source-5d88adf5",
+      "sourceMode": "full-chain-server-drive",
+      "passed": true,
+      "revokedReadersClosed": [
+        "revoked-reader",
+        "revoked-reader-node-a-duplicate",
+        "revoked-reader-node-b"
+      ],
+      "postClosePublishes": 3,
+      "observers": [
+        {
+          "name": "revoked-reader",
+          "uid": "u_octo59_reader",
+          "principalSpaceId": "s_octo59_docs",
+          "expectedAfterRevocation": "closed",
+          "passiveBaselineConfirmed": true,
+          "closeReason": "Forbidden",
+          "millisecondsFromMarkerToClose": 43,
+          "pptUpdateValuesReceivedAfterClose": 0
+        },
+        {
+          "name": "revoked-reader-node-a-duplicate",
+          "uid": "u_octo59_reader",
+          "principalSpaceId": "s_octo59_docs",
+          "expectedAfterRevocation": "closed",
+          "passiveBaselineConfirmed": true,
+          "closeReason": "Forbidden",
+          "millisecondsFromMarkerToClose": 43,
+          "pptUpdateValuesReceivedAfterClose": 0
+        },
+        {
+          "name": "revoked-reader-node-b",
+          "uid": "u_octo59_reader",
+          "principalSpaceId": "s_octo59_docs",
+          "expectedAfterRevocation": "closed",
+          "passiveBaselineConfirmed": true,
+          "closeReason": "Forbidden",
+          "millisecondsFromMarkerToClose": 45,
+          "pptUpdateValuesReceivedAfterClose": 0
+        },
+        {
+          "name": "independent-writer",
+          "uid": "u_octo59_owner",
+          "principalSpaceId": "s_octo59_docs",
+          "expectedAfterRevocation": "active",
+          "passiveBaselineConfirmed": false,
+          "closeReason": null,
+          "millisecondsFromMarkerToClose": null,
+          "pptUpdateValuesReceivedAfterClose": 0
+        },
+        {
+          "name": "writer-witness",
+          "uid": "u_octo59_owner",
+          "principalSpaceId": "s_octo59_docs",
+          "expectedAfterRevocation": "active",
+          "passiveBaselineConfirmed": true,
+          "closeReason": null,
+          "millisecondsFromMarkerToClose": null,
+          "pptUpdateValuesReceivedAfterClose": 0
+        }
+      ],
+      "http_authorization_after_change": [
+        {
+          "name": "revoked-reader",
+          "status": 403,
+          "error": "FORBIDDEN",
+          "ticketIssued": false
+        },
+        {
+          "name": "revoked-reader-node-a-duplicate",
+          "status": 403,
+          "error": "FORBIDDEN",
+          "ticketIssued": false
+        },
+        {
+          "name": "revoked-reader-node-b",
+          "status": 403,
+          "error": "FORBIDDEN",
+          "ticketIssued": false
+        },
+        {
+          "name": "independent-writer",
+          "status": 200,
+          "role": "admin",
+          "ticketIssued": true
+        },
+        {
+          "name": "writer-witness",
+          "status": 200,
+          "role": "admin",
+          "ticketIssued": true
+        }
+      ],
+      "post_close_observer_receipts": [
+        {
+          "name": "writer-witness",
+          "received": [
+            "0e6d1ee6-3a47-485a-b82a-dc7b23bcdb8e:ppt-writer-post:2",
+            "0e6d1ee6-3a47-485a-b82a-dc7b23bcdb8e:ppt-writer-post:3",
+            "0e6d1ee6-3a47-485a-b82a-dc7b23bcdb8e:ppt-writer-post:4"
+          ]
+        }
+      ]
+    },
+    {
+      "at": "2026-11-03T15:26:49.222Z",
+      "scenario": "native-yjs-redis-loss-71ef9985",
+      "sourceMode": "full-chain-server-drive",
+      "passed": true,
+      "revokedReadersClosed": [
+        "revoked-reader",
+        "revoked-reader-node-a-duplicate",
+        "revoked-reader-node-b"
+      ],
+      "postClosePublishes": 3,
+      "observers": [
+        {
+          "name": "revoked-reader",
+          "uid": "u_octo59_reader",
+          "principalSpaceId": "s_octo59_docs",
+          "expectedAfterRevocation": "closed",
+          "passiveObserver": true,
+          "passiveBaselineConfirmed": true,
+          "applicationMessagesSentAfterBaseline": 0,
+          "postBaselineApplicationSendAttempts": 0,
+          "logicalCloseReceived": true,
+          "closeReason": "Forbidden",
+          "websocketClosed": false,
+          "websocketCloseCode": null,
+          "millisecondsFromMarkerToClose": 110,
+          "permissionTermination": true,
+          "millisecondsFromMarkerToPermissionTermination": 110,
+          "syncPayloadFramesAfterLogicalClose": 0,
+          "yjsUpdateKeysReceivedAfterClose": 0,
+          "postCloseObserverKeysReceived": []
+        },
+        {
+          "name": "revoked-reader-node-a-duplicate",
+          "uid": "u_octo59_reader",
+          "principalSpaceId": "s_octo59_docs",
+          "expectedAfterRevocation": "closed",
+          "passiveObserver": true,
+          "passiveBaselineConfirmed": true,
+          "applicationMessagesSentAfterBaseline": 0,
+          "postBaselineApplicationSendAttempts": 0,
+          "logicalCloseReceived": true,
+          "closeReason": "Forbidden",
+          "websocketClosed": false,
+          "websocketCloseCode": null,
+          "millisecondsFromMarkerToClose": 110,
+          "permissionTermination": true,
+          "millisecondsFromMarkerToPermissionTermination": 110,
+          "syncPayloadFramesAfterLogicalClose": 0,
+          "yjsUpdateKeysReceivedAfterClose": 0,
+          "postCloseObserverKeysReceived": []
+        },
+        {
+          "name": "revoked-reader-node-b",
+          "uid": "u_octo59_reader",
+          "principalSpaceId": "s_octo59_docs",
+          "expectedAfterRevocation": "closed",
+          "passiveObserver": true,
+          "passiveBaselineConfirmed": true,
+          "applicationMessagesSentAfterBaseline": 0,
+          "postBaselineApplicationSendAttempts": 0,
+          "logicalCloseReceived": true,
+          "closeReason": "Forbidden",
+          "websocketClosed": false,
+          "websocketCloseCode": null,
+          "millisecondsFromMarkerToClose": 108,
+          "permissionTermination": true,
+          "millisecondsFromMarkerToPermissionTermination": 108,
+          "syncPayloadFramesAfterLogicalClose": 0,
+          "yjsUpdateKeysReceivedAfterClose": 0,
+          "postCloseObserverKeysReceived": []
+        },
+        {
+          "name": "other-space-reader",
+          "uid": "u_octo59_reader_b",
+          "principalSpaceId": "s_octo59_docs_b",
+          "expectedAfterRevocation": "active",
+          "passiveObserver": true,
+          "passiveBaselineConfirmed": true,
+          "applicationMessagesSentAfterBaseline": 0,
+          "postBaselineApplicationSendAttempts": 0,
+          "logicalCloseReceived": false,
+          "closeReason": null,
+          "websocketClosed": false,
+          "websocketCloseCode": null,
+          "millisecondsFromMarkerToClose": null,
+          "permissionTermination": false,
+          "millisecondsFromMarkerToPermissionTermination": null,
+          "syncPayloadFramesAfterLogicalClose": 0,
+          "yjsUpdateKeysReceivedAfterClose": 0,
+          "postCloseObserverKeysReceived": [
+            "aeb6cf0f-8c38-40dd-b929-2c8db7d37cf6:post:2",
+            "aeb6cf0f-8c38-40dd-b929-2c8db7d37cf6:post:3",
+            "aeb6cf0f-8c38-40dd-b929-2c8db7d37cf6:post:4"
+          ]
+        },
+        {
+          "name": "same-uid-other-space",
+          "uid": "u_octo59_reader",
+          "principalSpaceId": "s_octo59_docs_b",
+          "expectedAfterRevocation": "active",
+          "passiveObserver": true,
+          "passiveBaselineConfirmed": true,
+          "applicationMessagesSentAfterBaseline": 0,
+          "postBaselineApplicationSendAttempts": 0,
+          "logicalCloseReceived": false,
+          "closeReason": null,
+          "websocketClosed": false,
+          "websocketCloseCode": null,
+          "millisecondsFromMarkerToClose": null,
+          "permissionTermination": false,
+          "millisecondsFromMarkerToPermissionTermination": null,
+          "syncPayloadFramesAfterLogicalClose": 0,
+          "yjsUpdateKeysReceivedAfterClose": 0,
+          "postCloseObserverKeysReceived": [
+            "aeb6cf0f-8c38-40dd-b929-2c8db7d37cf6:post:2",
+            "aeb6cf0f-8c38-40dd-b929-2c8db7d37cf6:post:3",
+            "aeb6cf0f-8c38-40dd-b929-2c8db7d37cf6:post:4"
+          ]
+        },
+        {
+          "name": "same-space-other-uid",
+          "uid": "u_octo59_admin",
+          "principalSpaceId": "s_octo59_docs",
+          "expectedAfterRevocation": "active",
+          "passiveObserver": true,
+          "passiveBaselineConfirmed": true,
+          "applicationMessagesSentAfterBaseline": 0,
+          "postBaselineApplicationSendAttempts": 0,
+          "logicalCloseReceived": false,
+          "closeReason": null,
+          "websocketClosed": false,
+          "websocketCloseCode": null,
+          "millisecondsFromMarkerToClose": null,
+          "permissionTermination": false,
+          "millisecondsFromMarkerToPermissionTermination": null,
+          "syncPayloadFramesAfterLogicalClose": 0,
+          "yjsUpdateKeysReceivedAfterClose": 0,
+          "postCloseObserverKeysReceived": [
+            "aeb6cf0f-8c38-40dd-b929-2c8db7d37cf6:post:2",
+            "aeb6cf0f-8c38-40dd-b929-2c8db7d37cf6:post:3",
+            "aeb6cf0f-8c38-40dd-b929-2c8db7d37cf6:post:4"
+          ]
+        },
+        {
+          "name": "independent-writer",
+          "uid": "u_octo59_owner",
+          "principalSpaceId": "s_octo59_docs",
+          "expectedAfterRevocation": "active",
+          "passiveObserver": false,
+          "passiveBaselineConfirmed": false,
+          "applicationMessagesSentAfterBaseline": 0,
+          "postBaselineApplicationSendAttempts": 0,
+          "logicalCloseReceived": false,
+          "closeReason": null,
+          "websocketClosed": false,
+          "websocketCloseCode": null,
+          "millisecondsFromMarkerToClose": null,
+          "permissionTermination": false,
+          "millisecondsFromMarkerToPermissionTermination": null,
+          "syncPayloadFramesAfterLogicalClose": 0,
+          "yjsUpdateKeysReceivedAfterClose": 0,
+          "postCloseObserverKeysReceived": [
+            "aeb6cf0f-8c38-40dd-b929-2c8db7d37cf6:post:2",
+            "aeb6cf0f-8c38-40dd-b929-2c8db7d37cf6:post:3",
+            "aeb6cf0f-8c38-40dd-b929-2c8db7d37cf6:post:4"
+          ]
+        },
+        {
+          "name": "writer-witness",
+          "uid": "u_octo59_owner",
+          "principalSpaceId": "s_octo59_docs",
+          "expectedAfterRevocation": "active",
+          "passiveObserver": true,
+          "passiveBaselineConfirmed": true,
+          "applicationMessagesSentAfterBaseline": 0,
+          "postBaselineApplicationSendAttempts": 0,
+          "logicalCloseReceived": false,
+          "closeReason": null,
+          "websocketClosed": false,
+          "websocketCloseCode": null,
+          "millisecondsFromMarkerToClose": null,
+          "permissionTermination": false,
+          "millisecondsFromMarkerToPermissionTermination": null,
+          "syncPayloadFramesAfterLogicalClose": 0,
+          "yjsUpdateKeysReceivedAfterClose": 0,
+          "postCloseObserverKeysReceived": [
+            "aeb6cf0f-8c38-40dd-b929-2c8db7d37cf6:post:2",
+            "aeb6cf0f-8c38-40dd-b929-2c8db7d37cf6:post:3",
+            "aeb6cf0f-8c38-40dd-b929-2c8db7d37cf6:post:4"
+          ]
+        }
+      ],
+      "http_authorization_after_change": [
+        {
+          "name": "revoked-reader",
+          "status": 403,
+          "error": "forbidden",
+          "tokenIssued": false
+        },
+        {
+          "name": "revoked-reader-node-a-duplicate",
+          "status": 403,
+          "error": "forbidden",
+          "tokenIssued": false
+        },
+        {
+          "name": "revoked-reader-node-b",
+          "status": 403,
+          "error": "forbidden",
+          "tokenIssued": false
+        },
+        {
+          "name": "other-space-reader",
+          "status": 200,
+          "role": "reader",
+          "tokenIssued": true
+        },
+        {
+          "name": "same-uid-other-space",
+          "status": 200,
+          "role": "reader",
+          "tokenIssued": true
+        },
+        {
+          "name": "same-space-other-uid",
+          "status": 200,
+          "role": "reader",
+          "tokenIssued": true
+        },
+        {
+          "name": "independent-writer",
+          "status": 200,
+          "role": "admin",
+          "tokenIssued": true
+        },
+        {
+          "name": "writer-witness",
+          "status": 200,
+          "role": "admin",
+          "tokenIssued": true
+        }
+      ],
+      "post_close_observer_receipts": [
+        {
+          "name": "writer-witness",
+          "received": [
+            "aeb6cf0f-8c38-40dd-b929-2c8db7d37cf6:post:2",
+            "aeb6cf0f-8c38-40dd-b929-2c8db7d37cf6:post:3",
+            "aeb6cf0f-8c38-40dd-b929-2c8db7d37cf6:post:4"
+          ]
+        },
+        {
+          "name": "other-space-reader",
+          "received": [
+            "aeb6cf0f-8c38-40dd-b929-2c8db7d37cf6:post:2",
+            "aeb6cf0f-8c38-40dd-b929-2c8db7d37cf6:post:3",
+            "aeb6cf0f-8c38-40dd-b929-2c8db7d37cf6:post:4"
+          ]
+        },
+        {
+          "name": "same-uid-other-space",
+          "received": [
+            "aeb6cf0f-8c38-40dd-b929-2c8db7d37cf6:post:2",
+            "aeb6cf0f-8c38-40dd-b929-2c8db7d37cf6:post:3",
+            "aeb6cf0f-8c38-40dd-b929-2c8db7d37cf6:post:4"
+          ]
+        },
+        {
+          "name": "same-space-other-uid",
+          "received": [
+            "aeb6cf0f-8c38-40dd-b929-2c8db7d37cf6:post:2",
+            "aeb6cf0f-8c38-40dd-b929-2c8db7d37cf6:post:3",
+            "aeb6cf0f-8c38-40dd-b929-2c8db7d37cf6:post:4"
+          ]
+        }
+      ],
+      "stale_same_epoch_token_rejections": [
+        {
+          "client": "revoked-reader",
+          "permissionDenied": "Forbidden",
+          "closeCode": null,
+          "closeReason": null,
+          "initialSyncReceived": false
+        },
+        {
+          "client": "revoked-reader-node-a-duplicate",
+          "permissionDenied": "Forbidden",
+          "closeCode": null,
+          "closeReason": null,
+          "initialSyncReceived": false
+        },
+        {
+          "client": "revoked-reader-node-b",
+          "permissionDenied": "Forbidden",
+          "closeCode": null,
+          "closeReason": null,
+          "initialSyncReceived": false
+        }
+      ]
+    },
+    {
+      "at": "2026-11-03T15:42:08.177Z",
+      "scenario": "native-yjs-account-ttl-3311da7e",
+      "sourceMode": "full-chain-server-drive",
+      "passed": true,
+      "revokedReadersClosed": [
+        "revoked-reader",
+        "revoked-reader-node-a-duplicate",
+        "revoked-reader-node-b"
+      ],
+      "postClosePublishes": 3,
+      "observers": [
+        {
+          "name": "revoked-reader",
+          "uid": "u_octo59_reader",
+          "principalSpaceId": "s_octo59_docs",
+          "expectedAfterRevocation": "closed",
+          "passiveObserver": true,
+          "passiveBaselineConfirmed": true,
+          "applicationMessagesSentAfterBaseline": 0,
+          "postBaselineApplicationSendAttempts": 0,
+          "logicalCloseReceived": true,
+          "closeReason": "Forbidden",
+          "websocketClosed": false,
+          "websocketCloseCode": null,
+          "millisecondsFromMarkerToClose": 9766,
+          "permissionTermination": true,
+          "millisecondsFromMarkerToPermissionTermination": 9766,
+          "syncPayloadFramesAfterLogicalClose": 0,
+          "yjsUpdateKeysReceivedAfterClose": 0,
+          "postCloseObserverKeysReceived": []
+        },
+        {
+          "name": "revoked-reader-node-a-duplicate",
+          "uid": "u_octo59_reader",
+          "principalSpaceId": "s_octo59_docs",
+          "expectedAfterRevocation": "closed",
+          "passiveObserver": true,
+          "passiveBaselineConfirmed": true,
+          "applicationMessagesSentAfterBaseline": 0,
+          "postBaselineApplicationSendAttempts": 0,
+          "logicalCloseReceived": true,
+          "closeReason": "Forbidden",
+          "websocketClosed": false,
+          "websocketCloseCode": null,
+          "millisecondsFromMarkerToClose": 9766,
+          "permissionTermination": true,
+          "millisecondsFromMarkerToPermissionTermination": 9766,
+          "syncPayloadFramesAfterLogicalClose": 0,
+          "yjsUpdateKeysReceivedAfterClose": 0,
+          "postCloseObserverKeysReceived": []
+        },
+        {
+          "name": "revoked-reader-node-b",
+          "uid": "u_octo59_reader",
+          "principalSpaceId": "s_octo59_docs",
+          "expectedAfterRevocation": "closed",
+          "passiveObserver": true,
+          "passiveBaselineConfirmed": true,
+          "applicationMessagesSentAfterBaseline": 0,
+          "postBaselineApplicationSendAttempts": 0,
+          "logicalCloseReceived": true,
+          "closeReason": "Forbidden",
+          "websocketClosed": false,
+          "websocketCloseCode": null,
+          "millisecondsFromMarkerToClose": 9766,
+          "permissionTermination": true,
+          "millisecondsFromMarkerToPermissionTermination": 9766,
+          "syncPayloadFramesAfterLogicalClose": 0,
+          "yjsUpdateKeysReceivedAfterClose": 0,
+          "postCloseObserverKeysReceived": []
+        },
+        {
+          "name": "independent-writer",
+          "uid": "u_octo59_owner",
+          "principalSpaceId": "s_octo59_docs",
+          "expectedAfterRevocation": "active",
+          "passiveObserver": false,
+          "passiveBaselineConfirmed": false,
+          "applicationMessagesSentAfterBaseline": 0,
+          "postBaselineApplicationSendAttempts": 0,
+          "logicalCloseReceived": false,
+          "closeReason": null,
+          "websocketClosed": false,
+          "websocketCloseCode": null,
+          "millisecondsFromMarkerToClose": null,
+          "permissionTermination": false,
+          "millisecondsFromMarkerToPermissionTermination": null,
+          "syncPayloadFramesAfterLogicalClose": 0,
+          "yjsUpdateKeysReceivedAfterClose": 0,
+          "postCloseObserverKeysReceived": [
+            "39bcbcc8-1b38-4d92-b9b7-5571b3859909:post:28",
+            "39bcbcc8-1b38-4d92-b9b7-5571b3859909:post:29",
+            "39bcbcc8-1b38-4d92-b9b7-5571b3859909:post:30"
+          ]
+        },
+        {
+          "name": "writer-witness",
+          "uid": "u_octo59_owner",
+          "principalSpaceId": "s_octo59_docs",
+          "expectedAfterRevocation": "active",
+          "passiveObserver": true,
+          "passiveBaselineConfirmed": true,
+          "applicationMessagesSentAfterBaseline": 0,
+          "postBaselineApplicationSendAttempts": 0,
+          "logicalCloseReceived": false,
+          "closeReason": null,
+          "websocketClosed": false,
+          "websocketCloseCode": null,
+          "millisecondsFromMarkerToClose": null,
+          "permissionTermination": false,
+          "millisecondsFromMarkerToPermissionTermination": null,
+          "syncPayloadFramesAfterLogicalClose": 0,
+          "yjsUpdateKeysReceivedAfterClose": 0,
+          "postCloseObserverKeysReceived": [
+            "39bcbcc8-1b38-4d92-b9b7-5571b3859909:post:28",
+            "39bcbcc8-1b38-4d92-b9b7-5571b3859909:post:29",
+            "39bcbcc8-1b38-4d92-b9b7-5571b3859909:post:30"
+          ]
+        }
+      ],
+      "http_authorization_after_change": [
+        {
+          "name": "revoked-reader",
+          "status": 403,
+          "error": "forbidden",
+          "tokenIssued": false
+        },
+        {
+          "name": "revoked-reader-node-a-duplicate",
+          "status": 403,
+          "error": "forbidden",
+          "tokenIssued": false
+        },
+        {
+          "name": "revoked-reader-node-b",
+          "status": 403,
+          "error": "forbidden",
+          "tokenIssued": false
+        },
+        {
+          "name": "independent-writer",
+          "status": 200,
+          "role": "admin",
+          "tokenIssued": true
+        },
+        {
+          "name": "writer-witness",
+          "status": 200,
+          "role": "admin",
+          "tokenIssued": true
+        }
+      ],
+      "post_close_observer_receipts": [
+        {
+          "name": "writer-witness",
+          "received": [
+            "39bcbcc8-1b38-4d92-b9b7-5571b3859909:post:28",
+            "39bcbcc8-1b38-4d92-b9b7-5571b3859909:post:29",
+            "39bcbcc8-1b38-4d92-b9b7-5571b3859909:post:30"
+          ]
+        }
+      ],
+      "stale_same_epoch_token_rejections": [
+        {
+          "client": "revoked-reader",
+          "permissionDenied": "Forbidden",
+          "closeCode": null,
+          "closeReason": null,
+          "initialSyncReceived": false
+        },
+        {
+          "client": "revoked-reader-node-a-duplicate",
+          "permissionDenied": "Forbidden",
+          "closeCode": null,
+          "closeReason": null,
+          "initialSyncReceived": false
+        },
+        {
+          "client": "revoked-reader-node-b",
+          "permissionDenied": "Forbidden",
+          "closeCode": null,
+          "closeReason": null,
+          "initialSyncReceived": false
+        }
+      ]
+    },
+    {
+      "at": "2026-11-03T15:42:31.062Z",
+      "scenario": "native-ppt-account-ttl-19c63bd5",
+      "sourceMode": "full-chain-server-drive",
+      "passed": true,
+      "revokedReadersClosed": [
+        "revoked-reader",
+        "revoked-reader-node-a-duplicate",
+        "revoked-reader-node-b"
+      ],
+      "postClosePublishes": 3,
+      "observers": [
+        {
+          "name": "revoked-reader",
+          "uid": "u_octo59_admin",
+          "principalSpaceId": "s_octo59_docs",
+          "expectedAfterRevocation": "closed",
+          "passiveBaselineConfirmed": true,
+          "closeReason": "Forbidden",
+          "millisecondsFromMarkerToClose": 10101,
+          "pptUpdateValuesReceivedAfterClose": 0
+        },
+        {
+          "name": "revoked-reader-node-a-duplicate",
+          "uid": "u_octo59_admin",
+          "principalSpaceId": "s_octo59_docs",
+          "expectedAfterRevocation": "closed",
+          "passiveBaselineConfirmed": true,
+          "closeReason": "Forbidden",
+          "millisecondsFromMarkerToClose": 10102,
+          "pptUpdateValuesReceivedAfterClose": 0
+        },
+        {
+          "name": "revoked-reader-node-b",
+          "uid": "u_octo59_admin",
+          "principalSpaceId": "s_octo59_docs",
+          "expectedAfterRevocation": "closed",
+          "passiveBaselineConfirmed": true,
+          "closeReason": "Forbidden",
+          "millisecondsFromMarkerToClose": 10102,
+          "pptUpdateValuesReceivedAfterClose": 0
+        },
+        {
+          "name": "independent-writer",
+          "uid": "u_octo59_owner",
+          "principalSpaceId": "s_octo59_docs",
+          "expectedAfterRevocation": "active",
+          "passiveBaselineConfirmed": false,
+          "closeReason": null,
+          "millisecondsFromMarkerToClose": null,
+          "pptUpdateValuesReceivedAfterClose": 0
+        },
+        {
+          "name": "writer-witness",
+          "uid": "u_octo59_owner",
+          "principalSpaceId": "s_octo59_docs",
+          "expectedAfterRevocation": "active",
+          "passiveBaselineConfirmed": true,
+          "closeReason": null,
+          "millisecondsFromMarkerToClose": null,
+          "pptUpdateValuesReceivedAfterClose": 0
+        }
+      ],
+      "http_authorization_after_change": [
+        {
+          "name": "revoked-reader",
+          "status": 403,
+          "error": "FORBIDDEN",
+          "ticketIssued": false
+        },
+        {
+          "name": "revoked-reader-node-a-duplicate",
+          "status": 403,
+          "error": "FORBIDDEN",
+          "ticketIssued": false
+        },
+        {
+          "name": "revoked-reader-node-b",
+          "status": 403,
+          "error": "FORBIDDEN",
+          "ticketIssued": false
+        },
+        {
+          "name": "independent-writer",
+          "status": 200,
+          "role": "admin",
+          "ticketIssued": true
+        },
+        {
+          "name": "writer-witness",
+          "status": 200,
+          "role": "admin",
+          "ticketIssued": true
+        }
+      ],
+      "post_close_observer_receipts": [
+        {
+          "name": "writer-witness",
+          "received": [
+            "4da34cab-4441-4eed-a89b-b038fee0da12:ppt-writer-post:29",
+            "4da34cab-4441-4eed-a89b-b038fee0da12:ppt-writer-post:30",
+            "4da34cab-4441-4eed-a89b-b038fee0da12:ppt-writer-post:31"
+          ]
+        }
+      ]
+    },
+    {
+      "at": "2026-11-03T15:58:51.256Z",
+      "scenario": "native-yjs-proof-outage-90750d83",
+      "sourceMode": "full-chain-server-drive",
+      "passed": true,
+      "revokedReadersClosed": [
+        "revoked-reader",
+        "revoked-reader-node-a-duplicate",
+        "revoked-reader-node-b"
+      ],
+      "postClosePublishes": 3,
+      "observers": [
+        {
+          "name": "revoked-reader",
+          "uid": "u_octo59_reader",
+          "principalSpaceId": "s_octo59_docs",
+          "expectedAfterRevocation": "closed",
+          "passiveObserver": true,
+          "passiveBaselineConfirmed": true,
+          "applicationMessagesSentAfterBaseline": 0,
+          "postBaselineApplicationSendAttempts": 0,
+          "logicalCloseReceived": true,
+          "closeReason": "Authorization could not be confirmed",
+          "websocketClosed": false,
+          "websocketCloseCode": null,
+          "millisecondsFromMarkerToClose": 15012,
+          "permissionTermination": true,
+          "millisecondsFromMarkerToPermissionTermination": 15012,
+          "syncPayloadFramesAfterLogicalClose": 0,
+          "yjsUpdateKeysReceivedAfterClose": 0,
+          "postCloseObserverKeysReceived": []
+        },
+        {
+          "name": "revoked-reader-node-a-duplicate",
+          "uid": "u_octo59_reader",
+          "principalSpaceId": "s_octo59_docs",
+          "expectedAfterRevocation": "closed",
+          "passiveObserver": true,
+          "passiveBaselineConfirmed": true,
+          "applicationMessagesSentAfterBaseline": 0,
+          "postBaselineApplicationSendAttempts": 0,
+          "logicalCloseReceived": true,
+          "closeReason": "Authorization could not be confirmed",
+          "websocketClosed": false,
+          "websocketCloseCode": null,
+          "millisecondsFromMarkerToClose": 15012,
+          "permissionTermination": true,
+          "millisecondsFromMarkerToPermissionTermination": 15012,
+          "syncPayloadFramesAfterLogicalClose": 0,
+          "yjsUpdateKeysReceivedAfterClose": 0,
+          "postCloseObserverKeysReceived": []
+        },
+        {
+          "name": "revoked-reader-node-b",
+          "uid": "u_octo59_reader",
+          "principalSpaceId": "s_octo59_docs",
+          "expectedAfterRevocation": "closed",
+          "passiveObserver": true,
+          "passiveBaselineConfirmed": true,
+          "applicationMessagesSentAfterBaseline": 0,
+          "postBaselineApplicationSendAttempts": 0,
+          "logicalCloseReceived": true,
+          "closeReason": "Authorization could not be confirmed",
+          "websocketClosed": false,
+          "websocketCloseCode": null,
+          "millisecondsFromMarkerToClose": 15010,
+          "permissionTermination": true,
+          "millisecondsFromMarkerToPermissionTermination": 15010,
+          "syncPayloadFramesAfterLogicalClose": 0,
+          "yjsUpdateKeysReceivedAfterClose": 0,
+          "postCloseObserverKeysReceived": []
+        },
+        {
+          "name": "independent-writer",
+          "uid": "u_octo59_owner",
+          "principalSpaceId": "s_octo59_docs",
+          "expectedAfterRevocation": "active",
+          "passiveObserver": false,
+          "passiveBaselineConfirmed": false,
+          "applicationMessagesSentAfterBaseline": 0,
+          "postBaselineApplicationSendAttempts": 0,
+          "logicalCloseReceived": false,
+          "closeReason": null,
+          "websocketClosed": false,
+          "websocketCloseCode": null,
+          "millisecondsFromMarkerToClose": null,
+          "permissionTermination": false,
+          "millisecondsFromMarkerToPermissionTermination": null,
+          "syncPayloadFramesAfterLogicalClose": 0,
+          "yjsUpdateKeysReceivedAfterClose": 0,
+          "postCloseObserverKeysReceived": [
+            "d6453fe9-0cd6-4a44-9446-8893cae60f24:post:42",
+            "d6453fe9-0cd6-4a44-9446-8893cae60f24:post:43",
+            "d6453fe9-0cd6-4a44-9446-8893cae60f24:post:44"
+          ]
+        },
+        {
+          "name": "writer-witness",
+          "uid": "u_octo59_owner",
+          "principalSpaceId": "s_octo59_docs",
+          "expectedAfterRevocation": "active",
+          "passiveObserver": true,
+          "passiveBaselineConfirmed": true,
+          "applicationMessagesSentAfterBaseline": 0,
+          "postBaselineApplicationSendAttempts": 0,
+          "logicalCloseReceived": false,
+          "closeReason": null,
+          "websocketClosed": false,
+          "websocketCloseCode": null,
+          "millisecondsFromMarkerToClose": null,
+          "permissionTermination": false,
+          "millisecondsFromMarkerToPermissionTermination": null,
+          "syncPayloadFramesAfterLogicalClose": 0,
+          "yjsUpdateKeysReceivedAfterClose": 0,
+          "postCloseObserverKeysReceived": [
+            "d6453fe9-0cd6-4a44-9446-8893cae60f24:post:42",
+            "d6453fe9-0cd6-4a44-9446-8893cae60f24:post:43",
+            "d6453fe9-0cd6-4a44-9446-8893cae60f24:post:44"
+          ]
+        }
+      ],
+      "http_authorization_after_change": [
+        {
+          "name": "revoked-reader",
+          "status": 403,
+          "error": "forbidden",
+          "tokenIssued": false
+        },
+        {
+          "name": "revoked-reader-node-a-duplicate",
+          "status": 403,
+          "error": "forbidden",
+          "tokenIssued": false
+        },
+        {
+          "name": "revoked-reader-node-b",
+          "status": 403,
+          "error": "forbidden",
+          "tokenIssued": false
+        },
+        {
+          "name": "independent-writer",
+          "status": 200,
+          "role": "admin",
+          "tokenIssued": true
+        },
+        {
+          "name": "writer-witness",
+          "status": 200,
+          "role": "admin",
+          "tokenIssued": true
+        }
+      ],
+      "post_close_observer_receipts": [
+        {
+          "name": "writer-witness",
+          "received": [
+            "d6453fe9-0cd6-4a44-9446-8893cae60f24:post:42",
+            "d6453fe9-0cd6-4a44-9446-8893cae60f24:post:43",
+            "d6453fe9-0cd6-4a44-9446-8893cae60f24:post:44"
+          ]
+        }
+      ],
+      "stale_same_epoch_token_rejections": [
+        {
+          "client": "revoked-reader",
+          "permissionDenied": "Unauthorized",
+          "closeCode": null,
+          "closeReason": null,
+          "initialSyncReceived": false
+        },
+        {
+          "client": "revoked-reader-node-a-duplicate",
+          "permissionDenied": "Unauthorized",
+          "closeCode": null,
+          "closeReason": null,
+          "initialSyncReceived": false
+        },
+        {
+          "client": "revoked-reader-node-b",
+          "permissionDenied": "Unauthorized",
+          "closeCode": null,
+          "closeReason": null,
+          "initialSyncReceived": false
+        }
+      ]
+    },
+    {
+      "at": "2026-11-03T16:00:11.305Z",
+      "scenario": "native-ppt-proof-outage-86c2dc50",
+      "sourceMode": "full-chain-server-drive",
+      "passed": true,
+      "revokedReadersClosed": [
+        "revoked-reader",
+        "revoked-reader-node-a-duplicate",
+        "revoked-reader-node-b"
+      ],
+      "postClosePublishes": 3,
+      "observers": [
+        {
+          "name": "revoked-reader",
+          "uid": "u_octo59_reader",
+          "principalSpaceId": "s_octo59_docs",
+          "expectedAfterRevocation": "closed",
+          "passiveBaselineConfirmed": true,
+          "closeReason": "Authorization could not be confirmed",
+          "millisecondsFromMarkerToClose": 14882,
+          "pptUpdateValuesReceivedAfterClose": 0
+        },
+        {
+          "name": "revoked-reader-node-a-duplicate",
+          "uid": "u_octo59_reader",
+          "principalSpaceId": "s_octo59_docs",
+          "expectedAfterRevocation": "closed",
+          "passiveBaselineConfirmed": true,
+          "closeReason": "Authorization could not be confirmed",
+          "millisecondsFromMarkerToClose": 14882,
+          "pptUpdateValuesReceivedAfterClose": 0
+        },
+        {
+          "name": "revoked-reader-node-b",
+          "uid": "u_octo59_reader",
+          "principalSpaceId": "s_octo59_docs",
+          "expectedAfterRevocation": "closed",
+          "passiveBaselineConfirmed": true,
+          "closeReason": "Authorization could not be confirmed",
+          "millisecondsFromMarkerToClose": 14877,
+          "pptUpdateValuesReceivedAfterClose": 0
+        },
+        {
+          "name": "independent-writer",
+          "uid": "u_octo59_owner",
+          "principalSpaceId": "s_octo59_docs",
+          "expectedAfterRevocation": "active",
+          "passiveBaselineConfirmed": false,
+          "closeReason": null,
+          "millisecondsFromMarkerToClose": null,
+          "pptUpdateValuesReceivedAfterClose": 0
+        },
+        {
+          "name": "writer-witness",
+          "uid": "u_octo59_owner",
+          "principalSpaceId": "s_octo59_docs",
+          "expectedAfterRevocation": "active",
+          "passiveBaselineConfirmed": true,
+          "closeReason": null,
+          "millisecondsFromMarkerToClose": null,
+          "pptUpdateValuesReceivedAfterClose": 0
+        }
+      ],
+      "http_authorization_after_change": [
+        {
+          "name": "revoked-reader",
+          "status": 403,
+          "error": "FORBIDDEN",
+          "ticketIssued": false
+        },
+        {
+          "name": "revoked-reader-node-a-duplicate",
+          "status": 403,
+          "error": "FORBIDDEN",
+          "ticketIssued": false
+        },
+        {
+          "name": "revoked-reader-node-b",
+          "status": 403,
+          "error": "FORBIDDEN",
+          "ticketIssued": false
+        },
+        {
+          "name": "independent-writer",
+          "status": 200,
+          "role": "admin",
+          "ticketIssued": true
+        },
+        {
+          "name": "writer-witness",
+          "status": 200,
+          "role": "admin",
+          "ticketIssued": true
+        }
+      ],
+      "post_close_observer_receipts": [
+        {
+          "name": "writer-witness",
+          "received": [
+            "958c6713-0b23-4f23-b56c-4195411d71c5:ppt-writer-post:42",
+            "958c6713-0b23-4f23-b56c-4195411d71c5:ppt-writer-post:43",
+            "958c6713-0b23-4f23-b56c-4195411d71c5:ppt-writer-post:44"
+          ]
+        }
+      ]
+    }
+  ]
+}

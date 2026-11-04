@@ -280,3 +280,44 @@ describe('docMetaRepo.upsertHtmlByOctoDocSlug recovers from TOCTOU dup-entry (ma
     expect(updates).toHaveLength(0)
   })
 })
+describe('docMetaRepo.getEpochsByDocIds', () => {
+  it('reads an ID batch in one authoritative query and returns typed epochs', async () => {
+    mockQuery.mockResolvedValue([
+      {
+        doc_id: 'd_1',
+        document_name: 'octo:s1:f1:doc:d_1',
+        permission_epoch: '12',
+        status: 1,
+      },
+      {
+        doc_id: 'd_2',
+        document_name: 'octo:s1:f1:doc:d_2',
+        permission_epoch: '4',
+        status: 1,
+      },
+    ] as never)
+
+    await expect(docMetaRepo.getEpochsByDocIds(['d_1', 'd_2'])).resolves.toEqual([
+      {
+        doc_id: 'd_1',
+        document_name: 'octo:s1:f1:doc:d_1',
+        permission_epoch: 12,
+        status: 1,
+      },
+      {
+        doc_id: 'd_2',
+        document_name: 'octo:s1:f1:doc:d_2',
+        permission_epoch: 4,
+        status: 1,
+      },
+    ])
+    expect(mockQuery).toHaveBeenCalledTimes(1)
+    expect(mockQuery.mock.calls[0]![0]).toMatch(/FROM doc_meta WHERE doc_id IN \(\?, \?\)/)
+    expect(mockQuery.mock.calls[0]![1]).toEqual(['d_1', 'd_2'])
+  })
+
+  it('does not query the database for an empty ID batch', async () => {
+    await expect(docMetaRepo.getEpochsByDocIds([])).resolves.toEqual([])
+    expect(mockQuery).not.toHaveBeenCalled()
+  })
+})

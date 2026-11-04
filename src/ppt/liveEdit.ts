@@ -7,6 +7,7 @@ import { pptRelaySeqRepo } from '../db/repos/pptRelaySeqRepo.js'
 import { pptCollabFrameRepo } from '../db/repos/pptCollabFrameRepo.js'
 import { pptCollabOpRepo } from '../db/repos/pptCollabOpRepo.js'
 import { effectiveRole } from '../permission/shareScope.js'
+import { mergeDriveDerivedReader } from '../drive/derivedAccessClient.js'
 import { roleAtLeast, type Role } from '../permission/role.js'
 import { PptApiError } from '../api/ppt/envelope.js'
 import { config } from '../config/env.js'
@@ -38,8 +39,12 @@ export async function lockPptAuthority(tx: Tx, input: PptPrincipal, minimum: Rol
   if (Number(meta.permission_epoch) !== input.authorizedEpoch) throw new PptApiError('FORBIDDEN', 'permissions changed; read again')
   const direct = meta.owner_id === input.uid && meta.owner_space_id === input.spaceId
     ? 'admin' : ((await docMemberRepo.getRoleTx(tx, input.docId, input.uid, input.spaceId)) ?? 'none')
-  const role = input.isBot && input.spaceId !== meta.space_id ? direct
+  const crossSpaceBot = input.isBot && input.spaceId !== meta.space_id
+  let role = crossSpaceBot ? direct
     : effectiveRole(direct, input.spaceId === meta.space_id, meta.share_scope, meta.share_role)
+  if (minimum === 'reader' && !crossSpaceBot && !roleAtLeast(role, 'reader')) {
+    role = await mergeDriveDerivedReader(role, meta.doc_id, input.uid, input.spaceId)
+  }
   if (!roleAtLeast(role, minimum)) throw new PptApiError('FORBIDDEN', `${minimum} role required`)
   if (meta.status !== 1) throw new PptApiError('CONFLICT', 'document is archived')
   return meta

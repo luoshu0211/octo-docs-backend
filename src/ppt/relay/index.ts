@@ -16,7 +16,7 @@ import { productionAgedOpDropHandler } from './agedOpDrop.js'
 export { productionAgedOpDropHandler } from './agedOpDrop.js'
 import { RedisTicketStore } from '../../auth/pptCollabToken.js'
 import { currentEpoch } from '../../permission/epoch.js'
-import { recheckCurrentRole } from '../../permission/resolveRole.js'
+import { recheckCurrentRole, recheckCurrentAccess } from '../../permission/resolveRole.js'
 import { docMetaRepo } from '../../db/repos/docMetaRepo.js'
 import { pptDocStateRepo } from '../../db/repos/pptDocStateRepo.js'
 
@@ -38,6 +38,7 @@ export function createPptRelay(): PptRelay {
     // narrowing still tightens immediately, and returns 'none' for a
     // missing/soft-deleted doc or a removed member (fail-closed).
     roleProvider: (ctx) => recheckCurrentRole(ctx.documentName, ctx.uid, ctx.principalSpaceId, ctx.spaceMember),
+    accessProvider: (ctx) => recheckCurrentAccess(ctx.documentName, ctx.uid, ctx.principalSpaceId, ctx.spaceMember),
     docStatusProvider: async (docId) => {
       const meta = await docMetaRepo.getByDocId(docId)
       // status 0 = soft-deleted, 2 = archived (both refused by pptDocGuard, the

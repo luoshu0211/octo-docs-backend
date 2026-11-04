@@ -78,6 +78,7 @@ import { pptErrorHandler, sendPptError } from '../src/api/ppt/envelope.js'
 import { setOctoIdentity, type OctoIdentity, type OctoUser } from '../src/auth/octoIdentity.js'
 import { verifyPptRelayToken, verifyPptRelayTicket } from '../src/auth/pptCollabToken.js'
 import { issueCollabToken } from '../src/auth/issueCollabToken.js'
+import { setDriveDerivedAccess, type DriveDerivedAccess, type DerivedRole } from '../src/drive/derivedAccessClient.js'
 
 function stub(overrides: Partial<OctoIdentity>): OctoIdentity {
   return {
@@ -88,6 +89,19 @@ function stub(overrides: Partial<OctoIdentity>): OctoIdentity {
     getUsers: async (): Promise<OctoUser[]> => [],
     isSpaceMember: async () => false,
     ...overrides,
+  }
+}
+
+function driveAccess(role: DerivedRole): DriveDerivedAccess {
+  return {
+    async derivedAccess(docId, uid, principalSpaceId) {
+      return { docId, uid, principalSpaceId, role, sourceRevision: 'sha256:test',
+        validForMs: 15_000, expiresAt: performance.now() + 15_000 }
+    },
+    async versions(bindings) {
+      return bindings.map(binding => ({ ...binding, sourceRevision: 'sha256:test',
+        validForMs: 15_000, expiresAt: performance.now() + 15_000 }))
+    },
   }
 }
 
@@ -144,6 +158,7 @@ beforeEach(() => {
   currentMeta = null
   currentMemberRole = undefined
   currentState = null
+  setDriveDerivedAccess(driveAccess('none'))
   // Default identity: the writer 'u_writer' with a resolvable display name.
   setOctoIdentity(
     stub({
@@ -175,6 +190,21 @@ describe('POST /api/v1/ppt/docs/collab-token (§7.1)', () => {
       expect((await post(base, { ...request, clientSessionId: undefined })).status).toBe(400)
     } finally { await close() }
   })
+  it('issues a reader relay ticket when Drive is the only Human access source', async () => {
+    seedDoc()
+    setDriveDerivedAccess(driveAccess('reader'))
+    const { base, close } = await listen(makeApp())
+    try {
+      const res = await post(base, { docId: 'd_ppt1', clientSessionId: '33333333-3333-4333-8333-333333333333' })
+      expect(res.status).toBe(200)
+      const body = (await res.json()) as { data: { role: string; ticket: string } }
+      expect(body.data.role).toBe('reader')
+      expect(verifyPptRelayTicket(body.data.ticket).role).toBe('reader')
+    } finally {
+      await close()
+    }
+  })
+
   it('PPT-TOKEN-001: issues token/ticket with role/epoch/pptWsUrl/documentName/snapshotVersion/name', async () => {
     seedDoc()
     currentMemberRole = 'writer'

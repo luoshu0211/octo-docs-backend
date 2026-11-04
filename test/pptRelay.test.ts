@@ -13,6 +13,7 @@ import { InMemoryPptRelayStore, type PptRelayStore, RetryableStorageError, canon
 import { isRetryable, STORAGE_RETRY_BACKOFF_MS, MAX_OP_CLOCK, OP_CLOCK_SLACK } from '../src/ppt/relay/frames.js'
 import { issuePptCollabToken, PPT_RELAY_TICKET_AUD } from '../src/auth/pptCollabToken.js'
 import type { ResolvedRole, Role } from '../src/permission/role.js'
+import type { CurrentAccess } from '../src/permission/resolveRole.js'
 import type { BentoDoc } from '../src/ppt/bentoDoc.js'
 
 /**
@@ -191,6 +192,7 @@ async function setup(
     store?: PptRelayStore
     limits?: Partial<RelayLimits>
     roleProvider?: (ctx: { uid: string; docId: string; documentName: string; spaceMember: boolean }) => Promise<ResolvedRole>
+    accessProvider?: (ctx: { uid: string; docId: string; documentName: string; spaceMember: boolean }) => Promise<CurrentAccess>
     epochProvider?: (documentName: string) => Promise<number>
     docStatusProvider?: (docId: string) => Promise<'live' | 'deleted'>
     baseDocProvider?: (docId: string) => Promise<import('../src/ppt/bentoDoc.js').BentoDoc | null>
@@ -207,6 +209,7 @@ async function setup(
     store,
     epochProvider: opts.epochProvider ?? (async () => liveEpoch),
     roleProvider: opts.roleProvider ?? (async ({ uid }) => roleMap.get(uid) ?? 'writer'),
+    ...(opts.accessProvider ? { accessProvider: opts.accessProvider } : {}),
     docStatusProvider: opts.docStatusProvider ?? (async () => docStatus),
     ...(opts.baseDocProvider ? { baseDocProvider: opts.baseDocProvider } : {}),
     ...(opts.onAgedOpDrop ? { onAgedOpDrop: opts.onAgedOpDrop } : {}),
@@ -849,6 +852,34 @@ describe('PPT relay: snapshot + GC + offline replay (PPT-COLLAB-003 / PPT-COLLAB
 })
 
 describe('PPT relay: negotiated live permissions', () => {
+  it('rechecks same-epoch Drive-only tickets before admitting a reader', async () => {
+    let currentAccess: CurrentAccess = {
+      role: 'reader',
+      permissionEpoch: 0,
+      sourceRevision: 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      proofExpiresAt: performance.now() + 15_000,
+      sourceConfirmed: true,
+    }
+    const h = await setup({
+      roleProvider: async () => 'none',
+      accessProvider: async () => currentAccess,
+    })
+    const reader = await h.connect({ uid: 'u_drive', role: 'reader' })
+    expect((await helloReady(reader)).ready).toMatchObject({ role: 'reader' })
+    reader.send(OPS_FRAME(1, 'drive-reader-write'))
+    expect((await reader.recv()).code).toBe('forbidden-role')
+
+    currentAccess = {
+      role: 'none',
+      permissionEpoch: 0,
+      sourceRevision: null,
+      proofExpiresAt: null,
+      sourceConfirmed: true,
+    }
+    const oldTicket = h.ticketFor({ uid: 'u_drive', role: 'reader', epoch: 0 })
+    const revoked = await h.connect({ uid: 'u_drive', role: 'reader', ticket: oldTicket })
+    expect((await revoked.closed).code).toBe(4403)
+  })
   it.each(['live', 'presence', 'cutover'] as const)('preserves queued %s sends across a proof freeze', async kind => {
     const h = await setup({ roleProvider: async ({ spaceMember }) => spaceMember ? 'reader' : 'none' })
     const ticket = (epoch: number) => jwt.sign({ uid: 'u_queue', docId: DOC, documentName: DOCNAME,

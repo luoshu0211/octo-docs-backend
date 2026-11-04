@@ -2,7 +2,8 @@ import { EventEmitter } from 'node:events'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import * as Y from 'yjs'
 import { Redis as HocuspocusRedis } from '@hocuspocus/extension-redis'
-import { Document, OutgoingMessage, type Hocuspocus } from '@hocuspocus/server'
+import { Connection, Document, MessageType, OutgoingMessage, type Hocuspocus } from '@hocuspocus/server'
+import { createDecoder, readVarString, readVarUint } from 'lib0/decoding'
 import { fenceRedisGenerations } from '../src/collab/generationRedis.js'
 import { bindStateGeneration } from '../src/collab/stateGeneration.js'
 import { captureDurableSnapshot, durableReceipt, recordDurableReceipt } from '../src/collab/durableReceipt.js'
@@ -13,6 +14,10 @@ import { createServer } from '../src/collab/server.js'
 vi.mock('../src/permission/connectionRegistry.js', () => ({ connectionRegistry: { register: vi.fn(), unregister: vi.fn() } }))
 vi.mock('../src/collab/compactionNotice.js', async importOriginal => ({
   ...await importOriginal<typeof import('../src/collab/compactionNotice.js')>(), noticeStaleCacheOnJoin: vi.fn(),
+}))
+
+vi.mock('../src/collab/compactionCluster.js', async importOriginal => ({
+  ...await importOriginal<typeof import('../src/collab/compactionCluster.js')>(), markLoaded: vi.fn(async () => undefined),
 }))
 
 const generation = '00000000-0000-4000-8000-000000000001'
@@ -127,16 +132,45 @@ describe('Redis generation receipts retained for later connections', () => {
     f.document.getMap('sheet').set('not-yet-committed', 99)
     const server = createServer(f.extension)
     cleanups.push(() => server.destroy())
-    const replay = vi.fn()
+    const context = { user: { id: 'later-user' }, permission_epoch: 1, cacheGeneration: generation, role: 'writer' }
+    const request = new Request('http://localhost/collaboration')
+    const loadHook = server.configuration.afterLoadDocument!
+    await loadHook({
+      instance: server.hocuspocus, document: f.document, documentName: name, context,
+      socketId: 'later-socket', requestHeaders: request.headers, requestParameters: new URLSearchParams(),
+      connectionConfig: { readOnly: false, isAuthenticated: true },
+    })
+    const received: string[] = []
+    const connection = new Connection({
+      readyState: 1,
+      close() {},
+      send(message) {
+        if (!(message instanceof Uint8Array)) throw new TypeError('Expected a binary collaboration frame')
+        const decoder = createDecoder(message)
+        const address = readVarString(decoder)
+        const type = readVarUint(decoder)
+        if (type === MessageType.Stateless) {
+          expect(address).toBe(name)
+          received.push(readVarString(decoder))
+        }
+      },
+    }, request, f.document, 'later-socket', context)
+    cleanups.push(async () => {
+      connection.close()
+      await server.configuration.beforeUnloadDocument!({
+        instance: server.hocuspocus, document: f.document, documentName: name,
+      })
+    })
+    expect(f.document.hasConnection(connection)).toBe(true)
+    const replay = vi.spyOn(connection, 'sendStateless')
     const hook = server.configuration.connected!
-    const data = { documentName: name, socketId: 'later-socket',
-      context: { user: { id: 'later-user' }, permission_epoch: 1, cacheGeneration: generation, role: 'writer' },
-      connection: { document: f.document, socketId: 'later-socket', sendStateless: replay },
-    } as unknown as Parameters<typeof hook>[0]
+    const data = { documentName: name, socketId: 'later-socket', context, connection,
+    } as Parameters<typeof hook>[0]
     await hook(data)
     expect(replay).toHaveBeenCalledTimes(1)
     expect(replay).toHaveBeenCalledWith(frame(peer))
-    const delivered = Y.decodeSnapshot(Buffer.from(JSON.parse(replay.mock.calls[0]![0]).snapshot, 'base64'))
+    expect(received).toEqual([frame(peer)])
+    const delivered = Y.decodeSnapshot(Buffer.from(JSON.parse(received[0]!).snapshot, 'base64'))
     expect(delivered.ds.clients.get(peer.clientID)).toEqual([{ clock: 0, len: 2 }])
     expect(delivered.sv.get(f.document.clientID) ?? 0).toBe(0)
   })

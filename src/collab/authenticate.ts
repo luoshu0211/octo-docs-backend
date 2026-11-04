@@ -1,9 +1,9 @@
 /**
  * onAuthenticate implementation (§4.1).
  *
- * Hot path: local JWT verify (CPU, no IO) + permission_epoch compare
- * (currentEpoch: Redis cache, miss -> DB singleflight) + role from claims.
- * Only the stale branch recheckCurrentRole hits doc_member + owner.
+ * Connection authentication verifies the token, reads current permission_epoch
+ * (Redis cache with DB singleflight on miss), and resolves the current effective
+ * role on every handshake so same-epoch Drive changes are not trusted from claims.
  *
  * Throws to reject the connection. The thrown Error.message encodes the WS
  * close-code semantics for the front-end (§8.2):
@@ -12,7 +12,7 @@
  */
 import { verifyCollabToken } from '../auth/collabToken.js'
 import { currentEpoch } from '../permission/epoch.js'
-import { recheckCurrentRoleCached } from '../permission/recheck.js'
+import { recheckCurrentAccess, type CurrentAccess } from '../permission/resolveRole.js'
 import { parseDocumentName } from '../permission/documentName.js'
 import type { Role } from '../permission/role.js'
 
@@ -41,6 +41,8 @@ export interface AuthContext {
   role: Role
   permission_epoch: number
   principal_space_id: string
+  source_access?: CurrentAccess
+  activeAccessDisposer?: () => void
   /**
    * (#64) Was this uid a member of the doc's Space at token issuance? Carried
    * from the collab token's optional `space_member` claim (absent => false,
@@ -91,34 +93,44 @@ export async function authenticate(data: AuthInput): Promise<AuthContext> {
     || claims.current_space_id === ''
   ) throw forbidden()
 
-  // 3. permission_epoch check (§4.5). MUST await — number < Promise is always
-  //    false and the stale branch would never run (P1-C).
+  // 3. permission_epoch is authoritative for Docs-owned ACL changes, but it does
+  //    not track Drive source changes. Re-resolve the effective role on every
+  //    handshake so a same-epoch token cannot preserve revoked derived access.
   let epoch: number
   try {
     epoch = await currentEpoch(documentName)
   } catch {
     throw unauthorized() // 4401 — authoritative source unconfirmable, fail-closed
   }
-  if (claims.permission_epoch < epoch) {
-    let currentRole
-    try {
-      currentRole = await recheckCurrentRoleCached(
-        documentName,
-        claims.uid,
-        claims.principal_space_id,
-        claims.space_member ?? false,
-      )
-    } catch {
-      throw unauthorized() // recheck unconfirmable => fail-closed (4401)
-    }
-    if (currentRole === 'none') throw forbidden() // 4403: fully revoked
-    throw unauthorized() // 4401: refreshable, front-end refreshes token
+
+  let currentAccess: CurrentAccess
+  try {
+    currentAccess = await recheckCurrentAccess(
+      documentName,
+      claims.uid,
+      claims.principal_space_id,
+      claims.space_member ?? false,
+    )
+  } catch {
+    throw unauthorized() // 4401 — current role unconfirmable
+  }
+  if (
+    currentAccess.sourceRevision !== null &&
+    (currentAccess.proofExpiresAt === null || currentAccess.proofExpiresAt <= performance.now())
+  ) throw unauthorized()
+  const currentRole = currentAccess.role
+  if (currentRole === 'none') {
+    if (!currentAccess.sourceConfirmed) throw unauthorized()
+    throw forbidden() // 4403: no current Docs or Drive access
+  }
+  if (claims.permission_epoch < epoch || currentRole !== claims.role) {
+    throw unauthorized() // 4401: refresh the token after any current-role change
   }
 
-  // 4. role from claims (no recompute).
+  // The signed role is safe to use only after the authoritative resolver
+  // confirms the same effective role.
   const role = claims.role
-
-  // 5. parse documentName for downstream routing. M2: whiteboard keys are now
+  // 4. parse documentName for downstream routing. M2: whiteboard keys are now
   //    SERVED here (no longer rejected) — both document and whiteboard kinds
   //    pass; only malformed keys are forbidden.
   let parsed
@@ -128,7 +140,7 @@ export async function authenticate(data: AuthInput): Promise<AuthContext> {
     throw forbidden() // 4403
   }
 
-  // 5b. v2 identity binding (remove-sp §7.3). A v2 token carries docId +
+  // 4b. v2 identity binding (remove-sp §7.3). A v2 token carries docId +
   //     homeSpaceId alongside documentName; bind them to the connection so the
   //     token cannot be replayed against a room whose canonical key disagrees
   //     with the identity it was minted for. Zero-IO: step 2 already proved
@@ -145,19 +157,20 @@ export async function authenticate(data: AuthInput): Promise<AuthContext> {
     }
   }
 
-  // 6. reader/commenter: set readOnly so body writes are rejected BEFORE being
+  // 5. reader/commenter: set readOnly so body writes are rejected BEFORE being
   //    applied (v4). A commenter may comment via the REST API but must not edit
   //    the doc body over the collab connection, so it is read-only here too.
   if (role === 'reader' || role === 'commenter') {
     connectionConfig.readOnly = true
   }
 
-  // 7. inject context for downstream hooks (kind-tagged). The trusted display
+  // 6. inject context for downstream hooks (kind-tagged). The trusted display
   //    name (resolved at issuance, §4.7(b)) rides along so beforeHandleAwareness
   //    can stamp the presence frame's user.name; uid stays the identity.
   const base = {
     user: { id: claims.uid, ...(claims.name ? { name: claims.name } : {}) },
     role,
+    source_access: currentAccess,
     permission_epoch: claims.permission_epoch,
     principal_space_id: claims.principal_space_id,
     // #64: carry the space-membership claim (absent => false) so the write
