@@ -37,7 +37,10 @@ ENV TYPST_EXPORT_FONT_PATH=/usr/share/fonts
 # Compile concurrency is capped in typstService.ts (TYPST_EXPORT_MAX_CONCURRENT,
 # default 2).
 ARG TYPST_VERSION=v0.13.1
-RUN apk add --no-cache --virtual .typst-fetch curl=8.22.0-r0 tar=1.35-r5 xz=5.8.4-r0 \
+# Alpine removes superseded curl security revisions from stable repositories;
+# keep the unaffected extraction tools pinned.
+# hadolint ignore=DL3018
+RUN apk add --no-cache --virtual .typst-fetch curl tar=1.35-r5 xz=5.8.4-r0 \
     && ARCH="$(uname -m)" \
     && case "$ARCH" in \
          x86_64) TARGET=x86_64-unknown-linux-musl ;; \
