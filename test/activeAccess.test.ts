@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest'
-import { invalidateActiveAccess, pollActiveAccess, registerActiveAccess, type ActiveAccessParticipant } from '../src/permission/activeAccess.js'
+import { beginActiveAccessRegistration, invalidateActiveAccess, pollActiveAccess, registerActiveAccess, type ActiveAccessParticipant } from '../src/permission/activeAccess.js'
 import { getDriveDerivedAccess, setDriveDerivedAccess, type DriveDerivedAccess } from '../src/drive/derivedAccessClient.js'
 import type { CurrentAccess } from '../src/permission/resolveRole.js'
 
@@ -81,10 +81,12 @@ function bindPrincipal(
   resolve: () => Promise<CurrentAccess>,
   sink: ActiveAccessParticipant,
 ): void {
-  disposers.push(registerActiveAccess({
+  const binding = {
     docId: 'd1', uid, principalSpaceId,
     documentName: `octo:${principalSpaceId}:f1:doc:d1`,
-  }, 7, initial, resolve, sink))
+  }
+  const registration = beginActiveAccessRegistration(binding)
+  disposers.push(registerActiveAccess(binding, 7, initial, resolve, sink, registration))
 }
 
 function participant(): ActiveAccessParticipant & ParticipantSpies {
@@ -97,9 +99,11 @@ function bind(
   resolve: () => Promise<CurrentAccess>,
   sink: ActiveAccessParticipant,
 ): void {
-  disposers.push(registerActiveAccess({
+  const binding = {
     docId: 'd1', uid, principalSpaceId: 's1', documentName: 'octo:s1:f1:doc:d1',
-  }, 7, initial, resolve, sink))
+  }
+  const registration = beginActiveAccessRegistration(binding)
+  disposers.push(registerActiveAccess(binding, 7, initial, resolve, sink, registration))
 }
 
 beforeEach(() => {

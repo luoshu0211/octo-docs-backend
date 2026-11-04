@@ -8,7 +8,7 @@ import { bindStateGeneration } from '../src/collab/stateGeneration.js'
 import { stateGenerationRepo } from '../src/db/repos/stateGenerationRepo.js'
 import { docMetaRepo } from '../src/db/repos/docMetaRepo.js'
 import { getDriveDerivedAccess, setDriveDerivedAccess, type DerivedAccessVersion, type DriveDerivedAccess } from '../src/drive/derivedAccessClient.js'
-import { invalidateActiveAccess, pollActiveAccess } from '../src/permission/activeAccess.js'
+import { beginActiveAccessRegistration, invalidateActiveAccess, pollActiveAccess } from '../src/permission/activeAccess.js'
 import { recheckCurrentAccess, recheckCurrentRole, type CurrentAccess } from '../src/permission/resolveRole.js'
 import { recheckCurrentRoleCached } from '../src/permission/recheck.js'
 import type { AuthContext } from '../src/collab/authenticate.js'
@@ -82,7 +82,7 @@ function fixture() {
   Y.applyUpdate(client, Y.encodeStateAsUpdate(document))
   client.getMap('sheet').set('incoming', 'must be authorized')
   const context: AuthContext = { user: { id: 'test-writer' }, role: 'writer', permission_epoch: 8,
-    principal_space_id: 'principal-space', space_member: false, kind: 'document', space: 'sync-authz',
+    principal_space_id: 'principal-space', activeAccessRegistration: null, space_member: false, kind: 'document', space: 'sync-authz',
     folder: 'f_default', doc: 'sheet', stateGeneration: generation, cacheGeneration: generation }
   const request = new Request('http://localhost/collaboration')
   const connection = new Connection({ readyState: 1, send: vi.fn() } as unknown as WebSocketLike,
@@ -383,7 +383,10 @@ function trackLiveYjsSessions(
   documents: Document[],
 ): void {
   cleanups.push(async () => {
-    for (const session of sessions) session.context.activeAccessDisposer?.()
+    for (const session of sessions) {
+      session.context.activeAccessRegistration?.release()
+      session.context.activeAccessDisposer?.()
+    }
     for (const session of sessions) session.connection.close()
     for (const document of documents) {
       await server.hocuspocus.hooks('beforeUnloadDocument', {
@@ -424,6 +427,11 @@ function makeCurrentContext(uid: string, docId: string, state: CurrentAccess): A
     permission_epoch: CURRENT_EPOCH,
     principal_space_id: 'principal-space',
     source_access: state,
+    activeAccessRegistration: beginActiveAccessRegistration({
+      docId,
+      uid,
+      principalSpaceId: 'principal-space',
+    }),
     space_member: false,
     kind: 'document',
     space: 'source-expiry',

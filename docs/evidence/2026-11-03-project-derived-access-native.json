@@ -1,5 +1,29 @@
 {
   "scope": "Isolated native Server, Go Drive and two Docs processes with real Yjs/PPT sessions; no deployment",
+  "registration_source_transition_review": {
+    "scope": "Actual PPT relay over loopback WebSocket; synthetic source authority and epoch metadata, in-memory operation store. No deployment or new cross-service integration run.",
+    "handshake_invalidation_regression": "Yjs source invalidation between authority lookup and addConnection suppresses initial awareness; independent same-document UID remains readable.",
+    "share_expired": true,
+    "drive_reader_received_after_expiry": true,
+    "source_notice_sent": false,
+    "source_revision_probe_closed_code": 4403,
+    "independent_writer_still_open": true,
+    "no_post_revocation_frames": true,
+    "verification": {
+      "node": "22.22.2",
+      "test_files_passed": 312,
+      "test_files_skipped": 9,
+      "tests_passed": 4603,
+      "tests_skipped": 72,
+      "typescript_projects_passed": 3,
+      "changed_typescript_lint_passed": true,
+      "repository_lint": {
+        "errors": 4,
+        "warnings": 3,
+        "error_files_unmodified_in_this_review": true
+      }
+    }
+  },
   "doc_epoch_observation": {
     "yjs": 3,
     "ppt": 3,

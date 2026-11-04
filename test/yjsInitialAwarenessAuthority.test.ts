@@ -140,7 +140,9 @@ async function fixture(options: { sourceBytes?: number } = {}) {
     server.hocuspocus.documents.clear()
     for (const document of documents) {
       for (const connection of document.getConnections()) {
-        (connection.context as AuthContext | undefined)?.activeAccessDisposer?.()
+        const context = connection.context as AuthContext | undefined
+        context?.activeAccessRegistration?.release()
+        context?.activeAccessDisposer?.()
       }
     }
     for (const peer of peers) peer.handleClose()
@@ -153,13 +155,13 @@ async function fixture(options: { sourceBytes?: number } = {}) {
     }
     await server.destroy()
   })
-  function peer() {
+  function peer(uid = UID) {
     const capture = socketCapture()
     const client = server.hocuspocus.handleConnection(capture.socket, new Request('http://localhost/collaboration'))
     peers.push(client)
     function authenticate(address: string) {
       const documentName = address.split('\0', 1)[0]!
-      const token = signCollabToken({ uid: UID, documentName, role: 'reader', permission_epoch: 0,
+      const token = signCollabToken({ uid, documentName, role: 'reader', permission_epoch: 0,
         principal_space_id: SPACE, current_space_verified: true, current_space_id: SPACE }).token
       client.handleMessage(frame(address, MessageType.Auth, encoder => {
         writeVarUint(encoder, 0)
@@ -179,26 +181,29 @@ async function fixture(options: { sourceBytes?: number } = {}) {
     }
     return { ...capture, client, authenticate, settled }
   }
-  async function assertIndependentSync(p: ReturnType<typeof peer>) {
+  async function assertDocumentSync(p: ReturnType<typeof peer>, address: string, expectedText: string) {
     const replica = new Y.Doc()
     try {
-      p.client.handleMessage(frame(independentName, MessageType.Sync, encoder => {
+      p.client.handleMessage(frame(address, MessageType.Sync, encoder => {
         writeVarUint(encoder, 0)
         writeVarUint8Array(encoder, Y.encodeStateVector(replica))
       }))
       await vi.waitFor(() => {
         for (const message of p.sent) {
           const decoder = createDecoder(message)
-          if (readVarString(decoder) !== independentName || readVarUint(decoder) !== MessageType.Sync) continue
+          if (readVarString(decoder) !== address || readVarUint(decoder) !== MessageType.Sync) continue
           const type = readVarUint(decoder)
           if (type === 1 || type === 2) Y.applyUpdate(replica, readVarUint8Array(decoder))
         }
-        expect(replica.getMap('content').get('text')).toBe('independent document')
+        expect(replica.getMap('content').get('text')).toBe(expectedText)
       })
       expect(p.isOpen()).toBe(true)
     } finally { replica.destroy() }
   }
-  return { server, name, docId, independentName, peer, assertIndependentSync }
+  async function assertIndependentSync(p: ReturnType<typeof peer>) {
+    await assertDocumentSync(p, independentName, 'independent document')
+  }
+  return { server, name, docId, independentName, peer, assertDocumentSync, assertIndependentSync }
 }
 
 describe('native Hocuspocus initial-awareness source authority', () => {
@@ -283,6 +288,74 @@ describe('native Hocuspocus initial-awareness source authority', () => {
       }
     },
   )
+  it('rechecks a source handshake invalidated before binding while preserving an independent same-document reader', async () => {
+    const f = await fixture()
+    const sourceResult = deferred<CurrentAccess>()
+    const sourceStarted = deferred<void>()
+    let sourceChecks = 0
+    vi.mocked(recheckCurrentAccess).mockImplementation(async (documentName, uid) => {
+      if (documentName !== f.name) return access(false)
+      if (uid !== UID) return access(false)
+      if (++sourceChecks === 1) return access()
+      sourceStarted.resolve()
+      return sourceResult.promise
+    })
+
+    const independent = f.peer('u_independent')
+    independent.authenticate(f.name)
+    await independent.settled(f.name)
+
+    const ensureEntered = deferred<void>()
+    const ensureResult = deferred<null>()
+    vi.mocked(stateGenerationRepo.ensureSheet).mockImplementationOnce(async () => {
+      ensureEntered.resolve()
+      return ensureResult.promise
+    })
+    const joining = f.peer()
+    const address = `${f.name}\0late-source-reader`
+    try {
+      joining.authenticate(address)
+      await ensureEntered.promise
+      // No source binding exists for this uid yet: the notification lands after
+      // authenticate's proof lookup but before afterLoadDocument registers it.
+      invalidateActiveAccess(f.docId, SPACE)
+      ensureResult.resolve(null)
+      await joining.settled(address)
+      expect(awarenessStates(joining.sent, address)).toEqual([])
+      await vi.waitFor(() => expect(sourceChecks).toBe(2), { timeout: 1_000 })
+      await sourceStarted.promise
+      const replica = new Y.Doc()
+      try {
+        joining.client.handleMessage(frame(address, MessageType.Sync, encoder => {
+          writeVarUint(encoder, 0)
+          writeVarUint8Array(encoder, Y.encodeStateVector(replica))
+        }))
+        const { promise, resolve } = Promise.withResolvers<void>()
+        setImmediate(resolve)
+        await promise
+        for (const message of joining.sent) {
+          const decoder = createDecoder(message)
+          if (readVarString(decoder) !== address || readVarUint(decoder) !== MessageType.Sync) continue
+          const type = readVarUint(decoder)
+          if (type === 1 || type === 2) Y.applyUpdate(replica, readVarUint8Array(decoder))
+        }
+        expect(replica.getMap('content').get('text')).toBeUndefined()
+      } finally {
+        replica.destroy()
+      }
+      await f.assertDocumentSync(independent, f.name, 'source document')
+
+      sourceResult.resolve(access(false, 'none'))
+      await vi.waitFor(() => {
+        expect(addressedFrames(joining.sent, address, MessageType.CLOSE)).not.toHaveLength(0)
+      })
+      await f.assertDocumentSync(independent, f.name, 'source document')
+    } finally {
+      ensureResult.resolve(null)
+      sourceResult.resolve(access(false, 'none'))
+    }
+  })
+
 })
 
 describe('frozen logical-connection send queue bounds', () => {

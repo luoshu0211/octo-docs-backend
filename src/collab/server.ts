@@ -432,10 +432,16 @@ export function createServer(redis = createCollabRedis(config.redis)) {
         documentName: data.documentName,
         connectionConfig: data.connectionConfig,
       })
-      ctx.stateGeneration = await stateGenerationRepo.ensureSheet(data.documentName)
-      ctx.cacheGeneration = envelope.generation
-      if (ctx.stateGeneration && ctx.cacheGeneration !== ctx.stateGeneration) data.connectionConfig.readOnly = true
-      return ctx
+      try {
+        ctx.stateGeneration = await stateGenerationRepo.ensureSheet(data.documentName)
+        ctx.cacheGeneration = envelope.generation
+        if (ctx.stateGeneration && ctx.cacheGeneration !== ctx.stateGeneration) data.connectionConfig.readOnly = true
+        return ctx
+      } catch (error) {
+        ctx.activeAccessRegistration?.release()
+        ctx.activeAccessRegistration = null
+        throw error
+      }
     },
 
     async beforeSync(data) {
@@ -520,6 +526,8 @@ export function createServer(redis = createCollabRedis(config.redis)) {
     async onDisconnect(data) {
       const ctx = data.context as AuthContext | undefined
       if (ctx) {
+        ctx.activeAccessRegistration?.release()
+        ctx.activeAccessRegistration = null
         ctx.activeAccessDisposer?.()
         ctx.activeAccessDisposer = undefined
         await connectionRegistry.unregister(data.documentName, data.socketId)
@@ -580,13 +588,20 @@ export function createServer(redis = createCollabRedis(config.redis)) {
         const ctx = connection.context as AuthContext | undefined
         const docId = ctx?.doc ?? ctx?.board
         if (ctx?.source_access && docId) {
+          const registration = ctx.activeAccessRegistration
+          if (registration === null) throw new Error('Active access registration lease missing')
           ctx.activeAccessDisposer = registerActiveAccess(
             { docId, uid: ctx.user.id, principalSpaceId: ctx.principal_space_id, documentName: data.documentName },
             ctx.source_access.permissionEpoch ?? ctx.permission_epoch,
             ctx.source_access,
             () => recheckCurrentAccess(data.documentName, ctx.user.id, ctx.principal_space_id, ctx.space_member),
             gateYjsConnection(connection, ctx),
+            registration,
           )
+          ctx.activeAccessRegistration = null
+        } else {
+          ctx?.activeAccessRegistration?.release()
+          if (ctx) ctx.activeAccessRegistration = null
         }
         return data.document
       }

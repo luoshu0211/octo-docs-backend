@@ -12,6 +12,16 @@ const MAX_VERSION_BATCH = 50
 
 export interface ActiveAccessState extends CurrentAccess { permissionEpoch: number }
 export type ActiveAccessResolver = () => Promise<CurrentAccess>
+export interface ActiveAccessRegistrationLease {
+  readonly invalidated: boolean
+  release(): void
+}
+
+interface PendingRegistration {
+  binding: DerivedAccessBinding
+  invalidated: boolean
+}
+
 
 export interface ActiveAccessParticipant {
   /** Synchronously stop all document-content delivery before a source check. */
@@ -39,6 +49,18 @@ interface BindingRecord {
 }
 
 const bindings = new Map<string, BindingRecord>()
+const pendingRegistrations = new Set<PendingRegistration>()
+
+/** Track only handshakes awaiting source lookup or live-binding registration. */
+export function beginActiveAccessRegistration(binding: DerivedAccessBinding): ActiveAccessRegistrationLease {
+  const pending: PendingRegistration = { binding, invalidated: false }
+  pendingRegistrations.add(pending)
+  return {
+    get invalidated() { return pending.invalidated },
+    release() { pendingRegistrations.delete(pending) },
+  }
+}
+
 let pollTimer: NodeJS.Timeout | undefined
 let pollInProgress = false
 
@@ -140,7 +162,10 @@ export function registerActiveAccess(
   initial: CurrentAccess,
   resolve: ActiveAccessResolver,
   participant: ActiveAccessParticipant,
+  registration: ActiveAccessRegistrationLease,
 ): () => void {
+  const invalidated = registration.invalidated
+  registration.release()
   const key = bindingKey(binding)
   const state: ActiveAccessState = { ...initial, permissionEpoch }
   let record = bindings.get(key)
@@ -148,28 +173,36 @@ export function registerActiveAccess(
     record.binding = binding
     record.resolve = resolve
     record.participants.add(participant)
-    const nextState = stateForRegistration(record, state)
-    if (record.refreshing) {
-      const sameEpochIndependent = state.permissionEpoch === record.state.permissionEpoch &&
-        state.sourceConfirmed && state.sourceRevision === null
-      const sameEpochSourceChange = state.permissionEpoch === record.state.permissionEpoch &&
-        state.sourceConfirmed && state.sourceRevision !== null &&
-        state.sourceRevision !== record.state.sourceRevision
-      const newerEpoch = state.permissionEpoch > record.state.permissionEpoch
-      if (sameEpochIndependent || sameEpochSourceChange || newerEpoch) {
-        // A fresh independent/source-changed result or a newer Docs epoch
-        // supersedes an older in-flight source result. Same-epoch/same-source
-        // registration does not extend the shared Drive proof; let its existing
-        // refresh decide.
-        record.generation++
-        record.refreshing = false
-        resume(record, nextState)
-      } else {
-        participant.freeze()
-      }
+    if (invalidated) {
+      // The notice already started this shared binding's recheck, or another
+      // stale handshake created it and started one. Do not publish this
+      // handshake's pre-notice initial result over that authority.
+      if (record.refreshing) participant.freeze()
+      else participant.resume(record.state)
     } else {
-      record.generation++
-      resume(record, nextState)
+      const nextState = stateForRegistration(record, state)
+      if (record.refreshing) {
+        const sameEpochIndependent = state.permissionEpoch === record.state.permissionEpoch &&
+          state.sourceConfirmed && state.sourceRevision === null
+        const sameEpochSourceChange = state.permissionEpoch === record.state.permissionEpoch &&
+          state.sourceConfirmed && state.sourceRevision !== null &&
+          state.sourceRevision !== record.state.sourceRevision
+        const newerEpoch = state.permissionEpoch > record.state.permissionEpoch
+        if (sameEpochIndependent || sameEpochSourceChange || newerEpoch) {
+          // A fresh independent/source-changed result or a newer Docs epoch
+          // supersedes an older in-flight source result. Same-epoch/same-source
+          // registration does not extend the shared Drive proof; let its existing
+          // refresh decide.
+          record.generation++
+          record.refreshing = false
+          resume(record, nextState)
+        } else {
+          participant.freeze()
+        }
+      } else {
+        record.generation++
+        resume(record, nextState)
+      }
     }
   } else {
     record = {
@@ -184,6 +217,7 @@ export function registerActiveAccess(
       probing: false,
     }
     bindings.set(key, record)
+    if (invalidated) void refresh(record)
   }
 
   return () => {
@@ -197,12 +231,17 @@ export function registerActiveAccess(
   }
 }
 
-/** Revalidate only active bindings matching a Drive source-change notice. */
+/** Revalidate active bindings and in-flight handshakes matching a source-change notice. */
 export function invalidateActiveAccess(
   docId: string,
   principalSpaceId: string,
   uid?: string,
 ): void {
+  for (const pending of pendingRegistrations) {
+    if (pending.binding.docId !== docId || pending.binding.principalSpaceId !== principalSpaceId) continue
+    if (uid !== undefined && pending.binding.uid !== uid) continue
+    pending.invalidated = true
+  }
   for (const record of bindings.values()) {
     if (record.binding.docId !== docId || record.binding.principalSpaceId !== principalSpaceId) continue
     if (uid !== undefined && record.binding.uid !== uid) continue

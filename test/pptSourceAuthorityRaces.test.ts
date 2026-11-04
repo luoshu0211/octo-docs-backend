@@ -1,6 +1,7 @@
 // Env seeding MUST be first so config/env.ts reads it at load time.
 import './helpers/pptRelayEnv.js'
 
+
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createServer, type Server as HttpServer } from 'node:http'
 import type { AddressInfo } from 'node:net'
@@ -11,10 +12,21 @@ import { config } from '../src/config/env.js'
 import { PPT_RELAY_TICKET_AUD } from '../src/auth/pptCollabToken.js'
 import { InMemoryPptRelayStore } from '../src/ppt/relay/store.js'
 import { PptRelay, type PptRelayDeps, type RelayLimits } from '../src/ppt/relay/pptRelay.js'
-import { invalidateActiveAccess } from '../src/permission/activeAccess.js'
+import { invalidateActiveAccess, pollActiveAccess } from '../src/permission/activeAccess.js'
+import { getDriveDerivedAccess, setDriveDerivedAccess, type DriveDerivedAccess } from '../src/drive/derivedAccessClient.js'
 import type { CurrentAccess } from '../src/permission/resolveRole.js'
 import type { ResolvedRole, Role } from '../src/permission/role.js'
 import { effectiveRole, SHARE_ROLE_EDIT, SHARE_SCOPE_ANYONE } from '../src/permission/shareScope.js'
+const activeAccessMocks = vi.hoisted(() => ({
+  getEpochsByDocIds: vi.fn(async (docIds: readonly string[]) =>
+    docIds.map(doc_id => ({ doc_id, document_name: '', permission_epoch: 0, status: 1 }))),
+}))
+
+vi.mock('../src/db/repos/docMetaRepo.js', () => ({
+  docMetaRepo: { getEpochsByDocIds: activeAccessMocks.getEpochsByDocIds },
+}))
+
+const originalDriveAccess = getDriveDerivedAccess()
 
 const DOC = 'd_ppt_source_authority'
 const DOCNAME = 'octo:s_1:f_default:ppt:d_ppt_source_authority'
@@ -140,6 +152,8 @@ async function setup(options: SetupOptions = {}): Promise<Harness> {
 
 afterEach(async () => {
   while (harnesses.length > 0) await harnesses.pop()!.close()
+  activeAccessMocks.getEpochsByDocIds.mockClear()
+  setDriveDerivedAccess(originalDriveAccess)
   vi.clearAllTimers()
   vi.useRealTimers()
   vi.restoreAllMocks()
@@ -337,8 +351,9 @@ describe('PPT relay source-authority races', () => {
     const h = await setup({
       limits: { authRefreshMs: 60_000, heartbeatIntervalMs: 60_000, reauthGraceMs: 200 },
       roleProvider: async () => 'none',
-      accessProvider: async () => {
+      accessProvider: async ({ spaceMember }) => {
         if (++reads === 1) return sourceAccess('writer', 0, performance.now() + 60_000)
+        if (!spaceMember) return independentAccess('none')
         sourceStarted.resolve()
         const result = await sourceResult.promise
         sourceReturned.resolve()
@@ -453,7 +468,9 @@ describe('PPT relay source-authority races', () => {
       roleProvider: async ({ uid, spaceMember }) => uid === 'u_share_writer'
         ? spaceMember ? 'writer' : 'none'
         : 'writer',
-      accessProvider: async ({ uid }) => uid === 'u_share_writer' ? shareAccess : directWriter,
+      accessProvider: async ({ uid, spaceMember }) => uid === 'u_share_writer'
+        ? spaceMember ? shareAccess : independentAccess('none')
+        : directWriter,
     })
     const expiry = Math.floor(Date.now() / 1000) + 3_600
     const share = await h.connect({ uid: 'u_share_writer', role: 'writer', spaceMember: true, expSeconds: expiry })
@@ -660,5 +677,89 @@ describe('PPT relay source-authority races', () => {
     share.send(opsFrame(2, 'write-after-direct-grant-withdrawn'))
     expect(await outcome).toEqual({ kind: 'closed', code: 4403 })
     expect(await h.store.currentSeq(DOC)).toBe(1)
+  })
+  it('registers Drive proof after share expiry so a lost notice is found by the shared source probe', async () => {
+    let now = 1_000
+    vi.spyOn(performance, 'now').mockImplementation(() => now)
+    const revisionA = `sha256:${'a'.repeat(64)}`
+    let driveRevision = revisionA
+    let sourceRevoked = false
+    let firstExpiredResolution = true
+    const expiredProof = deferred<CurrentAccess>()
+    const proofExpiresAt = 61_000
+    setDriveDerivedAccess({
+      derivedAccess: async () => null,
+      versions: async bindings => bindings.map(binding => ({
+        ...binding,
+        sourceRevision: driveRevision,
+        validForMs: 60_000,
+        expiresAt: now + 60_000,
+      })),
+    } satisfies DriveDerivedAccess)
+
+    const sourceAccessFor = (role: ResolvedRole, sourceRevision: string): CurrentAccess => ({
+      role,
+      permissionEpoch: 0,
+      sourceRevision,
+      proofExpiresAt,
+      sourceConfirmed: true,
+    })
+    const h = await setup({
+      roleProvider: async ({ uid }) => uid === 'u_share_reader' ? 'reader' : 'writer',
+      accessProvider: async ({ uid, spaceMember }) => {
+        if (uid !== 'u_share_reader') return independentAccess('writer')
+        if (spaceMember) return independentAccess('reader')
+        if (firstExpiredResolution) {
+          firstExpiredResolution = false
+          return expiredProof.promise
+        }
+        return sourceRevoked ? sourceAccessFor('none', driveRevision) : sourceAccessFor('reader', driveRevision)
+      },
+    })
+    const expiry = Math.floor(Date.now() / 1_000) + 3_600
+    const reader = await h.connect({ uid: 'u_share_reader', role: 'reader', spaceMember: true, expSeconds: expiry })
+    const writer = await h.connect({ uid: 'u_independent_writer', role: 'writer', expSeconds: expiry + 3_600 })
+    await helloReady(reader)
+    await helloReady(writer)
+    const { internal, conn } = connectionFor(h.relay, 'u_share_reader')
+
+    let expiryCheck: Promise<void> | undefined
+    try {
+      vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] })
+      vi.setSystemTime(new Date(expiry * 1_000 + 1))
+      expiryCheck = internal.expireShareMembership(conn)
+      await turn()
+
+      const pendingFrameStart = reader.frames.length
+      expect(await sendAndAck(writer, opsFrame(1, 'drive-reader-after-membership-expiry')))
+        .toMatchObject({ ctl: 'ack', q: 1 })
+      await turn()
+      expect(reader.frames.slice(pendingFrameStart).some(frame => frame.ctl === 'op')).toBe(false)
+
+      expiredProof.resolve(sourceAccessFor('reader', revisionA))
+      await expiryCheck
+      expect(await reader.waitFor(frame => frame.ctl === 'op' && frame.q === 1))
+        .toMatchObject({ ctl: 'op', q: 1 })
+
+      // The Server→Docs notice is dropped. A changed Drive source revision is
+      // discovered by the ordinary aggregate probe; the complete resolver then
+      // confirms the last read source is gone and the socket must stop receiving.
+      driveRevision = `sha256:${'b'.repeat(64)}`
+      sourceRevoked = true
+      await pollActiveAccess()
+      await vi.waitFor(() => expect(reader.closeInfo?.code).toBe(4403))
+
+      const start = reader.frames.length
+      expect(await sendAndAck(writer, opsFrame(2, 'writer-after-source-revocation')))
+        .toMatchObject({ ctl: 'ack', q: 2 })
+      await turn()
+      expect(reader.frames.slice(start).some(frame => frame.ctl === 'op')).toBe(false)
+      expect(writer.ws.readyState).toBe(WebSocket.OPEN)
+    } finally {
+      expiredProof.resolve(sourceAccessFor('reader', revisionA))
+      await expiryCheck
+      now = 1_000
+    }
+
   })
 })

@@ -71,6 +71,10 @@ Yjs 普通文档、表格、白板以及 PPT 的真实读/票据入口都复用�
 
 通知/探测可以在异步重验过程中到达。结果提交时比较绑定 generation 与所依据的文档/source 版本；较旧结果不能覆盖较新失效或重新开放连接。刷新期间，同 epoch 的 source-independent 权威状态或 sourceRevision 变化，或更高 Docs epoch，可隔离较旧 in-flight 结果；同 epoch、同 source 的注册不能延长既有 Drive proof 截止时间。断连、文档卸载及进程关闭时移除绑定；多个相同绑定的连接共享查询但分别执行投递门禁。
 
+来源查权前取得在途注册 lease，失效提示同时标记尚未登记的匹配握手。Yjs 将 lease 从认证传至文档初始化和 addConnection；PPT 初连、reauth、分享 membership 到期查权也覆盖相同间隙。登记时消费 lease：已被标记的旧结果先冻结并重新查权，不先发送构造 awareness；认证、初始化失败和断开时释放未消费的 lease。只跟踪当前在途注册，沿用既有共享绑定探测。
+
+PPT 分享 membership 到期后先停止使用旧 claim 并冻结投递，再由统一 accessProvider 确认当前独立或 Drive 来源。仍可读时以完整 CurrentAccess（sourceRevision、证明期限及来源确认状态）替换活跃绑定；转为 Drive reader 后仍纳入批量来源探测。需要刷新 membership 的连接沿既有 reauth grace 处理，旧来源结果不能覆盖较新的票据或独立授权。
+
 Yjs 冻结连接的待发送队列复用现有 `config.ppt.relay.maxLiveBufferFrames/maxLiveBufferBytes`（`PPT_RELAY_MAX_LIVE_BUFFER_FRAMES` / `PPT_RELAY_MAX_LIVE_BUFFER_BYTES`）；超限丢弃待投递内容并以 4401 关闭该逻辑连接，不关闭同一物理 WebSocket 上的其他文档连接，不新增环境变量。
 
 PPT 复用现有 read-auth refresh、canPushRead、terminalClose 等机制；来源结果的恢复和关闭都必须持有当前 source-freeze/auth generation，不能覆盖较新的独立授权或票据重认证等待。Yjs 在 afterLoadDocument 为每个文档实例的公开 addConnection 注册边界安装逐逻辑连接发送门禁，并同步加入活跃绑定，使原生构造函数的首次 awareness 也受证明截止时间及共享绑定冻结约束；不等到 connected 才安装。构造期间若需关闭，先同步阻断内容和写入，再在 microtask 关闭逻辑连接，让原生路由和断连回调完成清理，同一物理 WebSocket 的其他文档不受影响。Redis registry 用于定位，不是权限权威；任何单个节点收到 HTTP 并不等于集群所有连接已处理。
@@ -89,13 +93,17 @@ PPT 复用现有 read-auth refresh、canPushRead、terminalClose 等机制；来
 2. 新 HTTP、旧同 epoch token 重连、现存 Yjs/PPT reader 均收敛；被动 reader 不发入站消息也能被撤权，关闭后不继续收到广播/replay/快照。
 3. 分别丢 Server 提示、Drive→Docs 请求、Redis 广播；只有文档 epoch 不变的 Project 撤权也能被来源指纹发现。再删掉最后挂载，不能因源集合为空漏检。
 4. 预热各层缓存，保持 Project epoch 不变后停用来源账号，验证成员快照到期不再授权；仅版本相等不能延长旧事实。源故障时有限期依赖权到期，独立授权保留。
-5. 失效发生在重验 await 中、探测响应乱序、退出再邀请、多个 Project/Space 混用，旧结果均不能重新开放当前无权连接。
+5. 失效发生在重验 await 中、探测响应乱序、退出再邀请、多个 Project/Space 混用，旧结果均不能重新开放当前无权连接。握手查权与绑定登记之间撤权时，不发送首次 awareness，另一 UID 的独立授权连接保持正常；PPT 分享到期切换到 Drive reader 后，即使丢失通知，来源探测仍关闭已撤权连接。
 6. PPT Human 的实际读取、collab-token、评论读取接口返回 Drive reader；Drive 来源不能写正文、表格、白板、PPT、评论、成员/share、导入或恢复版本。
 7. 多副本、服务重启、重复标签页及通知突发时按文档/绑定聚合，无每连接五秒完整查权或 N+1 源查询。正常依赖与故障证明到期分别计时，单测不能代替真实协作连接联合验收。
 
 ## 依赖与交付
 
-依赖 Drive 完整判定的同快照 revision/有效期、新批量来源版本 API、提交后的变化提示，以及 Server 的真实成员/epochs/账号缓存时间界限。Docs 本地端点、批量重验、连接闭环、短期角色缓存失效与 in-flight generation 隔离已实现；生产 PPT 活跃连接复用同一 5 秒绑定探测。最新全量回归通过 312 个测试文件、4615 条测试，另跳过 9 个文件、58 条测试；三个 TypeScript 检查通过。真实 Server、Go Drive、双节点 Docs、MySQL/PostgreSQL/Redis 联查的十个 Yjs/PPT 场景通过：覆盖通知链路分别丢失、最后挂载移除、隔离账号停用及真实 Drive 进程故障。被动 reader 基线后不发送应用消息；撤权后不再收到三次实际协作更新，独立授权及其他 UID/Space 的 reader 继续接收。旧同 epoch token 重连、新 HTTP/ticket 均同步拒绝；Doc epoch 全程未因来源变化而增加。账号停用采用隔离库故障注入，不作为账号管理接口验收。负载形态及逐连接结果记录于 `../evidence/2026-11-03-project-derived-access-native.json`，不是生产容量基准或部署证明。
+依赖 Drive 完整判定的同快照 revision/有效期、新批量来源版本 API、提交后的变化提示，以及 Server 的真实成员/epochs/账号缓存时间界限。Docs 本地端点、批量重验、连接闭环、短期角色缓存失效与 in-flight generation 隔离已实现；生产 PPT 活跃连接复用同一 5 秒绑定探测。本轮 Node 22.22.2 全量回归通过 312 个测试文件、4603 条测试，另跳过 9 个文件、72 条测试；三个 TypeScript 检查通过。既有真实 Server、Go Drive、双节点 Docs、MySQL/PostgreSQL/Redis 联查的十个 Yjs/PPT 场景记录继续保留：覆盖通知链路分别丢失、最后挂载移除、隔离账号停用及真实 Drive 进程故障。被动 reader 基线后不发送应用消息；撤权后不再收到三次实际协作更新，独立授权及其他 UID/Space 的 reader 继续接收。旧同 epoch token 重连、新 HTTP/ticket 均同步拒绝；Doc epoch 全程未因来源变化而增加。账号停用采用隔离库故障注入，不作为账号管理接口验收。负载形态及逐连接结果记录于 `../evidence/2026-11-03-project-derived-access-native.json`，不是生产容量基准或部署证明。
+
+本轮新增握手登记竞态及 PPT 来源切换回归，并用真实 PPT Relay/物理 WebSocket 验证：分享到期后仍以 Drive reader 接收内容，撤权不发送通知时由版本探测关闭 4403，随后独立 writer 仍可写、被关闭连接不再收取新帧。此轮烟测的来源权威及 epoch 为合成输入，操作存储为内存实现，不等同于再次执行跨服务或多节点联调。
+
+本轮修改的 TypeScript 文件 ESLint 通过。全仓 ESLint 仍有四个基线错误、三个警告，错误文件均未在本轮修改；全量测试和类型检查通过不等同于仓内全部静态门禁通过。
 
 DRIVE_DERIVED_ENABLED 默认关闭，既有内部地址、双向凭据和相关时间上界必须正确配置后才启用；不得把默认值当作生产已生效。服务间基线和错误语义由各权威规格管理，不把权限消息当内容同步。
 

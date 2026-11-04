@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { once } from 'node:events'
 import { createApp } from '../src/api/app.js'
 import { config } from '../src/config/env.js'
-import { registerActiveAccess, type ActiveAccessParticipant } from '../src/permission/activeAccess.js'
+import { beginActiveAccessRegistration, registerActiveAccess, type ActiveAccessParticipant } from '../src/permission/activeAccess.js'
 import type { CurrentAccess } from '../src/permission/resolveRole.js'
 import { consumeLocalSourceInvalidationEcho } from '../src/permission/epoch.js'
 import { recheckCurrentRoleCached } from '../src/permission/recheck.js'
@@ -113,16 +113,18 @@ describe('POST /internal/docs/source-invalidations', () => {
       resume: vi.fn(),
       close: vi.fn(),
     } satisfies ActiveAccessParticipant
-    const dispose = registerActiveAccess({
+    const binding = {
       docId: 'd_source_changed',
       uid: 'u_source',
       principalSpaceId: 's1',
       documentName: 'octo:s1:f1:doc:d_source_changed',
-    }, 12, state, async () => ({
+    }
+    const registration = beginActiveAccessRegistration(binding)
+    const dispose = registerActiveAccess(binding, 12, state, async () => ({
       ...state,
       role: 'none',
       sourceRevision: `sha256:${'b'.repeat(64)}`,
-    }), reader)
+    }), reader, registration)
     const { base, close } = await listen()
     try {
       const response = await fetch(`${base}/internal/docs/source-invalidations`, {
