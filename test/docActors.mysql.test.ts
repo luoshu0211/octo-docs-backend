@@ -57,6 +57,12 @@ let baseUrl: string
 let collabServer: CollabServer | undefined
 const driveDerivedDocs = new Set<string>()
 
+function derivedProof(docId: string, uid: string, principalSpaceId: string) {
+  return driveDerivedDocs.has(docId) && uid === 'reader_uid' && principalSpaceId === 'space-a'
+    ? { docId, uid, principalSpaceId, role: 'reader' as const, sourceRevision: 'test-revision', validForMs: 30_000, expiresAt: performance.now() + 30_000 }
+    : null
+}
+
 async function request(path: string, options: RequestOptions) {
   const response = await fetch(`${baseUrl}${path}`, {
     method: options.method ?? 'GET',
@@ -157,8 +163,8 @@ mysqlDescribe('OCTO-233 Docs actor wire and authenticated write behavior', () =>
       isSpaceMember: async (_uid: string, spaceId: string) => spaceId === 'space-a' || spaceId === 'space-b',
     } as unknown as OctoIdentity)
     setDriveDerivedAccess({
-      derivedRole: async (docId, uid, principalSpaceId) =>
-        driveDerivedDocs.has(docId) && uid === 'reader_uid' && principalSpaceId === 'space-a' ? 'reader' : 'none',
+      derivedAccess: async (docId, uid, principalSpaceId) => derivedProof(docId, uid, principalSpaceId),
+      versions: async () => null,
     })
     collabServer = createCollabServer({} as never)
 
@@ -170,7 +176,7 @@ mysqlDescribe('OCTO-233 Docs actor wire and authenticated write behavior', () =>
   afterAll(async () => {
     if (appServer) await new Promise<void>((resolve) => appServer.close(() => resolve()))
     await collabServer?.destroy()
-    setDriveDerivedAccess({ derivedRole: async () => 'none' })
+    setDriveDerivedAccess({ derivedAccess: async () => null, versions: async () => null })
     await closePool()
   })
 
@@ -394,16 +400,15 @@ mysqlDescribe('OCTO-233 Docs actor wire and authenticated write behavior', () =>
     for (const doc of docs) driveDerivedDocs.add(doc.docId)
 
     setDriveDerivedAccess({
-      derivedRole: async (docId, uid, principalSpaceId) => {
+      derivedAccess: async (docId, uid, principalSpaceId) => {
         // This integration regression deliberately measures the real HTTP deadline
         // against an external-style provider; fake timers cannot exercise fetch abort.
         const { promise, resolve } = Promise.withResolvers<void>()
         setTimeout(resolve, 400)
         await promise
-        return driveDerivedDocs.has(docId) && uid === 'reader_uid' && principalSpaceId === 'space-a'
-          ? 'reader'
-          : 'none'
+        return derivedProof(docId, uid, principalSpaceId)
       },
+      versions: async () => null,
     })
     try {
       const batch = await request('/api/v1/docs/metadata', {
@@ -423,10 +428,8 @@ mysqlDescribe('OCTO-233 Docs actor wire and authenticated write behavior', () =>
       )
     } finally {
       setDriveDerivedAccess({
-        derivedRole: async (docId, uid, principalSpaceId) =>
-          driveDerivedDocs.has(docId) && uid === 'reader_uid' && principalSpaceId === 'space-a'
-            ? 'reader'
-            : 'none',
+        derivedAccess: async (docId, uid, principalSpaceId) => derivedProof(docId, uid, principalSpaceId),
+        versions: async () => null,
       })
     }
   }, 10_000)
