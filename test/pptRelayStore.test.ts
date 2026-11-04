@@ -27,9 +27,9 @@ function deck(): BentoDoc {
 describe('InMemoryPptRelayStore invariants (§7.3)', () => {
   it('assigns strictly monotonic per-room sequences', async () => {
     const s = new InMemoryPptRelayStore()
-    const a = await s.appendOp('d1', 'f1', { t: 'ops', a: 1 })
-    const b = await s.appendOp('d1', 'f2', { t: 'ops', a: 2 })
-    const c = await s.appendOp('d1', 'f3', { t: 'ops', a: 3 })
+    const a = await s.appendOp('d1', 'f1', { t: 'ops', a: 1 }, 'test-editor')
+    const b = await s.appendOp('d1', 'f2', { t: 'ops', a: 2 }, 'test-editor')
+    const c = await s.appendOp('d1', 'f3', { t: 'ops', a: 3 }, 'test-editor')
     expect([a.seq, b.seq, c.seq]).toEqual([1, 2, 3])
     expect(a.duplicate || b.duplicate || c.duplicate).toBe(false)
     expect(await s.currentSeq('d1')).toBe(3)
@@ -37,8 +37,8 @@ describe('InMemoryPptRelayStore invariants (§7.3)', () => {
 
   it('sequences are independent per room', async () => {
     const s = new InMemoryPptRelayStore()
-    await s.appendOp('d1', 'f1', {})
-    const d2 = await s.appendOp('d2', 'f1', {})
+    await s.appendOp('d1', 'f1', {}, 'test-editor')
+    const d2 = await s.appendOp('d2', 'f1', {}, 'test-editor')
     expect(d2.seq).toBe(1)
     expect(await s.currentSeq('d1')).toBe(1)
     expect(await s.currentSeq('d2')).toBe(1)
@@ -46,8 +46,8 @@ describe('InMemoryPptRelayStore invariants (§7.3)', () => {
 
   it('dedups on (docId, frameId): a resent frame re-uses its original seq, no new row', async () => {
     const s = new InMemoryPptRelayStore()
-    const first = await s.appendOp('d1', 'dup', { v: 1 })
-    const again = await s.appendOp('d1', 'dup', { v: 1 })
+    const first = await s.appendOp('d1', 'dup', { v: 1 }, 'test-editor')
+    const again = await s.appendOp('d1', 'dup', { v: 1 }, 'test-editor')
     expect(again.seq).toBe(first.seq)
     expect(again.duplicate).toBe(true)
     expect(await s.currentSeq('d1')).toBe(1) // no second row
@@ -55,14 +55,14 @@ describe('InMemoryPptRelayStore invariants (§7.3)', () => {
 
   it('opsSince returns only ops after the cursor, ascending', async () => {
     const s = new InMemoryPptRelayStore()
-    for (const f of ['f1', 'f2', 'f3']) await s.appendOp('d1', f, { f })
+    for (const f of ['f1', 'f2', 'f3']) await s.appendOp('d1', f, { f }, 'test-editor')
     const tail = await s.opsSince('d1', 1)
     expect(tail.map((o) => o.seq)).toEqual([2, 3])
   })
 
   it('saveSnapshot advances the version atomically; prune drops only covered ops', async () => {
     const s = new InMemoryPptRelayStore()
-    for (const f of ['f1', 'f2', 'f3']) await s.appendOp('d1', f, { f })
+    for (const f of ['f1', 'f2', 'f3']) await s.appendOp('d1', f, { f }, 'test-editor')
     const r1 = await s.saveSnapshot({ docId: 'd1', coveredSeq: 2, doc: deck() })
     expect(r1.snapshotVersion).toBe(1)
     await s.pruneOpsThrough('d1', 2)
@@ -80,8 +80,8 @@ describe('InMemoryPptRelayStore invariants (§7.3)', () => {
 
   it('dedup survives prune: a frame re-sent after its op row is pruned re-acks its original seq, not a fresh one (XIN-1655 C1)', async () => {
     const s = new InMemoryPptRelayStore()
-    const first = await s.appendOp('d1', 'frame-1', { v: 1 })
-    await s.appendOp('d1', 'frame-2', { v: 2 })
+    const first = await s.appendOp('d1', 'frame-1', { v: 1 }, 'test-editor')
+    await s.appendOp('d1', 'frame-2', { v: 2 }, 'test-editor')
     expect(first.seq).toBe(1)
     // A snapshot covers + prunes seq 1 (its op row is now gone).
     await s.saveSnapshot({ docId: 'd1', coveredSeq: 1, doc: deck() })
@@ -90,7 +90,7 @@ describe('InMemoryPptRelayStore invariants (§7.3)', () => {
 
     // Re-sending the pruned frameId must re-ack its ORIGINAL seq as a duplicate,
     // never mint a new seq (which would rebroadcast a duplicate of a snapshotted op).
-    const resend = await s.appendOp('d1', 'frame-1', { v: 1 })
+    const resend = await s.appendOp('d1', 'frame-1', { v: 1 }, 'test-editor')
     expect(resend.duplicate).toBe(true)
     expect(resend.seq).toBe(1)
     expect(await s.currentSeq('d1')).toBe(2) // no new seq minted
@@ -104,7 +104,7 @@ describe('InMemoryPptRelayStore invariants (§7.3)', () => {
     ;(config.ppt.relay as { ledgerRetentionFrames: number }).ledgerRetentionFrames = 2
     try {
       const s = new InMemoryPptRelayStore()
-      for (const f of ['f1', 'f2', 'f3', 'f4', 'f5']) await s.appendOp('d1', f, { f })
+      for (const f of ['f1', 'f2', 'f3', 'f4', 'f5']) await s.appendOp('d1', f, { f }, 'test-editor')
       // Snapshot covers all 5; the prune reclaims ledger mappings with
       // seq <= coveredSeq - 2 = 3 (f1/f2/f3) and keeps f4/f5 (the recent frames an
       // idempotent resend could still target).
@@ -112,7 +112,7 @@ describe('InMemoryPptRelayStore invariants (§7.3)', () => {
       await s.pruneOpsThrough('d1', 5)
 
       // f4 is within the window -> still re-acked at its ORIGINAL seq (duplicate).
-      const recent = await s.appendOp('d1', 'f4', { f: 'f4' })
+      const recent = await s.appendOp('d1', 'f4', { f: 'f4' }, 'test-editor')
       expect(recent.duplicate).toBe(true)
       expect(recent.seq).toBe(4)
       expect(await s.currentSeq('d1')).toBe(5) // no seq minted for a live re-ack
@@ -120,7 +120,7 @@ describe('InMemoryPptRelayStore invariants (§7.3)', () => {
       // f1 fell out of the window -> its mapping was reclaimed, so the resend is a
       // FRESH seq + rebroadcast, NOT a re-ack. (The reducer drops it downstream as a
       // duplicate `op.s <= vv[a]`; here we pin the store's post-retention behavior.)
-      const stale = await s.appendOp('d1', 'f1', { f: 'f1' })
+      const stale = await s.appendOp('d1', 'f1', { f: 'f1' }, 'test-editor')
       expect(stale.duplicate).toBe(false)
       expect(stale.seq).toBe(6)
       expect(await s.currentSeq('d1')).toBe(6)

@@ -128,11 +128,11 @@ export class DbPptRelayStore implements PptRelayStore {
     await tx.execute('INSERT INTO ppt_collab_actor_seq (doc_id, actor, last_s) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE last_s = VALUES(last_s)', [docId, actor, last])
   }
 
-  async appendOp(docId: string, frameId: string, frame: unknown): Promise<AppendOpResult> {
+  async appendOp(docId: string, frameId: string, frame: unknown, editorUid: string): Promise<AppendOpResult> {
     const frameJson = JSON.stringify(frame)
     const frameBytes = Buffer.byteLength(frameJson, 'utf8')
     const payloadHash = canonicalPayloadHash(frame)
-    return withStoreRetry('append', () => this.appendOpOnce(docId, frameId, frameJson, frameBytes, payloadHash))
+    return withStoreRetry('append', () => this.appendOpOnce(docId, frameId, frameJson, frameBytes, payloadHash, editorUid))
   }
 
   private appendOpOnce(
@@ -141,6 +141,7 @@ export class DbPptRelayStore implements PptRelayStore {
     frameJson: string,
     frameBytes: number,
     payloadHash: string,
+    editorUid: string,
   ): Promise<AppendOpResult> {
     return transaction(async (tx) => {
       // Fast-path: a resend whose ledger row is already committed AND visible in
@@ -217,6 +218,11 @@ export class DbPptRelayStore implements PptRelayStore {
           throw new RoomCapacityError()
         }
       }
+      // The relay UID comes from its verified ticket, not the client-chosen Bento actor.
+      await tx.execute(
+        'UPDATE doc_meta SET updated_by = ?, updated_at = CURRENT_TIMESTAMP(3) WHERE doc_id = ?',
+        [editorUid, docId],
+      )
       return { seq, duplicate: false, frameBytes }
     })
   }

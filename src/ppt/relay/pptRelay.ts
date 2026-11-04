@@ -3066,10 +3066,10 @@ export class PptRelay {
     let duplicate: boolean
     try {
       let res
-      try { res = await this.store.appendOp(conn.docId, frameId, frame) } catch (error) {
+      try { res = await this.store.appendOp(conn.docId, frameId, frame, conn.uid) } catch (error) {
         if (!(error instanceof RoomCapacityError)) throw error
         await this.snapshotNow(conn.docId, true)
-        res = await this.store.appendOp(conn.docId, frameId, frame)
+        res = await this.store.appendOp(conn.docId, frameId, frame, conn.uid)
       }
       seq = res.seq
       duplicate = res.duplicate

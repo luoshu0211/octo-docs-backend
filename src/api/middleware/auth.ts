@@ -17,6 +17,7 @@ declare global {
     interface Request {
       uid?: string
       octoToken?: string
+      apiKeySpaceId?: string
       // Set on the human path (authMiddleware): the uids of bots this human user
       // owns (octo-server verify `owned_bots`). Used so "my documents"
       // (owner=me) also surfaces docs a user's bots own. Defaults to [] when the
@@ -45,10 +46,47 @@ export function extractOctoToken(req: Request): string {
 }
 
 /**
- * Require a valid octo identity; populates req.uid. 401 when missing/invalid.
+ * Require a valid Octo identity. Native API keys are restricted to the Docs
+ * metadata endpoint; all other routes retain session-token authentication.
  */
 export async function authMiddleware(req: Request, res: Response, next: NextFunction): Promise<void> {
   const token = extractOctoToken(req)
+  if (token.startsWith('uk_')) {
+    if (!(req.method === 'POST' && /^\/metadata\/?$/i.test(req.path))) {
+      res.status(401).json({ error: 'unauthorized' })
+      return
+    }
+
+    let identity
+    try {
+      identity = await getOctoIdentity().verifyApiKey(token)
+    } catch (err) {
+      if (err instanceof IdentityUnavailableError) {
+        res.status(503).json({ error: 'identity_unavailable' })
+        return
+      }
+      next(err)
+      return
+    }
+    if (!identity) {
+      res.status(401).json({ error: 'unauthorized' })
+      return
+    }
+    const headerSpace = req.header('X-Space-Id')
+    if (headerSpace !== undefined && headerSpace.trim() !== '' && headerSpace.trim() !== identity.spaceId) {
+      res.status(401).json({ error: 'unauthorized' })
+      return
+    }
+    req.uid = identity.uid
+    req.ownedBots = []
+    req.viewerSpaceId = identity.spaceId
+    req.verifiedViewerSpaceId = identity.spaceId
+    req.apiKeySpaceId = identity.spaceId
+    req.principalSpaceId = identity.spaceId
+    next()
+    return
+  }
+
   let identity
   try {
     identity = await getOctoIdentity().verifyToken(token)

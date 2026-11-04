@@ -5,12 +5,12 @@
  * ─────────────────────────────────────────────────────────────────────────────
  * 1. `spaceContextMiddleware` — parse the header. Mounted globally.
  *
- * The isolation boundary is the frontend-injected `X-Space-Id` header. This
- * middleware reads it, trims it, and stashes the result on `req.spaceId` for the
- * downstream metadata handlers to scope their queries by. A missing or empty
- * header is a hard 400 (`{ error: 'space_required' }`) — there is no warn/grace
- * mode: the isolation is enforced from the first request.
- *
+ * The normal isolation boundary is the frontend-injected `X-Space-Id` header.
+ * The metadata-only native API-key path may instead use `verifiedViewerSpaceId`,
+ * already resolved by octo-server; a supplied header is checked against that
+ * proof by authentication before this middleware runs. The selected Space is
+ * stashed on `req.spaceId`; without either value the response is 400
+ * (`{ error: 'space_required' }`).
  * It does NOT confirm membership, and `req.spaceId` is therefore NOT proof of
  * membership on its own. Every consumer either (a) sits behind
  * `requireSpaceMembership` below, or (b) re-derives authority from the caller's
@@ -95,10 +95,11 @@ declare global {
   }
 }
 
-/** Require an `X-Space-Id` header; populates req.spaceId. 400 when missing/empty. */
+/** Require an `X-Space-Id` header or an existing server-verified Space proof. */
 export function spaceContextMiddleware(req: Request, res: Response, next: NextFunction): void {
   const raw = req.header('X-Space-Id')
-  const spaceId = typeof raw === 'string' ? raw.trim() : ''
+  const headerSpace = typeof raw === 'string' ? raw.trim() : ''
+  const spaceId = headerSpace || (req.verifiedViewerSpaceId ?? '').trim()
   if (spaceId === '') {
     res.status(400).json({ error: 'space_required' })
     return

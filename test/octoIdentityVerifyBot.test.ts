@@ -102,3 +102,36 @@ describe('HttpOctoIdentity.verifyBot — /v1/auth/verify-bot', () => {
     expect(await identity.verifyBot('t')).toBeNull()
   })
 })
+
+describe('HttpOctoIdentity.verifyApiKey — /v1/auth/verify-api-key', () => {
+  it('posts the native API key and maps uid/space_id to a verified human principal', async () => {
+    const fetchMock = vi.fn(async () =>
+      botResponse({ uid: 'u_reader', space_id: 's_current' }),
+    )
+    vi.stubGlobal('fetch', fetchMock)
+
+    const identity = new HttpOctoIdentity('http://octo.test')
+    const result = await identity.verifyApiKey('uk_native_key')
+
+    expect(result).toEqual({ uid: 'u_reader', spaceId: 's_current' })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    const [url, init] = fetchMock.mock.calls[0]! as unknown as [string, RequestInit]
+    expect(url).toBe('http://octo.test/v1/auth/verify-api-key')
+    expect(init.method).toBe('POST')
+    expect(JSON.parse(init.body as string)).toEqual({ api_key: 'uk_native_key' })
+  })
+
+  it('returns null for rejected keys and responses without a bound uid or Space', async () => {
+    const responses = [
+      botResponse({ msg: 'invalid api key' }, false, 401),
+      botResponse({ uid: 'u_reader' }),
+      botResponse({ space_id: 's_current' }),
+    ]
+    vi.stubGlobal('fetch', vi.fn(async () => responses.shift()!))
+
+    const identity = new HttpOctoIdentity('http://octo.test')
+    await expect(identity.verifyApiKey('uk_rejected')).resolves.toBeNull()
+    await expect(identity.verifyApiKey('uk_missing_space')).resolves.toBeNull()
+    await expect(identity.verifyApiKey('uk_missing_uid')).resolves.toBeNull()
+  })
+})
