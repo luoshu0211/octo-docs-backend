@@ -3219,10 +3219,8 @@ describe('PPT relay: round-18 fixes (XIN-1754)', () => {
   })
 
   it('P1-1: a completed in-place reauth is NOT undone by the replaced share-expiry callback', async () => {
-    let releaseDirect: () => void = () => {}
-    const directGate = new Promise<void>((res) => {
-      releaseDirect = res
-    })
+    const { promise: directGate, resolve: releaseDirect } = Promise.withResolvers<void>()
+    const { promise: directLookupStarted, resolve: signalDirectLookupStarted } = Promise.withResolvers<void>()
     let directCalls = 0
     const access = (role: CurrentAccess['role']): CurrentAccess => ({
       role,
@@ -3237,31 +3235,90 @@ describe('PPT relay: round-18 fixes (XIN-1754)', () => {
       accessProvider: async ({ spaceMember }) => {
         if (spaceMember) return access('writer')
         directCalls++
-        if (directCalls === 1) await directGate
+        if (directCalls === 1) {
+          signalDirectLookupStarted()
+          await directGate
+        }
         return access('none')
       },
       limits: { reauthGraceMs: 5000, authRefreshMs: 100000 },
     })
-    const first = freshTicket({ uid: 'u_share', role: 'writer', spaceMember: true, ttl: 1 })
+    const first = freshTicket({ uid: 'u_share', role: 'writer', spaceMember: true, ttl: 30 })
+    const decodedFirst = jwt.decode(first)
+    if (!decodedFirst || typeof decodedFirst === 'string' || typeof decodedFirst.exp !== 'number') {
+      throw new Error('test ticket is missing an expiration')
+    }
+    const firstExp = decodedFirst.exp
     const c = await h.connect({ uid: 'u_share', role: 'writer', ticket: first })
-    await helloReady(c)
-    // Let the ~1s share-expiry timer fire and block in the direct CurrentAccess lookup.
-    await sleep(1300)
-    // Reauthenticate at the same epoch; the share-member proof resolves immediately,
-    // advances the generation, and replaces the stalled expiry attempt.
-    c.send({ t: 'reauth', pv: 2, ticket: freshTicket({ uid: 'u_share', role: 'writer', spaceMember: true, ttl: 30 }) })
-    await sleep(80)
-    // Releasing the stale lookup must not put this freshly authorized socket back
-    // into pendingReauth or otherwise replace its current authority.
-    releaseDirect()
-    await sleep(80)
-    // The socket keeps writer authority in place: a persisted `ops` write acks (not
-    // refused/closed) — the authority proxy now that snapshots are server-managed.
-    c.send(OPS_FRAME(9, 'reauth-not-undone'))
-    expect((await c.recvUntil((m) => m.ctl === 'ack' || m.ctl === 'refused')).at(-1)).toMatchObject({
-      ctl: 'ack',
-      k: 9,
+    c.send({ t: 'hello', pv: 2, since: 0, liveAuth: true })
+    expect((await c.recvUntil((m) => m.ctl === 'ready')).at(-1)).toMatchObject({
+      ctl: 'ready',
+      liveAuth: true,
     })
+
+    type TestConn = { shareExpiryTimer?: NodeJS.Timeout }
+    const internal = h.relay as unknown as {
+      rooms: Map<string, Set<TestConn>>
+      armShareExpiry: (conn: TestConn, expSeconds: number) => void
+      expireShareMembership: (conn: TestConn) => Promise<void>
+    }
+    const conn = [...internal.rooms.get(DOC)!][0]!
+    let expiryCheck: Promise<void> | undefined
+    let usingFakeTimers = false
+    const expireShareMembership = internal.expireShareMembership.bind(h.relay)
+    try {
+      // Keep the actual ticket-expiry timer from racing the initial hello. Once
+      // hello-ready arrives, advance to the ticket's real exp boundary and re-arm
+      // through the production timer helper so its callback runs deterministically.
+      if (conn.shareExpiryTimer) {
+        clearTimeout(conn.shareExpiryTimer)
+        conn.shareExpiryTimer = undefined
+      }
+      vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] })
+      usingFakeTimers = true
+      vi.setSystemTime(new Date(firstExp * 1000 + 1))
+      internal.expireShareMembership = (target) => {
+        const pending = expireShareMembership(target)
+        expiryCheck = pending
+        return pending
+      }
+      internal.armShareExpiry(conn, firstExp)
+      await vi.advanceTimersByTimeAsync(1)
+      expect(expiryCheck).toBeDefined()
+      await directLookupStarted
+      vi.useRealTimers()
+      usingFakeTimers = false
+
+      // The share-member proof resolves immediately and completes in place while
+      // the expired ticket's direct lookup remains parked.
+      const requestId = 'reauth-after-share-expiry'
+      c.send({ t: 'reauth', pv: 2, requestId, ticket: freshTicket({ uid: 'u_share', role: 'writer', spaceMember: true, ttl: 30 }) })
+      expect((await c.recvUntil((m) => m.ctl === 'auth-updated' && m.requestId === requestId)).at(-1)).toMatchObject({
+        ctl: 'auth-updated',
+        role: 'writer',
+        requestId,
+      })
+      // Releasing the stale lookup must not put this freshly authorized socket back
+      // into pendingReauth or otherwise replace its current authority.
+      releaseDirect()
+      const staleExpiryCheck = expiryCheck
+      if (!staleExpiryCheck) throw new Error('expired share callback was not captured')
+      await staleExpiryCheck
+      // The socket keeps writer authority in place: a persisted `ops` write acks
+      // (not refused/closed) — the authority proxy now that snapshots are server-managed.
+      c.send(OPS_FRAME(9, 'reauth-not-undone'))
+      expect((await c.recvUntil((m) => m.ctl === 'ack' || m.ctl === 'refused')).at(-1)).toMatchObject({
+        ctl: 'ack',
+        k: 9,
+      })
+    } finally {
+      releaseDirect()
+      try {
+        if (expiryCheck) await expiryCheck
+      } finally {
+        if (usingFakeTimers) vi.useRealTimers()
+      }
+    }
   })
 
   it('P1-3: a transient epoch-read failure during an epoch bump does not permanently disable a direct writer', async () => {
