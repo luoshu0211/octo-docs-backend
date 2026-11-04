@@ -119,7 +119,7 @@ describe('POST /internal/docs/source-invalidations', () => {
       principalSpaceId: 's1',
       documentName: 'octo:s1:f1:doc:d_source_changed',
     }
-    const registration = beginActiveAccessRegistration(binding)
+    const registration = beginActiveAccessRegistration(binding, 'connection:source-test')
     const dispose = registerActiveAccess(binding, 12, state, async () => ({
       ...state,
       role: 'none',

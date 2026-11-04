@@ -69,22 +69,22 @@ Yjs 普通文档、表格、白板以及 PPT 的真实读/票据入口都复用�
 - 文档自身角色实际下降：沿已有降权规则更新 readOnly/角色并阻止应用新的越权写，不广播一次提示就视为完成。
 - 权威源无法确认：不授权新的 Drive 读取；现有独立角色仍按本地权威事实判定。无有效独立来源且源证明已过期时停止投递，走现有 4401 可重认证路径。
 
-通知/探测可以在异步重验过程中到达。结果提交时比较绑定 generation 与所依据的文档/source 版本；较旧结果不能覆盖较新失效或重新开放连接。刷新期间，同 epoch 的 source-independent 权威状态或 sourceRevision 变化，或更高 Docs epoch，可隔离较旧 in-flight 结果；同 epoch、同 source 的注册不能延长既有 Drive proof 截止时间。断连、文档卸载及进程关闭时移除绑定；多个相同绑定的连接共享查询但分别执行投递门禁。
+通知/探测可以在异步重验过程中到达。提交时对比绑定的 Docs epoch 高水位、来源版本与参与者 generation；较低 epoch 的迟到登记/旧结果不能覆盖较新状态或重新开放连接。每个连接保留自己的 CurrentAccess 与 resolver；同一直接授权语义或同一精确分享票据可共用完整重验，不同 share-ticket scope 分开处理。share membership 声明及签名 expiry 不跨不同票据继承。独立授权参与者不被来源专属重验降权。5 秒权威 epoch 与来源版本查询仍按唯一 (doc_id, uid, principal_space_id) 绑定/批量执行；刷新一个 scope 时仍探测同绑定的其他未刷新参与者。epoch 与来源版本同时变化时，先失效 Drive 派生缓存，再合并该 scope 的重验。
 
 来源查权前取得在途注册 lease，失效提示同时标记尚未登记的匹配握手。Yjs 将 lease 从认证传至文档初始化和 addConnection；PPT 初连、reauth、分享 membership 到期查权也覆盖相同间隙。登记时消费 lease：已被标记的旧结果先冻结并重新查权，不先发送构造 awareness；认证、初始化失败和断开时释放未消费的 lease。只跟踪当前在途注册，沿用既有共享绑定探测。
 
-PPT 分享 membership 到期后先停止使用旧 claim 并冻结投递，再由统一 accessProvider 确认当前独立或 Drive 来源。仍可读时以完整 CurrentAccess（sourceRevision、证明期限及来源确认状态）替换活跃绑定；转为 Drive reader 后仍纳入批量来源探测。需要刷新 membership 的连接沿既有 reauth grace 处理，旧来源结果不能覆盖较新的票据或独立授权。
+PPT 分享 membership 到期后先停止使用旧 claim 并冻结投递，再由统一 accessProvider 确认当前独立或 Drive 来源。查权期间保留该连接的活跃参与者，将 resolver 切换到无分享 claim；可读时用完整 CurrentAccess（sourceRevision、证明期限及来源确认状态）登记直接授权。若并发 epoch 重验先完成，过期查权结果作废且不得删除该参与者；epoch 确认的当前权限可恢复读取，保留的 resolver 继续监控该连接；来源授权持续接受来源通知与五秒批量版本探测，多次 epoch 也不能丢失该监控。需要刷新 membership 的连接沿既有 reauth grace 处理；不同 ticket 的 share proof/期限不互用，断线连接的 resolver 随 participant 一并移除，旧来源结果不能覆盖较新的票据或独立授权。
 
 Yjs 冻结连接的待发送队列复用现有 `config.ppt.relay.maxLiveBufferFrames/maxLiveBufferBytes`（`PPT_RELAY_MAX_LIVE_BUFFER_FRAMES` / `PPT_RELAY_MAX_LIVE_BUFFER_BYTES`）；超限丢弃待投递内容并以 4401 关闭该逻辑连接，不关闭同一物理 WebSocket 上的其他文档连接，不新增环境变量。
 
-PPT 复用现有 read-auth refresh、canPushRead、terminalClose 等机制；来源结果的恢复和关闭都必须持有当前 source-freeze/auth generation，不能覆盖较新的独立授权或票据重认证等待。Yjs 在 afterLoadDocument 为每个文档实例的公开 addConnection 注册边界安装逐逻辑连接发送门禁，并同步加入活跃绑定，使原生构造函数的首次 awareness 也受证明截止时间及共享绑定冻结约束；不等到 connected 才安装。构造期间若需关闭，先同步阻断内容和写入，再在 microtask 关闭逻辑连接，让原生路由和断连回调完成清理，同一物理 WebSocket 的其他文档不受影响。Redis registry 用于定位，不是权限权威；任何单个节点收到 HTTP 并不等于集群所有连接已处理。
+PPT 复用现有 read-auth refresh、canPushRead、terminalClose 等机制；来源结果先通过活跃绑定及参与者 generation 校验，恢复还须持有当前 source-freeze/auth generation。确认撤权的终止关闭递增 auth generation，抢占仍在途的 epoch 复查；重新登记时必须重新取得 freeze 所有权，不能覆盖较新的独立授权或票据重认证等待。Yjs 在 afterLoadDocument 为每个文档实例的公开 addConnection 注册边界安装逐逻辑连接发送门禁，并同步加入活跃绑定，使原生构造函数的首次 awareness 也受证明截止时间及共享绑定冻结约束；不等到 connected 才安装。构造期间若需关闭，先同步阻断内容和写入，再在 microtask 关闭逻辑连接，让原生路由和断连回调完成清理，同一物理 WebSocket 的其他文档不受影响。Redis registry 用于定位，不是权限权威；任何单个节点收到 HTTP 并不等于集群所有连接已处理。
 
 ## 负载与生效边界
 
 - 设本节点活跃绑定数为 B、唯一文档数为 D。每轮来源批次最多 50 个绑定，因此 Docs→Drive 的版本 RPC 约为 ceil(B/50)/5 次每秒；文档自身 epoch 读按 D 批量合并。不是每个连接 1 次完整角色 RPC。
 - 同 doc/scope 的挂载读取合并；相同 Project/UID 的成员核验在 Drive 内合并，Server epoch/verify 每批不超过既有 50 条限制。不同 UID/Space 不合并授权结果。版本未变且证据有效时，完整 Docs 角色重算次数为 0。
 - 成员移除、挂载和本地授权变更：通知尽快处理；丢提示后在下一次来源探测看到权威变更再重验，不宣称退出响应返回时全局连接已断开。
-- 正常依赖可用时，每 5 秒开始一轮探测；处理时间另计，不把周期说成绝对完成时限。账号停用不改变 Project epoch，只靠来源成员快照到期核验及有限证明期收敛；依赖不可用时不能突破证明截止时刻继续读取。 距证明截止不足一轮时，按共享绑定提前执行完整查权；相等版本响应和仍基于原 MemberProof 的完整响应都不延长原截止时间。若原证明在两轮之间到期，首次发送可同步冻结该绑定并共享一次完整续证；冻结期间只缓冲，不发送过期内容。已有版本/epoch 探测尚未返回时不另开竞争续证，仍按原到期门禁关闭。完整结果确认无权则 4403，过期证明或到期后仍无法确认则 4401，不用新增每连接计时器延长等待。
+- 正常依赖可用时，每 5 秒开始一轮探测；处理时间另计，不把周期说成绝对完成时限。账号停用不改变 Project epoch，只靠来源成员快照到期核验及有限证明期收敛；依赖不可用时不能突破证明截止时刻继续读取。距离证明截止不足一轮时，按共享绑定提前执行完整查权；相等版本响应和仍基于原 MemberProof 的完整响应都不延长原截止时间。若原证明在两轮之间到期，首次发送可同步冻结该绑定并共享一次完整续证；仅续验该连接所属的来源 scope，不用另一连接的证明代替；冻结期间只缓冲，不发送过期内容。已有版本/epoch 探测尚未返回时不另开竞争续证，仍按原到期门禁关闭。完整结果确认无权则 4403，过期证明或到期后仍无法确认则 4401，不用新增每连接计时器延长等待。
 - 验收记录实际 B/D、批次、DB/RPC 数量和撤权延迟，覆盖多个节点与重复标签页，不以公式冒充容量实测。现有 PPT 周期若保留，仅查版本/必要状态，不额外叠加逐连接完整来源查权循环。
 
 ## 验收标准

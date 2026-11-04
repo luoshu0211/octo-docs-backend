@@ -74,6 +74,7 @@ function gateYjsConnection(
   let frozen = false
   let closed = false
   let closing = false
+  let participant!: ActiveAccessParticipant
   const closeLogicalConnection = (code: 4401 | 4403, reason: string): void => {
     if (closed) return
     frozen = true
@@ -115,14 +116,17 @@ function gateYjsConnection(
     if (sourceAccess && sourceAccess.sourceRevision !== null &&
         (sourceAccess.proofExpiresAt === null || performance.now() >= sourceAccess.proofExpiresAt)) {
       const docId = context.doc ?? context.board
-      if (docId && renewActiveAccess({ docId, uid: context.user.id, principalSpaceId: context.principal_space_id })) {
+      if (docId && renewActiveAccess(
+        { docId, uid: context.user.id, principalSpaceId: context.principal_space_id },
+        participant,
+      )) {
         queuePending(message)
       } else closeLogicalConnection(4401, 'Authorization could not be confirmed')
       return
     }
     send(message)
   }
-  return {
+  participant = {
     freeze() {
       frozen = true
     },
@@ -145,6 +149,7 @@ function gateYjsConnection(
       closeLogicalConnection(code, reason)
     },
   }
+  return participant
 }
 
 /** Never authorize a message using a role read invalidated while it was pending. */

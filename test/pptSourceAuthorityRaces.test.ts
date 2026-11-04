@@ -388,7 +388,9 @@ describe('PPT relay source-authority races', () => {
   })
 
   it('closes an expired source reader before live delivery while an independent writer keeps writing', async () => {
-    const proof = sourceAccess('reader', 0, performance.now() + 60_000)
+    let now = 1_000
+    vi.spyOn(performance, 'now').mockImplementation(() => now)
+    const proof = sourceAccess('reader', 0, 61_000)
     const directWriter = independentAccess('writer')
     const h = await setup({
       roleProvider: async ({ uid }) => uid === 'u_direct_writer' ? 'writer' : 'none',
@@ -399,8 +401,8 @@ describe('PPT relay source-authority races', () => {
     await helloReady(reader)
     await helloReady(writer)
 
-    // The injected source proof reaches its deadline without starting the 5-second monitor.
-    proof.proofExpiresAt = performance.now()
+    // Expire the monotonic source deadline without starting the 5-second monitor.
+    now = 61_001
     const readerStart = reader.frames.length
     const delivery = Promise.race([
       reader.closed.then(({ code }) => ({ kind: 'closed' as const, code })),
@@ -419,9 +421,10 @@ describe('PPT relay source-authority races', () => {
     expect(writer.ws.readyState).toBe(WebSocket.OPEN)
 
   })
-
   it('checks the proof again when an already-started replay reaches its first send', async () => {
-    const proof = sourceAccess('reader', 0, performance.now() + 60_000)
+    let now = 1_000
+    vi.spyOn(performance, 'now').mockImplementation(() => now)
+    const proof = sourceAccess('reader', 0, 61_000)
     const h = await setup({
       roleProvider: async () => 'none',
       accessProvider: async () => proof,
@@ -449,7 +452,7 @@ describe('PPT relay source-authority races', () => {
     reader.send({ t: 'hello', pv: 2, liveAuth: true, since: 0 })
     try {
       await parked
-      proof.proofExpiresAt = performance.now()
+      now = 61_001
       release()
       const outcome = await replayOutcome
       expect(outcome).toEqual({ kind: 'closed', code: 4401 })
@@ -459,9 +462,10 @@ describe('PPT relay source-authority races', () => {
     }
   })
 
+
   it('keeps an expired membership socket frozen through a source notice and closes at the original grace deadline', async () => {
 
-    const shareAccess = sourceAccess('writer', 0, performance.now() + 60_000)
+    const shareAccess = independentAccess('writer')
     const directWriter = independentAccess('writer')
     const h = await setup({
       limits: { authRefreshMs: 60_000, heartbeatIntervalMs: 60_000, reauthGraceMs: 200 },
@@ -639,7 +643,9 @@ describe('PPT relay source-authority races', () => {
 
   it('does not restore share-writer authority from a lapsed ticket claim after the direct grant is withdrawn', async () => {
     let direct: ResolvedRole = 'writer'
+    let liveEpoch = 0
     const h = await setup({
+      epochProvider: async () => liveEpoch,
       roleProvider: async () => direct,
       // Mirrors the production seam: the direct doc grant plus the space-share
       // setting. Only the CURRENT membership proof may open the share-derived role.
@@ -665,9 +671,11 @@ describe('PPT relay source-authority races', () => {
     // stale membership claim instead of closing it.
     await internal.expireShareMembership(conn)
     direct = 'none'
-    // No epoch notification is delivered. The shared source resolver runs alone
-    // and must use the connection's CURRENT (expired) membership proof.
-    invalidateActiveAccess(DOC, SPACE, 'u_lapsed_share_writer')
+    liveEpoch = 1
+    // Direct Docs permission changes are carried by the Docs epoch. The relay
+    // re-resolves the independent grant rather than relying on an expired share
+    // claim or treating a Drive-source notice as a direct-grant invalidation.
+    const epochBump = h.relay.applyEpochBump(DOCNAME)
     const start = share.frames.length
     const outcome = Promise.race([
       share.closed.then(({ code }) => ({ kind: 'closed' as const, code })),
@@ -676,6 +684,7 @@ describe('PPT relay source-authority races', () => {
     ])
     share.send(opsFrame(2, 'write-after-direct-grant-withdrawn'))
     expect(await outcome).toEqual({ kind: 'closed', code: 4403 })
+    await epochBump
     expect(await h.store.currentSeq(DOC)).toBe(1)
   })
   it('registers Drive proof after share expiry so a lost notice is found by the shared source probe', async () => {
@@ -761,5 +770,640 @@ describe('PPT relay source-authority races', () => {
       now = 1_000
     }
 
+  })
+  it('keeps each same-UID PPT connection on its own share proof after one ticket expires and its replacement disconnects', async () => {
+    let now = 1_000
+    vi.spyOn(performance, 'now').mockImplementation(() => now)
+    const revisionA = `sha256:${'c'.repeat(64)}`
+    let driveRevision = revisionA
+    let sourceRevoked = false
+    let holdShareRecheck = false
+    let holdDriveRecheck = false
+    const shareRecheckStarted = deferred<void>()
+    const staleShareRecheck = deferred<CurrentAccess>()
+    const driveRecheckStarted = deferred<void>()
+    const directDriveRecheck = deferred<CurrentAccess>()
+    const proofExpiresAt = 61_000
+    setDriveDerivedAccess({
+      derivedAccess: async () => null,
+      versions: async bindings => bindings.map(binding => ({
+        ...binding,
+        sourceRevision: driveRevision,
+        validForMs: 60_000,
+        expiresAt: now + 60_000,
+      })),
+    } satisfies DriveDerivedAccess)
+    const h = await setup({
+      accessProvider: async ({ uid, spaceMember }) => {
+        if (uid === 'u_connection_scoped_share' && spaceMember) {
+          if (holdShareRecheck) {
+            shareRecheckStarted.resolve(undefined)
+            return staleShareRecheck.promise
+          }
+          return {
+            role: 'writer',
+            permissionEpoch: 0,
+            sourceRevision: driveRevision,
+            proofExpiresAt,
+            sourceConfirmed: true,
+          }
+        }
+        if (uid === 'u_connection_scoped_share') {
+          if (holdDriveRecheck) {
+            driveRecheckStarted.resolve(undefined)
+            return directDriveRecheck.promise
+          }
+          return {
+            role: sourceRevoked ? 'none' : 'reader',
+            permissionEpoch: 0,
+            sourceRevision: driveRevision,
+            proofExpiresAt,
+            sourceConfirmed: true,
+          }
+        }
+        return independentAccess('writer')
+      },
+    })
+    const expiry = Math.floor(Date.now() / 1_000) + 3_600
+    const expiredReader = await h.connect({
+      uid: 'u_connection_scoped_share', role: 'writer', spaceMember: true, expSeconds: expiry,
+    })
+    const directWriter = await h.connect({
+      uid: 'u_connection_scope_writer', role: 'writer', expSeconds: expiry + 3_600,
+    })
+    await helloReady(expiredReader)
+    await helloReady(directWriter)
+    const { internal, conn } = connectionFor(h.relay, 'u_connection_scoped_share')
+
+    try {
+      holdShareRecheck = true
+      invalidateActiveAccess(DOC, SPACE, 'u_connection_scoped_share')
+      await shareRecheckStarted.promise
+      holdShareRecheck = false
+
+      vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] })
+      vi.setSystemTime(new Date(expiry * 1_000 + 1))
+      holdDriveRecheck = true
+      const expiryRecheck = internal.expireShareMembership(conn)
+      await driveRecheckStarted.promise
+
+      staleShareRecheck.resolve(independentAccess('writer'))
+      await staleShareRecheck.promise
+      const frozenStart = expiredReader.frames.length
+      expect(await sendAndAck(directWriter, opsFrame(1, 'blocked-during-expiry-recheck')))
+        .toMatchObject({ ctl: 'ack', q: 1 })
+      await turn()
+      expect(expiredReader.frames.slice(frozenStart).some(frame => frame.ctl === 'op')).toBe(false)
+
+      holdDriveRecheck = false
+      directDriveRecheck.resolve({
+        role: 'reader',
+        permissionEpoch: 0,
+        sourceRevision: driveRevision,
+        proofExpiresAt,
+        sourceConfirmed: true,
+      })
+      await expiryRecheck
+
+      const readyAfterExpiry = expiredReader.waitFor(
+        frame => frame.ctl === 'ready',
+        expiredReader.frames.length,
+      )
+      expiredReader.send({ t: 'hello', pv: 2, liveAuth: true, since: 0 })
+      expect(await readyAfterExpiry).toMatchObject({ ctl: 'ready', role: 'reader' })
+
+      const renewedShare = await h.connect({
+        uid: 'u_connection_scoped_share', role: 'writer', spaceMember: true,
+        expSeconds: expiry + 3_600,
+      })
+      await helloReady(renewedShare)
+      expect(await sendAndAck(renewedShare, opsFrame(2, 'fresh-share-proof-before-disconnect')))
+        .toMatchObject({ ctl: 'ack', q: 2 })
+      expect(await expiredReader.waitFor(frame => frame.ctl === 'op' && frame.q === 2))
+        .toMatchObject({ ctl: 'op', q: 2 })
+      renewedShare.close()
+      await renewedShare.closed
+      expect(renewedShare.ws.readyState).toBe(WebSocket.CLOSED)
+
+      expect(await sendAndAck(directWriter, opsFrame(3, 'drive-reader-remains-authorized')))
+        .toMatchObject({ ctl: 'ack', q: 3 })
+      expect(await expiredReader.waitFor(frame => frame.ctl === 'op' && frame.q === 3))
+        .toMatchObject({ ctl: 'op', q: 3 })
+      const readerWriteStart = expiredReader.frames.length
+      expiredReader.send(opsFrame(30, 'expired-share-reader-cannot-write'))
+      expect(await expiredReader.waitFor(frame => frame.ctl === 'refused', readerWriteStart))
+        .toMatchObject({ ctl: 'refused', code: 'forbidden-role' })
+
+      sourceRevoked = true
+      driveRevision = `sha256:${'d'.repeat(64)}`
+      await pollActiveAccess()
+      await vi.waitFor(() => expect(expiredReader.closeInfo?.code).toBe(4403))
+
+      const start = expiredReader.frames.length
+      expect(await sendAndAck(directWriter, opsFrame(4, 'no-frame-after-final-source-revocation')))
+        .toMatchObject({ ctl: 'ack', q: 4 })
+      await turn()
+      expect(expiredReader.frames.slice(start).some(frame => frame.ctl === 'op')).toBe(false)
+      expect(directWriter.ws.readyState).toBe(WebSocket.OPEN)
+    } finally {
+      vi.useRealTimers()
+      now = 1_000
+    }
+  })
+  it('keeps source tracking through repeated epoch wins while share-expiry lookup is pending', async () => {
+    let liveEpoch = 0
+    let driveRevision = `sha256:${'a'.repeat(64)}`
+    let driveRevoked = false
+    let directChecks = 0
+    let epochRechecks = 0
+    let revocationCheckStarted = false
+    const directCheckStarted = deferred<void>()
+    const directCheck = deferred<CurrentAccess>()
+    const revokedCheckStarted = deferred<void>()
+    const revokedCheck = deferred<CurrentAccess>()
+    const epochCheckStarted = [deferred<void>(), deferred<void>()]
+    const epochCheck = [deferred<ResolvedRole>(), deferred<ResolvedRole>()]
+    const proofExpiresAt = performance.now() + 60_000
+    setDriveDerivedAccess({
+      derivedAccess: async () => null,
+      versions: async bindings => bindings.map(binding => ({
+        ...binding,
+        sourceRevision: driveRevision,
+        validForMs: 60_000,
+        expiresAt: performance.now() + 60_000,
+      })),
+    })
+    const h = await setup({
+      epochProvider: async () => liveEpoch,
+      roleProvider: async ({ uid, spaceMember }) => {
+        if (uid !== 'u_epoch_handoff') return 'writer'
+        if (spaceMember) return 'writer'
+        if (epochRechecks < epochCheck.length) {
+          const index = epochRechecks++
+          epochCheckStarted[index]!.resolve()
+          return epochCheck[index]!.promise
+        }
+        return 'reader'
+      },
+      accessProvider: async ({ uid, spaceMember }) => {
+        if (uid !== 'u_epoch_handoff') return independentAccess('writer')
+        if (spaceMember) return independentAccess('writer')
+        directChecks++
+        directCheckStarted.resolve()
+        if (!driveRevoked) return directCheck.promise
+        revocationCheckStarted = true
+        revokedCheckStarted.resolve()
+        return revokedCheck.promise
+      },
+    })
+    const expiry = Math.floor(Date.now() / 1_000) + 3_600
+    const reader = await h.connect({
+      uid: 'u_epoch_handoff', role: 'writer', spaceMember: true, expSeconds: expiry,
+    })
+    const writer = await h.connect({
+      uid: 'u_handoff_writer', role: 'writer', expSeconds: expiry + 3_600,
+    })
+    await helloReady(reader)
+    await helloReady(writer)
+    const { internal, conn } = connectionFor(h.relay, 'u_epoch_handoff')
+    const liveConn = conn as TestConn & { auth: { pendingReauth?: boolean } }
+    let firstBump: Promise<void> | undefined
+    let secondBump: Promise<void> | undefined
+    let sourcePoll: Promise<void> | undefined
+    try {
+      vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] })
+      vi.setSystemTime(new Date(expiry * 1_000 + 1))
+      const expiryCheck = internal.expireShareMembership(conn)
+      await directCheckStarted.promise
+
+      liveEpoch = 1
+      firstBump = h.relay.applyEpochBump(DOCNAME)
+      await epochCheckStarted[0]!.promise
+      liveEpoch = 2
+      secondBump = h.relay.applyEpochBump(DOCNAME)
+      await epochCheckStarted[1]!.promise
+
+      directCheck.resolve({
+        role: 'reader',
+        permissionEpoch: 2,
+        sourceRevision: driveRevision,
+        proofExpiresAt,
+        sourceConfirmed: true,
+      })
+      await expiryCheck
+      expect(directChecks).toBe(1)
+      expect(liveConn.auth.pendingReauth).toBe(true)
+
+      epochCheck[0]!.resolve('reader')
+      await firstBump
+      epochCheck[1]!.resolve('reader')
+      await secondBump
+      expect(conn.roleEpoch).toBe(2)
+      expect(liveConn.auth.pendingReauth).not.toBe(true)
+
+      const beforeRevocation = reader.frames.length
+      expect(await sendAndAck(writer, opsFrame(1, 'writer-after-repeated-epoch-handoff', 2)))
+        .toMatchObject({ ctl: 'ack', q: 1 })
+      expect(await reader.waitFor(frame => frame.ctl === 'op' && frame.q === 1, beforeRevocation))
+        .toMatchObject({ ctl: 'op', q: 1 })
+
+      driveRevoked = true
+      driveRevision = `sha256:${'b'.repeat(64)}`
+      sourcePoll = pollActiveAccess()
+      await vi.waitFor(() => expect(revocationCheckStarted).toBe(true))
+      const beforeSourceClose = reader.frames.length
+      expect(await sendAndAck(writer, opsFrame(2, 'source-check-freezes-reader-before-revocation-confirmation', 2)))
+        .toMatchObject({ ctl: 'ack', q: 2 })
+      await turn()
+      expect(reader.frames.slice(beforeSourceClose).some(frame => frame.ctl === 'op')).toBe(false)
+      revokedCheck.resolve({
+        role: 'none',
+        permissionEpoch: liveEpoch,
+        sourceRevision: driveRevision,
+        proofExpiresAt,
+        sourceConfirmed: true,
+      })
+      await sourcePoll
+      await vi.waitFor(() => expect(reader.closeInfo?.code).toBe(4403))
+
+      const afterRevocation = reader.frames.length
+      expect(await sendAndAck(writer, opsFrame(3, 'no-frame-after-repeated-epoch-revocation', 2)))
+        .toMatchObject({ ctl: 'ack', q: 3 })
+      await turn()
+      expect(reader.frames.slice(afterRevocation).some(frame => frame.ctl === 'op')).toBe(false)
+    } finally {
+      directCheck.resolve({
+        role: driveRevoked ? 'none' : 'reader',
+        permissionEpoch: liveEpoch,
+        sourceRevision: driveRevision,
+        proofExpiresAt,
+        sourceConfirmed: true,
+      })
+      revokedCheck.resolve({
+        role: 'none',
+        permissionEpoch: liveEpoch,
+        sourceRevision: driveRevision,
+        proofExpiresAt,
+        sourceConfirmed: true,
+      })
+      epochCheck[0]!.resolve('reader')
+      epochCheck[1]!.resolve('reader')
+      if (sourcePoll) await sourcePoll
+      await firstBump
+      await secondBump
+    }
+  })
+  it('does not let an older epoch proof replace the newer epoch Drive proof', async () => {
+    let liveEpoch = 0
+    let driveRevision = `sha256:${'a'.repeat(64)}`
+    let directReads = 0
+    const expiryAccessStarted = deferred<void>()
+    const expiryAccess = deferred<CurrentAccess>()
+    const oldEpochAccessStarted = deferred<void>()
+    const oldEpochAccess = deferred<CurrentAccess>()
+    const currentEpochAccessStarted = deferred<void>()
+    const currentEpochAccess = deferred<CurrentAccess>()
+    const revokedAccessStarted = deferred<void>()
+    const revokedAccess = deferred<CurrentAccess>()
+    const proofExpiresAt = performance.now() + 60_000
+    const proof = (role: ResolvedRole, permissionEpoch: number, sourceRevision: string): CurrentAccess => ({
+      role,
+      permissionEpoch,
+      sourceRevision,
+      proofExpiresAt,
+      sourceConfirmed: true,
+    })
+    setDriveDerivedAccess({
+      derivedAccess: async () => null,
+      versions: async bindings => bindings.map(binding => ({
+        ...binding,
+        sourceRevision: driveRevision,
+        validForMs: 60_000,
+        expiresAt: performance.now() + 60_000,
+      })),
+    })
+    const initialAccess = independentAccess('writer')
+    const h = await setup({
+      epochProvider: async () => liveEpoch,
+      roleProvider: async ({ uid, spaceMember }) =>
+        uid === 'u_epoch_proof_handoff' && !spaceMember ? 'reader' : 'writer',
+      accessProvider: async ({ uid, spaceMember }) => {
+        if (uid !== 'u_epoch_proof_handoff' || spaceMember) return independentAccess('writer')
+        switch (++directReads) {
+          case 1:
+            expiryAccessStarted.resolve()
+            return expiryAccess.promise
+          case 2:
+            oldEpochAccessStarted.resolve()
+            return oldEpochAccess.promise
+          case 3:
+            currentEpochAccessStarted.resolve()
+            return currentEpochAccess.promise
+          default:
+            revokedAccessStarted.resolve()
+            return revokedAccess.promise
+        }
+      },
+    })
+    const expiry = Math.floor(Date.now() / 1_000) + 3_600
+    const reader = await h.connect({
+      uid: 'u_epoch_proof_handoff', role: 'writer', spaceMember: true, expSeconds: expiry,
+    })
+    const writer = await h.connect({
+      uid: 'u_epoch_proof_writer', role: 'writer', expSeconds: expiry + 3_600,
+    })
+    await helloReady(reader)
+    await helloReady(writer)
+    const { internal, conn } = connectionFor(h.relay, 'u_epoch_proof_handoff')
+    const liveConn = conn as TestConn & {
+      auth: { pendingReauth?: boolean }
+      sourceAccess?: CurrentAccess
+      shareExpiryGeneration?: number
+      reauthGeneration: number
+    }
+    let expiryCheck: Promise<void> | undefined
+    let oldBump: Promise<void> | undefined
+    let currentBump: Promise<void> | undefined
+    try {
+      vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] })
+      vi.setSystemTime(new Date(expiry * 1_000 + 1))
+      expiryCheck = internal.expireShareMembership(conn)
+      await expiryAccessStarted.promise
+
+      liveEpoch = 1
+      oldBump = h.relay.applyEpochBump(DOCNAME)
+      await oldEpochAccessStarted.promise
+      expiryAccess.resolve(proof('reader', 1, driveRevision))
+      await expiryCheck
+
+      liveEpoch = 2
+      currentBump = h.relay.applyEpochBump(DOCNAME)
+      await currentEpochAccessStarted.promise
+      const sourceBeforeOldResult = liveConn.sourceAccess
+      oldEpochAccess.resolve(proof('reader', 1, driveRevision))
+      await oldBump
+      expect(liveConn.auth.pendingReauth).toBe(true)
+      expect(liveConn.sourceAccess).toBe(sourceBeforeOldResult)
+      expect(liveConn.shareExpiryGeneration).toBe(liveConn.reauthGeneration)
+
+      const beforeCurrentProof = reader.frames.length
+      expect(await sendAndAck(writer, opsFrame(1, 'epoch-proof-stays-pending', 2)))
+        .toMatchObject({ ctl: 'ack', q: 1 })
+      await turn()
+      expect(reader.frames.slice(beforeCurrentProof).some(frame => frame.ctl === 'op')).toBe(false)
+
+      const currentRevision = `sha256:${'b'.repeat(64)}`
+      driveRevision = currentRevision
+      currentEpochAccess.resolve(proof('reader', 2, currentRevision))
+      await currentBump
+      expect(liveConn.roleEpoch).toBe(2)
+      expect(liveConn.sourceAccess).toMatchObject({ role: 'reader', sourceRevision: currentRevision })
+      expect(liveConn.auth.pendingReauth).not.toBe(true)
+      expect(liveConn.shareExpiryGeneration).toBeUndefined()
+      expect(await reader.waitFor(frame => frame.ctl === 'op' && frame.q === 1, beforeCurrentProof))
+        .toMatchObject({ ctl: 'op', q: 1 })
+
+      driveRevision = `sha256:${'c'.repeat(64)}`
+      invalidateActiveAccess(DOC, SPACE, 'u_epoch_proof_handoff')
+      await revokedAccessStarted.promise
+      const beforeRevocation = reader.frames.length
+      expect(await sendAndAck(writer, opsFrame(2, 'latest-source-proof-is-tracked', 2)))
+        .toMatchObject({ ctl: 'ack', q: 2 })
+      await turn()
+      expect(reader.frames.slice(beforeRevocation).some(frame => frame.ctl === 'op')).toBe(false)
+      revokedAccess.resolve(proof('none', 2, driveRevision))
+      await vi.waitFor(() => expect(reader.closeInfo?.code).toBe(4403))
+    } finally {
+      expiryAccess.resolve(proof('reader', 1, driveRevision))
+      oldEpochAccess.resolve(proof('reader', 1, driveRevision))
+      currentEpochAccess.resolve(proof('reader', 2, driveRevision))
+      revokedAccess.resolve(proof('none', 2, driveRevision))
+      await expiryCheck
+      await oldBump
+      await currentBump
+    }
+  })
+  it('does not let a stale share-expiry proof clear a newer epoch freeze', async () => {
+    let liveEpoch = 0
+    let directReads = 0
+    const driveRevision = `sha256:${'a'.repeat(64)}`
+    const proofExpiresAt = performance.now() + 60_000
+    const expiryAccessStarted = deferred<void>()
+    const expiryAccess = deferred<CurrentAccess>()
+    const epochTwoRoleStarted = deferred<void>()
+    const epochTwoRole = deferred<ResolvedRole>()
+    const proof = (permissionEpoch: number): CurrentAccess => ({
+      role: 'reader',
+      permissionEpoch,
+      sourceRevision: driveRevision,
+      proofExpiresAt,
+      sourceConfirmed: true,
+    })
+    setDriveDerivedAccess({
+      derivedAccess: async () => null,
+      versions: async bindings => bindings.map(binding => ({
+        ...binding,
+        sourceRevision: driveRevision,
+        validForMs: 60_000,
+        expiresAt: performance.now() + 60_000,
+      })),
+    })
+    const h = await setup({
+      epochProvider: async () => liveEpoch,
+      roleProvider: async ({ uid, spaceMember }) => {
+        if (uid !== 'u_stale_expiry_epoch_owner') return 'writer'
+        if (spaceMember) return 'writer'
+        if (liveEpoch === 2) {
+          epochTwoRoleStarted.resolve()
+          return epochTwoRole.promise
+        }
+        return 'reader'
+      },
+      accessProvider: async ({ uid, spaceMember }) => {
+        if (uid !== 'u_stale_expiry_epoch_owner' || spaceMember) return independentAccess('writer')
+        if (++directReads === 1) {
+          expiryAccessStarted.resolve()
+          return expiryAccess.promise
+        }
+        return proof(1)
+      },
+    })
+    const expiry = Math.floor(Date.now() / 1_000) + 3_600
+    const reader = await h.connect({
+      uid: 'u_stale_expiry_epoch_owner',
+      role: 'writer',
+      spaceMember: true,
+      expSeconds: expiry,
+    })
+    const writer = await h.connect({
+      uid: 'u_stale_expiry_writer',
+      role: 'writer',
+      expSeconds: expiry + 3_600,
+    })
+    await helloReady(reader)
+    await helloReady(writer)
+    const { internal, conn } = connectionFor(h.relay, 'u_stale_expiry_epoch_owner')
+    const liveConn = conn as TestConn & {
+      auth: { pendingReauth?: boolean; readAllowed: boolean }
+      epochGeneration: number
+      epochResolvedGeneration: number
+    }
+    let expiryCheck: Promise<void> | undefined
+    let firstBump: Promise<void> | undefined
+    let secondBump: Promise<void> | undefined
+    try {
+      expiryCheck = internal.expireShareMembership(conn)
+      await expiryAccessStarted.promise
+
+      liveEpoch = 1
+      firstBump = h.relay.applyEpochBump(DOCNAME)
+      await firstBump
+      expect(liveConn.epochGeneration).toBe(1)
+      expect(liveConn.epochResolvedGeneration).toBe(1)
+      expect(liveConn.auth.pendingReauth).not.toBe(true)
+
+      liveEpoch = 2
+      secondBump = h.relay.applyEpochBump(DOCNAME)
+      await epochTwoRoleStarted.promise
+      expect(liveConn.epochGeneration).toBe(2)
+      expect(liveConn.epochResolvedGeneration).toBe(1)
+      expect(liveConn.auth.pendingReauth).toBe(true)
+
+      const beforeOldExpiryProof = reader.frames.length
+      expiryAccess.resolve(proof(1))
+      await expiryCheck
+      expect(liveConn.auth.pendingReauth).toBe(true)
+      expect(liveConn.auth.readAllowed).toBe(false)
+
+      expect(await sendAndAck(writer, opsFrame(1, 'new-epoch-freeze-stays-private', 2)))
+        .toMatchObject({ ctl: 'ack', q: 1 })
+      await turn()
+      expect(reader.frames.slice(beforeOldExpiryProof).some(frame => frame.ctl === 'op')).toBe(false)
+
+      epochTwoRole.resolve('none')
+      await secondBump
+      await vi.waitFor(() => expect(reader.closeInfo?.code).toBe(4403))
+    } finally {
+      expiryAccess.resolve(proof(1))
+      epochTwoRole.resolve('none')
+      await expiryCheck
+      await firstBump
+      await secondBump
+    }
+  })
+  it('does not let an epoch recheck reopen a source-revoked reader during share expiry', async () => {
+    let liveEpoch = 0
+    let driveRevision = `sha256:${'a'.repeat(64)}`
+    let driveRevoked = false
+    const directCheckStarted = deferred<void>()
+    const directCheck = deferred<CurrentAccess>()
+    const epochCheckStarted = deferred<void>()
+    const epochCheck = deferred<ResolvedRole>()
+    const revokedCheckStarted = deferred<void>()
+    const revokedCheck = deferred<CurrentAccess>()
+    const proofExpiresAt = performance.now() + 60_000
+    setDriveDerivedAccess({
+      derivedAccess: async () => null,
+      versions: async bindings => bindings.map(binding => ({
+        ...binding,
+        sourceRevision: driveRevision,
+        validForMs: 60_000,
+        expiresAt: performance.now() + 60_000,
+      })),
+    })
+    const h = await setup({
+      epochProvider: async () => liveEpoch,
+      roleProvider: async ({ uid, spaceMember }) => {
+        if (uid !== 'u_epoch_source_close') return 'writer'
+        if (spaceMember) return 'writer'
+        epochCheckStarted.resolve()
+        return epochCheck.promise
+      },
+      accessProvider: async ({ uid, spaceMember }) => {
+        if (uid !== 'u_epoch_source_close') return independentAccess('writer')
+        if (spaceMember) return independentAccess('writer')
+        directCheckStarted.resolve()
+        if (!driveRevoked) return directCheck.promise
+        revokedCheckStarted.resolve()
+        return revokedCheck.promise
+      },
+    })
+    const expiry = Math.floor(Date.now() / 1_000) + 3_600
+    const reader = await h.connect({
+      uid: 'u_epoch_source_close', role: 'writer', spaceMember: true, expSeconds: expiry,
+    })
+    const writer = await h.connect({
+      uid: 'u_epoch_source_close_writer', role: 'writer', expSeconds: expiry + 3_600,
+    })
+    await helloReady(reader)
+    await helloReady(writer)
+    const { internal, conn } = connectionFor(h.relay, 'u_epoch_source_close')
+
+    let expiryCheck: Promise<void> | undefined
+    let epochBump: Promise<void> | undefined
+    try {
+      vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] })
+      vi.setSystemTime(new Date(expiry * 1_000 + 1))
+      expiryCheck = internal.expireShareMembership(conn)
+      await directCheckStarted.promise
+
+      liveEpoch = 1
+      epochBump = h.relay.applyEpochBump(DOCNAME)
+      await epochCheckStarted.promise
+      directCheck.resolve({
+        role: 'reader',
+        permissionEpoch: 1,
+        sourceRevision: driveRevision,
+        proofExpiresAt,
+        sourceConfirmed: true,
+      })
+      await expiryCheck
+
+      driveRevoked = true
+      driveRevision = `sha256:${'b'.repeat(64)}`
+      invalidateActiveAccess(DOC, SPACE, 'u_epoch_source_close')
+      await revokedCheckStarted.promise
+      const beforeRevocation = reader.frames.length
+      expect(await sendAndAck(writer, opsFrame(1, 'no-peer-frame-during-source-check', 1)))
+        .toMatchObject({ ctl: 'ack', q: 1 })
+      await turn()
+      expect(reader.frames.slice(beforeRevocation).some(frame => frame.ctl === 'op')).toBe(false)
+      revokedCheck.resolve({
+        role: 'none',
+        permissionEpoch: liveEpoch,
+        sourceRevision: driveRevision,
+        proofExpiresAt,
+        sourceConfirmed: true,
+      })
+      await vi.waitFor(() => expect(reader.closeInfo?.code).toBe(4403))
+      epochCheck.resolve('reader')
+      await epochBump
+      expect(reader.ws.readyState).toBe(WebSocket.CLOSED)
+
+      const afterClose = reader.frames.length
+      expect(await sendAndAck(writer, opsFrame(2, 'no-frame-after-epoch-source-revocation', 1)))
+        .toMatchObject({ ctl: 'ack', q: 2 })
+      await turn()
+      expect(reader.frames.slice(afterClose).some(frame => frame.ctl === 'op')).toBe(false)
+    } finally {
+      directCheck.resolve({
+        role: driveRevoked ? 'none' : 'reader',
+        permissionEpoch: liveEpoch,
+        sourceRevision: driveRevision,
+        proofExpiresAt,
+        sourceConfirmed: true,
+      })
+      revokedCheck.resolve({
+        role: 'none',
+        permissionEpoch: liveEpoch,
+        sourceRevision: driveRevision,
+        proofExpiresAt,
+        sourceConfirmed: true,
+      })
+      epochCheck.resolve('reader')
+      vi.useRealTimers()
+      await expiryCheck
+      await epochBump
+    }
   })
 })
