@@ -742,12 +742,68 @@ function mapInline(inlineTok: Token, ctx: Ctx): PmNode[] {
   return postProcessInline(out, ctx)
 }
 
+/**
+ * Marks that refuse to coexist with ANY other mark (ProseMirror `excludes: '_'`).
+ *
+ * `code` is the schema's only such mark today (src/schema/index.ts). The importer used to
+ * hand ProseMirror the raw nesting the Markdown source implied — `` **还没有 `summary` 命令** ``
+ * produced a text node carrying `[bold, code]` — which `PMNode.check()` rejects with
+ * "Invalid collection of marks". That throw travels up as SchemaIncompatibleError and the
+ * import route answers 422 `schema_incompatible`, so ONE such span anywhere in the file sinks
+ * the whole atomic import. The document has already been created by then, which is why the
+ * failure surfaced as "conversion succeeded but the document is empty".
+ *
+ * Encoded here as a name set rather than read off a live Schema on purpose: this module maps
+ * tokens to plain ProseMirror JSON and deliberately does not depend on schema/index.ts (which
+ * pulls in prosemirror-model). The set is asserted against the real schema in the tests, so a
+ * future mark that adds `excludes: '_'` fails there instead of silently reaching check().
+ */
+const EXCLUSIVE_MARKS = new Set(['code'])
+
+/**
+ * Drop marks that cannot legally coexist, keeping the innermost exclusive one.
+ *
+ * Precedence is deliberate: when an exclusive mark is present it wins and everything else is
+ * discarded. Markdown cannot express `bold` INSIDE `code` (the backticks make their content
+ * literal), so the surviving intent of `` **`x`** `` is the code span; the bold is decoration
+ * the schema has no representation for. Dropping it loses styling — accepting it loses the
+ * entire document.
+ *
+ * Non-exclusive marks only exclude their own type, so de-duplicating by type is enough for
+ * them (a doubled `bold` from nested `**` would otherwise be an invalid collection too).
+ */
+function reconcileMarks(
+  marks: Array<{ type: string; attrs?: Record<string, unknown> }>,
+): Array<{ type: string; attrs?: Record<string, unknown> }> {
+  // Innermost wins: the stack is outermost-first, so scan from the end.
+  for (let i = marks.length - 1; i >= 0; i--) {
+    const m = marks[i]
+    if (m && EXCLUSIVE_MARKS.has(m.type)) return [{ ...m }]
+  }
+  // CSS cascade invariant: when the same mark type nests, the CLOSEST ancestor wins.
+  // `marks` is outermost-first, so a later (inner) occurrence overrides an earlier
+  // (outer) one. Merge per attribute rather than replacing wholesale: an inner
+  // `<span color:blue>` inside an outer `<span font-size:24px>` keeps both — the inner
+  // layer only overrides the attributes it actually defines (here `color`), inheriting
+  // the rest. Nested colored spans / <mark> backgrounds therefore resolve innermost-wins.
+  const byType = new Map<string, { type: string; attrs?: Record<string, unknown> }>()
+  for (const m of marks) {
+    const prev = byType.get(m.type)
+    if (prev) {
+      if (m.attrs || prev.attrs) prev.attrs = { ...(prev.attrs ?? {}), ...(m.attrs ?? {}) }
+    } else {
+      byType.set(m.type, m.attrs ? { type: m.type, attrs: { ...m.attrs } } : { type: m.type })
+    }
+  }
+  return [...byType.values()]
+}
+
 function withMarks(
   node: PmNode,
   stack: Array<{ type: string; attrs?: Record<string, unknown> }>,
 ): PmNode {
-  const marks = stack.filter((m) => m.type !== '__dropped_link')
-  if (node.type === 'text' && marks.length) return { ...node, marks: marks.map((m) => ({ ...m })) }
+  const marks = reconcileMarks(stack.filter((m) => m.type !== '__dropped_link'))
+  if (node.type === 'text' && marks.length) return { ...node, marks }
   return node
 }
 
