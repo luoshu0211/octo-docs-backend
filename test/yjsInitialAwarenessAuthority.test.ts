@@ -12,8 +12,19 @@ import type { AuthContext } from '../src/collab/authenticate.js'
 import { stateGenerationRepo } from '../src/db/repos/stateGenerationRepo.js'
 import { invalidateActiveAccess } from '../src/permission/activeAccess.js'
 import { recheckCurrentAccess, type CurrentAccess } from '../src/permission/resolveRole.js'
+import type * as LoadAdmissionModule from '../src/collab/loadAdmission.js'
 
 vi.mock('../src/permission/epoch.js', () => ({ currentEpoch: vi.fn(async () => 0) }))
+vi.mock('../src/collab/loadAdmission.js', async original => {
+  const actual = await original<typeof LoadAdmissionModule>()
+  return {
+    ...actual,
+    loadAdmission: new actual.LoadAdmission(() => ({
+      heapUsed: 64 * 1024 ** 2, heapLimit: 512 * 1024 ** 2,
+      available: 3 * 1024 ** 3, capacity: 4 * 1024 ** 3,
+    })),
+  }
+})
 vi.mock('../src/db/repos/stateGenerationRepo.js', () => ({ stateGenerationRepo: { ensureSheet: vi.fn() } }))
 vi.mock('../src/permission/resolveRole.js', async original => ({
   ...await original<typeof import('../src/permission/resolveRole.js')>(),

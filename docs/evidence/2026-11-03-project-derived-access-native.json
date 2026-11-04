@@ -9,6 +9,13 @@
     "source_revision_probe_closed_code": 4403,
     "independent_writer_still_open": true,
     "no_post_revocation_frames": true,
+    "authority_fixture_admission": {
+      "input": "Test-local fixed memory reading on the real LoadAdmission instance",
+      "pressure_smoke_capacity_bytes": 2147483648,
+      "pressure_smoke_available_bytes": 0,
+      "production_admission_rejects_low_headroom": true,
+      "authorization_and_capacity_tests_passed_under_pressure": 19
+    },
     "verification": {
       "node": "22.22.2",
       "test_files_passed": 312,
