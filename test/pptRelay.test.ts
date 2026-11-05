@@ -353,8 +353,8 @@ describe('PPT relay: connect / replay / ready (PPT-WS-001)', () => {
   it('replays snapshot -> ops -> ready in order for a joiner behind the snapshot', async () => {
     const h = await setup()
     // Seed: 2 ops, a snapshot covering seq 1, then op 2 remains after prune.
-    await h.store.appendOp(DOC, 'f1', OPS_FRAME(1, 'f1'))
-    await h.store.appendOp(DOC, 'f2', OPS_FRAME(2, 'f2'))
+    await h.store.appendOp(DOC, 'f1', OPS_FRAME(1, 'f1'), 'test-editor')
+    await h.store.appendOp(DOC, 'f2', OPS_FRAME(2, 'f2'), 'test-editor')
     await h.store.saveSnapshot({ docId: DOC, coveredSeq: 1, doc: deck() })
     await h.store.pruneOpsThrough(DOC, 1)
 
@@ -765,7 +765,7 @@ describe('PPT relay: snapshot + GC + offline replay (PPT-COLLAB-003 / PPT-COLLAB
     const h = await setup()
     const w = await h.connect({ uid: 'u_w', role: 'writer' })
     await helloReady(w)
-    await h.store.appendOp(DOC, 'seed', OPS_FRAME(1, 'seed'))
+    await h.store.appendOp(DOC, 'seed', OPS_FRAME(1, 'seed'), 'test-editor')
     // The room high-water is 1, but this connection did not receive/ack seq 1.
     w.send({ t: 'snap', pv: 2, k: 1, epoch: 0, q: 1, doc: deck('unseen') })
     expect(await w.recv()).toMatchObject({ ctl: 'refused', code: 'snapshot-conflict' })
@@ -773,7 +773,7 @@ describe('PPT relay: snapshot + GC + offline replay (PPT-COLLAB-003 / PPT-COLLAB
 
   it('does not treat raw hello since as prune authority for a stale snapshot', async () => {
     const h = await setup()
-    await h.store.appendOp(DOC, 'seed-op', OPS_FRAME(1, 'seed-op'))
+    await h.store.appendOp(DOC, 'seed-op', OPS_FRAME(1, 'seed-op'), 'test-editor')
 
     const stale = await h.connect({ uid: 'u_stale', role: 'writer' })
     const { replay } = await helloReady(stale, 1)
@@ -899,7 +899,7 @@ describe('PPT relay: negotiated live permissions', () => {
     const gate = new Promise<void>(resolve => { release = resolve })
     void internal.enqueueOutbound(conn, () => gate)
     const first = OPS_FRAME(1, 'queued-first'), second = OPS_FRAME(2, 'queued-second')
-    await h.store.appendOp(DOC, first.frameId, first); await h.store.appendOp(DOC, second.frameId, second)
+    await h.store.appendOp(DOC, first.frameId, first, 'test-editor'); await h.store.appendOp(DOC, second.frameId, second, 'test-editor')
     const tasks: Promise<unknown>[] = []
     try {
       if (kind === 'cutover') conn.caughtUp = false
@@ -960,7 +960,7 @@ describe('PPT relay: negotiated live permissions', () => {
     conn.auth = { readAllowed: true, invalidated: false, pendingReauth: true }
     conn.replayPending = { since: 0, ready: false }
     const op = OPS_FRAME(1, 'buffered-after-proof')
-    const { seq: q } = await h.store.appendOp(DOC, op.frameId, op)
+    const { seq: q } = await h.store.appendOp(DOC, op.frameId, op, 'test-editor')
     const frame = { ctl: 'op', q, frame: op }
     conn.liveBuffer = [frame]; conn.liveBufferBytes = Buffer.byteLength(JSON.stringify(frame))
     // Hold replay at its storage read so the former concurrent drain gets ahead.
@@ -995,7 +995,7 @@ describe('PPT relay: negotiated live permissions', () => {
       role: kind === 'membership' ? 'reader' : 'writer', permission_epoch: value,
       principal_space_id: 's_1', space_member: kind === 'membership', home_space_verified: true,
       current_space_verified: true, jti: randomUUID() }, config.collabToken.secret, { audience: PPT_RELAY_TICKET_AUD, expiresIn: 30 })
-    await h.store.appendOp(DOC, 'initial', OPS_FRAME(1, 'initial'))
+    await h.store.appendOp(DOC, 'initial', OPS_FRAME(1, 'initial'), 'test-editor')
     await h.store.saveSnapshot({ docId: DOC, coveredSeq: 1, doc: deck() })
     const c = await h.connect({ uid: 'u_hello', role: 'writer', ticket: ticket(0) })
     try {
@@ -1024,7 +1024,7 @@ describe('PPT relay: negotiated live permissions', () => {
       role: 'reader', permission_epoch: epoch, principal_space_id: 's_1', space_member: true,
       home_space_verified: true, current_space_verified: true, jti: randomUUID() },
       config.collabToken.secret, { audience: PPT_RELAY_TICKET_AUD, expiresIn: 30 })
-    await h.store.appendOp(DOC, 'initial', OPS_FRAME(1, 'initial'))
+    await h.store.appendOp(DOC, 'initial', OPS_FRAME(1, 'initial'), 'test-editor')
     await h.store.saveSnapshot({ docId: DOC, coveredSeq: 1, doc: deck() })
     const c = await h.connect({ uid: 'u_share', role: 'reader', ticket: ticket(0) })
     const relay = h.relay as unknown as {
@@ -1591,7 +1591,7 @@ describe('PPT relay: fresh membership proof after a missed epoch signal', () => 
   it('retains a need cursor across proof refresh and serves it only after reauth', async () => {
     const h = await setup({ roleProvider: shareRole, limits: { authRefreshMs: 60_000 } })
     const c = await join(h)
-    await h.store.appendOp(DOC, 'missed-op', OPS_FRAME(1, 'missed-op'))
+    await h.store.appendOp(DOC, 'missed-op', OPS_FRAME(1, 'missed-op'), 'test-editor')
     h.setEpoch(1)
     c.send({ t: 'need', pv: 2, since: 0 })
     await c.recvUntil(f => f.ctl === 'auth-refresh')
@@ -1686,7 +1686,7 @@ describe('PPT relay: fresh membership proof after a missed epoch signal', () => 
       expect(conn.auth.pendingReauth).not.toBe(true)
 
       const frame = OPS_FRAME(1, 'peer-after-current-epoch-proof', 1)
-      await h.store.appendOp(DOC, frame.frameId, frame)
+      await h.store.appendOp(DOC, frame.frameId, frame, 'test-editor')
       await internal.deliver(conn, { ctl: 'op', q: 1, frame })
       expect((await c.recvUntil(f => f.ctl === 'op')).at(-1)).toMatchObject({ q: 1, frame: { frameId: frame.frameId } })
       expect(conn.liveBuffer).toHaveLength(0)
@@ -1715,7 +1715,7 @@ describe('PPT relay: fresh membership proof after a missed epoch signal', () => 
     try {
       await parked
       const frame = OPS_FRAME(1, 'during-status-lookup', 1)
-      await h.store.appendOp(DOC, frame.frameId, frame)
+      await h.store.appendOp(DOC, frame.frameId, frame, 'test-editor')
       await internal.deliver(conn, { ctl: 'op', q: 1, frame })
       await expect(c.recv(50)).rejects.toThrow('recv timeout')
       expect(conn.auth.pendingReauth).toBe(true)
@@ -1753,7 +1753,7 @@ describe('PPT relay: no silent drops post-commit (B7 / P1-12)', () => {
   it('an op still ACKs when the durable write succeeded but the snapshot read throws', async () => {
     const base = new InMemoryPptRelayStore()
     const store: PptRelayStore = {
-      appendOp: (d, f, fr) => base.appendOp(d, f, fr),
+      appendOp: (d, f, fr, editorUid) => base.appendOp(d, f, fr, editorUid),
       frameSeq: (d, f) => base.frameSeq(d, f),
       opsSince: (d, s, l) => base.opsSince(d, s, l),
       currentSeq: (d) => base.currentSeq(d),
@@ -1780,7 +1780,7 @@ describe('PPT relay: no silent drops post-commit (B7 / P1-12)', () => {
   it('the server snapshotter keeps the snapshot durable even if the post-save prune throws', async () => {
     const base = new InMemoryPptRelayStore()
     const store: PptRelayStore = {
-      appendOp: (d, f, fr) => base.appendOp(d, f, fr),
+      appendOp: (d, f, fr, editorUid) => base.appendOp(d, f, fr, editorUid),
       frameSeq: (d, f) => base.frameSeq(d, f),
       opsSince: (d, s, l) => base.opsSince(d, s, l),
       currentSeq: (d) => base.currentSeq(d),
@@ -1840,7 +1840,7 @@ describe('PPT relay: byte-accurate limits + binding blob cap (non-blocking)', ()
     const store = new InMemoryPptRelayStore()
     // Seed durable ops totalling some bytes BEFORE any socket connects (models a
     // process that restarted with a non-empty room).
-    await store.appendOp(DOC, 'seed1', { t: 'ops', ops: [{ op: 'set', a: 'u-test', s: 1, l: 1, k: 'p', v: 'y'.repeat(400) }] })
+    await store.appendOp(DOC, 'seed1', { t: 'ops', ops: [{ op: 'set', a: 'u-test', s: 1, l: 1, k: 'p', v: 'y'.repeat(400) }] }, 'test-editor')
     const seeded = await store.roomBytes(DOC)
     expect(seeded).toBeGreaterThan(0)
     const h = await setup({ store, limits: { maxRoomFrameBytes: seeded + 10 } })
@@ -1975,7 +1975,7 @@ describe('PPT relay: round-3 correctness fixes (XIN-1655)', () => {
 
   it('C5: replay `since` is an op-seq boundary (coveredSeq), independent of snapshotVersion', async () => {
     const store = new InMemoryPptRelayStore()
-    await store.appendOp(DOC, 'f1', OPS_FRAME(1, 'f1'))
+    await store.appendOp(DOC, 'f1', OPS_FRAME(1, 'f1'), 'test-editor')
     // Drive snapshotVersion ABOVE coveredSeq (two saves at the same covered seq),
     // so the two coordinate systems visibly diverge.
     await store.saveSnapshot({ docId: DOC, coveredSeq: 1, doc: deck() })
@@ -1983,7 +1983,7 @@ describe('PPT relay: round-3 correctness fixes (XIN-1655)', () => {
     const snap = await store.getSnapshot(DOC)
     expect(snap!.snapshotVersion).toBe(2)
     expect(snap!.coveredSeq).toBe(1)
-    await store.appendOp(DOC, 'f2', OPS_FRAME(2, 'f2')) // op past the snapshot boundary
+    await store.appendOp(DOC, 'f2', OPS_FRAME(2, 'f2'), 'test-editor') // op past the snapshot boundary
 
     const h = await setup({ store })
     // Fresh joiner (since=0): snapshot + EVERY op after coveredSeq(1). Treating the
@@ -2013,7 +2013,7 @@ describe('PPT relay: round-3 correctness fixes (XIN-1655)', () => {
       }
     }
     const store = new InflatedCounterStore()
-    for (const f of ['f1', 'f2', 'f3']) await store.appendOp(DOC, f, OPS_FRAME(1, f))
+    for (const f of ['f1', 'f2', 'f3']) await store.appendOp(DOC, f, OPS_FRAME(1, f), 'test-editor')
     const h = await setup({ store })
     const c = await h.connect({ uid: 'u1', role: 'writer' })
     const { ready, replay } = await helloReady(c, 0)
@@ -2131,7 +2131,7 @@ describe('PPT relay: round-4 fixes (XIN-1660)', () => {
 
   it('hardening: replay streams a backlog larger than the page size, in order and complete', async () => {
     const store = new InMemoryPptRelayStore()
-    for (let i = 1; i <= 5; i++) await store.appendOp(DOC, `f${i}`, OPS_FRAME(i, `f${i}`))
+    for (let i = 1; i <= 5; i++) await store.appendOp(DOC, `f${i}`, OPS_FRAME(i, `f${i}`), 'test-editor')
     const h = await setup({ store, limits: { replayPageSize: 2 } }) // 5 ops across 3 pages
     const c = await h.connect({ uid: 'u1', role: 'writer' })
     const { ready, replay } = await helloReady(c, 0)
@@ -2141,7 +2141,7 @@ describe('PPT relay: round-4 fixes (XIN-1660)', () => {
 
   it('P2-e: a resume cursor above the room high-water is refused (protocol error), not clamped', async () => {
     const store = new InMemoryPptRelayStore()
-    for (const f of ['f1', 'f2', 'f3']) await store.appendOp(DOC, f, OPS_FRAME(1, f))
+    for (const f of ['f1', 'f2', 'f3']) await store.appendOp(DOC, f, OPS_FRAME(1, f), 'test-editor')
     const h = await setup({ store })
     const c = await h.connect({ uid: 'u1', role: 'writer' })
     // Client claims to be synced through seq 99999 (above the real high-water 3).
@@ -2484,7 +2484,7 @@ describe('PPT relay: round-7 fixes (XIN-1695)', () => {
     // A store whose appendOp throws a transient (retryable) storage error: the
     // relay maps it to `storage-retry` and now attaches STORAGE_RETRY_BACKOFF_MS.
     class TransientAppendStore extends InMemoryPptRelayStore {
-      override async appendOp(docId: string, frameId: string, frame: unknown): ReturnType<InMemoryPptRelayStore['appendOp']> {
+      override async appendOp(docId: string, frameId: string, frame: unknown, _editorUid: string): ReturnType<InMemoryPptRelayStore['appendOp']> {
         void docId
         void frameId
         void frame
@@ -2669,8 +2669,8 @@ describe('PPT relay: NULL-hash pre-gate re-ack (XIN-1750, round-17)', () => {
 describe('PPT relay: RC round-12 blockers (XIN-1736)', () => {
   it('P1-E: a re-hello with a stale (lower) cursor does NOT re-deliver already-delivered ops', async () => {
     const h = await setup()
-    await h.store.appendOp(DOC, 'f1', OPS_FRAME(1, 'f1'))
-    await h.store.appendOp(DOC, 'f2', OPS_FRAME(2, 'f2'))
+    await h.store.appendOp(DOC, 'f1', OPS_FRAME(1, 'f1'), 'test-editor')
+    await h.store.appendOp(DOC, 'f2', OPS_FRAME(2, 'f2'), 'test-editor')
     const c = await h.connect({ uid: 'u1', role: 'writer' })
     const first = await helloReady(c, 0)
     expect(first.replay.filter((m) => m.ctl === 'op').map((m) => m.q)).toEqual([1, 2])
@@ -2720,7 +2720,7 @@ describe('PPT relay: RC round-12 blockers (XIN-1736)', () => {
 
   it('P1-I: a revoked (none) reader cannot re-ack a harvested frameId — the identity gate precedes the ledger lookup', async () => {
     const h = await setup()
-    await h.store.appendOp(DOC, 'harv', OPS_FRAME(1, 'harv')) // a durable frame authored earlier
+    await h.store.appendOp(DOC, 'harv', OPS_FRAME(1, 'harv'), 'test-editor') // a durable frame authored earlier
     const c = await h.connect({ uid: 'u_r', role: 'reader' })
     await helloReady(c)
     // Revoke to `none` and bump the epoch, WITHOUT pushing applyEpochBump: the
@@ -3038,9 +3038,9 @@ describe('PPT relay: round-16 fixes (XIN-1748)', () => {
     await helloReady(c) // caught up on an EMPTY room → deliveredThrough stays 0
     // Peers durably commit ops 1..3 this socket never observed (seeded straight into
     // the store, so no broadcast reaches c) — the optimistic-write-then-drop shape.
-    await h.store.appendOp(DOC, 'f1', OPS_FRAME(1, 'f1'))
-    await h.store.appendOp(DOC, 'f2', OPS_FRAME(2, 'f2'))
-    await h.store.appendOp(DOC, 'f3', OPS_FRAME(3, 'f3'))
+    await h.store.appendOp(DOC, 'f1', OPS_FRAME(1, 'f1'), 'test-editor')
+    await h.store.appendOp(DOC, 'f2', OPS_FRAME(2, 'f2'), 'test-editor')
+    await h.store.appendOp(DOC, 'f3', OPS_FRAME(3, 'f3'), 'test-editor')
     // c resends a frame already durable (same frameId + payload) — a known duplicate
     // that re-acks seq 3. On 5fb58629 the re-ack advanced c.deliveredThrough to 3.
     c.send(OPS_FRAME(1, 'f3'))
@@ -3059,9 +3059,9 @@ describe('PPT relay: round-16 fixes (XIN-1748)', () => {
     const h = await setup()
     const c = await h.connect({ uid: 'u_reack2', role: 'writer' })
     await helloReady(c) // caught up empty → deliveredThrough 0
-    await h.store.appendOp(DOC, 'g1', OPS_FRAME(1, 'g1'))
-    await h.store.appendOp(DOC, 'g2', OPS_FRAME(2, 'g2'))
-    await h.store.appendOp(DOC, 'g3', OPS_FRAME(3, 'g3'))
+    await h.store.appendOp(DOC, 'g1', OPS_FRAME(1, 'g1'), 'test-editor')
+    await h.store.appendOp(DOC, 'g2', OPS_FRAME(2, 'g2'), 'test-editor')
+    await h.store.appendOp(DOC, 'g3', OPS_FRAME(3, 'g3'), 'test-editor')
     c.send(OPS_FRAME(1, 'g3'))
     expect((await c.recvUntil((m) => m.ctl === 'ack')).at(-1)).toMatchObject({ ctl: 'ack', q: 3 })
     // c is caught up but has observed NOTHING; a snapshot covering the re-acked seq 3
@@ -3169,9 +3169,9 @@ describe('PPT relay: round-18 fixes (XIN-1754)', () => {
   it('P0-1: a writer caught-up via a CLAIMED cursor cannot snap-prune ops it never observed', async () => {
     const h = await setup()
     // The room already holds durable peer ops 1..3, no snapshot.
-    await h.store.appendOp(DOC, 'g1', OPS_FRAME(1, 'g1'))
-    await h.store.appendOp(DOC, 'g2', OPS_FRAME(2, 'g2'))
-    await h.store.appendOp(DOC, 'g3', OPS_FRAME(3, 'g3'))
+    await h.store.appendOp(DOC, 'g1', OPS_FRAME(1, 'g1'), 'test-editor')
+    await h.store.appendOp(DOC, 'g2', OPS_FRAME(2, 'g2'), 'test-editor')
+    await h.store.appendOp(DOC, 'g3', OPS_FRAME(3, 'g3'), 'test-editor')
     const c = await h.connect({ uid: 'u_claim', role: 'writer' })
     // Claim since = room high-water (3): replay streams NOTHING; the socket is marked
     // caught up with deliveredThrough 0 and a coverage floor of 3.
@@ -3198,9 +3198,9 @@ describe('PPT relay: round-18 fixes (XIN-1754)', () => {
     const c = await h.connect({ uid: 'u_dup', role: 'writer' })
     await helloReady(c) // caught up on an empty room → deliveredThrough 0
     // Peers durably commit ops 1..3 this socket never observed.
-    await store.appendOp(DOC, 'a1', OPS_FRAME(1, 'a1'))
-    await store.appendOp(DOC, 'a2', OPS_FRAME(2, 'a2'))
-    await store.appendOp(DOC, 'a3', OPS_FRAME(3, 'a3'))
+    await store.appendOp(DOC, 'a1', OPS_FRAME(1, 'a1'), 'test-editor')
+    await store.appendOp(DOC, 'a2', OPS_FRAME(2, 'a2'), 'test-editor')
+    await store.appendOp(DOC, 'a3', OPS_FRAME(3, 'a3'), 'test-editor')
     // c resends frame 'a3' (already durable at seq 3). frameIdentity throws → the
     // resend falls through to appendOp → duplicate:true at seq 3. On 7133d0e the
     // post-append markObservedSeq advanced deliveredThrough to 3 for this duplicate.

@@ -33,7 +33,7 @@ function baseDocProviderFor(doc: BentoDoc) {
 /** Append a golden frame to the store as a persisted ops frame `{t:'ops',...,ops}`. */
 async function seedFrames(store: InMemoryPptRelayStore, frames: GoldenFrame[]): Promise<void> {
   for (const f of frames) {
-    await store.appendOp(DOC, f.frameId, { t: 'ops', pv: 2, k: f.q, frameId: f.frameId, epoch: 0, ops: f.ops })
+    await store.appendOp(DOC, f.frameId, { t: 'ops', pv: 2, k: f.q, frameId: f.frameId, epoch: 0, ops: f.ops }, 'test-editor')
   }
 }
 
@@ -103,7 +103,7 @@ describe('PptSnapshotter.advance: durable-before-prune + room-byte reclaim', () 
     await snapshotter.advance(DOC, baseDocProviderFor(fx.genesis))
     // Tail arrives AFTER the snapshot; its seqs continue past coveredSeq.
     for (const f of fx.frames.filter((f) => f.q > N)) {
-      await store.appendOp(DOC, f.frameId, { t: 'ops', pv: 2, k: f.q, frameId: f.frameId, epoch: 0, ops: f.ops })
+      await store.appendOp(DOC, f.frameId, { t: 'ops', pv: 2, k: f.q, frameId: f.frameId, epoch: 0, ops: f.ops }, 'test-editor')
     }
     const snap = await store.getSnapshot(DOC)
     const tail = (await store.opsSince(DOC, snap!.coveredSeq)).map((o) => ({ seq: o.seq, ops: (o.frame as { ops: never[] }).ops }))
@@ -264,8 +264,8 @@ describe('PptSnapshotter.advance: per-actor s gap is never both dropped-from-sta
     const store = new InMemoryPptRelayStore()
     // Persist u-a s=1 (applies) at seq 1, and u-b s=2 (a gap) at seq 2. u-b's s=1 is
     // NEVER persisted, so the reducer buffers the s=2 op unapplied.
-    await store.appendOp(DOC, 'a-1', { t: 'ops', pv: 2, k: 1, frameId: 'a-1', epoch: 0, ops: aOps })
-    await store.appendOp(DOC, 'b-2', { t: 'ops', pv: 2, k: 2, frameId: 'b-2', epoch: 0, ops: bOps2 })
+    await store.appendOp(DOC, 'a-1', { t: 'ops', pv: 2, k: 1, frameId: 'a-1', epoch: 0, ops: aOps }, 'test-editor')
+    await store.appendOp(DOC, 'b-2', { t: 'ops', pv: 2, k: 2, frameId: 'b-2', epoch: 0, ops: bOps2 }, 'test-editor')
     expect((await store.opsSince(DOC, 0)).map((o) => o.seq)).toEqual([1, 2])
 
     const res = await new PptSnapshotter(store).advance(DOC, baseDocProviderFor(genesis))
@@ -288,12 +288,12 @@ describe('PptSnapshotter.advance: per-actor s gap is never both dropped-from-sta
   it('applies the gap op once its missing lower-s op is later persisted (recoverable, no loss)', async () => {
     const { genesis, aOps, bOps1, bOps2 } = mintGapScenario()
     const store = new InMemoryPptRelayStore()
-    await store.appendOp(DOC, 'a-1', { t: 'ops', pv: 2, k: 1, frameId: 'a-1', epoch: 0, ops: aOps })
-    await store.appendOp(DOC, 'b-2', { t: 'ops', pv: 2, k: 2, frameId: 'b-2', epoch: 0, ops: bOps2 })
+    await store.appendOp(DOC, 'a-1', { t: 'ops', pv: 2, k: 1, frameId: 'a-1', epoch: 0, ops: aOps }, 'test-editor')
+    await store.appendOp(DOC, 'b-2', { t: 'ops', pv: 2, k: 2, frameId: 'b-2', epoch: 0, ops: bOps2 }, 'test-editor')
     const snapshotter = new PptSnapshotter(store)
     await snapshotter.advance(DOC, baseDocProviderFor(genesis))
     // The missing u-b s=1 finally lands (seq 3) — the gap can now fill.
-    await store.appendOp(DOC, 'b-1', { t: 'ops', pv: 2, k: 3, frameId: 'b-1', epoch: 0, ops: bOps1 })
+    await store.appendOp(DOC, 'b-1', { t: 'ops', pv: 2, k: 3, frameId: 'b-1', epoch: 0, ops: bOps1 }, 'test-editor')
     const res = await snapshotter.advance(DOC, baseDocProviderFor(genesis))
 
     expect(res).not.toBeNull()
@@ -400,7 +400,7 @@ describe('PptSnapshotter.advance: ghost-target GC-freeze aging (XIN-1792 P1-3)',
   ]
   async function seedGhost(store: InMemoryPptRelayStore): Promise<void> {
     for (const f of ghostFrames) {
-      await store.appendOp(DOC, `f${f.seq}`, { t: 'ops', pv: 2, k: f.seq, frameId: `f${f.seq}`, epoch: 0, ops: f.ops })
+      await store.appendOp(DOC, `f${f.seq}`, { t: 'ops', pv: 2, k: f.seq, frameId: `f${f.seq}`, epoch: 0, ops: f.ops }, 'test-editor')
     }
   }
 
@@ -460,7 +460,7 @@ describe('PptSnapshotter.advance: ghost-target GC-freeze aging (XIN-1792 P1-3)',
       { seq: 2, ops: [{ op: 'set', a: 'u1', s: 2, l: 6, k: 'subtitle', v: 'yo' }] },
     ]
     for (const f of cleanFrames) {
-      await store.appendOp(DOC, `f${f.seq}`, { t: 'ops', pv: 2, k: f.seq, frameId: `f${f.seq}`, epoch: 0, ops: f.ops })
+      await store.appendOp(DOC, `f${f.seq}`, { t: 'ops', pv: 2, k: f.seq, frameId: `f${f.seq}`, epoch: 0, ops: f.ops }, 'test-editor')
     }
     const events: unknown[] = []
     const snapshotter = new PptSnapshotter(store, DEFAULT_MAX_BUFFERED_OP_LAG, (e) => events.push(e))
@@ -595,7 +595,7 @@ describe('reduceFrames / PptSnapshotter: a prototype-named node id cannot crash 
 
   it('advance() snapshots + prunes a room whose durable tail carries a prototype-named ins', async () => {
     const store = new InMemoryPptRelayStore()
-    await store.appendOp(DOC, 'proto-1', { t: 'ops', pv: 2, k: 1, frameId: 'proto-1', epoch: 0, ops: protoOps })
+    await store.appendOp(DOC, 'proto-1', { t: 'ops', pv: 2, k: 1, frameId: 'proto-1', epoch: 0, ops: protoOps }, 'test-editor')
     const snapshotter = new PptSnapshotter(store)
     // Pre-fix advance() threw here and left the op log un-prunable forever.
     const res = await snapshotter.advance(DOC, baseDocProviderFor(genesisDeck()))

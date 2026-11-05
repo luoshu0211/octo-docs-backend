@@ -136,9 +136,9 @@ describe.skipIf(process.env.PPT_CANONICAL_MYSQL_TEST !== '1')('PPT canonical ide
     expect(claims.docId).toBe(id); expect(upper.data.actor).toBe(lower.data.actor)
     const store = new DbPptRelayStore(true)
     const frame = { t: 'ops', ops: [{ op: 'set', a: claims.actor!, s: 1, l: 10000, k: 'caseTest', v: true }] }
-    await store.appendOp(claims.docId, randomUUID(), frame)
+    await store.appendOp(claims.docId, randomUUID(), frame, 'test-editor')
     const reconnect = verifyPptRelayTicket(lower.data.ticket)
-    await store.appendOp(reconnect.docId, randomUUID(), { t: 'ops', ops: [{ ...frame.ops[0], s: 2, l: 10001, v: false }] })
+    await store.appendOp(reconnect.docId, randomUUID(), { t: 'ops', ops: [{ ...frame.ops[0], s: 2, l: 10001, v: false }] }, 'test-editor')
     const watermarks = await query<{ doc_id: string; last_s: number }>('SELECT doc_id,last_s FROM ppt_collab_actor_seq WHERE doc_id = ?', [id])
     expect(watermarks).toEqual([{ doc_id: id, last_s: 2 }])
     for (const table of ['ppt_version', 'ppt_comment', 'ppt_collab_actor_seq']) {
@@ -157,7 +157,7 @@ describe.skipIf(process.env.PPT_CANONICAL_MYSQL_TEST !== '1')('PPT canonical ide
     const original = config.ppt.relay.maxRoomFrameBytes
     config.ppt.relay.maxRoomFrameBytes = cap
     try {
-      const results = await Promise.allSettled(frames.map(frame => new DbPptRelayStore(true).appendOp(id, randomUUID(), frame)))
+      const results = await Promise.allSettled(frames.map(frame => new DbPptRelayStore(true).appendOp(id, randomUUID(), frame, 'test-editor')))
       expect(results.filter(result => result.status === 'fulfilled')).toHaveLength(1)
       expect(results.filter(result => result.status === 'rejected')).toHaveLength(1)
       const store = new DbPptRelayStore(true)

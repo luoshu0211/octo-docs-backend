@@ -934,4 +934,3 @@ describe('MR98-012 sibling-written rows — an observed Redis failure re-arms th
     expect(r.compactedAt).toBe(STAMP)
   })
 })
-

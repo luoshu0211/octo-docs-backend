@@ -246,6 +246,7 @@ function makeDb() {
       if (!cur) return []
       return [{ snapshot_version: cur.version, covered_seq: cur.covered, doc_json: cur.docJson, state_json: cur.stateJson }]
     }
+    if (sql.startsWith('UPDATE doc_meta SET updated_by =')) return []
     throw new Error(`unrouted SQL in fake: ${sql}`)
   }
 
@@ -285,6 +286,7 @@ function makeDb() {
           if (sql.includes('INSERT INTO ppt_live_snapshot')) await acquire(params[0] as string)
           return route(sql, params, ctx)
         },
+        execute: async (sql: string, params: unknown[] = []) => route(sql, params, ctx),
       }
       try {
         return await fn(tx)
@@ -347,8 +349,8 @@ describe('DbPptRelayStore — append monotonicity & first-writer race (B1 / P0-2
   it('two concurrent first writers persist at DISTINCT seqs, neither refused', async () => {
     const store = new DbPptRelayStore()
     const [a, b] = await Promise.all([
-      store.appendOp(D, 'f1', { t: 'ops', ops: [{ kind: 'set' }] }),
-      store.appendOp(D, 'f2', { t: 'ops', ops: [{ kind: 'set' }] }),
+      store.appendOp(D, 'f1', { t: 'ops', ops: [{ kind: 'set' }] }, 'test-editor'),
+      store.appendOp(D, 'f2', { t: 'ops', ops: [{ kind: 'set' }] }, 'test-editor'),
     ])
     expect(a.duplicate).toBe(false)
     expect(b.duplicate).toBe(false)
@@ -358,8 +360,8 @@ describe('DbPptRelayStore — append monotonicity & first-writer race (B1 / P0-2
 
   it('a resent frameId re-acks its original seq without a second row', async () => {
     const store = new DbPptRelayStore()
-    const first = await store.appendOp(D, 'dup', { v: 1 })
-    const again = await store.appendOp(D, 'dup', { v: 1 })
+    const first = await store.appendOp(D, 'dup', { v: 1 }, 'test-editor')
+    const again = await store.appendOp(D, 'dup', { v: 1 }, 'test-editor')
     expect(again.duplicate).toBe(true)
     expect(again.seq).toBe(first.seq)
     expect(db.ops.get(D)!.size).toBe(1)
@@ -367,9 +369,9 @@ describe('DbPptRelayStore — append monotonicity & first-writer race (B1 / P0-2
 
   it('a resent frameId with a different payload is refused instead of re-acked', async () => {
     const store = new DbPptRelayStore()
-    await store.appendOp(D, 'dup-payload', { v: 1 })
+    await store.appendOp(D, 'dup-payload', { v: 1 }, 'test-editor')
     expect(db.frames.get(D)?.get('dup-payload')?.payloadHash).toBe(payloadHash('{"v":1}'))
-    await expect(store.appendOp(D, 'dup-payload', { v: 2 })).rejects.toMatchObject({
+    await expect(store.appendOp(D, 'dup-payload', { v: 2 }, 'test-editor')).rejects.toMatchObject({
       duplicatePayloadMismatch: true,
     })
     expect(db.ops.get(D)!.size).toBe(1)
@@ -379,8 +381,8 @@ describe('DbPptRelayStore — append monotonicity & first-writer race (B1 / P0-2
   it('concurrent resend of the SAME frameId: one persists, the other re-acks (no permanent storage-failed)', async () => {
     const store = new DbPptRelayStore()
     const [a, b] = await Promise.all([
-      store.appendOp(D, 'same', { v: 1 }),
-      store.appendOp(D, 'same', { v: 1 }),
+      store.appendOp(D, 'same', { v: 1 }, 'test-editor'),
+      store.appendOp(D, 'same', { v: 1 }, 'test-editor'),
     ])
     expect(a.seq).toBe(b.seq) // both resolve to the one persisted seq
     expect(a.duplicate !== b.duplicate).toBe(true) // exactly one is the winner
@@ -389,28 +391,28 @@ describe('DbPptRelayStore — append monotonicity & first-writer race (B1 / P0-2
 
   it('sequence does NOT regress after a full-coverage snapshot prunes every op (P0-2)', async () => {
     const store = new DbPptRelayStore()
-    await store.appendOp(D, 'f1', { n: 1 })
-    await store.appendOp(D, 'f2', { n: 2 })
-    await store.appendOp(D, 'f3', { n: 3 })
+    await store.appendOp(D, 'f1', { n: 1 }, 'test-editor')
+    await store.appendOp(D, 'f2', { n: 2 }, 'test-editor')
+    await store.appendOp(D, 'f3', { n: 3 }, 'test-editor')
     await store.saveSnapshot({ docId: D, coveredSeq: 3, doc: deck() })
     await store.pruneOpsThrough(D, 3) // op table now empty
     expect(db.ops.get(D)!.size).toBe(0)
     // A MAX(seq)+1 scheme would hand out 1 again here; the durable counter does not.
-    const next = await store.appendOp(D, 'f4', { n: 4 })
+    const next = await store.appendOp(D, 'f4', { n: 4 }, 'test-editor')
     expect(next.seq).toBe(4)
     expect(await store.currentSeq(D)).toBe(4)
   })
 
   it('opsSince returns only the tail after the cursor, ascending', async () => {
     const store = new DbPptRelayStore()
-    for (const f of ['f1', 'f2', 'f3']) await store.appendOp(D, f, { f })
+    for (const f of ['f1', 'f2', 'f3']) await store.appendOp(D, f, { f }, 'test-editor')
     expect((await store.opsSince(D, 1)).map((o) => o.seq)).toEqual([2, 3])
   })
 
   it('dedup survives prune via the ppt_collab_frame ledger: resend a pruned frameId -> re-acked at its ORIGINAL seq, not re-minted (C1)', async () => {
     const store = new DbPptRelayStore()
-    const first = await store.appendOp(D, 'frame-1', { n: 1 })
-    await store.appendOp(D, 'frame-2', { n: 2 })
+    const first = await store.appendOp(D, 'frame-1', { n: 1 }, 'test-editor')
+    await store.appendOp(D, 'frame-2', { n: 2 }, 'test-editor')
     expect(first.seq).toBe(1)
     expect(db.frames.get(D)!.get('frame-1')?.seq).toBe(1) // ledger written at APPEND time
     // Snapshot covers + prunes seq 1: its ppt_collab_op row is physically deleted
@@ -422,7 +424,7 @@ describe('DbPptRelayStore — append monotonicity & first-writer race (B1 / P0-2
 
     // A re-send of the pruned frame must NOT mint a fresh seq (which would
     // rebroadcast a duplicate of an op the snapshot already subsumes).
-    const resend = await store.appendOp(D, 'frame-1', { n: 1 })
+    const resend = await store.appendOp(D, 'frame-1', { n: 1 }, 'test-editor')
     expect(resend.duplicate).toBe(true)
     expect(resend.seq).toBe(1) // original seq, from the ledger
     expect(await store.currentSeq(D)).toBe(2) // counter did NOT advance
@@ -431,7 +433,7 @@ describe('DbPptRelayStore — append monotonicity & first-writer race (B1 / P0-2
 
   it('ledger retention prune (P1-4): drops rows at/below retainThroughSeq, keeps recent ones', async () => {
     const store = new DbPptRelayStore()
-    for (const f of ['f1', 'f2', 'f3']) await store.appendOp(D, f, { f })
+    for (const f of ['f1', 'f2', 'f3']) await store.appendOp(D, f, { f }, 'test-editor')
     expect(db.frames.get(D)!.size).toBe(3)
     // Reclaim ledger rows FAR behind coverage (here: through seq 2). f1/f2 go; f3 stays,
     // so a recent resend still re-acks its original seq.
@@ -443,7 +445,7 @@ describe('DbPptRelayStore — append monotonicity & first-writer race (B1 / P0-2
 
   it('ledger retention prune is a no-op when the retention window covers the whole ledger', async () => {
     const store = new DbPptRelayStore()
-    for (const f of ['f1', 'f2']) await store.appendOp(D, f, { f })
+    for (const f of ['f1', 'f2']) await store.appendOp(D, f, { f }, 'test-editor')
     // retainThroughSeq <= 0 (coveredSeq below the retention window) removes nothing —
     // this is why the default C1 idempotent-resend contract is preserved.
     await transaction((tx) => pptCollabFrameRepo.pruneLedgerThroughTx(tx as Tx, D, 0))
@@ -460,7 +462,7 @@ describe('DbPptRelayStore — append monotonicity & first-writer race (B1 / P0-2
     ;(config.ppt.relay as { ledgerRetentionFrames: number }).ledgerRetentionFrames = 2
     try {
       const store = new DbPptRelayStore()
-      for (const f of ['f1', 'f2', 'f3', 'f4', 'f5']) await store.appendOp(D, f, { f })
+      for (const f of ['f1', 'f2', 'f3', 'f4', 'f5']) await store.appendOp(D, f, { f }, 'test-editor')
       expect(db.frames.get(D)!.size).toBe(5)
       await store.saveSnapshot({ docId: D, coveredSeq: 5, doc: deck() })
       // retainThroughSeq = coveredSeq(5) - ledgerRetentionFrames(2) = 3 -> f1/f2/f3 go.
@@ -480,7 +482,7 @@ describe('DbPptRelayStore — append monotonicity & first-writer race (B1 / P0-2
     db.frames.set(D, new Map([['legacy-pruned', { seq: 1, payloadHash: null }]]))
     db.seqCounter.set(D, 1)
 
-    await expect(store.appendOp(D, 'legacy-pruned', { n: 2 })).rejects.toMatchObject({
+    await expect(store.appendOp(D, 'legacy-pruned', { n: 2 }, 'test-editor')).rejects.toMatchObject({
       duplicatePayloadMismatch: true,
     })
     expect(db.ops.get(D)?.size ?? 0).toBe(0)
@@ -490,7 +492,7 @@ describe('DbPptRelayStore — append monotonicity & first-writer race (B1 / P0-2
   it('D1: a resend whose fast-path ledger read misses the pre-commit snapshot still re-acks the ORIGINAL seq (append-time PK authority), never re-mints/rebroadcasts', async () => {
     const store = new DbPptRelayStore()
     // Original append commits frame-1 at seq 1 (ledger frame-1 -> 1, op row 1).
-    const first = await store.appendOp(D, 'frame-1', { n: 1 })
+    const first = await store.appendOp(D, 'frame-1', { n: 1 }, 'test-editor')
     expect(first.seq).toBe(1)
     expect(first.duplicate).toBe(false)
 
@@ -501,7 +503,7 @@ describe('DbPptRelayStore — append monotonicity & first-writer race (B1 / P0-2
     // the ledger PK insert raises ER_DUP_ENTRY and the FOR UPDATE re-read (a current
     // read, NOT hidden) returns the committed seq.
     db.hiddenFromSnapshot.add(`${D}:frame-1`)
-    const resend = await store.appendOp(D, 'frame-1', { n: 1 })
+    const resend = await store.appendOp(D, 'frame-1', { n: 1 }, 'test-editor')
     expect(resend.duplicate).toBe(true) // NOT a fresh, rebroadcastable op
     expect(resend.seq).toBe(1) // re-acked at the original seq
     expect(db.ops.get(D)!.size).toBe(1) // no second op row minted
@@ -509,7 +511,7 @@ describe('DbPptRelayStore — append monotonicity & first-writer race (B1 / P0-2
 
   it('D2: prune is a plain DELETE (no INSERT … SELECT into the ledger), so it does not lock the gap above coveredSeq that a concurrent append needs', async () => {
     const store = new DbPptRelayStore()
-    for (const f of ['f1', 'f2', 'f3']) await store.appendOp(D, f, { f })
+    for (const f of ['f1', 'f2', 'f3']) await store.appendOp(D, f, { f }, 'test-editor')
     await store.saveSnapshot({ docId: D, coveredSeq: 2, doc: deck() })
 
     // The prune executes only a freed-bytes SUM and a DELETE — never the old
@@ -518,7 +520,7 @@ describe('DbPptRelayStore — append monotonicity & first-writer race (B1 / P0-2
     db.sqlLog.length = 0
     const [freed, appended] = await Promise.all([
       store.pruneOpsThrough(D, 2),
-      store.appendOp(D, 'f4', { f: 'f4' }), // append ABOVE the pruned range, concurrently
+      store.appendOp(D, 'f4', { f: 'f4' }, 'test-editor'), // append ABOVE the pruned range, concurrently
     ])
     expect(db.sqlLog.some((s) => s.includes('DELETE FROM ppt_collab_op'))).toBe(true)
     expect(db.sqlLog.some((s) => s.includes('INSERT IGNORE INTO ppt_collab_frame'))).toBe(false)
@@ -533,7 +535,7 @@ describe('DbPptRelayStore — append monotonicity & first-writer race (B1 / P0-2
 
   it('frameSeq reads the ledger for the relay pre-gate dedup lookup (D3)', async () => {
     const store = new DbPptRelayStore()
-    await store.appendOp(D, 'frame-1', { n: 1 })
+    await store.appendOp(D, 'frame-1', { n: 1 }, 'test-editor')
     expect(await store.frameSeq(D, 'frame-1')).toBe(1)
     expect(await store.frameSeq(D, 'never-seen')).toBeNull()
     // Survives prune: the mapping outlives the op row.
@@ -546,7 +548,7 @@ describe('DbPptRelayStore — append monotonicity & first-writer race (B1 / P0-2
 describe('DbPptRelayStore — snapshot version atomicity (B2 / P0-3)', () => {
   it('two concurrent first snapshots ack DISTINCT versions (no same-version overwrite)', async () => {
     const store = new DbPptRelayStore()
-    await store.appendOp(D, 'f1', { n: 1 })
+    await store.appendOp(D, 'f1', { n: 1 }, 'test-editor')
     const [r1, r2] = await Promise.all([
       store.saveSnapshot({ docId: D, coveredSeq: 1, doc: deck('A') }),
       store.saveSnapshot({ docId: D, coveredSeq: 1, doc: deck('B') }),
@@ -557,7 +559,7 @@ describe('DbPptRelayStore — snapshot version atomicity (B2 / P0-3)', () => {
 
   it('a snapshot that covers LESS than the current one neither rewinds coverage nor bumps the version (P0-3)', async () => {
     const store = new DbPptRelayStore()
-    for (const f of ['f1', 'f2', 'f3']) await store.appendOp(D, f, { f })
+    for (const f of ['f1', 'f2', 'f3']) await store.appendOp(D, f, { f }, 'test-editor')
     const hi = await store.saveSnapshot({ docId: D, coveredSeq: 3, doc: deck('hi') })
     expect(hi.snapshotVersion).toBe(1)
     const lo = await store.saveSnapshot({ docId: D, coveredSeq: 1, doc: deck('lo') })
@@ -569,7 +571,7 @@ describe('DbPptRelayStore — snapshot version atomicity (B2 / P0-3)', () => {
 
   it('P1-3: a snapshot above the safety budget fails CLOSED before the write (no truncate-then-prune)', async () => {
     const store = new DbPptRelayStore()
-    await store.appendOp(D, 'f1', { n: 1 })
+    await store.appendOp(D, 'f1', { n: 1 }, 'test-editor')
     // A doc whose JSON exceeds the snapshot safety budget must be REFUSED before the
     // upsert — a silent truncation followed by a prune would destroy the deck.
     const huge = deck('x'.repeat(SNAPSHOT_COLUMN_MAX_BYTES + 1))
@@ -583,8 +585,8 @@ describe('DbPptRelayStore — snapshot version atomicity (B2 / P0-3)', () => {
 
   it('prune-after-durable reclaims bytes and getSnapshot reflects the latest save', async () => {
     const store = new DbPptRelayStore()
-    const a = await store.appendOp(D, 'f1', { n: 1 })
-    const b = await store.appendOp(D, 'f2', { n: 2 })
+    const a = await store.appendOp(D, 'f1', { n: 1 }, 'test-editor')
+    const b = await store.appendOp(D, 'f2', { n: 2 }, 'test-editor')
     const total = a.frameBytes + b.frameBytes
     expect(await store.roomBytes(D)).toBe(total)
     await store.saveSnapshot({ docId: D, coveredSeq: 1, doc: deck() })
@@ -609,7 +611,7 @@ describe('DbPptRelayStore — ledger-less resend & transient lock retry (XIN-169
     const store = new DbPptRelayStore()
     // Before the fix the op insert (outside the catch) hit the op-table UNIQUE and
     // rolled back -> permanent storage-failed. Now it re-acks the op's original seq.
-    const res = await store.appendOp(D, 'pre', { v: 1 })
+    const res = await store.appendOp(D, 'pre', { v: 1 }, 'test-editor')
     expect(res).toMatchObject({ seq: 1, duplicate: true })
     // The ledger row is reconciled to the op's original seq for future resends.
     expect(db.frames.get(D)?.get('pre')?.seq).toBe(1)
@@ -629,13 +631,13 @@ describe('DbPptRelayStore — ledger-less resend & transient lock retry (XIN-169
     expect(db.frames.get(D)?.get('pre')).toBeUndefined() // no ledger row
 
     const store = new DbPptRelayStore()
-    await expect(store.appendOp(D, 'pre', { v: 2 })).rejects.toMatchObject({ duplicatePayloadMismatch: true })
+    await expect(store.appendOp(D, 'pre', { v: 2 }, 'test-editor')).rejects.toMatchObject({ duplicatePayloadMismatch: true })
   })
 
   it('P1-5: a transient lock-wait timeout is retried and the append then succeeds', async () => {
     db.setLockErrorsOnFrameRead(2) // fail twice; the 3rd (final) attempt succeeds
     const store = new DbPptRelayStore()
-    const res = await store.appendOp(D, 'f1', { v: 1 })
+    const res = await store.appendOp(D, 'f1', { v: 1 }, 'test-editor')
     expect(res).toMatchObject({ seq: 1, duplicate: false })
     expect(await store.currentSeq(D)).toBe(1) // clean allocate, no burned seq
   })
@@ -643,14 +645,14 @@ describe('DbPptRelayStore — ledger-less resend & transient lock retry (XIN-169
   it('P1-5: a lock failure that outlives the retries surfaces as a RETRYABLE storage error, not permanent', async () => {
     db.setLockErrorsOnFrameRead(99) // never recovers within the attempt budget
     const store = new DbPptRelayStore()
-    await expect(store.appendOp(D, 'f1', { v: 1 })).rejects.toMatchObject({ retryable: true })
+    await expect(store.appendOp(D, 'f1', { v: 1 }, 'test-editor')).rejects.toMatchObject({ retryable: true })
   })
 
   it('P1-4/P1-B: openReplay streams pages from ONE transaction without materializing the tail', async () => {
     const store = new DbPptRelayStore()
-    await store.appendOp(D, 'f1', { n: 1 })
-    await store.appendOp(D, 'f2', { n: 2 })
-    await store.appendOp(D, 'f3', { n: 3 })
+    await store.appendOp(D, 'f1', { n: 1 }, 'test-editor')
+    await store.appendOp(D, 'f2', { n: 2 }, 'test-editor')
+    await store.appendOp(D, 'f3', { n: 3 }, 'test-editor')
     await store.saveSnapshot({ docId: D, coveredSeq: 1, doc: deck() })
     await store.pruneOpsThrough(D, 1)
     db.transaction.mockClear()
@@ -679,9 +681,9 @@ describe('DbPptRelayStore — ledger-less resend & transient lock retry (XIN-169
     // indefinitely (join starvation). The fix pins the read at the high-water
     // captured when replay opened.
     const store = new DbPptRelayStore()
-    await store.appendOp(D, 'f1', { n: 1 })
-    await store.appendOp(D, 'f2', { n: 2 })
-    await store.appendOp(D, 'f3', { n: 3 })
+    await store.appendOp(D, 'f1', { n: 1 }, 'test-editor')
+    await store.appendOp(D, 'f2', { n: 2 }, 'test-editor')
+    await store.appendOp(D, 'f3', { n: 3 }, 'test-editor')
     const cursor = await store.openReplay(D, 0, { pageRows: 1, pageBytes: 1_000_000 })
     expect(cursor.highWater).toBe(3)
 
@@ -696,7 +698,7 @@ describe('DbPptRelayStore — ledger-less resend & transient lock retry (XIN-169
       for (const op of page) delivered.push(op.seq)
       // Simulate a live append landing during replay (past the captured high-water).
       appended += 1
-      await store.appendOp(D, `f${appended}`, { n: appended })
+      await store.appendOp(D, `f${appended}`, { n: appended }, 'test-editor')
     }
     await cursor.close()
 
@@ -708,7 +710,7 @@ describe('DbPptRelayStore — ledger-less resend & transient lock retry (XIN-169
 
   it('P1-D: transient replay page read failures are retried inside nextPage', async () => {
     const store = new DbPptRelayStore()
-    await store.appendOp(D, 'f1', { n: 1 })
+    await store.appendOp(D, 'f1', { n: 1 }, 'test-editor')
     db.setLockErrorsOnOpPageRead(2)
     const cursor = await store.openReplay(D, 0, { pageRows: 10, pageBytes: 1_000_000 })
     expect((await cursor.nextPage()).map((o) => o.seq)).toEqual([1])
@@ -717,7 +719,7 @@ describe('DbPptRelayStore — ledger-less resend & transient lock retry (XIN-169
 
   it('P1-D: replay page read retry exhaustion is classified retryable', async () => {
     const store = new DbPptRelayStore()
-    await store.appendOp(D, 'f1', { n: 1 })
+    await store.appendOp(D, 'f1', { n: 1 }, 'test-editor')
     db.setLockErrorsOnOpPageRead(99)
     const cursor = await store.openReplay(D, 0, { pageRows: 10, pageBytes: 1_000_000 })
     await expect(cursor.nextPage()).rejects.toMatchObject({ retryable: true })
@@ -738,20 +740,20 @@ describe('DbPptRelayStore — RC round-12 (XIN-1736)', () => {
 
   it('P1-A: a resend of the SAME edit after an epoch bump (new epoch/k, reordered keys) re-acks, not refused', async () => {
     const store = new DbPptRelayStore()
-    const first = await store.appendOp(D, 'e1', opsFrame(1, { epoch: 0, k: 1 }))
+    const first = await store.appendOp(D, 'e1', opsFrame(1, { epoch: 0, k: 1 }), 'test-editor')
     expect(first.duplicate).toBe(false)
     // Same ops, different transport envelope (the exact resend the pre-fix
     // whole-envelope hash permanently refused as `protocol-version`).
     const resend = { pv: 2, t: 'ops', frameId: 'e1', k: 9, epoch: 5, ops: [{ value: 1, prop: 'x', key: 's1e1', kind: 'set' }] }
-    const again = await store.appendOp(D, 'e1', resend)
+    const again = await store.appendOp(D, 'e1', resend, 'test-editor')
     expect(again).toMatchObject({ seq: first.seq, duplicate: true })
     expect(db.ops.get(D)!.size).toBe(1)
   })
 
   it('P1-A: a resend with the SAME frameId but DIFFERENT ops is still refused', async () => {
     const store = new DbPptRelayStore()
-    await store.appendOp(D, 'e2', opsFrame(1))
-    await expect(store.appendOp(D, 'e2', opsFrame(2))).rejects.toMatchObject({ duplicatePayloadMismatch: true })
+    await store.appendOp(D, 'e2', opsFrame(1), 'test-editor')
+    await expect(store.appendOp(D, 'e2', opsFrame(2), 'test-editor')).rejects.toMatchObject({ duplicatePayloadMismatch: true })
   })
 
   it('P2-d: a NULL-hash ledger row whose op row still exists is verified against frame_json (re-ack + backfill)', async () => {
@@ -760,7 +762,7 @@ describe('DbPptRelayStore — RC round-12 (XIN-1736)', () => {
     db.ops.set(D, new Map([[1, { seq: 1, frameId: 'legacy', frameJson: JSON.stringify(frame), frameBytes: 40 }]]))
     db.seqCounter.set(D, 1)
     db.frames.set(D, new Map([['legacy', { seq: 1, payloadHash: null }]]))
-    const res = await store.appendOp(D, 'legacy', frame)
+    const res = await store.appendOp(D, 'legacy', frame, 'test-editor')
     expect(res).toMatchObject({ seq: 1, duplicate: true })
     // Backfilled so the next resend re-acks on the fast hash path.
     expect(db.frames.get(D)!.get('legacy')!.payloadHash).toBe(canonicalPayloadHash(frame))
@@ -771,7 +773,7 @@ describe('DbPptRelayStore — RC round-12 (XIN-1736)', () => {
     db.ops.set(D, new Map([[1, { seq: 1, frameId: 'legacy2', frameJson: JSON.stringify(opsFrame(1)), frameBytes: 40 }]]))
     db.seqCounter.set(D, 1)
     db.frames.set(D, new Map([['legacy2', { seq: 1, payloadHash: null }]]))
-    await expect(store.appendOp(D, 'legacy2', opsFrame(2))).rejects.toMatchObject({ duplicatePayloadMismatch: true })
+    await expect(store.appendOp(D, 'legacy2', opsFrame(2), 'test-editor')).rejects.toMatchObject({ duplicatePayloadMismatch: true })
   })
 
   it('XIN-1750: resolveNullHashReack recomputes the canonical-ops hash from frame_json for the pre-gate re-ack (no mutation gate, no in-memory fake)', async () => {
@@ -797,7 +799,7 @@ describe('DbPptRelayStore — RC round-12 (XIN-1736)', () => {
 
   it('P1-G / XIN-1807 P1-1: a byte-bounded replay fetches each row body exactly once (no re-fetch, no whole-tail materialization)', async () => {
     const store = new DbPptRelayStore()
-    for (const n of [1, 2, 3, 4]) await store.appendOp(D, `g${n}`, opsFrame('y'.repeat(60), { frameId: `g${n}` }))
+    for (const n of [1, 2, 3, 4]) await store.appendOp(D, `g${n}`, opsFrame('y'.repeat(60), { frameId: `g${n}` }), 'test-editor')
     // Large row cap, tiny byte cap: the byte bound is now enforced at FETCH time via a
     // cheap size pre-scan (XIN-1807 P1-1), so a page never materializes the whole tail —
     // it body-selects only the rows that fit the budget. Each row is fetched exactly
@@ -820,7 +822,7 @@ describe('DbPptRelayStore — RC round-12 (XIN-1736)', () => {
 
   it('XIN-1807 P1-1: the byte-size pre-scan reads no frame bodies (bounded materialization)', async () => {
     const store = new DbPptRelayStore()
-    for (const n of [1, 2, 3, 4]) await store.appendOp(D, `p${n}`, opsFrame('z'.repeat(60), { frameId: `p${n}` }))
+    for (const n of [1, 2, 3, 4]) await store.appendOp(D, `p${n}`, opsFrame('z'.repeat(60), { frameId: `p${n}` }), 'test-editor')
     db.sqlLog.length = 0
     const cursor = await store.openReplay(D, 0, { pageRows: 100, pageBytes: 1 })
     await cursor.nextPage()
@@ -832,7 +834,7 @@ describe('DbPptRelayStore — RC round-12 (XIN-1736)', () => {
 
   it('P1-H: the head read and each op page run in SEPARATE short transactions (no tx held across pages)', async () => {
     const store = new DbPptRelayStore()
-    for (const n of [1, 2, 3]) await store.appendOp(D, `h${n}`, opsFrame(n, { frameId: `h${n}` }))
+    for (const n of [1, 2, 3]) await store.appendOp(D, `h${n}`, opsFrame(n, { frameId: `h${n}` }), 'test-editor')
     db.sqlLog.length = 0
     const cursor = await store.openReplay(D, 0, { pageRows: 1, pageBytes: 1_000_000 })
     await cursor.nextPage()
@@ -845,7 +847,7 @@ describe('DbPptRelayStore — RC round-12 (XIN-1736)', () => {
 
   it('P1-B: a concurrent snapshot+prune advancing coverage past the cursor makes the next page retryable (no silent skip)', async () => {
     const store = new DbPptRelayStore()
-    for (const n of [1, 2, 3, 4, 5]) await store.appendOp(D, `b${n}`, opsFrame(n, { frameId: `b${n}` }))
+    for (const n of [1, 2, 3, 4, 5]) await store.appendOp(D, `b${n}`, opsFrame(n, { frameId: `b${n}` }), 'test-editor')
     const cursor = await store.openReplay(D, 0, { pageRows: 2, pageBytes: 1_000_000 })
     expect((await cursor.nextPage()).map((o) => o.seq)).toEqual([1, 2])
     // A snapshot commits covering seq 4 and prunes 1..4 while we page.

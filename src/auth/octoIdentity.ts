@@ -168,6 +168,13 @@ export interface OctoIdentity {
   verifyToken(
     token: string,
   ): Promise<{ uid: string; name?: string; ownedBots?: string[] } | null>;
+  /**
+   * Resolve a native Octo API key to its human uid and server-verified current
+   * Space. API-key callers are supported only by the Docs metadata endpoint.
+   * Invalid or unbound keys return null; authority failures throw.
+   */
+  verifyApiKey(apiKey: string): Promise<{ uid: string; spaceId: string } | null>;
+
 
   /**
    * (a-bot) Resolve a bot bearer token to its trusted bot uid, the bot's space,
@@ -461,6 +468,36 @@ export class HttpOctoIdentity implements OctoIdentity {
           .filter((uid) => uid !== "")
       : [];
     return { uid: body.uid, name: body.name, ownedBots };
+  }
+
+  async verifyApiKey(apiKey: string): Promise<{ uid: string; spaceId: string } | null> {
+    if (!apiKey) return null;
+    let res: Response;
+    try {
+      res = await fetch(`${this.baseUrl}/v1/auth/verify-api-key`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ api_key: apiKey }),
+        signal: AbortSignal.timeout(5000),
+      });
+    } catch {
+      throw identityUnavailable("transport_error");
+    }
+    if (!res.ok) {
+      await res.body?.cancel();
+      if ([400, 401, 403].includes(res.status)) return null;
+      throw identityUnavailable("non_ok_response", res.status);
+    }
+    let body: { uid?: unknown; space_id?: unknown } | null
+    try {
+      body = await res.json() as { uid?: unknown; space_id?: unknown } | null
+    } catch {
+      throw identityUnavailable("malformed_response")
+    }
+    const uid = typeof body?.uid === "string" ? body.uid.trim() : ""
+    const spaceId = typeof body?.space_id === "string" ? body.space_id.trim() : ""
+    if (!uid || !spaceId) throw identityUnavailable("malformed_response")
+    return { uid, spaceId }
   }
 
   async verifyBot(
@@ -1031,6 +1068,10 @@ export class MiddlewareOctoIdentity implements OctoIdentity {
     // Until wired, delegate to the HTTP introspection endpoint (which already
     // parses owned_bots -> ownedBots, keeping the contract identical).
     return this.delegate.verifyToken(token);
+  }
+
+  verifyApiKey(apiKey: string): Promise<{ uid: string; spaceId: string } | null> {
+    return this.delegate.verifyApiKey(apiKey);
   }
 
   getUser(

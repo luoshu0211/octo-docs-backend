@@ -1,5 +1,5 @@
 import { beforeEach, afterEach, expect, it, vi } from 'vitest'
-const db=vi.hoisted(()=>({seq:0,watermarks:new Map<string,number>(),frames:[] as {seq:number;frame_json:string}[],ledger:new Map<string,{seq:number;payloadHash:string}>(),snapshot:{} as {covered_seq:number;doc_json:string;state_json:string},logs:[] as string[],title:''}))
+const db=vi.hoisted(()=>({seq:0,watermarks:new Map<string,number>(),frames:[] as {seq:number;frame_json:string}[],ledger:new Map<string,{seq:number;payloadHash:string}>(),snapshot:{} as {covered_seq:number;doc_json:string;state_json:string},logs:[] as string[],title:'',updatedBy:''}))
 vi.mock('../src/db/pool.js',()=>({getPool:vi.fn(),query:async()=>[],transaction:async(fn:(tx:unknown)=>Promise<unknown>)=>{
  const saved=structuredClone(db)
  try{return await fn({query:async(sql:string,args:(string|number)[])=>{
@@ -12,7 +12,8 @@ vi.mock('../src/db/pool.js',()=>({getPool:vi.fn(),query:async()=>[],transaction:
  throw new Error(sql)
  },execute:async(sql:string,args:(string|number)[])=>{
  if(sql.startsWith('INSERT INTO ppt_collab_actor_seq'))db.watermarks.set(String(args[1]),Number(args[2]))
- else if(sql.startsWith('UPDATE doc_meta'))db.title=String(args[0])
+ else if(sql.startsWith('UPDATE doc_meta SET title ='))db.title=String(args[0])
+ else if(sql.startsWith('UPDATE doc_meta SET updated_by ='))db.updatedBy=String(args[0])
  else throw new Error(sql)
  return {affectedRows:1}
  }})}catch(error){Object.assign(db,saved);throw error}
@@ -29,68 +30,68 @@ const documentLimit = config.ppt.write.maxDocumentBytes
 afterEach(() => { config.ppt.write.maxDocumentBytes = documentLimit })
 beforeEach(()=>{
  const deck=instantiateTemplate(getPptTemplate('blank')!,new Date().toISOString());const sync=new SyncState('@genesis');sync.adopt(deck)
- Object.assign(db,{seq:0,watermarks:new Map(),frames:[],ledger:new Map(),logs:[],title:deck.title,snapshot:{covered_seq:0,doc_json:JSON.stringify(deck),state_json:JSON.stringify(sync.toJSON())}})
+ Object.assign(db,{seq:0,watermarks:new Map(),frames:[],ledger:new Map(),logs:[],title:deck.title,updatedBy:'',snapshot:{covered_seq:0,doc_json:JSON.stringify(deck),state_json:JSON.stringify(sync.toJSON())}})
 })
 const frame=(s:number,k='custom',v:unknown=s)=>({t:'ops',ops:[{op:'set',a:'actor',s,l:s+100,k,v}]})
 it('does not treat a NULL legacy snapshot byte sum as a safe fast-path bound',async()=>{
  const store=new DbPptRelayStore(true)
- await store.appendOp('doc','first',frame(1))
+ await store.appendOp('doc', 'first', frame(1), 'test-editor')
  Object.assign(db.snapshot,{state_json:null})
- await expect(store.appendOp('doc','legacy-null',frame(2))).rejects.toThrow('live snapshot required')
+ await expect(store.appendOp('doc', 'legacy-null', frame(2), 'test-editor')).rejects.toThrow('live snapshot required')
  expect(db.seq).toBe(1);expect(db.ledger.has('legacy-null')).toBe(false);expect(db.frames).toHaveLength(1);expect(db.watermarks.get('actor')).toBe(1)
 })
 it('checks accumulated document growth and rolls back rejected frames, ledger and actor sequence',async()=>{
  const store=new DbPptRelayStore(true)
- await store.appendOp('doc','first',frame(1,'custom','a'.repeat(1500)))
+ await store.appendOp('doc', 'first', frame(1,'custom','a'.repeat(1500)), 'test-editor')
  const deck=JSON.parse(db.snapshot.doc_json);const state=SyncState.fromJSON('@relay',JSON.parse(db.snapshot.state_json))
  state.apply(deck,frame(1,'custom','a'.repeat(1500)).ops)
  config.ppt.write.maxDocumentBytes=Buffer.byteLength(JSON.stringify(deck))
  const before=structuredClone(db)
- await expect(store.appendOp('doc','over',frame(2,'other','b'.repeat(500)))).rejects.toMatchObject({code:'PAYLOAD_TOO_LARGE'})
+ await expect(store.appendOp('doc', 'over', frame(2,'other','b'.repeat(500)), 'test-editor')).rejects.toMatchObject({code:'PAYLOAD_TOO_LARGE'})
  expect(db.seq).toBe(before.seq);expect(db.ledger.has('over')).toBe(false);expect(db.watermarks.get('actor')).toBe(1)
- await expect(store.appendOp('doc','shrink',frame(2,'custom','small'))).resolves.toMatchObject({duplicate:false})
+ await expect(store.appendOp('doc', 'shrink', frame(2,'custom','small'), 'test-editor')).resolves.toMatchObject({duplicate:false})
 })
 it('seeds old sessions once and avoids full-tail replay on subsequent small frames',async()=>{
  const store=new DbPptRelayStore(true)
- for(let i=1;i<=512;i++)await store.appendOp('doc',`f${i}`,frame(i))
+ for(let i=1;i<=512;i++)await store.appendOp('doc', `f${i}`, frame(i), 'test-editor')
  expect(db.watermarks.get('actor')).toBe(512)
  expect(db.logs.filter(sql=>sql.includes('SELECT frame_json FROM ppt_collab_op'))).toHaveLength(1)
- await expect(new DbPptRelayStore(true).appendOp('doc','restart',frame(513))).resolves.toMatchObject({seq:513})
+ await expect(new DbPptRelayStore(true).appendOp('doc', 'restart', frame(513), 'test-editor')).resolves.toMatchObject({seq:513})
  expect(db.logs.filter(sql=>sql.includes('SELECT frame_json FROM ppt_collab_op'))).toHaveLength(1)
 })
 it('rolls back frame, ledger and watermark together on a sequence gap',async()=>{
- const store=new DbPptRelayStore(true);await store.appendOp('doc','first',frame(1))
- await expect(store.appendOp('doc','gap',frame(3))).rejects.toThrow('contiguous')
+ const store=new DbPptRelayStore(true);await store.appendOp('doc', 'first', frame(1), 'test-editor')
+ await expect(store.appendOp('doc', 'gap', frame(3), 'test-editor')).rejects.toThrow('contiguous')
  expect(db.seq).toBe(1);expect(db.ledger.has('gap')).toBe(false);expect(db.watermarks.get('actor')).toBe(1)
- await expect(store.appendOp('doc','second',frame(2))).resolves.toMatchObject({seq:2})
+ await expect(store.appendOp('doc', 'second', frame(2), 'test-editor')).resolves.toMatchObject({seq:2})
 })
 it('accepts a 512-character winning title, rejects 513 without advancing state',async()=>{
  const store=new DbPptRelayStore(true)
- await store.appendOp('doc','title',frame(1,'title','中'.repeat(512)));expect(db.title).toBe('中'.repeat(512))
- await expect(store.appendOp('doc','bad-title',frame(2,'title','中'.repeat(513)))).rejects.toThrow('title')
+ await store.appendOp('doc', 'title', frame(1,'title','中'.repeat(512)), 'test-editor');expect(db.title).toBe('中'.repeat(512))
+ await expect(store.appendOp('doc', 'bad-title', frame(2,'title','中'.repeat(513)), 'test-editor')).rejects.toThrow('title')
  expect(db.watermarks.get('actor')).toBe(1);expect(db.title.length).toBe(512)
 })
 
 it('re-acks duplicate frames before sequence validation and independently tracks actors',async()=>{
  const store=new DbPptRelayStore(true);const original=frame(1)
- await store.appendOp('doc','one',original)
- await expect(store.appendOp('doc','one',original)).resolves.toMatchObject({seq:1,duplicate:true})
+ await store.appendOp('doc', 'one', original, 'test-editor')
+ await expect(store.appendOp('doc', 'one', original, 'test-editor')).resolves.toMatchObject({seq:1,duplicate:true})
  expect(db.watermarks.get('actor')).toBe(1)
- await store.appendOp('doc','other',{t:'ops',ops:[{op:'set',a:'other',s:1,l:1,k:'custom',v:1}]})
+ await store.appendOp('doc', 'other', {t:'ops',ops:[{op:'set',a:'other',s:1,l:1,k:'custom',v:1}]}, 'test-editor')
  expect(db.watermarks.get('other')).toBe(1);expect(db.watermarks.get('actor')).toBe(1)
 })
 it('keeps actor continuity after a covered tail is pruned and the store restarts',async()=>{
- const store=new DbPptRelayStore(true);await store.appendOp('doc','one',frame(1))
+ const store=new DbPptRelayStore(true);await store.appendOp('doc', 'one', frame(1), 'test-editor')
  const deck=JSON.parse(db.snapshot.doc_json);const state=SyncState.fromJSON('@relay',JSON.parse(db.snapshot.state_json))
  state.apply(deck,JSON.parse(JSON.stringify(frame(1).ops)))
  db.snapshot={covered_seq:1,doc_json:JSON.stringify(deck),state_json:JSON.stringify(state.toJSON())};db.frames=[]
- await expect(new DbPptRelayStore(true).appendOp('doc','two',frame(2))).resolves.toMatchObject({seq:2})
+ await expect(new DbPptRelayStore(true).appendOp('doc', 'two', frame(2), 'test-editor')).resolves.toMatchObject({seq:2})
  expect(db.watermarks.get('actor')).toBe(2)
 })
 it('does not replace metadata with a losing LWW title frame',async()=>{
- const store=new DbPptRelayStore(true);await store.appendOp('doc','winner',frame(1,'title','Winning title'))
+ const store=new DbPptRelayStore(true);await store.appendOp('doc', 'winner', frame(1,'title','Winning title'), 'test-editor')
  const loser=frame(2,'title','Losing title');loser.ops[0]!.l=1
- await store.appendOp('doc','loser',loser)
+ await store.appendOp('doc', 'loser', loser, 'test-editor')
  expect(db.title).toBe('Winning title');expect(db.watermarks.get('actor')).toBe(2)
 })
 
@@ -99,6 +100,6 @@ it('bounds new session actors while allowing existing sessions to reconnect',asy
  json.vv=Object.fromEntries(Array.from({length:MAX_PPT_SESSION_ACTORS},(_,i)=>[`session${i}`,1]))
  db.snapshot.state_json=JSON.stringify(json)
  const store=new DbPptRelayStore(true)
- await expect(store.appendOp('doc','new',frame(1))).rejects.toThrow('session actor limit')
- await expect(store.appendOp('doc','known',{t:'ops',ops:[{op:'set',a:'session0',s:2,l:100,k:'custom',v:2}]})).resolves.toMatchObject({duplicate:false})
+ await expect(store.appendOp('doc', 'new', frame(1), 'test-editor')).rejects.toThrow('session actor limit')
+ await expect(store.appendOp('doc', 'known', {t:'ops',ops:[{op:'set',a:'session0',s:2,l:100,k:'custom',v:2}]}, 'test-editor')).resolves.toMatchObject({duplicate:false})
 })
