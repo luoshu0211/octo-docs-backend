@@ -136,6 +136,8 @@ describe('GET /api/v1/docs — discovery result projection', () => {
         owner_id: 'u_2',
         doc_type: 'html',
         octo_doc_slug: 'private-body-address',
+        created_by: 'private_creator',
+        updated_by: 'private_editor',
         role: null,
         updated_at: new Date(0),
       }] as never,
@@ -166,6 +168,8 @@ describe('GET /api/v1/docs — discovery result projection', () => {
         owner_id: 'u_2',
         doc_type: 'doc',
         role: 2,
+        created_by: 'creator_uid',
+        updated_by: '',
         updated_at: new Date(0),
       }] as never,
     })
@@ -192,7 +196,7 @@ describe('GET /api/v1/docs — role serialization mirrors the projected numeric 
     isSpaceMemberMock.mockResolvedValue(true)
     vi.mocked(docMetaRepo.listForUser).mockResolvedValue({
       total: 1,
-      items: [{ doc_id: 'd_1', title: 't', owner_id: 'u_2', doc_type: 'doc', role: numeric, updated_at: new Date(0) }] as never,
+      items: [{ doc_id: 'd_1', title: 't', owner_id: 'u_2', doc_type: 'doc', role: numeric, created_by: '', updated_by: '', updated_at: new Date(0) }] as never,
     })
     const res = mockRes()
     await listDocsHandler(req({ spaceId: 's_target' }), res as never)

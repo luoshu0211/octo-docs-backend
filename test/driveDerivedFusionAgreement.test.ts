@@ -36,6 +36,7 @@ import {
   setDriveDerivedAccess,
   HttpDriveDerivedAccess,
   type DriveDerivedAccess,
+  type DerivedRole,
 } from '../src/drive/derivedAccessClient.js'
 import { SHARE_SCOPE_RESTRICTED, SHARE_ROLE_EDIT } from '../src/permission/shareScope.js'
 import type { ResolvedRole } from '../src/permission/role.js'
@@ -63,13 +64,18 @@ const docMeta = {
 }
 
 /** A drive stub answering a fixed role (or throwing), counting its calls. */
-function stubDrive(role: ResolvedRole | (() => never)): { calls: number } {
+function stubDrive(role: DerivedRole | (() => never)): { calls: number } {
   const state = { calls: 0 }
   const impl: DriveDerivedAccess = {
-    async derivedRole() {
+    async derivedAccess(docId, uid, principalSpaceId) {
       state.calls += 1
-      if (typeof role === 'function') role()
-      return role
+      const resolved = typeof role === 'function' ? role() : role
+      return { docId, uid, principalSpaceId, role: resolved, sourceRevision: 'sha256:test',
+        validForMs: 15_000, expiresAt: performance.now() + 15_000 }
+    },
+    async versions(bindings) {
+      return bindings.map(binding => ({ ...binding, sourceRevision: 'sha256:test',
+        validForMs: 15_000, expiresAt: performance.now() + 15_000 }))
     },
   }
   setDriveDerivedAccess(impl)

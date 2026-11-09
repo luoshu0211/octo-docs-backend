@@ -147,6 +147,7 @@ function stubIdentity(
   }));
   const identity: OctoIdentity = {
     verifyToken: vi.fn(async () => null),
+    verifyApiKey: vi.fn(async () => null),
     getUser,
     lookupSpacePrincipalAsBot: vi.fn(async () => ({ status: "not_found" })),
     getUsers: vi.fn(async () => []),

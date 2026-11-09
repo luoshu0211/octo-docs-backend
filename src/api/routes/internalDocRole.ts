@@ -38,14 +38,14 @@ function credentialMatches(actual: string): boolean {
   return timingSafeEqual(digest(actual), digest(expected))
 }
 
-function authorize(req: Request, res: Response): boolean {
+export function authorizeInternalDocRequest(req: Request, res: Response): boolean {
   if (credentialMatches(req.header('x-internal-token') ?? '')) return true
   res.status(401).json({ error: 'unauthorized' })
   return false
 }
 
 export async function internalDocRoleHandler(req: Request, res: Response): Promise<void> {
-  if (!authorize(req, res)) return
+  if (!authorizeInternalDocRequest(req, res)) return
   const docId = req.params.docId ?? ''
   const uid = typeof req.query.uid === 'string' ? req.query.uid : ''
   const principalSpaceId = typeof req.query.principal_space_id === 'string' ? req.query.principal_space_id : ''

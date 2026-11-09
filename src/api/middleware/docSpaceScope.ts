@@ -56,22 +56,38 @@ export function humanDocSpaceScopeMiddleware(req: Request, _res: Response, next:
  * caller's current Space is server-verified. Document authorization remains
  * docId/ACL based; equality with the document home Space is not required.
  */
+export type HumanCurrentSpaceResult =
+  | { verified: true }
+  | { verified: false; status: 400; error: 'space_required' }
+  | { verified: false; status: 404; error: 'not_found' }
+
+/** Resolve the Human current-Space proof without writing an HTTP response. */
+export async function resolveHumanCurrentSpace(req: Request): Promise<HumanCurrentSpaceResult> {
+  const candidate = (req.viewerSpaceId ?? '').trim()
+  if (candidate === '') return { verified: false, status: 400, error: 'space_required' }
+  const verified = req.verifiedViewerSpaceId === candidate
+    || await confirmSpaceMembership(req.uid ?? '', candidate, req.octoToken ?? '')
+  if (!verified) return { verified: false, status: 404, error: 'not_found' }
+  req.verifiedViewerSpaceId = candidate
+  return { verified: true }
+}
+
+/**
+ * Temporary pre-Space-qualified safety gate.
+ *
+ * Human requests still locate by docId, but may authorize only while the
+ * caller's current Space is server-verified. Document authorization remains
+ * docId/ACL based; equality with the document home Space is not required.
+ */
 export async function requireVerifiedHumanCurrentSpace(
   req: Request,
   res: Response,
   _meta: Pick<DocMeta, 'space_id'>,
 ): Promise<boolean> {
-  const candidate = (req.viewerSpaceId ?? '').trim()
-  if (candidate === '') {
-    res.status(400).json({ error: 'space_required' })
+  const result = await resolveHumanCurrentSpace(req)
+  if (!result.verified) {
+    res.status(result.status).json({ error: result.error })
     return false
   }
-  const verified = req.verifiedViewerSpaceId === candidate
-    || await confirmSpaceMembership(req.uid ?? '', candidate, req.octoToken ?? '')
-  if (!verified) {
-    res.status(404).json({ error: 'not_found' })
-    return false
-  }
-  req.verifiedViewerSpaceId = candidate
   return true
 }

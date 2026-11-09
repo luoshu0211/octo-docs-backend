@@ -118,7 +118,7 @@ describe.skipIf(process.env.PPT_BUDGET_MYSQL_TEST !== '1')('PPT 32 MiB real pers
     edited.slides[31]!.notes += 'x'
     await request(`/v1/bot/docs/${id}/ppt`, 'PATCH', { baseRevision: reopened.baseRevision, deck: edited }, 413)
     const badFrame = randomUUID()
-    await expect(store.appendOp(id, badFrame, { t: 'ops', ops: [{ op: 'set', a: 'capacity-writer', s: 1, l: 999999, k: 'overflow', v: true }] })).rejects.toMatchObject({ code: 'PAYLOAD_TOO_LARGE' })
+    await expect(store.appendOp(id, badFrame, { t: 'ops', ops: [{ op: 'set', a: 'capacity-writer', s: 1, l: 999999, k: 'overflow', v: true }] }, 'test-editor')).rejects.toMatchObject({ code: 'PAYLOAD_TOO_LARGE' })
     expect(await store.frameSeq(id, badFrame)).toBeNull()
     const unchanged = await request(path + '/live')
     expect(unchanged.baseRevision).toBe(reopened.baseRevision)

@@ -66,6 +66,7 @@ beforeEach(() => {
   isSpaceMember.mockResolvedValue(true)
   setOctoIdentity({
     verifyToken: async (token) => token === 'human-token' ? { uid: 'human_actor' } : null,
+    verifyApiKey: async () => null,
     verifyBot: async (token) => token === 'bot-token'
       ? { uid: 'bot_actor', spaceId: 's_docs', ownerUid: 'human_actor' } : null,
     getUser: async () => null,

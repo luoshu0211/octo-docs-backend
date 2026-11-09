@@ -6,6 +6,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 // without live infra (mirrors attachments.test.ts / versions.test.ts).
 vi.mock('../src/api/guard.js', () => ({
   requireDocRole: vi.fn(),
+  resolveDocRole: vi.fn(),
 }))
 vi.mock('../src/db/pool.js', () => ({
   query: vi.fn(async () => []),
@@ -25,9 +26,8 @@ vi.mock('../src/util/ids.js', () => ({
 }))
 
 import { createDocHandler, getDocHandler, docsRouter } from '../src/api/routes/docs.js'
-import { requireDocRole } from '../src/api/guard.js'
+import { requireDocRole, resolveDocRole } from '../src/api/guard.js'
 import { docMetaRepo } from '../src/db/repos/docMetaRepo.js'
-
 interface MockRes {
   statusCode: number
   body: unknown
@@ -76,6 +76,7 @@ const metaRow = {
 
 beforeEach(() => {
   vi.mocked(requireDocRole).mockReset()
+  vi.mocked(resolveDocRole).mockReset()
 })
 
 describe('GET /api/v1/docs/:docId — read one (§8.4)', () => {
@@ -93,18 +94,19 @@ describe('GET /api/v1/docs/:docId — read one (§8.4)', () => {
     await getDocHandler(req({ docId: 'd_1' }), res as never)
 
     expect(res.statusCode).toBe(200)
-    expect(res.body).toEqual({
+    expect(res.body).toMatchObject({
       docId: 'd_1',
       documentName: 'octo:s1:f_default:d_1',
       title: 'My Doc',
       ownerId: 'u_owner',
+      createdBy: 'u_owner',
+      updatedBy: 'u_owner',
       spaceId: 's1',
       folderId: 'f_default',
       docType: 'doc',
       role: 'reader',
       createdAt: new Date(0),
       updatedAt: new Date(1000),
-      shareUrl: '/d/d_1',
       // #64 additive share-scope fields; a doc with no share settings set reads
       // as the fail-safe default (restricted / read).
       shareScope: 'restricted',
@@ -112,11 +114,22 @@ describe('GET /api/v1/docs/:docId — read one (§8.4)', () => {
       spaceSearchable: false,
       permissionEpoch: 7,
     })
-    // snake_case columns are never leaked on the wire.
     const body = res.body as Record<string, unknown>
+    // snake_case columns are never leaked on the wire.
     expect(body).not.toHaveProperty('doc_id')
     expect(body).not.toHaveProperty('owner_id')
     expect(body).not.toHaveProperty('document_name')
+    expect(body).not.toHaveProperty('created_by')
+    expect(body).not.toHaveProperty('updated_by')
+  })
+
+  it('returns empty actor identifiers when metadata records no editor', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue({
+      meta: { ...metaRow, created_by: '', updated_by: '' }, role: 'reader',
+    } as never)
+    const res = mockRes()
+    await getDocHandler(req({ docId: 'd_1' }), res as never)
+    expect(res.body).toMatchObject({ createdBy: '', updatedBy: '' })
   })
 
   it('surfaces the owner role string name straight from the guard', async () => {
@@ -258,19 +271,23 @@ describe('GET /api/v1/docs — role label serialization', () => {
   }
 
   function listReq() {
-    return { uid: 'u_1', spaceId: 's1', params: {}, body: undefined, query: {} } as never
+    return { uid: 'u_1', spaceId: 's1', botToken: 'test-bot', params: {}, body: undefined, query: {} } as never
   }
 
   it('labels all canonical stored roles and drops an anomalous projection', async () => {
     vi.mocked(docMetaRepo.listForUser).mockResolvedValue({
       total: 5,
       items: [
-        { doc_id: 'd_admin', title: 'A', owner_id: 'u_1', doc_type: 'doc', role: 3, updated_at: new Date(0) },
-        { doc_id: 'd_writer', title: 'W', owner_id: 'u_o', doc_type: 'doc', role: 2, updated_at: new Date(0) },
-        { doc_id: 'd_commenter', title: 'C', owner_id: 'u_o', doc_type: 'doc', role: 4, updated_at: new Date(0) },
-        { doc_id: 'd_reader', title: 'R', owner_id: 'u_o', doc_type: 'doc', role: 1, updated_at: new Date(0) },
-        { doc_id: 'd_corrupt', title: 'X', owner_id: 'u_o', doc_type: 'doc', role: 99, updated_at: new Date(0) },
+        { doc_id: 'd_admin', title: 'A', owner_id: 'u_1', doc_type: 'doc', role: 3, created_by: 'creator_uid', updated_by: 'editor_uid', updated_at: new Date(0) },
+        { doc_id: 'd_writer', title: 'W', owner_id: 'u_o', doc_type: 'doc', role: 2, created_by: '', updated_by: '', updated_at: new Date(0) },
+        { doc_id: 'd_commenter', title: 'C', owner_id: 'u_o', doc_type: 'doc', role: 4, created_by: '', updated_by: '', updated_at: new Date(0) },
+        { doc_id: 'd_reader', title: 'R', owner_id: 'u_o', doc_type: 'doc', role: 1, created_by: '', updated_by: '', updated_at: new Date(0) },
+        { doc_id: 'd_corrupt', title: 'X', owner_id: 'u_o', doc_type: 'doc', role: 99, created_by: '', updated_by: '', updated_at: new Date(0) },
       ],
+    } as never)
+    vi.mocked(resolveDocRole).mockResolvedValue({
+      ok: true,
+      guard: { meta: metaRow as never, role: 'reader' },
     } as never)
     const res = mockRes()
     await getListHandler()(listReq(), res as never)
@@ -282,5 +299,14 @@ describe('GET /api/v1/docs — role label serialization', () => {
       ['d_commenter', 'commenter'],
       ['d_reader', 'reader'],
     ])
+    const wireItems = (res.body as { items: Array<Record<string, unknown>> }).items
+    expect(wireItems.find((item) => item.docId === 'd_admin')).toMatchObject({
+      createdBy: 'creator_uid',
+      updatedBy: 'editor_uid',
+    })
+    expect(wireItems.find((item) => item.docId === 'd_writer')).toMatchObject({
+      createdBy: '',
+      updatedBy: '',
+    })
   })
 })

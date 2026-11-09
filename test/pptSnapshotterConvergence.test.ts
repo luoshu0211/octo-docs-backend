@@ -192,7 +192,7 @@ describe('XIN-1783 durability contract — adversarial fuzz: snapshot@provenSeq 
 /** Append an adversarial ops frame straight to the store (bypasses the wire gate,
  *  which is exactly the "if such an op were persisted" premise of each finding). */
 async function put(store: InMemoryPptRelayStore, seq: number, ops: Op[]): Promise<void> {
-  await store.appendOp(DOC, `f-${seq}`, { t: 'ops', pv: 2, k: seq, frameId: `f-${seq}`, epoch: 0, ops })
+  await store.appendOp(DOC, `f-${seq}`, { t: 'ops', pv: 2, k: seq, frameId: `f-${seq}`, epoch: 0, ops }, 'test-editor')
 }
 const baseDocProviderFor = (doc: BentoDoc) => async () => doc
 

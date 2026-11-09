@@ -8,11 +8,13 @@ import { AddressInfo } from 'node:net'
  * Round 2 missed the docs<->drive contract mismatch because every unit test
  * stubbed the response with docs-side-authored fixtures, which were always
  * self-consistent. Here we stand up a REAL http server that emits the exact
- * bytes the drive service sends (`octo-drive .../derivedaccess/api.go` returns
- * `{"role":"reader"}` / `{"role":"none"}`) and drive the client through actual
- * fetch/JSON parsing, so contract drift can no longer hide behind a stub.
+ * bytes the drive service sends from the complete derived-access contract and
+ * drives the client through actual fetch/JSON parsing, so contract drift can no
+ * longer hide behind a docs-side-authored stub.
  */
 import { HttpDriveDerivedAccess } from '../src/drive/derivedAccessClient.js'
+const readerRevision = `sha256:${'a'.repeat(64)}`
+const emptyRevision = `sha256:${'b'.repeat(64)}`
 
 let server: Server | null = null
 
@@ -39,20 +41,21 @@ afterEach(async () => {
 })
 
 describe('HttpDriveDerivedAccess real drive wire contract (TES-144)', () => {
-  it('parses real drive wire {"role":"reader"} as reader', async () => {
-    const baseUrl = await serveRawBody('{"role":"reader"}')
-    expect(await makeClient(baseUrl).derivedRole('d_xxx', 'u_bob', 'sp-xyz')).toBe('reader')
+  it('parses the complete Drive reader proof from real wire JSON', async () => {
+    const raw = JSON.stringify({ role: 'reader', source_revision: readerRevision, valid_for_ms: 15_000 })
+    const baseUrl = await serveRawBody(raw)
+    expect(await makeClient(baseUrl).derivedAccess('d_xxx', 'u_bob', 'sp-xyz'))
+      .toMatchObject({ role: 'reader', sourceRevision: readerRevision, validForMs: 15_000 })
   })
 
-  it('parses real drive wire {"role":"none"} as none', async () => {
-    const baseUrl = await serveRawBody('{"role":"none"}')
-    expect(await makeClient(baseUrl).derivedRole('d_xxx', 'u_bob', 'sp-xyz')).toBe('none')
+  it('parses a confirmed Drive none result with its source proof', async () => {
+    const baseUrl = await serveRawBody(JSON.stringify({ role: 'none', source_revision: emptyRevision, valid_for_ms: 15_000 }))
+    expect(await makeClient(baseUrl).derivedAccess('d_xxx', 'u_bob', 'sp-xyz'))
+      .toMatchObject({ role: 'none', sourceRevision: emptyRevision })
   })
 
-  it('fails closed on legacy {"access":true} shape (contract-drift regression guard)', async () => {
-    // Pin the docs side: if drive ever regressed to the old {access} shape, docs
-    // must NOT silently accept it — it fails closed to none.
+  it('does not treat legacy {"access":true} as a complete source proof', async () => {
     const baseUrl = await serveRawBody('{"access":true}')
-    expect(await makeClient(baseUrl).derivedRole('d_xxx', 'u_bob', 'sp-xyz')).toBe('none')
+    expect(await makeClient(baseUrl).derivedAccess('d_xxx', 'u_bob', 'sp-xyz')).toBeNull()
   })
 })

@@ -836,4 +836,24 @@ export const docMetaRepo = {
     if (rows.length === 0) return null
     return Number(rows[0]!.permission_epoch)
   },
+  /** Read unique active-document epochs directly from the authoritative DB. */
+  async getEpochsByDocIds(docIds: readonly string[]): Promise<Array<{
+    doc_id: string
+    document_name: string
+    permission_epoch: number
+    status: number
+  }>> {
+    if (docIds.length === 0) return []
+    const rows = await query<{
+      doc_id: string
+      document_name: string
+      permission_epoch: number
+      status: number
+    }>(
+      `SELECT doc_id, document_name, permission_epoch, status
+       FROM doc_meta WHERE doc_id IN (${docIds.map(() => '?').join(', ')})`,
+      [...docIds],
+    )
+    return rows.map(row => ({ ...row, permission_epoch: Number(row.permission_epoch) }))
+  },
 }

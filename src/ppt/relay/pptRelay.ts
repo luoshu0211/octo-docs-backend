@@ -2,6 +2,16 @@ import { randomUUID } from 'node:crypto'
 import { PptDocumentCapacityError } from '../documentBudget.js'
 import { connectionRegistry } from '../../permission/connectionRegistry.js'
 import type { Role } from '../../permission/role.js'
+import {
+  beginActiveAccessRegistration,
+  prepareActiveAccessShareExpiry,
+  registerActiveAccess,
+  renewActiveAccess,
+  type ActiveAccessParticipant,
+  type ActiveAccessRegistrationLease,
+  type ActiveAccessState,
+} from '../../permission/activeAccess.js'
+import type { CurrentAccess } from '../../permission/resolveRole.js'
 import { nodeId } from '../../collab/compactionCluster.js'
 import { pptPersistenceFailure, type PptPersistenceFailure } from './persistenceFailure.js'
 /**
@@ -234,6 +244,10 @@ export interface RoleResolutionContext {
   spaceMember: boolean
 }
 
+function activeAuthorityScope(spaceMember: boolean, ticketId: string): string {
+  return spaceMember ? `ppt:share:${ticketId}` : 'ppt:direct'
+}
+
 export interface PptRelayDeps {
   /** Production uses shared invalidation and durable catch-up across replicas. */
   clustered?: boolean
@@ -249,6 +263,8 @@ export interface PptRelayDeps {
   epochProvider: (documentName: string) => Promise<number>
   /** Re-resolve a connection's effective role (default: none => close). */
   roleProvider?: (ctx: RoleResolutionContext) => Promise<ResolvedRole>
+  /** Full current role plus the Drive source proof for active-session tracking. */
+  accessProvider?: (ctx: RoleResolutionContext) => Promise<CurrentAccess>
   /** Doc liveness for the doc-deleted guard (default: assume live). */
   docStatusProvider?: (docId: string) => Promise<'live' | 'deleted'>
   /**
@@ -281,6 +297,11 @@ interface ConnAuthState {
 }
 
 interface Conn {
+  activeAccessDisposer?: () => void
+  activeAccessParticipant?: ActiveAccessParticipant
+  sourceAccess?: CurrentAccess
+  /** Generation owning an active-source read freeze, distinct from ticket reauth. */
+  sourceAccessGeneration?: number
   connectionId: string
   heartbeatTimer?: ReturnType<typeof setInterval>
   presenceSubscribed: boolean
@@ -306,15 +327,14 @@ interface Conn {
   name?: string
   /** Space-membership claim minted at issuance (fed to role re-resolution). */
   spaceMember: boolean
-  /**
-   * Monotonic counter bumped on every successful in-place `reauth` (XIN-1739 P1-1).
-   * A share-expiry callback ({@link expireShareMembership}) captures this value
-   * BEFORE its `roleProvider` await and bails if it changed while awaiting: a fresh
-   * `reauth` that completed in the meantime already replaced the connection's
-   * authority and re-armed the expiry timer, so the stalled OLD callback must not
-   * resume and shove the freshly re-authorized socket back into `pendingReauth`.
-   */
+  /** Generation of the current ticket reauthorization, separate from source/epoch freezes. */
   reauthGeneration: number
+  /** Owner generation for epoch rechecks; distinct from source-notice freezes. */
+  epochGeneration: number
+  /** Latest epoch owner whose authorization recheck completed successfully. */
+  epochResolvedGeneration: number
+  /** Share-expiry lookup remains in handoff until direct authority is transferred. */
+  shareExpiryGeneration?: number
   /**
    * Monotonic authority-withdrawal generation (XIN-1840 P1-1). Bumped by
    * {@link PptRelay.withdrawAuthority} EVERY time this connection's authority is
@@ -583,6 +603,7 @@ export class PptRelay {
   private readonly ticketStore: TicketStore
   private readonly epochProvider: (documentName: string) => Promise<number>
   private readonly roleProvider?: (ctx: RoleResolutionContext) => Promise<ResolvedRole>
+  private readonly accessProvider?: (ctx: RoleResolutionContext) => Promise<CurrentAccess>
   private readonly docStatusProvider?: (docId: string) => Promise<'live' | 'deleted'>
   private readonly pv: number
   private readonly limits: RelayLimits
@@ -701,6 +722,7 @@ export class PptRelay {
     this.ticketStore = deps.ticketStore ?? new InMemoryTicketStore()
     this.epochProvider = deps.epochProvider
     this.roleProvider = deps.roleProvider
+    this.accessProvider = deps.accessProvider
     this.docStatusProvider = deps.docStatusProvider
     this.pv = deps.protocolVersion ?? config.ppt.relay.protocolVersion
     this.limits = { ...defaultLimits(), ...(deps.limits ?? {}) }
@@ -848,91 +870,119 @@ export class PptRelay {
       return
     }
 
-    // The ticket's `role`/`permission_epoch` are a SNAPSHOT taken at issuance.
-    // If the live epoch has advanced since, the user may have been downgraded or
-    // revoked between issuance and connect, so the ticket's cached role MUST NOT
-    // seed the connection's authority — otherwise a stale writer ticket could
-    // mutate simply by stamping the current epoch on its frames (PPT-EPOCH-001).
-    // Re-resolve the LIVE role server-side; if we cannot (no roleProvider), the
-    // stale ticket is rejected so the client re-mints a fresh one. A ticket at
-    // the current epoch is trusted as-is (its authority is still fresh).
-    let role: ResolvedRole = claims.role
-    // A membership proof is scoped to its issuance epoch, just like the role.
-    // Stale tickets may retain direct grants, but cannot revive a Space share.
     const spaceMember = claims.permission_epoch === liveEpoch && claims.space_member === true
-    if (claims.permission_epoch !== liveEpoch) {
-      if (!this.roleProvider) {
-        socket.close(CLOSE_UNAUTHORIZED, 'stale ticket epoch')
-        return
-      }
-      // Re-resolve without the stale membership claim. Share-only users must
-      // present a ticket minted after the change; a short TTL is not live proof.
-      try {
-        role = await this.roleProvider({
-          uid: claims.uid,
-          docId: claims.docId,
-          documentName: claims.documentName,
-          principalSpaceId: claims.principal_space_id,
-          spaceMember,
-        })
-      } catch {
-        role = 'none'
-      }
-      if (role === 'none') {
-        socket.close(CLOSE_FORBIDDEN, 'access revoked')
-        return
-      }
-    }
-
-    // If the socket already closed during the async handshake window, do NOT join
-    // the room (Jerry-Xin: never `addToRoom` a closed socket).
-    if (earlyClosed || socket.readyState !== WebSocket.OPEN) return
-
-    conn = {
-      connectionId: randomUUID(),
-      presenceSubscribed: false,
-      presenceReady: false,
-      actor: claims.actor,
-      socket,
-      uid: claims.uid,
+    const connectionId = randomUUID()
+    const activeAccessRegistration = beginActiveAccessRegistration({
       docId: claims.docId,
-      documentName: claims.documentName,
+      uid: claims.uid,
       principalSpaceId: claims.principal_space_id,
-      role,
-      // The role above was validated/re-resolved against the live epoch.
-      roleEpoch: liveEpoch,
-      name: claims.name,
-      spaceMember,
-      reauthGeneration: 0,
-      authGeneration: 0,
-      frameTimes: [],
-      ephemeralFrameTimes: [],
-      dedupReackTimes: [],
-      opsAdmissionTimes: [],
-      caughtUp: false,
-      replayInFlight: false,
-      flushDepth: 0,
-      replayPending: null,
-      liveBuffer: [],
-      deliveredThrough: 0,
-      liveBufferBytes: 0,
-      auth: { readAllowed: roleAtLeast(role, 'reader'), invalidated: false },
-      inboundChain: Promise.resolve(),
-      inboundDepth: 0,
-      inboundBytes: 0,
-      outboundDepth: 0,
-      outboundChain: Promise.resolve(),
-      drainChain: Promise.resolve(),
-    }
-    this.addToRoom(conn)
-    this.armHeartbeat(conn)
-    this.armAuthRefresh(conn)
-    this.armShareExpiry(conn, claims.exp)
-    // Drain frames buffered before auth completed, in receipt order. No `await`
-    // runs between assigning `conn` and this loop, so no `onData` callback can
-    // interleave and reorder ahead of the queued frames.
-    for (const raw of preauth) {
-      this.enqueueInbound(conn, raw)
+    }, activeAuthorityScope(spaceMember, claims.jti))
+    let registrationTransferred = false
+    try {
+      // Drive source changes do not advance the Docs epoch, so production always
+      // resolves the current role and source proof, including same-epoch tickets.
+      let role: ResolvedRole = claims.role
+      let sourceAccess: CurrentAccess | undefined
+      const roleContext = {
+        uid: claims.uid,
+        docId: claims.docId,
+        documentName: claims.documentName,
+        principalSpaceId: claims.principal_space_id,
+        spaceMember,
+      }
+      if (this.accessProvider) {
+        try {
+          sourceAccess = await this.accessProvider(roleContext)
+        } catch {
+          socket.close(CLOSE_UNAUTHORIZED, 'authorization unavailable')
+          return
+        }
+        if (sourceAccess.role === 'none') {
+          socket.close(sourceAccess.sourceConfirmed ? CLOSE_FORBIDDEN : CLOSE_UNAUTHORIZED,
+            sourceAccess.sourceConfirmed ? 'access revoked' : 'authorization unavailable')
+          return
+        }
+        if (sourceAccess.sourceRevision !== null &&
+            (sourceAccess.proofExpiresAt === null || sourceAccess.proofExpiresAt <= performance.now())) {
+          socket.close(CLOSE_UNAUTHORIZED, 'authorization proof expired')
+          return
+        }
+        role = sourceAccess.role
+      } else if (claims.permission_epoch !== liveEpoch) {
+        if (!this.roleProvider) {
+          socket.close(CLOSE_UNAUTHORIZED, 'stale ticket epoch')
+          return
+        }
+        try {
+          role = await this.roleProvider(roleContext)
+        } catch {
+          role = 'none'
+        }
+        if (role === 'none') {
+          socket.close(CLOSE_FORBIDDEN, 'access revoked')
+          return
+        }
+      }
+
+      // If the socket already closed during the async handshake window, do NOT join
+      // the room (Jerry-Xin: never `addToRoom` a closed socket).
+      if (earlyClosed || socket.readyState !== WebSocket.OPEN) return
+
+      conn = {
+        connectionId,
+        presenceSubscribed: false,
+        presenceReady: false,
+        actor: claims.actor,
+        socket,
+        uid: claims.uid,
+        docId: claims.docId,
+        documentName: claims.documentName,
+        principalSpaceId: claims.principal_space_id,
+        role,
+        sourceAccess,
+        // The role above was validated/re-resolved against the live epoch.
+        roleEpoch: liveEpoch,
+        name: claims.name,
+        spaceMember,
+        reauthGeneration: 0,
+        epochGeneration: 0,
+        epochResolvedGeneration: 0,
+        authGeneration: 0,
+        frameTimes: [],
+        ephemeralFrameTimes: [],
+        dedupReackTimes: [],
+        opsAdmissionTimes: [],
+        caughtUp: false,
+        replayInFlight: false,
+        flushDepth: 0,
+        replayPending: null,
+        liveBuffer: [],
+        deliveredThrough: 0,
+        liveBufferBytes: 0,
+        auth: { readAllowed: roleAtLeast(role, 'reader'), invalidated: false },
+        inboundChain: Promise.resolve(),
+        inboundDepth: 0,
+        inboundBytes: 0,
+        outboundDepth: 0,
+        outboundChain: Promise.resolve(),
+        drainChain: Promise.resolve(),
+      }
+      this.addToRoom(conn)
+      if (sourceAccess) {
+        this.attachActiveAccess(conn, sourceAccess, activeAccessRegistration)
+        registrationTransferred = true
+      }
+      this.armHeartbeat(conn)
+      this.armAuthRefresh(conn)
+      this.armShareExpiry(conn, claims.exp)
+      // Drain frames buffered before auth completed, in receipt order. No `await`
+      // runs between assigning `conn` and this loop, so no `onData` callback can
+      // interleave and reorder ahead of the queued frames.
+      for (const raw of preauth) {
+        this.enqueueInbound(conn, raw)
+      }
+    } finally {
+      if (!registrationTransferred) activeAccessRegistration.release()
     }
   }
 
@@ -976,7 +1026,100 @@ export class PptRelay {
     room.add(conn)
   }
 
+  private attachActiveAccess(
+    conn: Conn,
+    state: CurrentAccess,
+    registration: ActiveAccessRegistrationLease,
+  ): void {
+    conn.sourceAccess = state
+    let sourceFreezeGeneration: number | undefined
+    const participant = conn.activeAccessParticipant ??= {
+      freeze: () => {
+        if (conn.auth.terminalClose || !this.rooms.get(conn.docId)?.has(conn)) return
+        // Once the share claim has expired, the tracked resolver is direct-only and
+        // may take over a concurrent epoch freeze. While the claim is still live,
+        // epoch revalidation retains ownership until its membership result settles.
+        if (conn.spaceMember && conn.auth.pendingReauth === true &&
+            conn.sourceAccessGeneration !== conn.authGeneration) return
+        conn.authGeneration++
+        sourceFreezeGeneration = conn.authGeneration
+        conn.sourceAccessGeneration = conn.authGeneration
+        conn.auth = { readAllowed: false, invalidated: false, pendingReauth: true }
+        this.schedulePresence(conn.docId)
+      },
+      resume: (current: ActiveAccessState) => {
+        if (conn.auth.terminalClose || conn.socket.readyState !== WebSocket.OPEN ||
+            !this.rooms.get(conn.docId)?.has(conn)) return
+        const generation = sourceFreezeGeneration
+        if (generation !== undefined) {
+          sourceFreezeGeneration = undefined
+          if (conn.authGeneration !== generation || conn.sourceAccessGeneration !== generation ||
+              conn.auth.pendingReauth !== true) return
+          conn.sourceAccessGeneration = undefined
+        } else if (conn.auth.pendingReauth === true) {
+          return
+        }
+        const downgraded = roleRank(current.role) < roleRank(conn.role)
+        if (downgraded) conn.role = current.role
+        conn.roleEpoch = current.permissionEpoch
+        if (conn.reauthGraceTimer) {
+          clearTimeout(conn.reauthGraceTimer)
+          conn.reauthGraceTimer = undefined
+        }
+        if (!conn.spaceMember && conn.shareExpiryGeneration === conn.reauthGeneration) {
+          conn.shareExpiryGeneration = undefined
+        }
+        conn.sourceAccess = current
+        conn.auth = { readAllowed: roleAtLeast(conn.role, 'reader'), invalidated: false }
+        this.schedulePresence(conn.docId)
+        if (downgraded && conn.liveAuth) {
+          void this.gatedSend(conn, { ctl: 'role-changed', role: conn.role, epoch: current.permissionEpoch })
+        }
+        void this.resumeReadDelivery(conn)
+      },
+      close: (code, reason) => {
+        if (conn.auth.terminalClose || conn.socket.readyState !== WebSocket.OPEN ||
+            !this.rooms.get(conn.docId)?.has(conn)) return true
+        if (conn.reauthGraceTimer && conn.auth.pendingReauth === true &&
+            conn.shareExpiryGeneration !== conn.reauthGeneration) {
+          sourceFreezeGeneration = undefined
+          return false
+        }
+        const generation = sourceFreezeGeneration
+        if (generation === undefined) return false
+        sourceFreezeGeneration = undefined
+        if (conn.authGeneration !== generation || conn.sourceAccessGeneration !== generation ||
+            conn.auth.pendingReauth !== true) return false
+        conn.authGeneration++
+        conn.sourceAccessGeneration = undefined
+        conn.auth = { readAllowed: false, invalidated: false, terminalClose: { code, reason } }
+        void this.closeConn(conn, code, reason)
+        return true
+      },
+    }
+    const context = {
+      uid: conn.uid,
+      docId: conn.docId,
+      documentName: conn.documentName,
+      principalSpaceId: conn.principalSpaceId,
+    }
+    conn.activeAccessDisposer = registerActiveAccess(
+      { docId: conn.docId, uid: conn.uid, principalSpaceId: conn.principalSpaceId, documentName: conn.documentName },
+      state.permissionEpoch ?? conn.roleEpoch,
+      state,
+      // The ticket-carried membership proof can lapse after the shared binding is
+      // registered (`expireShareMembership` clears `conn.spaceMember`). Resolve with
+      // the CURRENT proof so a withdrawn direct grant cannot be re-derived as a
+      // share writer from an expired claim.
+      () => this.accessProvider!({ ...context, spaceMember: conn.spaceMember }),
+      participant,
+      registration,
+    )
+  }
+
   private removeFromRoom(conn: Conn): void {
+    conn.activeAccessDisposer?.()
+    conn.activeAccessDisposer = undefined
     if (conn.heartbeatTimer) clearInterval(conn.heartbeatTimer)
     conn.heartbeatTimer = undefined
     if (conn.authTimer) clearTimeout(conn.authTimer)
@@ -1193,7 +1336,22 @@ export class PptRelay {
   }
 
   private canPushRead(conn: Conn): boolean {
-    return conn.auth.readAllowed && !conn.auth.invalidated && conn.auth.pendingReauth !== true && conn.socket.readyState === WebSocket.OPEN
+    if (!conn.auth.readAllowed || conn.auth.invalidated || conn.auth.pendingReauth === true ||
+        conn.socket.readyState !== WebSocket.OPEN) return false
+    const source = conn.sourceAccess
+    if (source && source.sourceRevision !== null &&
+        (source.proofExpiresAt === null || source.proofExpiresAt <= performance.now())) {
+      if (conn.activeAccessParticipant &&
+          renewActiveAccess(
+            { docId: conn.docId, uid: conn.uid, principalSpaceId: conn.principalSpaceId },
+            conn.activeAccessParticipant,
+          )) return false
+      const reason = 'authorization proof expired'
+      conn.auth = { readAllowed: false, invalidated: false, terminalClose: { code: CLOSE_UNAUTHORIZED, reason } }
+      void this.closeConn(conn, CLOSE_UNAUTHORIZED, reason)
+      return false
+    }
+    return true
   }
 
   /**
@@ -1293,6 +1451,12 @@ export class PptRelay {
       return
     }
     if (!this.canPushRead(peer)) {
+      // The deadline check can synchronously start a shared source freeze.
+      // Keep this first frame with later frozen deliveries rather than closing it.
+      if (peer.auth.pendingReauth === true && !peer.auth.terminalClose && peer.socket.readyState === WebSocket.OPEN) {
+        await this.bufferLiveFrame(peer, frame)
+        return
+      }
       const terminal = peer.auth.terminalClose
       await this.closeConn(peer, terminal?.code ?? CLOSE_FORBIDDEN, terminal?.reason ?? 'read authorization invalidated')
       return
@@ -1631,6 +1795,8 @@ export class PptRelay {
   }
 
   private armAuthRefresh(conn: Conn): void {
+    // Access-managed production sockets use the shared five-second batched monitor.
+    if (conn.activeAccessDisposer) return
     const jitter = Math.floor(Math.random() * Math.max(1, this.limits.authRefreshMs / 5))
     conn.authTimer = setTimeout(() => {
       void this.refreshReadAuth(conn, 'timer').finally(() => {
@@ -1651,57 +1817,135 @@ export class PptRelay {
 
   private async expireShareMembership(conn: Conn): Promise<void> {
     if (!conn.spaceMember || conn.socket.readyState !== WebSocket.OPEN || !this.rooms.get(conn.docId)?.has(conn)) return
-    if (conn.auth.pendingReauth || conn.auth.terminalClose) return
-    // Capture the reauth generation BEFORE the roleProvider await (XIN-1739 P1-1):
-    // an in-place `reauth` that completes while we await replaces the connection's
-    // authority and re-arms this timer, so a resume that ignored it would clobber a
-    // freshly re-authorized socket back into pendingReauth. The callback that ran
-    // this method already nulled `shareExpiryTimer`, so `handleReauth`'s clearTimeout
-    // cannot cancel this in-flight body — the generation guard is what stops it.
+    if ((conn.auth.pendingReauth && conn.sourceAccessGeneration !== conn.authGeneration) || conn.auth.terminalClose) return
+    // Preserve the reauth and source generations across the unified source lookup;
+    // neither a fresh ticket nor a concurrent source withdrawal may be overwritten.
     const generation = conn.reauthGeneration
-    const authGeneration = conn.authGeneration
-    let directRole: ResolvedRole = 'none'
-    if (this.roleProvider) {
-      try {
-        directRole = await this.roleProvider({
-          uid: conn.uid,
+    const registration = beginActiveAccessRegistration({
+      docId: conn.docId,
+      uid: conn.uid,
+      principalSpaceId: conn.principalSpaceId,
+    }, 'ppt:direct')
+    const sourceManaged = this.accessProvider !== undefined
+    if (sourceManaged) {
+      conn.shareExpiryGeneration = generation
+      conn.spaceMember = false
+      conn.activeAccessParticipant?.freeze()
+      if (conn.activeAccessParticipant) {
+        prepareActiveAccessShareExpiry({
           docId: conn.docId,
-          documentName: conn.documentName,
+          uid: conn.uid,
           principalSpaceId: conn.principalSpaceId,
-          spaceMember: false,
-        })
-      } catch {
-        directRole = 'none'
+        }, conn.activeAccessParticipant)
       }
     }
-    // A reauth (or another expiry cycle) intervened while awaiting → this callback
-    // is stale; bail without touching the connection's now-fresh authority.
-    // Epoch changes and terminal withdrawals also invalidate the old lookup,
-    // even without a completed reauth. Never clear their freeze/close state.
-    if (conn.reauthGeneration !== generation || conn.authGeneration !== authGeneration
-      || conn.auth.pendingReauth || conn.auth.terminalClose) return
-    if (!conn.spaceMember || conn.socket.readyState !== WebSocket.OPEN || !this.rooms.get(conn.docId)?.has(conn)) return
-    if (roleRank(directRole) >= roleRank(conn.role)) {
-      // Direct role covers the connection independent of the expired membership
-      // claim — keep the socket, drop the (now stale) membership dependency.
-      conn.spaceMember = false
-      conn.auth = { readAllowed: roleAtLeast(conn.role, 'reader'), invalidated: false }
-      return
+    const authGeneration = conn.authGeneration
+    let registrationTransferred = false
+    let preserveHandoff = false
+    try {
+      let directAccess: CurrentAccess | undefined
+      let directRole: ResolvedRole = 'none'
+      if (this.accessProvider) {
+        try {
+          directAccess = await this.accessProvider({
+            uid: conn.uid,
+            docId: conn.docId,
+            documentName: conn.documentName,
+            principalSpaceId: conn.principalSpaceId,
+            spaceMember: false,
+          })
+        } catch {
+          directAccess = undefined
+        }
+      } else if (this.roleProvider) {
+        try {
+          directRole = await this.roleProvider({
+            uid: conn.uid,
+            docId: conn.docId,
+            documentName: conn.documentName,
+            principalSpaceId: conn.principalSpaceId,
+            spaceMember: false,
+          })
+        } catch {
+          directRole = 'none'
+        }
+      }
+      // A fresh ticket or an epoch refresh owns any concurrent auth generation.
+      // Keep this participant on the direct-source scope until that owner settles.
+      if (conn.reauthGeneration !== generation || conn.auth.terminalClose ||
+          conn.socket.readyState !== WebSocket.OPEN || !this.rooms.get(conn.docId)?.has(conn)) return
+      if (conn.authGeneration !== authGeneration) {
+        preserveHandoff = true
+        const current = conn.sourceAccess
+        const currentPermissionEpoch = current?.permissionEpoch
+        const transferredCurrentProof = conn.epochResolvedGeneration === conn.epochGeneration &&
+          conn.auth.pendingReauth === true && conn.spaceMember === false &&
+          conn.sourceAccessGeneration === undefined &&
+          current?.sourceConfirmed === true && current.role !== 'none' &&
+          typeof currentPermissionEpoch === 'number' &&
+          currentPermissionEpoch >= conn.roleEpoch &&
+          (current.sourceRevision === null ||
+           (current.proofExpiresAt !== null && current.proofExpiresAt > performance.now()))
+        if (transferredCurrentProof && current && typeof currentPermissionEpoch === 'number') {
+          if (roleRank(current.role) < roleRank(conn.role)) conn.role = current.role
+          conn.roleEpoch = currentPermissionEpoch
+          if (conn.reauthGraceTimer) {
+            clearTimeout(conn.reauthGraceTimer)
+            conn.reauthGraceTimer = undefined
+          }
+          conn.auth = { readAllowed: roleAtLeast(conn.role, 'reader'), invalidated: false }
+          this.schedulePresence(conn.docId)
+          void this.resumeReadDelivery(conn)
+        } else if (conn.auth.pendingReauth === true) {
+          this.armReauthGrace(conn)
+        }
+        return
+      }
+      if ((conn.auth.pendingReauth &&
+           conn.sourceAccessGeneration !== conn.authGeneration) ||
+          conn.auth.terminalClose) {
+        preserveHandoff = true
+        if (conn.auth.pendingReauth === true) this.armReauthGrace(conn)
+        return
+      }
+      if ((!sourceManaged && !conn.spaceMember) || conn.socket.readyState !== WebSocket.OPEN ||
+          !this.rooms.get(conn.docId)?.has(conn)) return
+
+      if (sourceManaged && directAccess?.sourceConfirmed &&
+          (directAccess.permissionEpoch ?? conn.roleEpoch) >= conn.roleEpoch &&
+          (directAccess.sourceRevision === null ||
+           (directAccess.proofExpiresAt !== null && directAccess.proofExpiresAt > performance.now())) &&
+          roleAtLeast(directAccess.role, 'reader')) {
+        // The unified resolver is the authority: keep independent or Drive-backed
+        // reading, and replace the expired membership result with its full proof.
+        this.attachActiveAccess(conn, directAccess, registration)
+        registrationTransferred = true
+        return
+      }
+      if (!sourceManaged && roleRank(directRole) >= roleRank(conn.role)) {
+        conn.authGeneration++
+        conn.sourceAccessGeneration = undefined
+        conn.spaceMember = false
+        conn.auth = { readAllowed: roleAtLeast(conn.role, 'reader'), invalidated: false }
+        return
+      }
+      // Genuinely share-derived or unconfirmable: buffer reads and writes while
+      // the client presents a fresh ticket, then fail closed at the existing grace
+      // deadline. The prior membership claim is no longer usable.
+      conn.authGeneration++
+      conn.sourceAccessGeneration = undefined
+      conn.auth = { readAllowed: conn.auth.readAllowed, invalidated: false, pendingReauth: true }
+      this.armReauthGrace(conn)
+      this.schedulePresence(conn.docId)
+    } finally {
+      if (sourceManaged && conn.shareExpiryGeneration === generation &&
+          (registrationTransferred || !preserveHandoff ||
+           conn.reauthGeneration !== generation || conn.auth.terminalClose ||
+           !this.rooms.get(conn.docId)?.has(conn))) {
+        conn.shareExpiryGeneration = undefined
+      }
+      if (!registrationTransferred) registration.release()
     }
-    // Genuinely share-derived: the ticket's membership claim just expired and the
-    // direct role does not cover it. Instead of hard-closing — which, with the
-    // short ticket TTL, becomes a permanent connect/replay/close loop (P1-3) —
-    // enter PENDING-REAUTH: buffer live frames and give the client a short grace
-    // window to present a freshly-minted ticket via an in-place `reauth` frame. If
-    // none arrives before the deadline, fail closed. A client that reauth'd
-    // proactively (before expiry) already re-armed this timer, so it never fires.
-    // Freezing to pendingReauth withdraws the live authority, so bump the withdrawal
-    // generation too (XIN-1840 P1-1): a gate parked mid-await that captured the prior
-    // value refuses on resume rather than writing against the just-frozen socket.
-    conn.authGeneration++
-    conn.auth = { readAllowed: conn.auth.readAllowed, invalidated: false, pendingReauth: true }
-    this.schedulePresence(conn.docId)
-    this.armReauthGrace(conn)
   }
 
   /**
@@ -1806,57 +2050,97 @@ export class PptRelay {
       return this.failReauth(conn, 'document unavailable')
     }
     const freshSpaceMember = claims.permission_epoch === liveEpoch && claims.space_member === true
-    let role: ResolvedRole = claims.role
-    if (claims.permission_epoch !== liveEpoch) {
-      if (!this.roleProvider) return this.failReauth(conn, 'stale reauth ticket epoch')
-      try {
-        role = await this.roleProvider({ uid: conn.uid, docId: conn.docId, documentName: conn.documentName, principalSpaceId: conn.principalSpaceId, spaceMember: freshSpaceMember })
-      } catch {
-        role = 'none'
+    const roleContext: RoleResolutionContext = {
+      uid: conn.uid,
+      docId: conn.docId,
+      documentName: conn.documentName,
+      principalSpaceId: conn.principalSpaceId,
+      spaceMember: freshSpaceMember,
+    }
+    const registration = beginActiveAccessRegistration({
+      docId: conn.docId,
+      uid: conn.uid,
+      principalSpaceId: conn.principalSpaceId,
+    }, activeAuthorityScope(freshSpaceMember, claims.jti))
+    let registrationTransferred = false
+    try {
+      let sourceAccess: CurrentAccess | undefined
+      let role: ResolvedRole = claims.role
+      if (this.accessProvider) {
+        try {
+          sourceAccess = await this.accessProvider(roleContext)
+        } catch {
+          return this.failReauth(conn, 'authorization unavailable', CLOSE_UNAUTHORIZED)
+        }
+        if (sourceAccess.role === 'none') {
+          return this.failReauth(conn, sourceAccess.sourceConfirmed ? 'access revoked' : 'authorization unavailable',
+            sourceAccess.sourceConfirmed ? CLOSE_FORBIDDEN : CLOSE_UNAUTHORIZED)
+        }
+        if (sourceAccess.sourceRevision !== null &&
+            (sourceAccess.proofExpiresAt === null || sourceAccess.proofExpiresAt <= performance.now())) {
+          return this.failReauth(conn, 'authorization proof expired', CLOSE_UNAUTHORIZED)
+        }
+        role = sourceAccess.role
+      } else if (claims.permission_epoch !== liveEpoch) {
+        if (!this.roleProvider) return this.failReauth(conn, 'stale reauth ticket epoch', CLOSE_UNAUTHORIZED)
+        try {
+          role = await this.roleProvider(roleContext)
+        } catch {
+          role = 'none'
+        }
       }
+      if (!roleAtLeast(role, 'reader')) return this.failReauth(conn, 'access revoked')
+      if (conn.socket.readyState !== WebSocket.OPEN || !this.rooms.get(conn.docId)?.has(conn)) return
+      // A concurrent withdrawal (revocation / epoch bump / doc deletion) condemned this
+      // socket while we awaited above; its close is QUEUED but readyState/room-membership
+      // are still true. Do NOT adopt fresh authority over it — that is exactly the P1-1
+      // laundering (`handleReauth` rebuilding conn.auth after 4 awaits). Bail; the queued
+      // close stays authoritative (XIN-1840 P1-1).
+      if (conn.authGeneration !== gen) return
+      // Success: adopt the fresh authority in place, re-arm the share-expiry timer
+      // from the fresh ticket's expiry, clear pending reauth, and flush via cutover.
+      // Older epoch checks captured the previous membership/role context.
+      conn.authGeneration++
+      conn.sourceAccessGeneration = undefined
+      if (conn.reauthGraceTimer) {
+        clearTimeout(conn.reauthGraceTimer)
+        conn.reauthGraceTimer = undefined
+      }
+      conn.role = role
+      conn.name = claims.name
+      conn.roleEpoch = liveEpoch
+      conn.spaceMember = freshSpaceMember
+      // Bump the reauth generation so any share-expiry callback still awaiting its
+      // source lookup (armed against the OLD ticket) bails instead of shoving this
+      // freshly re-authorized socket back into pendingReauth.
+      conn.reauthGeneration++
+      conn.shareExpiryGeneration = undefined
+      if (conn.shareExpiryTimer) {
+        clearTimeout(conn.shareExpiryTimer)
+        conn.shareExpiryTimer = undefined
+      }
+      this.armShareExpiry(conn, claims.exp)
+      conn.auth = { readAllowed: roleAtLeast(role, 'reader'), invalidated: false }
+      if (sourceAccess) {
+        this.attachActiveAccess(conn, sourceAccess, registration)
+        registrationTransferred = true
+      }
+      if (conn.liveAuth) await this.sendAuth(conn, { ctl: 'auth-updated', role, epoch: liveEpoch, requestId })
+      this.schedulePresence(conn.docId)
+      await this.resumeReadDelivery(conn)
+    } finally {
+      if (!registrationTransferred) registration.release()
     }
-    if (!roleAtLeast(role, 'reader')) return this.failReauth(conn, 'access revoked')
-    if (conn.socket.readyState !== WebSocket.OPEN || !this.rooms.get(conn.docId)?.has(conn)) return
-    // A concurrent withdrawal (revocation / epoch bump / doc deletion) condemned this
-    // socket while we awaited above; its close is QUEUED but readyState/room-membership
-    // are still true. Do NOT adopt fresh authority over it — that is exactly the P1-1
-    // laundering (`handleReauth` rebuilding conn.auth after 4 awaits). Bail; the queued
-    // close stays authoritative (XIN-1840 P1-1).
-    if (conn.authGeneration !== gen) return
-    // Success: adopt the fresh authority in place, re-arm the share-expiry timer
-    // from the fresh ticket's expiry, clear pending reauth, and flush via cutover.
-    // Older epoch checks captured the previous membership/role context.
-    conn.authGeneration++
-    if (conn.reauthGraceTimer) {
-      clearTimeout(conn.reauthGraceTimer)
-      conn.reauthGraceTimer = undefined
-    }
-    conn.role = role
-    conn.name = claims.name
-    conn.roleEpoch = liveEpoch
-    conn.spaceMember = freshSpaceMember
-    // Bump the reauth generation so any share-expiry callback still awaiting its
-    // roleProvider (armed against the OLD ticket) bails on resume instead of shoving
-    // this freshly re-authorized socket back into pendingReauth (XIN-1739 P1-1).
-    conn.reauthGeneration++
-    if (conn.shareExpiryTimer) {
-      clearTimeout(conn.shareExpiryTimer)
-      conn.shareExpiryTimer = undefined
-    }
-    this.armShareExpiry(conn, claims.exp)
-    conn.auth = { readAllowed: roleAtLeast(role, 'reader'), invalidated: false }
-    if (conn.liveAuth) await this.sendAuth(conn, { ctl: 'auth-updated', role, epoch: liveEpoch, requestId })
-    this.schedulePresence(conn.docId)
-    await this.resumeReadDelivery(conn)
+
   }
 
-  private failReauth(conn: Conn, reason: string): void {
+  private failReauth(conn: Conn, reason: string, code: 4401 | 4403 = CLOSE_FORBIDDEN): void {
     if (conn.reauthGraceTimer) {
       clearTimeout(conn.reauthGraceTimer)
       conn.reauthGraceTimer = undefined
     }
-    conn.auth = { readAllowed: false, invalidated: false, terminalClose: { code: CLOSE_FORBIDDEN, reason } }
-    void this.closeConn(conn, CLOSE_FORBIDDEN, reason)
+    conn.auth = { readAllowed: false, invalidated: false, terminalClose: { code, reason } }
+    void this.closeConn(conn, code, reason)
   }
 
   private async refreshReadAuth(conn: Conn, _reason: string): Promise<boolean> {
@@ -2384,6 +2668,7 @@ export class PptRelay {
       if (conn.liveAuth) {
         if (!conn.auth.pendingReauth) {
           conn.authGeneration++
+          conn.sourceAccessGeneration = undefined
           conn.auth = { readAllowed: false, invalidated: false, pendingReauth: true }
           this.schedulePresence(conn.docId)
           this.armReauthGrace(conn)
@@ -2858,10 +3143,10 @@ export class PptRelay {
     let duplicate: boolean
     try {
       let res
-      try { res = await this.store.appendOp(conn.docId, frameId, frame) } catch (error) {
+      try { res = await this.store.appendOp(conn.docId, frameId, frame, conn.uid) } catch (error) {
         if (!(error instanceof RoomCapacityError)) throw error
         await this.snapshotNow(conn.docId, true)
-        res = await this.store.appendOp(conn.docId, frameId, frame)
+        res = await this.store.appendOp(conn.docId, frameId, frame, conn.uid)
       }
       seq = res.seq
       duplicate = res.duplicate
@@ -3040,14 +3325,16 @@ export class PptRelay {
     // Otherwise a slow deletion-status check could keep serving a revoked reader.
     // Without a role provider this method only sweeps deletions; do not leave
     // those connections in a freeze that no role lookup can subsequently clear.
-    const frozenGen = new Map<Conn, number>()
+    const frozenGen = new Map<Conn, { auth: number; epoch: number }>()
     if (this.roleProvider) {
       for (const room of this.rooms.values()) {
         for (const conn of room) {
           if (conn.documentName !== documentName || conn.auth.terminalClose) continue
+          conn.epochGeneration++
           conn.authGeneration++
+          conn.sourceAccessGeneration = undefined
           conn.auth = { readAllowed: false, invalidated: false, pendingReauth: true }
-          frozenGen.set(conn, conn.authGeneration)
+          frozenGen.set(conn, { auth: conn.authGeneration, epoch: conn.epochGeneration })
         }
       }
     }
@@ -3083,85 +3370,170 @@ export class PptRelay {
     } catch {
       /* fall through: still re-resolve roles; a lost epoch is handled per-frame */
     }
-    for (const room of this.rooms.values()) {
-      for (const conn of [...room]) {
-        if (conn.documentName !== documentName) continue
-        const gen = frozenGen.get(conn)
-        if (gen === undefined || conn.authGeneration !== gen) continue
-        const outcome = await this.recheckRole({
-          uid: conn.uid,
-          docId: conn.docId,
-          documentName: conn.documentName,
-          principalSpaceId: conn.principalSpaceId,
-          spaceMember: conn.spaceMember,
-        })
-        // Discard stale outcomes BEFORE any role, epoch or terminal mutation.
-        if (conn.authGeneration !== gen) continue
-        if (outcome.kind === 'close-membership') {
-          if (conn.liveAuth && gen !== undefined && conn.authGeneration === gen) {
-            // A fresh membership proof can be supplied on this same socket.
-            // Reads/writes stay frozen until verified; timeout still fails closed.
-            this.armReauthGrace(conn)
-            // A failed epoch lookup must not send 0 below the client's confirmed
-            // watermark. This only requests proof; authority remains frozen.
-            void this.sendAuth(conn, { ctl: 'auth-refresh', role: conn.role, epoch: Math.max(newEpoch, conn.roleEpoch) })
-            continue
-          }
-          // The frozen space-membership claim became load-bearing and cannot be
-          // re-verified on a live socket — fail closed (P1-6). The client re-mints
-          // a ticket carrying fresh membership.
-          conn.auth = { readAllowed: false, invalidated: false, terminalClose: { code: CLOSE_FORBIDDEN, reason: 'membership recheck required' } }
-          void this.closeConn(conn, CLOSE_FORBIDDEN, 'membership recheck required')
-          continue
+    const connections = [...this.rooms.values()].flatMap(room => [...room])
+    await Promise.all(connections.map(async conn => {
+      if (conn.documentName !== documentName) return
+      const generation = frozenGen.get(conn)
+      if (generation === undefined || conn.authGeneration !== generation.auth) return
+      const gen = generation.auth
+      const epochGeneration = generation.epoch
+      const outcome = await this.recheckRole({
+        uid: conn.uid,
+        docId: conn.docId,
+        documentName: conn.documentName,
+        principalSpaceId: conn.principalSpaceId,
+        spaceMember: conn.spaceMember,
+      })
+      // Discard stale outcomes BEFORE any role, epoch or terminal mutation.
+      if (conn.authGeneration !== gen) return
+      const expiryHandoff = this.accessProvider !== undefined &&
+        conn.shareExpiryGeneration === conn.reauthGeneration
+      if (outcome.kind === 'close-membership' && !expiryHandoff) {
+        if (conn.liveAuth && conn.authGeneration === gen) {
+          this.armReauthGrace(conn)
+          void this.sendAuth(conn, {
+            ctl: 'auth-refresh',
+            role: conn.role,
+            epoch: Math.max(newEpoch, conn.roleEpoch),
+          })
+          return
         }
-        const role = outcome.role
-        if (role === 'none') {
-          conn.auth = { readAllowed: false, invalidated: false, terminalClose: { code: CLOSE_FORBIDDEN, reason: 'access revoked' } }
-          void this.closeConn(conn, CLOSE_FORBIDDEN, 'access revoked')
-          continue
-        }
-        // Only a downgrade takes effect live; an upgrade needs fresh authority.
-        const downgraded = roleRank(role) < roleRank(conn.role)
-        if (downgraded) {
-          conn.role = role
-        }
-        // Record that this connection's role now reflects the live epoch, so
-        // guardMutation does not re-resolve it again for the same epoch. Only
-        // stamp when we actually have the authoritative epoch — otherwise leave
-        // roleEpoch stale so the per-frame guard re-resolves later.
-        if (epochOk) conn.roleEpoch = newEpoch
-        // Do NOT set a sticky pendingReauth when the epoch read merely FAILED
-        // (XIN-1739 P1-3). `recheckRole` above already re-resolved this connection's
-        // authority from the live `roleProvider` (fresh share_scope/share_role, and a
-        // load-bearing frozen membership claim would have taken the close-membership
-        // branch), so a non-`none` outcome means the socket IS currently authorized —
-        // only the epoch VERSION stamp is missing. Leaving `roleEpoch` stale (above)
-        // makes `guardMutation` / `refreshReadAuth` re-resolve and re-check the epoch
-        // per frame once the transient failure clears, so mutations stay fail-closed
-        // (a frame at the wrong epoch is `stale-epoch`) WITHOUT permanently disabling
-        // an otherwise-authorized socket. The previous `pendingReauth: !epochOk` had
-        // NO clearer on this path (refreshReadAuth/refreshRoleDownOnly preserve it,
-        // armReauthGrace was never called here, and no client sends `reauth`
-        // unprompted), so a single transient epoch-read blip left the socket neither
-        // usable (reads suppressed, writes `forbidden-role`) nor closed — forever.
-        //
-        // A DIFFERENT withdrawal (e.g. `closeRoomForDeleted`) condemned this socket while
-        // we awaited `epochProvider`/`recheckRole`; its `terminalClose`/freeze is already
-        // set and its close is QUEUED. Do NOT rebuild a live authority over it (the P1-1
-        // laundering) — skip and leave the withdrawal authoritative (XIN-1840 P1-1). A
-        // socket that joined AFTER our freeze (not in `frozenGen`) is likewise skipped:
-        // its own connect-time authority stands, this bump does not own it.
-        if (gen === undefined || conn.authGeneration !== gen) continue
-        conn.auth = { readAllowed: roleAtLeast(conn.role, 'reader'), invalidated: false }
-        this.schedulePresence(conn.docId)
-        if (conn.liveAuth && epochOk) {
-          // No privilege increase without fresh authority. Same/lower roles can
-          // adopt the authoritative epoch without replaying document state.
-          void this.sendAuth(conn, { ctl: roleRank(role) > roleRank(conn.role) ? 'auth-refresh' : 'auth-updated', role: conn.role, epoch: newEpoch })
-        } else if (downgraded) void this.gatedSend(conn, { ctl: 'role-changed', role: conn.role, epoch: newEpoch })
-        void this.resumeReadDelivery(conn)
+        conn.auth = { readAllowed: false, invalidated: false, terminalClose: { code: CLOSE_FORBIDDEN, reason: 'membership recheck required' } }
+        void this.closeConn(conn, CLOSE_FORBIDDEN, 'membership recheck required')
+        return
       }
-    }
+      let confirmedAccess: CurrentAccess | undefined
+      if (expiryHandoff) {
+        const reauthGeneration = conn.reauthGeneration
+        const shareExpiryGeneration = conn.shareExpiryGeneration
+        const registration = beginActiveAccessRegistration({
+          docId: conn.docId,
+          uid: conn.uid,
+          principalSpaceId: conn.principalSpaceId,
+        }, 'ppt:direct')
+        let registrationTransferred = false
+        try {
+          try {
+            confirmedAccess = await this.accessProvider!({
+              uid: conn.uid,
+              docId: conn.docId,
+              documentName: conn.documentName,
+              principalSpaceId: conn.principalSpaceId,
+              spaceMember: false,
+            })
+          } catch {
+            confirmedAccess = undefined
+          }
+          if (conn.epochGeneration !== epochGeneration ||
+              conn.reauthGeneration !== reauthGeneration ||
+              conn.shareExpiryGeneration !== shareExpiryGeneration ||
+              conn.auth.terminalClose || conn.socket.readyState !== WebSocket.OPEN ||
+              !this.rooms.get(conn.docId)?.has(conn) ||
+              (conn.authGeneration !== gen &&
+               !registration.invalidated && !registration.sourceRevisionInvalidated)) return
+
+          const confirmed = confirmedAccess?.sourceConfirmed === true &&
+            confirmedAccess.role !== 'none' &&
+            (confirmedAccess.sourceRevision === null ||
+             (confirmedAccess.proofExpiresAt !== null &&
+              confirmedAccess.proofExpiresAt > performance.now())) &&
+            (!epochOk || (confirmedAccess.permissionEpoch !== null &&
+              confirmedAccess.permissionEpoch >= newEpoch))
+          const revoked = confirmedAccess?.sourceConfirmed === true &&
+            confirmedAccess.role === 'none'
+          if (!confirmed && !registration.invalidated) {
+            if (revoked) {
+              conn.auth = { readAllowed: false, invalidated: false, terminalClose: { code: CLOSE_FORBIDDEN, reason: 'access revoked' } }
+              void this.closeConn(conn, CLOSE_FORBIDDEN, 'access revoked')
+            } else if (conn.liveAuth) {
+              this.armReauthGrace(conn)
+              void this.sendAuth(conn, {
+                ctl: 'auth-refresh',
+                role: conn.role,
+                epoch: Math.max(newEpoch, conn.roleEpoch),
+              })
+            } else {
+              conn.auth = { readAllowed: false, invalidated: false, terminalClose: { code: CLOSE_UNAUTHORIZED, reason: 'authorization could not be confirmed' } }
+              void this.closeConn(conn, CLOSE_UNAUTHORIZED, 'authorization could not be confirmed')
+            }
+            return
+          }
+          if (!confirmedAccess) {
+            if (conn.liveAuth) {
+              this.armReauthGrace(conn)
+              void this.sendAuth(conn, {
+                ctl: 'auth-refresh',
+                role: conn.role,
+                epoch: Math.max(newEpoch, conn.roleEpoch),
+              })
+            } else {
+              conn.auth = { readAllowed: false, invalidated: false, terminalClose: { code: CLOSE_UNAUTHORIZED, reason: 'authorization could not be confirmed' } }
+              void this.closeConn(conn, CLOSE_UNAUTHORIZED, 'authorization could not be confirmed')
+            }
+            return
+          }
+          this.attachActiveAccess(conn, confirmedAccess, registration)
+          registrationTransferred = true
+          if (!registration.invalidated && conn.shareExpiryGeneration === reauthGeneration) {
+            conn.shareExpiryGeneration = undefined
+          }
+          if (!confirmed || conn.authGeneration !== gen || conn.auth.terminalClose) return
+        } finally {
+          if (!registrationTransferred) registration.release()
+        }
+      }
+      const role = confirmedAccess?.role ?? (outcome.kind === 'role' ? outcome.role : 'none')
+      if (role === 'none') {
+        conn.auth = { readAllowed: false, invalidated: false, terminalClose: { code: CLOSE_FORBIDDEN, reason: 'access revoked' } }
+        void this.closeConn(conn, CLOSE_FORBIDDEN, 'access revoked')
+        return
+      }
+      // Only a downgrade takes effect live; an upgrade needs fresh authority.
+      const downgraded = roleRank(role) < roleRank(conn.role)
+      if (downgraded) {
+        conn.role = role
+      }
+      // Record that this connection's role now reflects the live epoch, so
+      // guardMutation does not re-resolve it again for the same epoch. Only
+      // stamp when we actually have the authoritative epoch — otherwise leave
+      // roleEpoch stale so the per-frame guard re-resolves later.
+      if (epochOk) conn.roleEpoch = confirmedAccess?.permissionEpoch ?? newEpoch
+      // Do NOT set a sticky pendingReauth when the epoch read merely FAILED
+      // (XIN-1739 P1-3). `recheckRole` above already re-resolved this connection's
+      // authority from the live `roleProvider` (fresh share_scope/share_role, and a
+      // load-bearing frozen membership claim would have taken the close-membership
+      // branch), so a non-`none` outcome means the socket IS currently authorized —
+      // only the epoch VERSION stamp is missing. Leaving `roleEpoch` stale (above)
+      // makes `guardMutation` / `refreshReadAuth` re-resolve and re-check the epoch
+      // per frame once the transient failure clears, so mutations stay fail-closed
+      // (a frame at the wrong epoch is `stale-epoch`) WITHOUT permanently disabling
+      // an otherwise-authorized socket. The previous `pendingReauth: !epochOk` had
+      // NO clearer on this path (refreshReadAuth/refreshRoleDownOnly preserve it,
+      // armReauthGrace was never called here, and no client sends `reauth`
+      // unprompted), so a single transient epoch-read blip left the socket neither
+      // usable (reads suppressed, writes `forbidden-role`) nor closed — forever.
+      //
+      // A DIFFERENT withdrawal (e.g. `closeRoomForDeleted`) condemned this socket while
+      // we awaited `epochProvider`/`recheckRole`; its `terminalClose`/freeze is already
+      // set and its close is QUEUED. Do NOT rebuild a live authority over it (the P1-1
+      // laundering) — skip and leave the withdrawal authoritative (XIN-1840 P1-1). A
+      // socket that joined AFTER our freeze (not in `frozenGen`) is likewise skipped:
+      // its own connect-time authority stands, this bump does not own it.
+      if (conn.authGeneration !== gen) return
+      if (conn.reauthGraceTimer) {
+        clearTimeout(conn.reauthGraceTimer)
+        conn.reauthGraceTimer = undefined
+      }
+      conn.auth = { readAllowed: roleAtLeast(conn.role, 'reader'), invalidated: false }
+      conn.epochResolvedGeneration = epochGeneration
+      this.schedulePresence(conn.docId)
+      if (conn.liveAuth && epochOk) {
+        // No privilege increase without fresh authority. Same/lower roles can
+        // adopt the authoritative epoch without replaying document state.
+        void this.sendAuth(conn, { ctl: roleRank(role) > roleRank(conn.role) ? 'auth-refresh' : 'auth-updated', role: conn.role, epoch: conn.roleEpoch })
+      } else if (downgraded) void this.gatedSend(conn, { ctl: 'role-changed', role: conn.role, epoch: conn.roleEpoch })
+      void this.resumeReadDelivery(conn)
+    }))
   }
 
   /** Close every socket in a deleted doc's room with 4404 (§6.4 / EPOCH-002). */

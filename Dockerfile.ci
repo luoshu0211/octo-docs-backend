@@ -53,8 +53,11 @@ ARG TYPST_SHA256_AMD64=7d214bfeffc2e585dc422d1a09d2b144969421281e8c7f5d784b65fc6
 ARG TYPST_SHA256_ARM64=4f5b7ee6e57fb639019ee0f6bffcf940edad228ede6ff5269a9f05a1544ceed4
 ARG GITLAB_TOKEN
 
+# Alpine removes superseded curl security revisions from stable repositories;
+# keep the unaffected extraction tools pinned.
+# hadolint ignore=DL3018
 RUN sed -i 's#https://dl-cdn.alpinelinux.org#https://mirrors.tuna.tsinghua.edu.cn#g' /etc/apk/repositories \
-    && apk add --no-cache curl=8.23.0-r0 tar=1.35-r5 xz=5.8.4-r0 \
+    && apk add --no-cache curl tar=1.35-r5 xz=5.8.4-r0 \
     && ARCH="$(uname -m)" \
     && case "$ARCH" in \
          x86_64) TARGET=x86_64-unknown-linux-musl; TYPST_SHA256="$TYPST_SHA256_AMD64" ;; \

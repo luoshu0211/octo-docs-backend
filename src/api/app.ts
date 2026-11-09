@@ -79,6 +79,7 @@ import { collabTokenRouter } from './routes/collabToken.js'
 import { docsRouter, documentResourceRouter, spaceCollectionRouter } from './routes/docs.js'
 import { internalHtmlRegistrationRouter } from './routes/internalHtmlRegistration.js'
 import { internalDocRoleRouter } from './routes/internalDocRole.js'
+import { internalSourceInvalidationsRouter } from './routes/internalSourceInvalidations.js'
 import { membersRouter } from './routes/members.js'
 import { memberNotificationsRouter } from './routes/memberNotifications.js'
 import { forwardGrantRouter } from './routes/forwardGrant.js'
@@ -219,6 +220,10 @@ export function createApp(
     )
   }
 
+  if (serveInternal) {
+    app.use('/internal/docs/source-invalidations', createRateLimiter(opts.rateLimit),
+      express.json({ limit: 64 * 1024 }), internalSourceInvalidationsRouter)
+  }
   const jsonBodyParser = express.json({ limit: '1mb' })
   const sheetWriteJsonBodyParser = express.json({ limit: config.sheetWrite.maxRequestBytes })
   app.use((req, res, next) => {

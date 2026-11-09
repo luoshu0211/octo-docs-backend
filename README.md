@@ -74,6 +74,18 @@ Human deletion through `DELETE /api/v1/docs/:docId` retains its existing verifie
 Space and document-admin checks, soft deletion, and collaboration invalidation.
 This policy does not change bot creation, editing, or other resource operations.
 
+## Document metadata actors
+
+`GET /api/v1/docs/:docId` and readable rows in the Docs list expose `createdBy`
+and `updatedBy` as persisted user IDs; `updatedBy` is an empty string when no
+editor is recorded. `POST /api/v1/docs/metadata` accepts up to 500 `docIds` and
+returns `{ items: [{ docId, createdBy, updatedBy, updatedAt }] }` only for active
+documents the caller can read. Missing, deleted, archived, and unreadable IDs
+are omitted. The Bot endpoint
+`POST /v1/bot/docs/metadata` applies the same rule using the Bot's server-verified
+Space and exact cross-Space grants. These fields do not change document ownership
+or access permissions.
+
 ## Prerequisites
 
 - **Node.js ≥ 20** (developed on v22), npm.

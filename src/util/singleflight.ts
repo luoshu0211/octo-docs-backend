@@ -50,4 +50,11 @@ export class TtlCache<T> {
   delete(key: string): void {
     this.store.delete(key)
   }
+
+  deleteWhere(predicate: (key: string, value: T) => boolean): void {
+    const now = this.nowMs()
+    for (const [key, entry] of this.store) {
+      if (now >= entry.expiresAt || predicate(key, entry.value)) this.store.delete(key)
+    }
+  }
 }

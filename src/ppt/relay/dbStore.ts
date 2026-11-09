@@ -128,11 +128,11 @@ export class DbPptRelayStore implements PptRelayStore {
     await tx.execute('INSERT INTO ppt_collab_actor_seq (doc_id, actor, last_s) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE last_s = VALUES(last_s)', [docId, actor, last])
   }
 
-  async appendOp(docId: string, frameId: string, frame: unknown): Promise<AppendOpResult> {
+  async appendOp(docId: string, frameId: string, frame: unknown, editorUid: string): Promise<AppendOpResult> {
     const frameJson = JSON.stringify(frame)
     const frameBytes = Buffer.byteLength(frameJson, 'utf8')
     const payloadHash = canonicalPayloadHash(frame)
-    return withStoreRetry('append', () => this.appendOpOnce(docId, frameId, frameJson, frameBytes, payloadHash))
+    return withStoreRetry('append', () => this.appendOpOnce(docId, frameId, frameJson, frameBytes, payloadHash, editorUid))
   }
 
   private appendOpOnce(
@@ -141,6 +141,7 @@ export class DbPptRelayStore implements PptRelayStore {
     frameJson: string,
     frameBytes: number,
     payloadHash: string,
+    editorUid: string,
   ): Promise<AppendOpResult> {
     return transaction(async (tx) => {
       // Fast-path: a resend whose ledger row is already committed AND visible in
@@ -207,6 +208,14 @@ export class DbPptRelayStore implements PptRelayStore {
       }
       // Includes the new op row: validate against only the prior tail by removing
       // it from the query boundary below. All effects roll back on failure.
+      // Only after the frame is confirmed new and both durable inserts succeed,
+      // update doc_meta. This keeps relay and draft saves in doc_meta -> snapshot
+      // lock order. Sequence or budget failures roll this write back with the frame.
+      // The relay UID comes from its verified ticket, not the client-chosen Bento actor.
+      await tx.execute(
+        'UPDATE doc_meta SET updated_by = ?, updated_at = CURRENT_TIMESTAMP(3) WHERE doc_id = ?',
+        [editorUid, docId],
+      )
       if (this.enforceActorSequence) {
         await this.validateSequence(tx, docId, seq, frameJson)
         // The counter row already serializes writers. Use a current read, not
