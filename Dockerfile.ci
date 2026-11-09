@@ -104,7 +104,7 @@ RUN sed -i 's#https://dl-cdn.alpinelinux.org#https://mirrors.tuna.tsinghua.edu.c
 #   - font-noto-cjk  → Chinese/Japanese/Korean glyphs
 #   - font-noto-emoji → colour emoji (matches what the editor shows)
 RUN apk add --no-cache \
-      font-noto=2026.06.01-r0 \
+      font-noto=2026.11.01-r0 \
       font-noto-cjk=0_git20220127-r1 \
       font-noto-emoji=2.051-r0
 
