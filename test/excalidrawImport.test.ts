@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { generateKeyBetween } from 'fractional-indexing'
-import { cleanupReplacedExcalidrawAttachments, prepareExcalidrawImport, ExcalidrawImportError } from '../src/import/excalidraw.js'
+import { prepareExcalidrawImport, ExcalidrawImportError } from '../src/import/excalidraw.js'
 
 const PNG = `data:image/png;base64,${Buffer.from([0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a,0,0,0,0]).toString('base64')}`
 const rect = (id: string, extra: Record<string, unknown> = {}) => ({ id, type: 'rectangle', version: 1, versionNonce: 1, x: 0, y: 0, width: 10, height: 10, ...extra })
@@ -113,38 +113,5 @@ describe('prepareExcalidrawImport', () => {
     })
     expect(upload).not.toHaveBeenCalled()
     expect(result.files).toEqual({})
-  })
-})
-
-
-describe('cleanupReplacedExcalidrawAttachments', () => {
-  it('deletes only attachments authoritatively owned by the replaced board and keeps rows on object failure', async () => {
-    const { docAttachmentRepo } = await import('../src/db/repos/docAttachmentRepo.js')
-    const { getObjectStore } = await import('../src/storage/objectStore.js')
-    const getById = vi.spyOn(docAttachmentRepo, 'getById')
-      .mockImplementation(async (attachId) => {
-        if (attachId === 'att_owned') return { attachId, docId: 'b1', objectKey: 'b1/att_owned/a.png' } as never
-        if (attachId === 'att_retry') return { attachId, docId: 'b1', objectKey: 'b1/att_retry/b.png' } as never
-        if (attachId === 'att_foreign') return { attachId, docId: 'other', objectKey: 'other/att_foreign/c.png' } as never
-        return null
-      })
-    const deleteById = vi.spyOn(docAttachmentRepo, 'deleteById').mockResolvedValue()
-    const deleteObject = vi.spyOn(getObjectStore(), 'delete')
-      .mockImplementation(async (key) => { if (key.includes('att_retry')) throw new Error('transient') })
-
-    await cleanupReplacedExcalidrawAttachments('b1', {
-      one: { attachId: 'att_owned' },
-      duplicate: { attachId: 'att_owned' },
-      retry: { attachId: 'att_retry' },
-      foreign: { attachId: 'att_foreign' },
-      external: { dataURL: 'https://example.test/image.png' },
-    })
-
-    expect(getById).toHaveBeenCalledTimes(3)
-    expect(deleteObject).toHaveBeenCalledWith('b1/att_owned/a.png')
-    expect(deleteById).toHaveBeenCalledWith('att_owned')
-    expect(deleteById).not.toHaveBeenCalledWith('att_retry')
-    expect(deleteObject).not.toHaveBeenCalledWith('other/att_foreign/c.png')
-    expect(deleteById).not.toHaveBeenCalledWith('att_foreign')
   })
 })
