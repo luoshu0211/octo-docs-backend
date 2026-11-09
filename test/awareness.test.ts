@@ -4,6 +4,7 @@ import type { AuthContext } from '../src/collab/authenticate.js'
 
 function ctxFor(id: string): AuthContext {
   return {
+    activeAccessRegistration: null,
     user: { id },
     role: 'writer',
     permission_epoch: 1,

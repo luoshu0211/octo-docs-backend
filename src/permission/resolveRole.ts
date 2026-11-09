@@ -14,8 +14,8 @@ import { docMetaRepo, type DocMeta } from '../db/repos/docMetaRepo.js'
 import { docMemberRepo } from '../db/repos/docMemberRepo.js'
 import { parseDocumentName } from './documentName.js'
 import { effectiveRole } from './shareScope.js'
-import { mergeDriveDerivedReader } from '../drive/derivedAccessClient.js'
-import type { ResolvedRole } from './role.js'
+import { getDriveDerivedAccess, type DerivedAccessProof } from '../drive/derivedAccessClient.js'
+import { roleAtLeast, roleRank, type ResolvedRole } from './role.js'
 
 export async function resolveRole(uid: string, docId: string, principalSpaceId: string): Promise<ResolvedRole> {
   const meta = await docMetaRepo.getByDocId(docId)
@@ -29,7 +29,7 @@ export async function resolveRole(uid: string, docId: string, principalSpaceId: 
  * Shared documentName -> doc_meta resolver (§8.1 key/row consistency).
  *
  * Every server-side path that turns a *connection key* into its doc_meta row —
- * collab-token issuance (§4.4) and the WS write recheck (§4.1) — resolves it the
+ * collab-token issuance, fresh WS handshakes and write rechecks — resolves it the
  * SAME way, keyed on document_name. Because a board's document_name IS its
  * 5-segment `:wb:` key, this one path serves documents and whiteboards alike and
  * replaces the doc_id lookup issuance used to special-case boards with. An exact
@@ -51,22 +51,60 @@ export async function resolveDocMetaByName(documentName: string): Promise<DocMet
   return meta
 }
 
+
+export interface CurrentAccess {
+  role: ResolvedRole
+  permissionEpoch: number | null
+  sourceRevision: string | null
+  proofExpiresAt: number | null
+  sourceConfirmed: boolean
+}
+
+/** Resolve the current Docs role and preserve the Drive proof that supports it. */
+export async function recheckCurrentAccess(
+  documentName: string,
+  uid: string,
+  principalSpaceId: string,
+  spaceMember = false,
+): Promise<CurrentAccess> {
+  const meta = await resolveDocMetaByName(documentName)
+  if (!meta) return { role: 'none', permissionEpoch: null, sourceRevision: null, proofExpiresAt: null, sourceConfirmed: true }
+  const direct = uid === meta.owner_id && principalSpaceId === meta.owner_space_id
+    ? 'admin'
+    : ((await docMemberRepo.getRole(meta.doc_id, uid, principalSpaceId)) ?? 'none')
+  const base = effectiveRole(direct, spaceMember, meta.share_scope, meta.share_role)
+  if (roleAtLeast(base, 'reader')) {
+    return { role: base, permissionEpoch: Number(meta.permission_epoch), sourceRevision: null, proofExpiresAt: null, sourceConfirmed: true }
+  }
+  try {
+    const proof: DerivedAccessProof | null = await getDriveDerivedAccess()
+      .derivedAccess(meta.doc_id, uid, principalSpaceId)
+    if (!proof) return { role: base, permissionEpoch: Number(meta.permission_epoch), sourceRevision: null, proofExpiresAt: null, sourceConfirmed: false }
+    return {
+      role: roleRank(base) >= roleRank(proof.role) ? base : proof.role,
+      permissionEpoch: Number(meta.permission_epoch),
+      sourceRevision: proof.sourceRevision,
+      proofExpiresAt: proof.expiresAt,
+      sourceConfirmed: true,
+    }
+  } catch {
+    return { role: base, permissionEpoch: Number(meta.permission_epoch), sourceRevision: null, proofExpiresAt: null, sourceConfirmed: false }
+  }
+}
 /**
- * recheckCurrentRole(documentName, uid, spaceMember) — §4.1 stale branch.
+ * recheckCurrentRole(documentName, uid, spaceMember) — current effective role.
  *
- * Resolves the doc by document_name then applies resolveRole, and — for #64 —
- * merges in the space-share-derived role via `effectiveRole`. The doc's share
- * settings are read FRESH from the row (`resolveDocMetaByName` is `SELECT *`, so
- * share_scope/share_role ride along), because a scope narrowing can only tighten
- * access and must take effect immediately. The requester's space membership is
- * NOT re-derived here (no service credential on the socket hot path); it is the
- * token-carried `space_member` claim passed in by the caller (absent => false,
- * fail-closed, design §5.2f/O1). Validates the key shape & that the parsed
- * folder matches doc_meta.folder_id (§4.1/§8.1). Returns 'none' if the doc does
- * not exist.
+ * Resolves the doc by document_name, applies direct ownership/membership and
+ * Space-share rules, then merges the Drive-derived reader. A fresh WS handshake
+ * calls this function directly because permission_epoch does not version Drive
+ * sources. Message-triggered rechecks may wrap it with the short-TTL singleflight
+ * cache in `permission/recheck.ts`.
  *
- * NOTE: callers wrap this with singleflight + short-TTL cache (§4.1 thundering
- * herd protection); this function itself is the authoritative DB read.
+ * The doc's share settings are read FRESH from the row (`resolveDocMetaByName`
+ * is `SELECT *`, so share_scope/share_role ride along). The requester's
+ * `space_member` proof is carried by the token (absent => false, fail-closed,
+ * design §5.2f/O1). The documentName shape and folder are validated against
+ * doc_meta; a malformed, absent or inconsistent doc resolves to 'none'.
  */
 export async function recheckCurrentRole(
   documentName: string,
@@ -74,20 +112,5 @@ export async function recheckCurrentRole(
   principalSpaceId: string,
   spaceMember = false,
 ): Promise<ResolvedRole> {
-  // M2: both document (4-seg) and whiteboard (5-seg `:wb:`) keys are served, via
-  // the shared document_name resolver. The permission subject is meta.doc_id
-  // either way; a malformed / absent / inconsistent key resolves to null and we
-  // fail closed with 'none'.
-  const meta = await resolveDocMetaByName(documentName)
-  if (!meta) return 'none'
-  const direct = uid === meta.owner_id && principalSpaceId === meta.owner_space_id ? 'admin' : ((await docMemberRepo.getRole(meta.doc_id, uid, principalSpaceId)) ?? 'none')
-  // #64: max(directRole, share-derived). restricted docs (default) yield
-  // shareDerived='none', so this is byte-identical to the pre-feature result.
-  const base = effectiveRole(direct, spaceMember, meta.share_scope, meta.share_role)
-  // Source 3 (TES-137): fold in the drive-library-derived reader with the SAME
-  // merge the collab-token issuance and open-context paths use, so a caller who
-  // only reaches the doc via a drive library gets the identical role on this
-  // live-socket recheck as at issuance — the WS stays open for a derived viewer
-  // instead of being torn down on the first stale-token frame.
-  return mergeDriveDerivedReader(base, meta.doc_id, uid, principalSpaceId)
+  return (await recheckCurrentAccess(documentName, uid, principalSpaceId, spaceMember)).role
 }

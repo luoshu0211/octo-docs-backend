@@ -36,7 +36,7 @@ import { newDocId } from '../../util/ids.js'
 import { buildDocShareUrl } from '../../util/docShareLink.js'
 import { config } from '../../config/env.js'
 import { getOctoIdentity } from '../../auth/octoIdentity.js'
-import { requireDocRole } from '../guard.js'
+import { requireDocRole, resolveDocRole } from '../guard.js'
 import { resolveRole } from '../../permission/resolveRole.js'
 import { resolveRequestPrincipalSpace } from '../../permission/principalSpace.js'
 import { editPptLive } from '../../ppt/liveEdit.js'
@@ -45,7 +45,7 @@ import { resolveEffectiveRole } from '../../permission/resolveEffectiveRole.js'
 import { issueCollabTokenByDocId } from '../../auth/issueCollabToken.js'
 import { recordVerifiedRecentView } from '../services/recordRecentView.js'
 import { requireSpaceMembership, spaceContextMiddleware } from '../middleware/spaceContext.js'
-import { requireVerifiedHumanCurrentSpace } from '../middleware/docSpaceScope.js'
+import { requireVerifiedHumanCurrentSpace, resolveHumanCurrentSpace } from '../middleware/docSpaceScope.js'
 import { searchDocs, VisibleTermsTooLargeError, encodeSearchCursor, decodeSearchCursor } from '../../search/osClient.js'
 
 export const docsRouter: ExpressRouter = Router()
@@ -401,6 +401,8 @@ export async function getDocHandler(req: Request, res: Response) {
     documentName: meta.document_name,
     title: meta.title,
     ownerId: meta.owner_id,
+    createdBy: meta.created_by,
+    updatedBy: meta.updated_by,
     spaceId: meta.space_id,
     folderId: meta.folder_id,
     docType: meta.doc_type,
@@ -468,13 +470,27 @@ export async function listDocsHandler(req: Request, res: Response) {
   const owner = includeDiscoverable ? undefined : requestedOwner
 
   const { total, items } = await docMetaRepo.listForUser({ uid, spaceId, principalSpaceId: req.principalSpaceId!, isSpaceMember, folderId, owner, ownedBots, includeDiscoverable, q, types, page, pageSize, sort })
+  // The SQL list role may be synthetic (owned Bot) or archived; only the shared
+  // read guard proves the active access required to disclose actor fields.
+  // Discoverable rows without a SQL role may still be Drive-readable.
+
+  const readableDocIds = new Set<string>()
+  await Promise.all(items.map(async (d) => {
+    const role = roleName(Number(d.role))
+    if (!role && !includeDiscoverable) return
+    const result = await resolveDocRole(req, d.doc_id, 'reader')
+    if (result.ok) readableDocIds.add(d.doc_id)
+  }))
+
   const visibleItems = items.flatMap((d) => {
     const role = roleName(Number(d.role))
     if (!role && !includeDiscoverable) return []
+    const canRead = readableDocIds.has(d.doc_id)
     return [{
       docId: d.doc_id,
       title: d.title,
       ownerId: d.owner_id,
+      ...(canRead ? { createdBy: d.created_by, updatedBy: d.updated_by } : {}),
       docType: d.doc_type,
       // A discoverable-but-inaccessible row exposes only list metadata. In
       // particular, never disclose the HTML collaboration/body addressing.
@@ -487,7 +503,64 @@ export async function listDocsHandler(req: Request, res: Response) {
   res.status(200).json({ total, items: visibleItems })
 }
 
-docsRouter.get('/', listDocsHandler)
+docsRouter.get('/', documentAsync(listDocsHandler))
+
+const MAX_METADATA_DOC_IDS = 500
+const METADATA_ROLE_LOOKUP_CONCURRENCY = 100
+
+/** Return metadata only for documents the caller can read, without per-doc HTTP errors. */
+async function docsMetadataHandler(req: Request, res: Response): Promise<void> {
+  const rawDocIds: unknown = req.body?.docIds
+  if (
+    !Array.isArray(rawDocIds)
+    || rawDocIds.length > MAX_METADATA_DOC_IDS
+    || rawDocIds.some((docId: unknown) => typeof docId !== 'string')
+  ) {
+    res.status(400).json({ error: 'invalid_doc_ids' })
+    return
+  }
+
+  // Human collection requests still require a verified current Space. This is a
+  // request-level failure, not a document result, so preserve the GET guard's
+  // existing 400/404 response once rather than repeating it for every ID.
+  if (req.docSpaceScope?.mode === 'human') {
+    const currentSpace = await resolveHumanCurrentSpace(req)
+    if (!currentSpace.verified) {
+      res.status(currentSpace.status).json({ error: currentSpace.error })
+      return
+    }
+  }
+
+  // Preserve input order while bounding ACL fan-out below the 500-item batch cap.
+
+  const docIds = [...new Set(rawDocIds as string[])]
+  const itemsByIndex: Array<{ docId: string; createdBy: string; updatedBy: string; updatedAt: Date } | undefined> =
+    new Array(docIds.length)
+  let nextIndex = 0
+  const workers = Math.min(METADATA_ROLE_LOOKUP_CONCURRENCY, docIds.length)
+  await Promise.all(Array.from({ length: workers }, async () => {
+    for (;;) {
+      const index = nextIndex++
+      if (index >= docIds.length) return
+      const docId = docIds[index]!
+      const result = await resolveDocRole(req, docId, 'reader')
+      if (!result.ok) continue
+      const { meta } = result.guard
+      itemsByIndex[index] = {
+        docId,
+        createdBy: meta.created_by,
+        updatedBy: meta.updated_by,
+        updatedAt: meta.updated_at,
+      }
+    }
+  }))
+  const items = itemsByIndex.filter(
+    (item): item is { docId: string; createdBy: string; updatedBy: string; updatedAt: Date } => item !== undefined,
+  )
+  res.status(200).json({ items })
+}
+
+docsRouter.post('/metadata', documentAsync(docsMetadataHandler))
 
 /**
  * POST /api/v1/docs/search — full-text search with permission down-push (P4).
@@ -1149,6 +1222,7 @@ export async function openContextHandler(req: Request, res: Response): Promise<v
     isBot: false,
     principalSpaceId,
     token: req.octoToken,
+    verifiedSpaceId: req.verifiedViewerSpaceId,
   })
   if (role === 'none') {
     // See the titleOn403 rationale in this handler's doc comment. Omitted rather than sent empty
@@ -1204,7 +1278,7 @@ export async function docIdCollabTokenHandler(req: Request, res: Response): Prom
  * `X-Space-Id` is REQUIRED here (per-route spaceContextMiddleware, so a
  * single-document request passing through this router without a match never
  * trips the 400). Mounted BEFORE the DocumentResourceRouter so the fixed paths
- * (`/`, `/search`, `/recent`, `/recent/creators`, `/manageable`) are never
+ * (`/`, `/metadata`, `/search`, `/recent`, `/recent/creators`, `/manageable`) are never
  * shadowed by `/:docId`.
  */
 export const spaceCollectionRouter: ExpressRouter = Router()
@@ -1213,8 +1287,9 @@ export const spaceCollectionRouter: ExpressRouter = Router()
 // their row-level owner/doc_member predicates and only add Space-shared rows for
 // confirmed members; gating those reads would subtract legitimate cross-Space
 // direct grants.
+spaceCollectionRouter.post('/metadata', spaceContextMiddleware, documentAsync(docsMetadataHandler))
 spaceCollectionRouter.post('/', spaceContextMiddleware, requireSpaceMembership, documentAsync(createDocHandler))
-spaceCollectionRouter.get('/', spaceContextMiddleware, requireSpaceMembership, listDocsHandler)
+spaceCollectionRouter.get('/', spaceContextMiddleware, requireSpaceMembership, documentAsync(listDocsHandler))
 spaceCollectionRouter.post('/search', spaceContextMiddleware, requireSpaceMembership, searchDocsHandler)
 spaceCollectionRouter.get('/recent', spaceContextMiddleware, requireSpaceMembership, listRecentHandler)
 spaceCollectionRouter.get('/recent/creators', spaceContextMiddleware, requireSpaceMembership, listRecentCreatorsHandler)

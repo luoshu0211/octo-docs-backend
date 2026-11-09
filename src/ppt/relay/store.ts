@@ -300,8 +300,10 @@ export interface PptRelayStore {
    * Append an op frame durably, assigning the next room sequence. If `frameId`
    * already exists for `docId`, return its original seq with `duplicate:true`
    * and DO NOT create a second row.
+   * Optional authenticated principal UID for writes routed through the PPT relay.
+   * It is distinct from client-chosen Bento actor IDs.
    */
-  appendOp(docId: string, frameId: string, frame: unknown): Promise<AppendOpResult>
+  appendOp(docId: string, frameId: string, frame: unknown, editorUid: string): Promise<AppendOpResult>
   /**
    * Seq already recorded for `(docId, frameId)`, or null if unseen. A CURRENT
    * read of the dedup ledger used by the relay BEFORE its mutation gate
@@ -376,7 +378,7 @@ export class InMemoryPptRelayStore implements PptRelayStore {
     return r
   }
 
-  async appendOp(docId: string, frameId: string, frame: unknown): Promise<AppendOpResult> {
+  async appendOp(docId: string, frameId: string, frame: unknown, _editorUid: string): Promise<AppendOpResult> {
     const r = this.room(docId)
     const bytes = Buffer.byteLength(JSON.stringify(frame), 'utf8')
     const payloadHash = canonicalPayloadHash(frame)

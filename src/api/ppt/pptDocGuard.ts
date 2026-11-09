@@ -6,6 +6,7 @@ import type { ResolvedRole } from '../../permission/role.js'
 import { HTML_PPT_DOC_TYPE } from '../../db/docType.js'
 import { PptApiError } from './envelope.js'
 import { confirmSpaceMembership } from '../../permission/spaceMembership.js'
+import { mergeDriveDerivedReader } from '../../drive/derivedAccessClient.js'
 
 export interface PptDocGuard {
   meta: DocMeta
@@ -34,7 +35,8 @@ export async function loadPptDocForRead(
   // Resolve membership once so role and signed share eligibility cannot disagree.
   const direct = await resolveRole(uid, meta.doc_id, spaceId)
   const spaceMember = spaceId === meta.space_id
-  const role = effectiveRole(direct, spaceMember, meta.share_scope, meta.share_role)
+  const baseRole = effectiveRole(direct, spaceMember, meta.share_scope, meta.share_role)
+  const role = await mergeDriveDerivedReader(baseRole, meta.doc_id, uid, spaceId)
   if (role === 'none') throw new PptApiError('FORBIDDEN', 'no access to this document')
   // Only an authorized caller can learn archived state or document kind.
   if (meta.status === 2) throw new PptApiError('CONFLICT', 'document is archived')

@@ -6,8 +6,7 @@ import { docMetaRepo, type DocMeta } from '../db/repos/docMetaRepo.js'
 import { resolveRole } from '../permission/resolveRole.js'
 import { roleAtLeast, type ResolvedRole, type Role } from '../permission/role.js'
 import { resolveEffectiveRole } from '../permission/resolveEffectiveRole.js'
-import type { DocSpaceScope } from './middleware/docSpaceScope.js'
-import { requireVerifiedHumanCurrentSpace } from './middleware/docSpaceScope.js'
+import { resolveHumanCurrentSpace, type DocSpaceScope } from './middleware/docSpaceScope.js'
 import { resolveRequestPrincipalSpace } from '../permission/principalSpace.js'
 
 export interface DocGuard {
@@ -22,11 +21,6 @@ export function requireSameSpace(res: Response, meta: DocMeta, spaceId: string):
   return false
 }
 
-/** Return a non-leaking 404 for a Bot without a principal-qualified direct grant. */
-function botNotFound(res: Response): null {
-  res.status(404).json({ error: 'not_found' })
-  return null
-}
 
 /**
  * Resolve the doc space-scoping policy for a request (remove-sp §6). Fails
@@ -40,24 +34,61 @@ function docScopeOf(req: Request): DocSpaceScope {
 }
 
 /**
- * Load the doc and resolve the caller's effective role, enforcing a minimum
- * role. Writes the appropriate HTTP error and returns null when blocked:
- *   404 doc missing/deleted or unauthorized cross-space Bot, 409 archived,
- *   403 insufficient role.
- *
- * Doc location + space scoping follow the explicit per-mount policy
- * (`req.docSpaceScope`), NOT `req.botToken` (remove-sp §6):
- *   - Human ({ mode: 'human' }): locate by `docId` alone. `X-Space-Id` never
- *     scopes selection or authz, so a cross-Space direct member / owner /
- *     anyone_in_space caller resolves exactly as if `sp` had been correct, and a
- *     missing/wrong header yields the identical result.
- *   - Bot ({ mode: 'bot', spaceId }): same-Space behavior is unchanged. A cross-Space
- *     Bot is admitted ONLY by an exact direct grant keyed by (docId, botUid, Bot Space);
- *     otherwise it receives non-leaking 404 and never inherits link/Space sharing.
- *
- * Link/share-derived access is evaluated only for Humans and same-Space Bots. A
- * cross-Space Bot can use only its exact direct role; this prevents a B Bot from
- * inheriting A's link-sharing policy while allowing an explicitly approved (Bot,B).
+ * Resolve the doc and caller's effective role without writing an HTTP response.
+ * This is shared by single-document guards and batch metadata reads, so every
+ * surface uses the same Human/Bot scope and ACL rules.
+ */
+export type DocRoleResolution =
+  | { ok: true; guard: DocGuard }
+  | { ok: false; status: number; error: string }
+
+export async function resolveDocRole(
+  req: Request,
+  docId: string,
+  minRole: Role,
+): Promise<DocRoleResolution> {
+  if (!req.docSpaceScope) return { ok: false, status: 404, error: 'not_found' }
+  const scope = docScopeOf(req)
+  const meta = await docMetaRepo.getByDocId(docId)
+  if (!meta || meta.status === 0) return { ok: false, status: 404, error: 'not_found' }
+  if (scope.mode === 'human') {
+    const currentSpace = await resolveHumanCurrentSpace(req)
+    if (!currentSpace.verified) {
+      return { ok: false, status: currentSpace.status, error: currentSpace.error }
+    }
+  }
+  const principalSpaceId = await resolveRequestPrincipalSpace(req)
+  if (!principalSpaceId) return { ok: false, status: 403, error: 'principal_space_unverified' }
+  const direct = await resolveRole(req.uid!, docId, principalSpaceId)
+  const crossSpaceBot = scope.mode === 'bot' && scope.spaceId !== meta.space_id
+  if (crossSpaceBot) {
+    // Explicit direct grant only. Keep 404 for both absent and insufficient grants so
+    // a foreign-Space Bot cannot use role distinctions as a document oracle.
+    if (direct === 'none' || !roleAtLeast(direct, minRole)) {
+      return { ok: false, status: 404, error: 'not_found' }
+    }
+  }
+  const role = crossSpaceBot
+    ? direct
+    : await resolveEffectiveRole(req.uid!, direct, meta, {
+        isBot: scope.mode === 'bot',
+        principalSpaceId,
+        token: req.octoToken,
+        verifiedSpaceId: req.apiKeySpaceId,
+      })
+  if (role === 'none' || !roleAtLeast(role, minRole)) {
+    return { ok: false, status: 403, error: 'forbidden' }
+  }
+  // State is disclosed only after authorization. This preserves the Phase-1
+  // contract: an existing doc with no effective role is 403, while 409 is
+  // visible only to an authorized caller.
+  if (meta.status === 2) return { ok: false, status: 409, error: 'conflict' }
+  return { ok: true, guard: { meta, role } }
+}
+
+/**
+ * Load the doc and resolve the caller's effective role, writing the legacy HTTP
+ * error response when blocked.
  */
 export async function requireDocRole(
   req: Request,
@@ -65,44 +96,10 @@ export async function requireDocRole(
   docId: string,
   minRole: Role,
 ): Promise<DocGuard | null> {
-  const uid = req.uid!
-  if (!req.docSpaceScope) return botNotFound(res)
-  const scope = docScopeOf(req)
-  const meta = await docMetaRepo.getByDocId(docId)
-  if (!meta || meta.status === 0) {
-    res.status(404).json({ error: 'not_found' })
+  const result = await resolveDocRole(req, docId, minRole)
+  if (!result.ok) {
+    res.status(result.status).json({ error: result.error })
     return null
   }
-  if (scope.mode === 'human' && !(await requireVerifiedHumanCurrentSpace(req, res, meta))) return null
-  const principalSpaceId = await resolveRequestPrincipalSpace(req)
-  if (!principalSpaceId) {
-    res.status(403).json({ error: 'principal_space_unverified' })
-    return null
-  }
-  const direct = await resolveRole(uid, docId, principalSpaceId)
-  const crossSpaceBot = scope.mode === 'bot' && scope.spaceId !== meta.space_id
-  if (crossSpaceBot) {
-    // Explicit direct grant only. Keep 404 for both absent and insufficient grants so
-    // a foreign-Space Bot cannot use role distinctions as a document oracle.
-    if (direct === 'none' || !roleAtLeast(direct, minRole)) return botNotFound(res)
-  }
-  const role = crossSpaceBot
-    ? direct
-    : await resolveEffectiveRole(uid, direct, meta, {
-        isBot: scope.mode === 'bot',
-        principalSpaceId,
-        token: req.octoToken,
-      })
-  if (role === 'none' || !roleAtLeast(role, minRole)) {
-    res.status(403).json({ error: 'forbidden' })
-    return null
-  }
-  // State is disclosed only after authorization. This preserves the Phase-1
-  // contract: an existing doc with no effective role is 403, while 409 is
-  // visible only to an authorized caller.
-  if (meta.status === 2) {
-    res.status(409).json({ error: 'conflict' })
-    return null
-  }
-  return { meta, role }
+  return result.guard
 }

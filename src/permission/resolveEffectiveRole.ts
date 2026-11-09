@@ -74,6 +74,9 @@ export interface ShareCaller {
    * carries no session token — passes it as undefined.
    */
   token?: string
+  /** Current Space already verified on this request, if available. */
+  verifiedSpaceId?: string
+
 }
 
 /**
@@ -120,9 +123,11 @@ export async function resolveEffectiveRoleWithMembership(
     role = direct
   } else {
     try {
-      member = caller.isBot
+      member = caller.verifiedSpaceId === meta.space_id
         ? true
-        : await getOctoIdentity().isSpaceMember(uid, meta.space_id, caller.token ?? '')
+        : caller.isBot
+          ? true
+          : await getOctoIdentity().isSpaceMember(uid, meta.space_id, caller.token ?? '')
     } catch {
       // Fail-closed, SCOPED to the relay ticket path: a lookup error never widens
       // access, and the SAME false drives both the role and the token claim so they
@@ -169,9 +174,13 @@ export async function resolveEffectiveRole(
   } else if (meta.share_scope === SHARE_SCOPE_ANYONE && caller.principalSpaceId !== meta.space_id) {
     base = direct
   } else {
-    const member = meta.share_scope === SHARE_SCOPE_AUTHENTICATED ? false : caller.isBot
-      ? true
-      : await getOctoIdentity().isSpaceMember(uid, meta.space_id, caller.token ?? '')
+    const member = meta.share_scope === SHARE_SCOPE_AUTHENTICATED
+      ? false
+      : caller.verifiedSpaceId === meta.space_id
+        ? true
+        : caller.isBot
+          ? true
+          : await getOctoIdentity().isSpaceMember(uid, meta.space_id, caller.token ?? '')
     base = effectiveRole(direct, member, meta.share_scope, meta.share_role)
   }
 

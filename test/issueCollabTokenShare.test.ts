@@ -9,7 +9,6 @@ vi.mock('../src/db/repos/docMemberRepo.js', () => ({
   docMemberRepo: { getRole: vi.fn() },
 }))
 vi.mock('../src/permission/epoch.js', () => ({ currentEpoch: vi.fn(async () => 3) }))
-vi.mock('../src/permission/recheck.js', () => ({ recheckCurrentRoleCached: vi.fn() }))
 
 import { issueCollabToken, issueCollabTokenByDocId } from '../src/auth/issueCollabToken.js'
 import { verifyCollabToken, signCollabToken } from '../src/auth/collabToken.js'
