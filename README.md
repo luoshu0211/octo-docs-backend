@@ -74,6 +74,21 @@ Human deletion through `DELETE /api/v1/docs/:docId` retains its existing verifie
 Space and document-admin checks, soft deletion, and collaboration invalidation.
 This policy does not change bot creation, editing, or other resource operations.
 
+## Whiteboard attachment lifetime
+
+An Excalidraw `replace` import removes old live file references and tombstones
+old elements. It retains their attachment records and stored bytes because
+named versions and safety snapshots still reference them. A later restore can
+therefore resolve the original images, and its safety snapshot can recover the
+replacement images when undoing the restore.
+
+Staged images are cleaned up when the scene edit explicitly rejects the import.
+A thrown scene write or response-delivery failure can follow a committed edit,
+so its images are retained for readback. Unreferenced staged images and historical
+media may require later reclamation; deleting them safely requires checking both
+live and retained-version references. This path does not implement that collector
+or reconstruct image objects deleted by an older deployment.
+
 ## Document metadata actors
 
 `GET /api/v1/docs/:docId` and readable rows in the Docs list expose `createdBy`

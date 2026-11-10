@@ -53,7 +53,6 @@ import { editBoardScene } from '../services/editBoardScene.js'
 import {
   prepareExcalidrawImport,
   cleanupExcalidrawAttachments,
-  cleanupReplacedExcalidrawAttachments,
   ExcalidrawImportError,
 } from '../../import/excalidraw.js'
 import { cleanupCopiedAttachment, copyStoredObject } from './attachments.js'
@@ -130,6 +129,7 @@ export async function importExcalidrawHandler(req: Request, res: Response): Prom
   }
 
   let prepared: Awaited<ReturnType<typeof prepareExcalidrawImport>> | undefined
+  let sceneWriteStarted = false
   try {
     // The state vector from this exact live read is the import's concurrency
     // base. editBoardScene re-reads/rechecks it and creates the safety snapshot.
@@ -146,6 +146,7 @@ export async function importExcalidrawHandler(req: Request, res: Response): Prom
       ? current.elements.filter((el) => typeof el.id === 'string').map((el) => el.id as string)
       : undefined
     const deletedFileIds = mode === 'replace' ? Object.keys(current.files) : undefined
+    sceneWriteStarted = true
     const result = await editBoardScene({
       uid: req.uid,
       docId: guard.meta.doc_id,
@@ -165,9 +166,8 @@ export async function importExcalidrawHandler(req: Request, res: Response): Prom
       res.status(result.status).json(body)
       return
     }
-    if (mode === 'replace') {
-      await cleanupReplacedExcalidrawAttachments(guard.meta.doc_id, current.files)
-    }
+    // Removed live file references remain reachable from the safety snapshot
+    // and named versions. Keep their attachment rows and bytes for restoration.
     res.status(200).json({
       docId: guard.meta.doc_id,
       mode,
@@ -180,7 +180,10 @@ export async function importExcalidrawHandler(req: Request, res: Response): Prom
       newDocVersionSeq: result.newDocVersionSeq,
     })
   } catch (err) {
-    await cleanupExcalidrawAttachments(prepared?.uploadedAttachments ?? [])
+    // A thrown commit may follow apply/broadcast. Preserve prepared attachments
+    // on an uncertain write or response failure; only explicit rejection above
+    // proves the scene did not adopt them.
+    if (!sceneWriteStarted) await cleanupExcalidrawAttachments(prepared?.uploadedAttachments ?? [])
     if (err instanceof ExcalidrawImportError) {
       res.status(err.status).json({ error: err.code })
       return

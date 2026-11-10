@@ -27,6 +27,8 @@
     "test/benchmarkStorageDocument.test.ts",
     "test/botDocDelete.test.ts",
     "test/botMentionAuthorGate.test.ts",
+    "test/importExcalidrawRoute.test.ts",
+    "test/excalidrawAttachmentRetention.test.ts",
     "test/persistence.test.ts",
     "test/persistenceV2.test.ts",
     "test/persistenceOversizeGuard.test.ts",
