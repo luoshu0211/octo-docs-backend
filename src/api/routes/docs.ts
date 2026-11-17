@@ -89,7 +89,7 @@ function toStringArray(v: unknown): string[] {
  * symmetric with the write side and closing the cross-space metadata leak.
  */
 async function resolveViewerSpaceMembership(req: Request): Promise<boolean> {
-  if (req.botToken !== undefined) return true
+  if (req.botToken !== undefined || req.docSpaceScope?.mode === 'cli') return true
   // isSpaceMember documents a fail-closed `false` on lookup errors, but a rejected
   // promise would still bubble to a 500 on /docs, /docs/recent and
   // /docs/recent/creators instead of merely dropping the share branch. Catch it

@@ -8,20 +8,25 @@ const failures = {
   AUTH_REQUIRED: [401, 'Authentication token is required or invalid.'],
   FORBIDDEN: [403, 'Access denied.'],
   NOT_FOUND: [404, 'Resource not found.'],
-  CONFLICT: [409, 'The document is archived.'],
+  CONFLICT: [409, 'The requested change conflicts with the current resource state.'],
+  PAYLOAD_TOO_LARGE: [413, 'Request or result is too large.'],
+  UNSUPPORTED_MEDIA_TYPE: [415, 'Media type is not supported.'],
+  DUPLICATE: [409, 'The resource already exists.'],
   RATE_LIMITED: [429, 'Too many requests.'],
   INTERNAL_ERROR: [500, 'Internal server error.'],
   UPSTREAM_UNAVAILABLE: [503, 'Authentication service unavailable.'],
 } as const
 
 export class CliError extends Error {
-  constructor(readonly code: keyof typeof failures) {
+  constructor(readonly code: keyof typeof failures, readonly details?: Record<string, unknown>) {
     super(failures[code][1])
   }
 
   get status() { return failures[this.code][0] }
 
-  get envelope() { return { error: { code: this.code, message: this.message } } }
+  get envelope() {
+    return { error: { code: this.code, message: this.message, ...(this.details === undefined ? {} : { details: this.details }) } }
+  }
 }
 
 type PermissionGroup = { domain: string; actions: string[] }
@@ -59,22 +64,22 @@ const internalAgent = new Agent({
 
 const serviceName = /^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?\.svc(?:\.cluster\.local)?)?$/i
 
-function authURL(base: string): URL {
+export function cliServiceURL(base: string, path: string): URL {
   let url: URL
-  try { url = new URL(base) } catch { throw new Error('Invalid OCTO_AUTH_SERVER_URL') }
+  try { url = new URL(base) } catch { throw new Error('Invalid service URL') }
   const host = url.hostname.replace(/^\[|\]$|\.$/g, '')
   if (url.username || url.password || url.search || url.hash ||
       (url.protocol !== 'https:' && (url.protocol !== 'http:' || !(isInternalPeer(host) || serviceName.test(host))))) {
-    throw new Error('OCTO_AUTH_SERVER_URL must use HTTPS or an internal HTTP address')
+    throw new Error('Service URL must use HTTPS or an internal HTTP address')
   }
-  url.pathname = url.pathname.replace(/\/+$/, '') + '/v2/internal/tokens/_resolve'
+  url.pathname = url.pathname.replace(/\/+$/, '') + path
   return url
 }
 
 const maxResolveBytes = 1024 * 1024
 
-function requestResolve(url: URL, secret: string, token: string): Promise<{ status: number; body: unknown }> {
-  const payload = JSON.stringify({ token })
+export function postCliService(url: URL, credential: Record<string, string>, input: unknown): Promise<{ status: number; body: unknown }> {
+  const payload = JSON.stringify(input)
   const request = url.protocol === 'http:' ? httpRequest : httpsRequest
   return new Promise((resolve, reject) => {
     const call = request(url, {
@@ -82,7 +87,7 @@ function requestResolve(url: URL, secret: string, token: string): Promise<{ stat
       method: 'POST',
       signal: AbortSignal.timeout(5000),
       headers: {
-        authorization: 'Bearer ' + secret,
+        ...credential,
         'content-type': 'application/json',
         'content-length': Buffer.byteLength(payload),
       },
@@ -125,9 +130,9 @@ export function createAuthResolver(base?: string, secret?: string): ((token: str
     throw new Error('OCTO_AUTH_SERVER_URL and OCTO_AUTH_SERVICE_SECRET must be configured together')
   }
   if (Buffer.byteLength(secret) < 32 || /\s/.test(secret)) throw new Error('Invalid OCTO_AUTH_SERVICE_SECRET')
-  const url = authURL(base.trim())
+  const url = cliServiceURL(base.trim(), '/v2/internal/tokens/_resolve')
   return async (token) => {
-    const { status, body } = await requestResolve(url, secret, token)
+    const { status, body } = await postCliService(url, { authorization: 'Bearer ' + secret }, { token })
       .catch(() => { throw new CliError('UPSTREAM_UNAVAILABLE') })
     if (isRecord(body) && isRecord(body.error)) {
       if (status === 401 && body.error.code === 'AUTH_REQUIRED') throw new CliError('AUTH_REQUIRED')

@@ -1,5 +1,9 @@
-import { Router, type Request, type Response, type NextFunction } from 'express'
+import { Router, type Request, type Response, type NextFunction, type RequestHandler } from 'express'
 import { rateLimit } from 'express-rate-limit'
+import { withVerifiedCliSpace } from '../../permission/cliSpace.js'
+import { docsBusinessHandlers, errorForStatus } from './adapter.js'
+import { PptApiError } from '../ppt/errors.js'
+import { docsOperations } from './operations.js'
 import { config } from '../../config/env.js'
 import { isDocType } from '../../db/docType.js'
 import { docMetaRepo, type DocMeta } from '../../db/repos/docMetaRepo.js'
@@ -29,9 +33,9 @@ export function createCliV2Router(rateOptions: RateLimiterOptions = {}): Router 
     message: limited,
   })
 
-  const get = (path: string, action: string, handle: Handler) => {
-    router.get(path, (req, res, next) => {
-      if (req.method !== 'GET') { next('route'); return }
+  const register = (method: 'get' | 'post' | 'put' | 'patch' | 'delete', path: string, action: string, ...handle: RequestHandler[]) => {
+    router.route(path)[method]((req, res, next) => {
+      if (req.method !== method.toUpperCase()) { next('route'); return }
       const headers = req.headersDistinct.authorization
       const token = headers?.length === 1 ? /^Bearer[ \t]+([^,\s]+)$/i.exec(headers[0] ?? '')?.[1] : undefined
       if (!token) { next(new CliError('AUTH_REQUIRED')); return }
@@ -40,20 +44,36 @@ export function createCliV2Router(rateOptions: RateLimiterOptions = {}): Router 
         return byUser(req, res, (error?: unknown) => {
           if (error) { next(error); return }
           if (!hasAction(permissions, action)) { next(new CliError('FORBIDDEN')); return }
-          handle(req, res, principal).catch(next)
+          req.uid = principal.userId
+          req.spaceId = principal.spaceId
+          req.principalSpaceId = principal.spaceId
+          req.apiKeySpaceId = principal.spaceId
+          req.docSpaceScope = { mode: 'cli', spaceId: principal.spaceId }
+          withVerifiedCliSpace({ uid: principal.userId, spaceId: principal.spaceId }, next)
         })
       }).catch(next)
-    })
+    }, ...handle)
   }
 
-  get('/docs', readDocuments, listDocs)
-  get('/docs/:doc_id', readDocuments, getDoc)
+  const pilot = (handle: Handler): RequestHandler => (req, res, next) => {
+    void handle(req, res, res.locals.cliPrincipal as CliPrincipal).catch(next)
+  }
+  register('get', '/docs', readDocuments, pilot(listDocs))
+  register('get', '/docs/:doc_id', readDocuments, pilot(getDoc))
+  const handlers = docsBusinessHandlers()
+  for (const operation of docsOperations) {
+    const [method, path, action] = operation
+    register(method, path, action, ...handlers(operation))
+  }
   router.use((_req, _res, next) => next(new CliError('NOT_FOUND')))
   router.use((error: unknown, _req: Request, res: Response, next: NextFunction) => {
     if (res.headersSent) { next(error); return }
-    const failure = error instanceof CliError ? error : error instanceof URIError
-      ? new CliError('VALIDATION_ERROR')
-      : new CliError('INTERNAL_ERROR')
+    const status = typeof error === 'object' && error !== null && 'status' in error ? error.status : undefined
+    const failure = error instanceof CliError ? error :
+      error instanceof PptApiError ? errorForStatus(error.httpStatus, { error: error.code.toLowerCase() }) :
+      status === 413 ? new CliError('PAYLOAD_TOO_LARGE') :
+      status === 415 ? new CliError('UNSUPPORTED_MEDIA_TYPE') :
+      status === 400 || error instanceof URIError ? new CliError('VALIDATION_ERROR') : new CliError('INTERNAL_ERROR')
     res.status(failure.status).json(failure.envelope)
   })
   return router

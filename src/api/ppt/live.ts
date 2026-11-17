@@ -19,7 +19,7 @@ export async function pptPrincipal(req: Request, res: Response, write: boolean |
   const docId = req.params.docId!
   const minimum = typeof write === 'string' ? write : write ? 'writer' : 'reader'
   const bot = req.docSpaceScope?.mode === 'bot'
-  const guard = bot ? await requireDocRole(req, res, docId, minimum)
+  const guard = bot || req.docSpaceScope?.mode === 'cli' ? await requireDocRole(req, res, docId, minimum)
     : await loadPptDocForRead(req.uid!, req.spaceId!, docId, { token: req.octoToken })
   if (!guard) return null
   if (guard.meta.doc_type !== 'html_ppt') throw PptApiError.unsupportedDocumentType('document is not a PPT')

@@ -1,6 +1,7 @@
 import { createServer, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { docsOperations } from '../src/api/cliv2/operations.js'
 import { createApp } from '../src/api/app.js'
 import { docMemberRepo } from '../src/db/repos/docMemberRepo.js'
 import { docMetaRepo, type DocMeta } from '../src/db/repos/docMetaRepo.js'
@@ -45,7 +46,7 @@ beforeEach(async () => {
         token_id: 'token-fixture', subject_type: 'user', owner_id: owner,
         subject_id: body.token === 'malformed' ? 'wrong-user' : owner, space_id: 'space_a',
       },
-      permissions: [{ domain: 'docs.documents', actions: body.token === 'no-action' ? ['docs.content:*'] : ['docs.documents:read'] }],
+      permissions: [{ domain: 'docs.documents', actions: body.token === 'no-action' ? ['docs.content:*'] : ['docs.documents:*'] }],
       bot_bindings: [{ bot_id: 'bot_a' }],
     } }))
   }))
@@ -121,7 +122,33 @@ describe('Docs CLI v2 read pilot', () => {
     expect(requests).toHaveLength(token ? 1 : 0)
   })
 
-  it('mounts only the public read routes and leaves the legacy auth response intact', async () => {
+  it('uses the existing rename transaction with the token user and skips writes outside its Space', async () => {
+    const rename = vi.spyOn(docMetaRepo, 'rename').mockResolvedValue(undefined)
+    const patch = (id: string) => fetch(appOrigin + endpoint + '/' + id, {
+      method: 'PATCH',
+      headers: { authorization: 'Bearer valid', 'content-type': 'application/json', 'x-space-id': 'space_b' },
+      body: JSON.stringify({ title: 'New name' }),
+    })
+    const ok = await patch(doc.doc_id)
+    expect(ok.status).toBe(200)
+    expect(await ok.json()).toEqual({ data: { doc_id: doc.doc_id, title: 'New name' } })
+    const other = await patch(foreign.doc_id)
+    expect(other.status).toBe(404)
+    expect(rename).toHaveBeenCalledTimes(1)
+    expect(rename).toHaveBeenCalledWith(doc.doc_id, 'New name', 'user_a')
+  })
+
+  it('gates every generated route and leaves private import helpers outside the CLI router', async () => {
+    expect(docsOperations).toHaveLength(43)
+    const responses = await Promise.all(docsOperations.map(async ([method, path]) =>
+      fetch(appOrigin + '/v2/cli' + path.replace(/:[a-z_]+/g, 'fixture_id'), { method: method.toUpperCase() })))
+    expect(responses.map(response => response.status)).toEqual(docsOperations.map(() => 401))
+    const manual = await fetch(appOrigin + '/v2/cli/docs/d_same/_import_docx', { method: 'POST' })
+    expect(manual.status).toBe(404)
+    expect(requests).toHaveLength(0)
+  })
+
+  it('keeps the CLI delete policy, public mount, and legacy auth independent', async () => {
     const internal = await listen(createServer(createApp({ surface: 'internal' })))
     expect((await fetch(internal + endpoint)).status).toBe(404)
     const legacy = await read('/api/v1/docs')
@@ -130,8 +157,9 @@ describe('Docs CLI v2 read pilot', () => {
     const write = await fetch(appOrigin + endpoint + '/' + doc.doc_id, {
       method: 'DELETE', headers: { authorization: 'Bearer valid' },
     })
-    expect(write.status).toBe(404)
-    expect(requests).toHaveLength(0)
+    expect(write.status).toBe(403)
+    expect(await write.json()).toMatchObject({ error: { code: 'FORBIDDEN', details: { reason: 'cli_delete_disabled' } } })
+    expect(requests).toHaveLength(1)
     expect(docMetaRepo.getByDocId).not.toHaveBeenCalled()
   })
 })
