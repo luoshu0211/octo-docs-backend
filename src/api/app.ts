@@ -102,6 +102,7 @@ import { importRouter } from './routes/import.js'
 import { createPptRouter, pptErrorHandler } from './ppt/envelope.js'
 import { createBotPptRouter } from './ppt/live.js'
 import { sanitizeUrlForLog } from './accessLog.js'
+import { createCliV2Router } from './cliv2/router.js'
 
 /** Which audience's routes a given listener serves. See the module comment. */
 export type AppSurface = 'public' | 'internal' | 'all'
@@ -155,6 +156,11 @@ export function createApp(
   // Origin for the configured origin(s). Covers both the metadata API and the
   // local-hmac attachment blob gateway below.
   app.use(corsMiddleware)
+
+  if (servePublic) {
+    const cliV2 = createCliV2Router(opts.rateLimit)
+    if (cliV2) app.use('/v2/cli', cliV2)
+  }
 
   // Self-hosted attachment blob gateway (XIN-717). Only relevant for the
   // local-hmac driver, where the browser PUTs/GETs the binary directly at this

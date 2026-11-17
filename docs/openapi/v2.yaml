@@ -1,0 +1,180 @@
+openapi: 3.1.0
+info:
+  title: OCTO Docs CLI API
+  version: 2.0.0
+  description: |
+    Metadata reads scoped to the unified token's user and Space.
+    The service enables these routes when OCTO_AUTH_SERVER_URL and OCTO_AUTH_SERVICE_SECRET are configured.
+servers:
+  - url: /
+    description: Docs service origin. The gateway supplies its own mount prefix.
+tags:
+  - name: docs
+    description: Document metadata.
+security:
+  - bearerAuth: []
+paths:
+  /v2/cli/docs:
+    get:
+      tags: [docs]
+      operationId: docs.list
+      summary: List visible documents
+      description: List documents owned by or accessible to the token user within its Space.
+      x-octo-action: docs.documents:read
+      x-octo-principal: token_user
+      parameters:
+        - name: folder_id
+          in: query
+          schema: {type: string}
+        - name: owner
+          in: query
+          schema: {type: string, enum: [me]}
+        - name: q
+          in: query
+          schema: {type: string}
+        - name: type
+          in: query
+          description: Repeat this parameter to include multiple document types.
+          style: form
+          explode: true
+          schema:
+            type: array
+            items: {type: string, enum: [doc, sheet, board, html, html_ppt]}
+        - name: sort
+          in: query
+          schema: {type: string, enum: ['updatedAt:asc', 'updatedAt:desc'], default: 'updatedAt:desc'}
+        - name: page
+          in: query
+          schema: {type: integer, minimum: 1, maximum: 2147483647, default: 1}
+        - name: page_size
+          in: query
+          schema: {type: integer, minimum: 1, maximum: 100, default: 20}
+      responses:
+        '200':
+          description: Document metadata and pagination.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/DocsListResponse'}
+        '400': {$ref: '#/components/responses/ValidationError'}
+        '401': {$ref: '#/components/responses/AuthenticationRequired'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/UpstreamUnavailable'}
+  /v2/cli/docs/{doc_id}:
+    get:
+      tags: [docs]
+      operationId: docs.get
+      summary: Get document metadata
+      description: Read an active document in the token's Space with reader access or higher.
+      x-octo-action: docs.documents:read
+      x-octo-principal: token_user
+      parameters:
+        - name: doc_id
+          in: path
+          required: true
+          schema: {type: string, minLength: 1}
+      responses:
+        '200':
+          description: Document metadata and the token user's current role.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/DocsGetResponse'}
+        '400': {$ref: '#/components/responses/ValidationError'}
+        '401': {$ref: '#/components/responses/AuthenticationRequired'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Archived'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/UpstreamUnavailable'}
+components:
+  securitySchemes:
+    bearerAuth: {type: http, scheme: bearer}
+  responses:
+    ValidationError:
+      description: VALIDATION_ERROR. The supplied parameters are invalid.
+      content: &errorContent
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorResponse'}
+    AuthenticationRequired:
+      description: AUTH_REQUIRED. The bearer token is missing, invalid or expired.
+      content: *errorContent
+    Forbidden:
+      description: FORBIDDEN. The action or resource permission was denied.
+      content: *errorContent
+    NotFound:
+      description: NOT_FOUND. The resource is absent from the token's Space.
+      content: *errorContent
+    RateLimited:
+      description: RATE_LIMITED. Retry after the request rate drops.
+      content: *errorContent
+    InternalError:
+      description: INTERNAL_ERROR. The service could not finish the request.
+      content: *errorContent
+    UpstreamUnavailable:
+      description: UPSTREAM_UNAVAILABLE. A required service could not verify access.
+      content: *errorContent
+    Archived:
+      description: CONFLICT. The document is archived.
+      content: *errorContent
+  schemas:
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum: [AUTH_REQUIRED, FORBIDDEN, NOT_FOUND, CONFLICT, VALIDATION_ERROR, RATE_LIMITED, INTERNAL_ERROR, UPSTREAM_UNAVAILABLE]
+            message: {type: string}
+    OffsetPagination:
+      type: object
+      required: [total, page, page_size]
+      properties:
+        total: {type: integer, minimum: 0}
+        page: {type: integer, minimum: 1, maximum: 2147483647}
+        page_size: {type: integer, minimum: 1, maximum: 100}
+    DocumentItem:
+      type: object
+      required: [doc_id, title, doc_type, owner_id, role, updated_at]
+      properties:
+        doc_id: {type: string}
+        title: {type: string}
+        doc_type: {type: string}
+        owner_id: {type: string}
+        created_by: {type: string}
+        updated_by: {type: string}
+        octo_doc_slug: {type: string}
+        role: {type: string, enum: [reader, commenter, writer, admin]}
+        updated_at: {type: string, format: date-time}
+    Document:
+      allOf:
+        - $ref: '#/components/schemas/DocumentItem'
+        - type: object
+          required: [document_name, space_id, folder_id, created_at, share_url, share_scope, share_role, is_space_searchable, permission_epoch]
+          properties:
+            document_name: {type: string}
+            space_id: {type: string}
+            folder_id: {type: string}
+            created_at: {type: string, format: date-time}
+            share_url: {type: string}
+            share_scope: {type: string}
+            share_role: {type: string}
+            is_space_searchable: {type: boolean}
+            permission_epoch: {type: integer}
+    DocsListResponse:
+      type: object
+      required: [data, pagination]
+      properties:
+        data: {type: array, items: {$ref: '#/components/schemas/DocumentItem'}}
+        pagination: {$ref: '#/components/schemas/OffsetPagination'}
+    DocsGetResponse:
+      type: object
+      required: [data]
+      properties:
+        data: {$ref: '#/components/schemas/Document'}
