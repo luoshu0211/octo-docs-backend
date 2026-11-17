@@ -6,16 +6,19 @@ import { requireDocRole } from '../guard.js'
 import { createBotPptRouter } from '../ppt/live.js'
 import { createPptExportRouter } from '../ppt/export.js'
 import { attachmentsRouter } from '../routes/attachments.js'
-import { boardExportRouter } from '../routes/boardExport.js'
+import { boardExportRouter, exportBoardHandler } from '../routes/boardExport.js'
 import { commentsRouter } from '../routes/comments.js'
 import { docContentRouter } from '../routes/docContent.js'
 import { docSceneRouter } from '../routes/docScene.js'
 import { docSheetRouter } from '../routes/docSheet.js'
 import { createDocHandler, docsRouter, searchDocsHandler } from '../routes/docs.js'
+import { exportRouter } from '../routes/export.js'
+import { importRouter } from '../routes/import.js'
 import { membersRouter } from '../routes/members.js'
 import { versionsRouter } from '../routes/versions.js'
 import { forwardCliGrant, removeCliMember, setCliMember } from './access.js'
 import { CliError } from './auth.js'
+import { exportExcalidraw, prepareBoardComment } from './board.js'
 import type { DocsOperation } from './operations.js'
 
 type AsyncHandler = (req: Request, res: Response) => Promise<unknown>
@@ -33,19 +36,18 @@ const customHandlers: Record<string, AsyncHandler> = {
 // Select the concrete business callback from each pinned Express router by its
 // exact method + path. Express Router exposes route layers separately from
 // mount middleware. Only the declared callbacks run under the CLI guard.
-function registeredHandler(routers: Record<string, Router>, operation: DocsOperation): RequestHandler {
+function registeredHandlers(routers: Record<string, Router>, operation: DocsOperation): RequestHandler[] {
   const [method, , , id, family, oldPath] = operation
   const custom = customHandlers[family]
-  if (custom) return custom
+  if (custom) return [custom]
   const registered = (routers[family]?.stack as (ILayer & { route?: IRoute })[] | undefined) ?? []
   const layers = registered.flatMap(layer => layer.route?.path === oldPath ? layer.route.stack : [])
     .filter(layer => layer.method === method)
-  // The PPT live PATCH also registers a body parser, which runs in our own
-  // route here with the same limit. The final callback is the business handler.
-  const expected = id === 'docs.ppt.edit' ? 2 : 1
-  const handler = layers.at(-1)?.handle
-  if (layers.length !== expected || !handler) throw new Error('No unique business handler for ' + id)
-  return handler
+  // Imports use their route's existing raw parser and size limit. The PPT
+  // live PATCH uses the CLI JSON parser with the same limit as its own.
+  const expected = family === 'import' || id === 'docs.ppt.edit' ? 2 : 1
+  if (layers.length !== expected) throw new Error('No unique business handler for ' + id)
+  return layers.map(layer => layer.handle)
 }
 
 function plainObject(value: unknown): value is JsonRecord {
@@ -55,7 +57,7 @@ function plainObject(value: unknown): value is JsonRecord {
 // Nested editor payloads, signed headers and keyed cell maps have their own
 // wire formats. Only the surrounding API DTO uses the CLI field convention.
 const opaque = new Set([
-  'doc', 'deck', 'scene', 'elements', 'files', 'app_state', 'ops', 'headers',
+  'doc', 'deck', 'scene', 'elements', 'files', 'app_state', 'ops', 'headers', 'element_id_map', 'file_id_map',
   'cells', 'dims', 'drawings', 'hyperlinks', 'merges', 'sheets', 'freeze', 'filters', 'data_validations', 'conditional_formats',
   'sheet_cells', 'sheet_dims', 'sheet_hyperlinks', 'sheet_merges', 'sheet_list', 'sheet_freeze',
   'sheet_filters', 'sheet_data_validations', 'sheet_conditional_formats',
@@ -127,18 +129,32 @@ function responseAdapter(res: Response, id: string) {
   }) as Response['json']
 }
 
+const importMedia = new Map([
+  ['docs.import.docx', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'],
+  ['docs.import.markdown', 'text/markdown'],
+  ['docs.import.xlsx', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'],
+  ['docs.import.excalidraw', 'application/json'],
+])
+
 export function docsBusinessHandlers() {
   const routers = {
     docs: docsRouter, content: docContentRouter, sheet: docSheetRouter, scene: docSceneRouter,
     boardExport: boardExportRouter, ppt: createBotPptRouter(), pptExport: createPptExportRouter(true),
     members: membersRouter, comments: commentsRouter, versions: versionsRouter, attachments: attachmentsRouter,
+    import: importRouter, export: exportRouter,
   }
   return (operation: DocsOperation): RequestHandler[] => {
     const [, , , id, , , params = {}, query = {}] = operation
-    const callback = registeredHandler(routers, operation)
-    const parse = json({ limit: id === 'docs.sheet.edit' ? config.sheetWrite.maxRequestBytes :
+    const handlers = registeredHandlers(routers, operation)
+    const callback = handlers.at(-1)!
+    const medium = importMedia.get(id)
+    const validateMedia: RequestHandler = (req, _res, next) => {
+      if (medium && req.is(medium) === false) { next(new CliError('UNSUPPORTED_MEDIA_TYPE')); return }
+      next()
+    }
+    const parse = medium ? handlers[0]! : json({ limit: id === 'docs.sheet.edit' ? config.sheetWrite.maxRequestBytes :
       id === 'docs.ppt.edit' ? config.ppt.write.maxRequestBytes : '1mb' })
-    return [parse, (req, res, next) => {
+    return [validateMedia, parse, (req, res, next) => {
       const dispatch = async () => {
         req.params = Object.fromEntries(Object.entries(params).map(([key, name]) => [key, req.params[name] ?? '']))
         const initialQuery = req.query
@@ -161,6 +177,16 @@ export function docsBusinessHandlers() {
           const guard = await requireDocRole(req, res, req.params.docId!, 'admin')
           if (!guard) return
           if (guard.meta.share_scope === SHARE_SCOPE_AUTHENTICATED) throw new CliError('FORBIDDEN')
+        }
+        if (id === 'docs.comments.add' && plainObject(body) && !await prepareBoardComment(req, res, body)) return
+        if (id === 'docs.scene.export' && req.query.format === 'excalidraw') {
+          await exportExcalidraw(req, res)
+          return
+        }
+        if (medium) req.headers['x-octo-import-apply'] = 'true'
+        if (id === 'docs.file.export' && (req.query.format === 'png' || req.query.format === 'svg')) {
+          await exportBoardHandler(req, res)
+          return
         }
         await callback(req, res, next)
       }

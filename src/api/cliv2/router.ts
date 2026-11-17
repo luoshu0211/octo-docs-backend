@@ -44,6 +44,7 @@ export function createCliV2Router(rateOptions: RateLimiterOptions = {}): Router 
         return byUser(req, res, (error?: unknown) => {
           if (error) { next(error); return }
           if (!hasAction(permissions, action)) { next(new CliError('FORBIDDEN')); return }
+          res.locals.cliCanReadContent = hasAction(permissions, 'docs.content:read')
           req.uid = principal.userId
           req.spaceId = principal.spaceId
           req.principalSpaceId = principal.spaceId

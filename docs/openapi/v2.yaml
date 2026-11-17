@@ -330,6 +330,311 @@ paths:
           schema:
             type: integer
           description: items per page
+  /v2/cli/docs/{doc_id}/_import_docx:
+    post:
+      operationId: docs.import.docx
+      summary: Import DOCX content
+      description: Atomically replace rich text with the imported Word document.
+      tags:
+        - docs
+      x-octo-principal: token_user
+      x-octo-action: docs.content:write
+      x-octo-cli-hidden: true
+      x-octo-retry: never
+      parameters:
+        - name: doc_id
+          in: path
+          schema:
+            type: string
+          required: true
+          description: Document ID.
+      requestBody:
+        required: true
+        description: Raw file bytes.
+        content:
+          application/vnd.openxmlformats-officedocument.wordprocessingml.document:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '200':
+          description: Import completed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocsImportDocxResponse'
+        '400':
+          $ref: '#/components/responses/VALIDATION_ERROR'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          $ref: '#/components/responses/FORBIDDEN'
+        '404':
+          $ref: '#/components/responses/NOT_FOUND'
+        '409':
+          $ref: '#/components/responses/CONFLICT'
+        '413':
+          $ref: '#/components/responses/PAYLOAD_TOO_LARGE'
+        '415':
+          $ref: '#/components/responses/UNSUPPORTED_MEDIA_TYPE'
+        '429':
+          $ref: '#/components/responses/RATE_LIMITED'
+        '500':
+          $ref: '#/components/responses/INTERNAL_ERROR'
+        '503':
+          $ref: '#/components/responses/UPSTREAM_UNAVAILABLE'
+      x-octo-risk: write
+  /v2/cli/docs/{doc_id}/_import_markdown:
+    post:
+      operationId: docs.import.markdown
+      summary: Import MARKDOWN content
+      description: Atomically replace rich text with the imported Markdown file.
+      tags:
+        - docs
+      x-octo-principal: token_user
+      x-octo-action: docs.content:write
+      x-octo-cli-hidden: true
+      x-octo-retry: never
+      parameters:
+        - name: doc_id
+          in: path
+          schema:
+            type: string
+          required: true
+          description: Document ID.
+      requestBody:
+        required: true
+        description: Raw file bytes.
+        content:
+          text/markdown:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '200':
+          description: Import completed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocsImportMarkdownResponse'
+        '400':
+          $ref: '#/components/responses/VALIDATION_ERROR'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          $ref: '#/components/responses/FORBIDDEN'
+        '404':
+          $ref: '#/components/responses/NOT_FOUND'
+        '409':
+          $ref: '#/components/responses/CONFLICT'
+        '413':
+          $ref: '#/components/responses/PAYLOAD_TOO_LARGE'
+        '415':
+          $ref: '#/components/responses/UNSUPPORTED_MEDIA_TYPE'
+        '429':
+          $ref: '#/components/responses/RATE_LIMITED'
+        '500':
+          $ref: '#/components/responses/INTERNAL_ERROR'
+        '503':
+          $ref: '#/components/responses/UPSTREAM_UNAVAILABLE'
+      x-octo-risk: write
+  /v2/cli/docs/{doc_id}/_import_xlsx:
+    post:
+      operationId: docs.import.xlsx
+      summary: Import XLSX content
+      description: Import the first visible worksheet and replace the target sheet content.
+      tags:
+        - docs
+      x-octo-principal: token_user
+      x-octo-action: docs.content:write
+      x-octo-cli-hidden: true
+      x-octo-retry: never
+      parameters:
+        - name: doc_id
+          in: path
+          schema:
+            type: string
+          required: true
+          description: Document ID.
+      requestBody:
+        required: true
+        description: Raw file bytes.
+        content:
+          application/vnd.openxmlformats-officedocument.spreadsheetml.sheet:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '200':
+          description: Import completed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocsImportXlsxResponse'
+        '400':
+          $ref: '#/components/responses/VALIDATION_ERROR'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          $ref: '#/components/responses/FORBIDDEN'
+        '404':
+          $ref: '#/components/responses/NOT_FOUND'
+        '409':
+          $ref: '#/components/responses/CONFLICT'
+        '413':
+          $ref: '#/components/responses/PAYLOAD_TOO_LARGE'
+        '415':
+          $ref: '#/components/responses/UNSUPPORTED_MEDIA_TYPE'
+        '429':
+          $ref: '#/components/responses/RATE_LIMITED'
+        '500':
+          $ref: '#/components/responses/INTERNAL_ERROR'
+        '503':
+          $ref: '#/components/responses/UPSTREAM_UNAVAILABLE'
+      x-octo-risk: write
+  /v2/cli/docs/{doc_id}/_import_excalidraw:
+    post:
+      operationId: docs.import.excalidraw
+      summary: Import EXCALIDRAW content
+      description: Import a native Excalidraw file in merge or replace mode.
+      tags:
+        - docs
+      x-octo-principal: token_user
+      x-octo-action: docs.content:write
+      x-octo-cli-hidden: true
+      x-octo-retry: never
+      parameters:
+        - name: doc_id
+          in: path
+          schema:
+            type: string
+          required: true
+          description: Document ID.
+        - name: mode
+          in: query
+          schema:
+            type: string
+            enum:
+              - merge
+              - replace
+            default: merge
+          description: Import mode.
+      requestBody:
+        required: true
+        description: Raw file bytes.
+        content:
+          application/json:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '200':
+          description: Import completed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocsImportExcalidrawResponse'
+        '400':
+          $ref: '#/components/responses/VALIDATION_ERROR'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          $ref: '#/components/responses/FORBIDDEN'
+        '404':
+          $ref: '#/components/responses/NOT_FOUND'
+        '409':
+          $ref: '#/components/responses/CONFLICT'
+        '413':
+          $ref: '#/components/responses/PAYLOAD_TOO_LARGE'
+        '415':
+          $ref: '#/components/responses/UNSUPPORTED_MEDIA_TYPE'
+        '429':
+          $ref: '#/components/responses/RATE_LIMITED'
+        '500':
+          $ref: '#/components/responses/INTERNAL_ERROR'
+        '503':
+          $ref: '#/components/responses/UPSTREAM_UNAVAILABLE'
+      x-octo-risk: write
+  /v2/cli/docs/{doc_id}/_export:
+    get:
+      operationId: docs.file.export
+      summary: Export a document or board to a file
+      tags:
+        - docs
+      x-octo-principal: token_user
+      x-octo-action: docs.content:read
+      x-octo-cli-hidden: true
+      x-octo-binary-response: true
+      parameters:
+        - name: doc_id
+          in: path
+          schema:
+            type: string
+          required: true
+          description: Document ID.
+        - name: format
+          in: query
+          schema:
+            type: string
+            enum:
+              - md
+              - docx
+              - pdf
+              - xlsx
+              - png
+              - svg
+          required: true
+      responses:
+        '200':
+          description: Exported document bytes
+          headers:
+            Content-Disposition:
+              description: Attachment filename.
+              schema:
+                type: string
+          content:
+            text/markdown:
+              schema:
+                type: string
+                format: binary
+            application/vnd.openxmlformats-officedocument.wordprocessingml.document:
+              schema:
+                type: string
+                format: binary
+            application/pdf:
+              schema:
+                type: string
+                format: binary
+            application/vnd.openxmlformats-officedocument.spreadsheetml.sheet:
+              schema:
+                type: string
+                format: binary
+            image/png:
+              schema:
+                type: string
+                format: binary
+            image/svg+xml:
+              schema:
+                type: string
+                format: binary
+        '400':
+          $ref: '#/components/responses/VALIDATION_ERROR'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          $ref: '#/components/responses/FORBIDDEN'
+        '404':
+          $ref: '#/components/responses/NOT_FOUND'
+        '413':
+          $ref: '#/components/responses/PAYLOAD_TOO_LARGE'
+        '429':
+          $ref: '#/components/responses/RATE_LIMITED'
+        '500':
+          $ref: '#/components/responses/INTERNAL_ERROR'
+        '503':
+          $ref: '#/components/responses/UPSTREAM_UNAVAILABLE'
+      x-octo-risk: read
+      description: The server selects the export renderer from the format and document type.
   /v2/cli/docs/{doc_id}/content:
     get:
       operationId: docs.content.get
@@ -558,10 +863,8 @@ paths:
   /v2/cli/docs/{doc_id}/scene/_export:
     get:
       operationId: docs.scene.export
-      summary: Export a live whiteboard as a PNG or SVG
-      description: >-
-        Use --image-format png or svg and --output to save the rendered bytes. Without --output the CLI reports
-        response metadata.
+      summary: Export the live whiteboard as PNG, SVG or Excalidraw
+      description: Use --image-format png, svg or excalidraw. Excalidraw exports include referenced board images.
       x-octo-risk: read
       x-octo-binary-response: true
       parameters:
@@ -578,17 +881,22 @@ paths:
             enum:
               - png
               - svg
+              - excalidraw
             default: png
-          description: 'Image format: png (default) or svg.'
+          description: Board export format. Defaults to png.
       responses:
         '200':
-          description: The rendered board image
+          description: Rendered image or portable Excalidraw file
           content:
             image/png:
               schema:
                 type: string
                 format: binary
             image/svg+xml:
+              schema:
+                type: string
+                format: binary
+            application/vnd.excalidraw+json:
               schema:
                 type: string
                 format: binary
@@ -1741,7 +2049,8 @@ paths:
       description: >-
         For a reply use parent_id and omit anchors. For a root, pass a document selection, a sheet cell anchor, a
         board anchor, or a PPT anchor through the JSON contract. Pass Idempotency-Key when required by the document
-        type.
+        type. For a whiteboard root, point or element_ids can replace the explicit anchor fields. Resolving
+        element_ids also requires docs.content:read.
       x-octo-risk: write
       parameters:
         - name: doc_id
@@ -1759,9 +2068,9 @@ paths:
             maxLength: 128
             pattern: ^[\x21-\x7e]+$
           description: >-
-            Required for PPT comments: 1–128 printable ASCII characters without spaces. Preserve the identical key
-            and body on an uncertain retry. The CLI rejects an explicitly blank key; length and character bounds
-            are backend-enforced.
+            Required for PPT comments: 1–128 printable ASCII characters without spaces. Preserve the identical key and
+            body on an uncertain retry. The CLI rejects an explicitly blank key; length and character bounds are
+            backend-enforced.
       requestBody:
         required: true
         content:
@@ -2525,6 +2834,12 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/ErrorResponse'
+    UNSUPPORTED_MEDIA_TYPE:
+      description: UNSUPPORTED_MEDIA_TYPE. Use a media type declared for this operation.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
     RATE_LIMITED:
       description: RATE_LIMITED. The service rate limit was reached.
       content:
@@ -2592,6 +2907,101 @@ components:
           schema:
             $ref: '#/components/schemas/ErrorResponse'
   schemas:
+    DocsImportDocxResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            doc_id:
+              type: string
+            base_version:
+              type: string
+            bytes:
+              type: integer
+            new_doc_version_seq:
+              type: integer
+            warnings:
+              type: array
+              items:
+                type: string
+          required:
+            - base_version
+      required:
+        - data
+    DocsImportMarkdownResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            doc_id:
+              type: string
+            base_version:
+              type: string
+            bytes:
+              type: integer
+            new_doc_version_seq:
+              type: integer
+            warnings:
+              type: array
+              items:
+                type: string
+          required:
+            - base_version
+      required:
+        - data
+    DocsImportXlsxResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            base_version:
+              type: string
+            warnings:
+              type: array
+              items:
+                type: string
+          required:
+            - base_version
+      required:
+        - data
+    DocsImportExcalidrawResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            doc_id:
+              type: string
+            base_version:
+              type: string
+            bytes:
+              type: integer
+            new_doc_version_seq:
+              type: integer
+            mode:
+              type: string
+              enum:
+                - merge
+                - replace
+            imported_elements:
+              type: integer
+            imported_files:
+              type: integer
+            element_id_map:
+              type: object
+              additionalProperties:
+                type: string
+            file_id_map:
+              type: object
+              additionalProperties:
+                type: string
+          required:
+            - base_version
+      required:
+        - data
     ErrorResponse:
       type: object
       required:
@@ -4074,14 +4484,14 @@ components:
         anchor_start:
           type: string
           description: >-
-            root only: opaque base64 anchor start; accepts a Yjs editor position, sheet cell key, or canonical
-            versioned Board anchor
+            root only: opaque base64 anchor start; accepts a Yjs editor position, sheet cell key, or canonical versioned
+            Board anchor
           x-octo-flag: anchorStart
         anchor_end:
           type: string
           description: >-
-            root only: opaque base64 anchor end; accepts a Yjs editor position, sheet cell key, or canonical
-            versioned Board anchor
+            root only: opaque base64 anchor end; accepts a Yjs editor position, sheet cell key, or canonical versioned
+            Board anchor
           x-octo-flag: anchorEnd
         anchor_text:
           type: string
@@ -4092,8 +4502,8 @@ components:
         block_path:
           type: string
           description: >-
-            root only: disambiguate anchorText by block, as a comma-separated child-index path from the doc root
-            (e.g. 0,2)
+            root only: disambiguate anchorText by block, as a comma-separated child-index path from the doc root (e.g.
+            0,2)
           x-octo-flag: blockPath
         occurrence:
           type: integer
@@ -4140,6 +4550,21 @@ components:
           description: >-
             PPT anchor contract. The CLI checks required fields and enums; coordinate bounds, identifiers,
             version/revision values and unknown fields are validated by the backend.
+        point:
+          type: string
+          maxLength: 128
+          description: Whiteboard point in X,Y coordinates.
+          x-octo-flag: point
+        element_ids:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items:
+            type: string
+            minLength: 1
+            maxLength: 256
+          description: Live whiteboard element IDs. Repeat --element-id to select multiple elements.
+          x-octo-flag: element-id
     DocsCommentsAddResponse:
       type: object
       properties:
