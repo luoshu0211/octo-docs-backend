@@ -5,6 +5,7 @@
  * (§4.2); no group inheritance. PK (doc_id, uid, principal_space_id) => at most one row per compound principal.
  */
 import { query, getPool, transaction, type Tx } from '../pool.js'
+import { docLibraryEventRepo } from './docLibraryEventRepo.js'
 import { roleFromNumber, type Role } from '../../permission/role.js'
 
 export interface DocMemberRow {
@@ -95,22 +96,22 @@ export const docMemberRepo = {
    * Direct member grant with a durable Human-recipient notification.
    *
    * The exact Space-qualified member row is locked before the upsert so a
-   * role edit remains silent while a first add (or an add after removal)
-   * atomically creates/resets the unread notification.
+   * role edit emits a change event while a new grant atomically creates
+   * or resets the existing unread reminder.
    */
   async upsertDirectWithNotification(params: DirectMemberInput & { notifyRecipient: boolean }): Promise<{ created: boolean }> {
     return memberTransaction(tx => this.upsertDirectWithNotificationTx(tx, params))
   },
 
   async upsertDirectWithNotificationTx(tx: Tx, params: DirectMemberInput & { notifyRecipient: boolean }): Promise<{ created: boolean }> {
-    const existing = await tx.query<{ present: number }>(
-      `SELECT 1 AS present FROM doc_member
+    const [existing] = await tx.query<{ role: number }>(
+      `SELECT role FROM doc_member
        WHERE doc_id = ? AND uid = ? AND principal_space_id = ?
        LIMIT 1 FOR UPDATE`,
       [params.docId, params.uid, params.principalSpaceId],
     )
     await this.upsertDirectTx(tx, params)
-    const created = existing.length === 0
+    const created = existing === undefined
     if (created && params.notifyRecipient) {
       await tx.query(
         `INSERT INTO doc_member_notification
@@ -121,6 +122,12 @@ export const docMemberRepo = {
            event_at = VALUES(event_at), read_at = NULL`,
         [params.uid, params.principalSpaceId, params.docId, params.grantedBy, params.roleNum],
       )
+    }
+    if (params.notifyRecipient && existing && Number(existing.role) !== params.roleNum) {
+      await docLibraryEventRepo.record(tx, { uid: params.uid, spaceId: params.principalSpaceId }, {
+        docId: params.docId, actorUid: params.grantedBy, kind: 'member_role_changed',
+        previousRole: Number(existing.role), newRole: params.roleNum,
+      })
     }
     return { created }
   },
@@ -137,7 +144,28 @@ export const docMemberRepo = {
     principalSpaceId: string
     roleNum: number
     grantedBy: string
+    notifyRecipient?: boolean
   }): Promise<boolean> {
+    if (params.notifyRecipient) {
+      return memberTransaction(async (tx) => {
+        const [member] = await tx.query<{ role: number }>(
+          `SELECT role FROM doc_member WHERE doc_id = ? AND uid = ? AND principal_space_id = ? FOR UPDATE`,
+          [params.docId, params.uid, params.principalSpaceId],
+        )
+        if (!member) return false
+        await tx.execute(
+          `UPDATE doc_member SET role = ?, granted_by = ? WHERE doc_id = ? AND uid = ? AND principal_space_id = ?`,
+          [params.roleNum, params.grantedBy, params.docId, params.uid, params.principalSpaceId],
+        )
+        if (Number(member.role) !== params.roleNum) {
+          await docLibraryEventRepo.record(tx, { uid: params.uid, spaceId: params.principalSpaceId }, {
+            docId: params.docId, actorUid: params.grantedBy, kind: 'member_role_changed',
+            previousRole: Number(member.role), newRole: params.roleNum,
+          })
+        }
+        return true
+      })
+    }
     const result = await query<{ affectedRows?: number }>(
       `UPDATE doc_member
          SET role = ?, granted_by = ?
@@ -212,12 +240,13 @@ export const docMemberRepo = {
     principalSpaceId: string
     uid: string
     botUids: string[]
+    notifyFromUid?: string
   }): Promise<{ changed: boolean; removedUids: string[]; newEpoch?: number }> {
     const uids = [...new Set([params.uid, ...params.botUids].filter((uid) => uid !== ''))]
     return memberTransaction(async (tx) => {
       const placeholders = uids.map(() => '?').join(', ')
-      const present = await tx.query<{ uid: string }>(
-        `SELECT uid FROM doc_member
+      const present = await tx.query<{ uid: string; role: number }>(
+        `SELECT uid, role FROM doc_member
          WHERE doc_id = ? AND principal_space_id = ? AND uid IN (${placeholders})
          FOR UPDATE`,
         [params.docId, params.principalSpaceId, ...uids],
@@ -229,6 +258,14 @@ export const docMemberRepo = {
         [params.docId, params.principalSpaceId, ...uids],
       )
       if (removedUids.length === 0) return { changed: false, removedUids: [] }
+
+      const recipient = present.find(({ uid }) => uid === params.uid)
+      if (params.notifyFromUid && recipient) {
+        await docLibraryEventRepo.record(tx, { uid: params.uid, spaceId: params.principalSpaceId }, {
+          docId: params.docId, actorUid: params.notifyFromUid, kind: 'member_removed',
+          previousRole: Number(recipient.role),
+        })
+      }
 
       const removedPlaceholders = removedUids.map(() => '?').join(', ')
       await tx.query(

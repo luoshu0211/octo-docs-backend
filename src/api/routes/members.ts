@@ -209,7 +209,6 @@ membersRouter.put("/:docId/members", async (req: Request, res: Response) => {
     );
   if (notificationEligible) {
     // The member row and the recipient's durable unread reminder commit together.
-    // Existing rows are role edits and deliberately do not create a new reminder.
     ({ created } = await docMemberRepo.upsertDirectWithNotification({
       ...write,
       notifyRecipient,
@@ -222,7 +221,7 @@ membersRouter.put("/:docId/members", async (req: Request, res: Response) => {
     // A foreign-Space principal is update-only. A Bot explicitly selecting this
     // Space deliberately performs no current-membership/eligibility revalidation:
     // the exact row must already exist and this route cannot mint a new grant.
-    const updated = await docMemberRepo.updateExistingDirect(write);
+    const updated = await docMemberRepo.updateExistingDirect(notifyRecipient ? { ...write, notifyRecipient } : write);
     if (!updated) {
       res.status(404).json({ error: "member_not_found" });
       return;
@@ -308,6 +307,7 @@ membersRouter.delete(
         uid: targetUid,
         principalSpaceId,
         botUids,
+        ...(targetIsBot ? {} : { notifyFromUid: req.uid! }),
       });
     }
     if (removal.changed && removal.newEpoch !== undefined) {

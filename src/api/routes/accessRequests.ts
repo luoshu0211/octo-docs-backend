@@ -21,10 +21,12 @@ import { Router, type Router as ExpressRouter, type Request, type Response } fro
 import { docMetaRepo } from '../../db/repos/docMetaRepo.js'
 import {
   docAccessRequestRepo,
+  type DocAccessRequestRow,
   REQUEST_STATUS_PENDING,
   REQUEST_STATUS_APPROVED,
   REQUEST_STATUS_DENIED,
 } from '../../db/repos/docAccessRequestRepo.js'
+import { docLibraryEventRepo } from '../../db/repos/docLibraryEventRepo.js'
 import { requireDocRole, requireSameSpace } from '../guard.js'
 import { requireVerifiedHumanCurrentSpace } from '../middleware/docSpaceScope.js'
 import { resolveRole } from '../../permission/resolveRole.js'
@@ -245,6 +247,83 @@ accessRequestsRouter.get('/:docId/access-requests', async (req: Request, res: Re
       createdAt: r.created_at,
     })),
   })
+})
+
+function requestStatus(row: DocAccessRequestRow) {
+  switch (Number(row.status)) {
+    case REQUEST_STATUS_PENDING: return 'pending'
+    case REQUEST_STATUS_APPROVED: return 'approved'
+    case REQUEST_STATUS_DENIED: return 'denied'
+    default: return 'cancelled'
+  }
+}
+
+async function requestDetails(row: DocAccessRequestRow) {
+  const status = requestStatus(row)
+  const grantedRole = status === 'approved'
+    ? await docLibraryEventRepo.grantedRole({ uid: row.uid, spaceId: row.principal_space_id }, row.doc_id, row.request_id)
+    : null
+  return {
+    requestId: row.request_id,
+    uid: row.uid,
+    principalSpaceId: row.principal_space_id,
+    requestedRole: roleName(Number(row.requested_role)),
+    reason: row.reason,
+    createdAt: row.created_at,
+    status,
+    grantedRole: grantedRole === null ? null : roleName(Number(grantedRole)),
+  }
+}
+
+accessRequestsRouter.get('/:docId/access-requests/mine', async (req, res, next) => {
+  try {
+    const docId = req.params.docId!
+    const meta = await docMetaRepo.getByDocId(docId)
+    if (req.docSpaceScope?.mode !== 'human' || !meta || meta.status === 0) {
+      res.status(404).json({ error: 'not_found' })
+      return
+    }
+    if (!(await requireVerifiedHumanCurrentSpace(req, res, meta))) return
+    const principalSpace = await resolveRequestPrincipalSpace(req)
+    if (!principalSpace) {
+      res.status(403).json({ error: 'principal_space_unverified' })
+      return
+    }
+    const decisionFor = req.query.decisionFor
+    if (decisionFor !== undefined && (typeof decisionFor !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(decisionFor))) {
+      res.status(400).json({ error: 'invalid_request_id' })
+      return
+    }
+    const row = await docAccessRequestRepo.getMine(docId, req.uid!, principalSpace)
+    const decision = decisionFor === undefined
+      ? null : await docLibraryEventRepo.decision({ uid: req.uid!, spaceId: principalSpace }, docId, decisionFor)
+    res.setHeader('Cache-Control', 'private, no-store')
+    res.json({
+      request: row === null ? null : await requestDetails(row),
+      decision: decision === null ? null : {
+        status: decision.kind === 'access_approved' ? 'approved' : 'denied',
+        grantedRole: decision.new_role === null ? null : roleName(Number(decision.new_role)),
+      },
+    })
+  } catch (error) {
+    next(error)
+  }
+})
+
+accessRequestsRouter.get('/:docId/access-requests/:requestId', async (req, res, next) => {
+  try {
+    const docId = req.params.docId!
+    if (!(await requireDocRole(req, res, docId, 'admin'))) return
+    const row = await docAccessRequestRepo.getByRequestId(docId, req.params.requestId!)
+    if (row === null) {
+      res.status(404).json({ error: 'not_found' })
+      return
+    }
+    res.setHeader('Cache-Control', 'private, no-store')
+    res.json(await requestDetails(row))
+  } catch (error) {
+    next(error)
+  }
 })
 
 /**

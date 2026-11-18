@@ -3,6 +3,7 @@ import { describe, expect, it, vi, beforeEach } from 'vitest'
 vi.mock('../src/db/pool.js', () => ({
   query: vi.fn(),
   getPool: vi.fn(() => ({ execute: vi.fn() })),
+  transaction: vi.fn(async (run) => run({ execute: query })),
 }))
 
 import { query } from '../src/db/pool.js'
@@ -68,10 +69,16 @@ describe('Space-qualified permission persistence', () => {
   })
 
   it('keeps same UID requests in two Spaces as distinct PK rows', async () => {
-    vi.mocked(query).mockResolvedValueOnce([]).mockResolvedValueOnce([{ request_id: 'r1', status: 1 }] as never)
-    await docAccessRequestRepo.submit({ docId: 'd1', uid: 'u1', principalSpaceId: 'space-b', requestedRoleNum: 1, reason: '' })
-    expect(vi.mocked(query).mock.calls[0]?.[1]?.slice(0, 3)).toEqual(['d1', 'u1', 'space-b'])
-    expect(vi.mocked(query).mock.calls[1]?.[0]).toContain('principal_space_id = ?')
+    vi.mocked(query).mockResolvedValue([])
+    const a = await docAccessRequestRepo.submit({
+      docId: 'd1', uid: 'u1', principalSpaceId: 'space-a', requestedRoleNum: 1, reason: '',
+    })
+    const b = await docAccessRequestRepo.submit({
+      docId: 'd1', uid: 'u1', principalSpaceId: 'space-b', requestedRoleNum: 1, reason: '',
+    })
+    expect(a.requestId).not.toBe(b.requestId)
+    expect(vi.mocked(query).mock.calls[0]?.[1]?.slice(0, 3)).toEqual(['d1', 'u1', 'space-a'])
+    expect(vi.mocked(query).mock.calls[2]?.[1]?.slice(0, 3)).toEqual(['d1', 'u1', 'space-b'])
   })
 
   it('migration backfills from doc home Space and upgrades all three PKs', () => {

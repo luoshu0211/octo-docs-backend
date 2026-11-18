@@ -82,6 +82,7 @@ import { internalDocRoleRouter } from './routes/internalDocRole.js'
 import { internalSourceInvalidationsRouter } from './routes/internalSourceInvalidations.js'
 import { membersRouter } from './routes/members.js'
 import { memberNotificationsRouter } from './routes/memberNotifications.js'
+import { libraryEventsRouter } from './routes/libraryEvents.js'
 import { forwardGrantRouter } from './routes/forwardGrant.js'
 import { accessRequestsRouter } from './routes/accessRequests.js'
 import { cardActionDecideHandler, CARD_ACTION_DECIDE_PATH } from './routes/cardActionDecide.js'
@@ -300,6 +301,7 @@ export function createApp(
   //     `/recent/creators`) are never shadowed by the router's `/:docId`.
   api.use(spaceCollectionRouter)
   api.use(memberNotificationsRouter)
+  api.use(libraryEventsRouter)
 
   // 4b. DocumentResourceRouter (remove-sp §6): every single-document operation,
   //     located by path docId with NO spaceContextMiddleware — open-context, the

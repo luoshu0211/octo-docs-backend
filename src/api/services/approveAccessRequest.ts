@@ -1,9 +1,10 @@
 import { transaction } from '../../db/pool.js'
 import { docAccessRequestRepo, REQUEST_STATUS_APPROVED } from '../../db/repos/docAccessRequestRepo.js'
+import { docLibraryEventRepo } from '../../db/repos/docLibraryEventRepo.js'
 import { docMemberRepo } from '../../db/repos/docMemberRepo.js'
 import { docMetaRepo } from '../../db/repos/docMetaRepo.js'
 import { refreshAndPublish } from '../../permission/epoch.js'
-import { roleAtLeast, roleFromNumber, type Role } from '../../permission/role.js'
+import { roleAtLeast, roleFromNumber, roleToNumber, type Role } from '../../permission/role.js'
 
 export interface ApproveAccessRequestParams {
   docId: string
@@ -55,11 +56,7 @@ export async function approveAccessRequest(
     const current = owner
       ? 'admin' as const
       : (await docMemberRepo.getRoleTx(tx, params.docId, params.uid, params.principalSpaceId)) ?? 'none'
-    if (current === 'admin') {
-      return { transitioned: true as const, requesterRole: 'admin' as const }
-    }
-
-    const changed = await docMemberRepo.upsertGrantMaxTx(tx, {
+    const changed = current !== 'admin' && await docMemberRepo.upsertGrantMaxTx(tx, {
       docId: params.docId,
       uid: params.uid,
       principalSpaceId: params.principalSpaceId,
@@ -76,6 +73,10 @@ export async function approveAccessRequest(
       newEpoch = Number(rows[0]?.permission_epoch ?? 0)
     }
     const requesterRole: Role = roleAtLeast(current, granted) ? current as Role : granted
+    await docLibraryEventRepo.record(tx, { uid: params.uid, spaceId: params.principalSpaceId }, {
+      kind: 'access_approved', docId: params.docId, requestId: params.requestId,
+      actorUid: params.decidedBy, newRole: roleToNumber(requesterRole),
+    })
     return { transitioned: true as const, requesterRole, newEpoch }
   })
 

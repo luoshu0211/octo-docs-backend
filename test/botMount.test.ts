@@ -593,7 +593,7 @@ describe('human mount /api/v1/docs stays unchanged', () => {
     expect(res.status).toBe(200)
     expect(spaceBots).toHaveBeenCalledWith('s_real', 'human-session-token')
     expect(removePrincipalWithBots).toHaveBeenCalledWith({
-      docId: 'd_bot', uid: 'u_target', principalSpaceId: 's_real', botUids: [],
+      docId: 'd_bot', uid: 'u_target', principalSpaceId: 's_real', botUids: [], notifyFromUid: 'u_admin',
     })
     expect(removePrincipalExact).not.toHaveBeenCalled()
   })
