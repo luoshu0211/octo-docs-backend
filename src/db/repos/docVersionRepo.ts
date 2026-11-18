@@ -8,7 +8,7 @@
  * Columns map snake_case -> camelCase in the typed return (see DocVersion). The
  * binary state is stored compressed (node:zlib gzipSync) and decompressed on
  * read (gunzipSync); size_bytes records the UNCOMPRESSED length for metrics /
- * retention. Listing never fetches state_blob (large) — only getStateById does.
+ * retention. Listing never fetches state_blob (large).
  */
 import { gzipSync, gunzipSync } from 'node:zlib'
 import { query, transaction, type Tx } from '../pool.js'
@@ -69,8 +69,7 @@ function mapRow(row: DocVersionMetaRow): DocVersion {
   }
 }
 
-// Metadata projection used by every read path except getStateById, so the
-// LONGBLOB is never pulled into memory for listings / ownership checks.
+// Keep the LONGBLOB out of listings and ownership checks.
 const META_COLS =
   'id, doc_id, document_name, kind, name, restored_from, compressed, size_bytes, schema_version, created_at, created_by'
 
@@ -162,9 +161,9 @@ export const docVersionRepo = {
   },
 
   /**
-   * Insert a KIND_AUTO snapshot and prune stale auto rows in ONE transaction
-   * (§5.4 / §0-A A4-2). Doing both under a single transaction avoids the race
-   * where two concurrent afterStoreDocument writers prune each other's rows.
+   * Insert a KIND_AUTO snapshot and prune stale auto rows in one transaction.
+   * Return null if the document is missing or its latest retained auto snapshot
+   * already contains the same state and schema.
    *
    * Two prune passes, both pinned to `kind = KIND_AUTO` as a HARD constraint:
    * KIND_NAMED / KIND_RESTORE_MARKER rows are NEVER eligible for deletion.
@@ -173,25 +172,59 @@ export const docVersionRepo = {
    *      table directly in a DELETE subquery, so the keep-set is wrapped in an
    *      aliased derived table.
    *   2. by age  — drop auto rows older than `retainDays` days.
-   * Both run on the existing idx_doc_kind (doc_id, kind, id) index.
+   * Both run on the existing idx_doc_kind (doc_id, kind, id) index. Use the
+   * same age cutoff for comparison and pruning so a duplicate cannot expire
+   * between those statements and leave no snapshot.
    *
    * `retainCount` / `retainDays` are clamped to non-negative integers and
    * inlined into the SQL: mysql2 `.execute()` (prepared statements) rejects a
    * `?` bind for LIMIT / INTERVAL with ER_WRONG_ARGUMENTS, and the clamped
    * integers carry no injection surface (same rationale as listByDoc's LIMIT).
    */
-  async createAutoWithPrune(input: CreateAutoInput): Promise<number> {
+  async createAutoWithPrune(input: CreateAutoInput): Promise<number | null> {
     const keep = Math.max(1, Math.floor(input.retainCount))
     const days = Math.max(0, Math.floor(input.retainDays))
     return transaction(async (tx) => {
-      const id = await this.createTx(tx, {
-        docId: input.docId,
-        documentName: input.documentName,
-        kind: KIND_AUTO,
-        state: input.state,
-        schemaVersion: input.schemaVersion,
-        createdBy: input.createdBy,
-      })
+      // Lock a stable row even when there is no version yet. The interval and
+      // idle callbacks use different Redis keys and may run on different nodes.
+      const [doc] = await tx.query<{ cutoff: string }>(
+        `SELECT CAST(NOW() - INTERVAL ${days} DAY AS CHAR) AS cutoff
+         FROM doc_meta WHERE doc_id = ? FOR UPDATE`,
+        [input.docId],
+      )
+      if (!doc) return null
+
+      // Compare only against the latest row. Avoid transferring its blob if
+      // the metadata rules out a match or the age prune would delete the row.
+      const [latest] = await tx.query<{ state_blob: Buffer | null; compressed: number }>(
+        `SELECT CASE WHEN schema_version = ? AND size_bytes = ?
+                      AND created_at >= ?
+                     THEN state_blob ELSE NULL END AS state_blob, compressed
+         FROM doc_version WHERE doc_id = ? AND kind = ?
+         ORDER BY id DESC LIMIT 1`,
+        [input.schemaVersion, input.state.byteLength, doc.cutoff, input.docId, KIND_AUTO],
+      )
+      let previousState = latest?.state_blob
+      if (previousState && latest?.compressed) {
+        try {
+          previousState = gunzipSync(previousState, { maxOutputLength: Math.max(1, input.state.byteLength) })
+        } catch {
+          // An unreadable historical snapshot must not block a new restore point.
+          previousState = null
+        }
+      }
+
+      let id: number | null = null
+      if (!previousState?.equals(input.state)) {
+        id = await this.createTx(tx, {
+          docId: input.docId,
+          documentName: input.documentName,
+          kind: KIND_AUTO,
+          state: input.state,
+          schemaVersion: input.schemaVersion,
+          createdBy: input.createdBy,
+        })
+      }
       // 1. count-based prune (keep most-recent N auto rows for this doc).
       await tx.query(
         `DELETE FROM doc_version
@@ -210,8 +243,8 @@ export const docVersionRepo = {
       await tx.query(
         `DELETE FROM doc_version
          WHERE doc_id = ? AND kind = ?
-           AND created_at < NOW() - INTERVAL ${days} DAY`,
-        [input.docId, KIND_AUTO],
+           AND created_at < ?`,
+        [input.docId, KIND_AUTO, doc.cutoff],
       )
       return id
     })

@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { gzipSync } from 'node:zlib'
 
 // Offline unit test for createAutoWithPrune: the REAL repo method runs against a
 // mocked pool transaction, so we can assert the INSERT + both prune passes run
@@ -17,13 +18,20 @@ interface Call {
   params: unknown[]
 }
 
+const cutoff = '2026-11-11 00:00:00'
+
 /** Wire `transaction` to a tx that records every query and fakes LAST_INSERT_ID. */
-function mockTx(insertId = 4242): Call[] {
+function mockTx(insertId = 4242, latest?: {
+  state_blob: Buffer | null
+  compressed: number
+}): Call[] {
   const calls: Call[] = []
   vi.mocked(transaction).mockImplementation(async (fn: never) => {
     const tx = {
       query: vi.fn(async (sql: string, params: unknown[] = []) => {
         calls.push({ sql, params })
+        if (sql.includes('FROM doc_meta')) return [{ cutoff }]
+        if (sql.includes('AS state_blob')) return latest ? [latest] : []
         if (sql.includes('LAST_INSERT_ID')) return [{ id: insertId }]
         return []
       }),
@@ -48,6 +56,32 @@ beforeEach(() => {
 })
 
 describe('docVersionRepo.createAutoWithPrune', () => {
+  it('skips an identical snapshot and still runs retention', async () => {
+    const calls = mockTx(99, {
+      state_blob: gzipSync(baseInput.state),
+      compressed: 1,
+    })
+
+    expect(await docVersionRepo.createAutoWithPrune(baseInput)).toBeNull()
+    expect(calls.some((c) => c.sql.includes('INSERT INTO doc_version'))).toBe(false)
+    expect(calls.filter((c) => c.sql.includes('DELETE FROM doc_version'))).toHaveLength(2)
+  })
+
+  it('inserts an edited snapshot even when the byte length is unchanged', async () => {
+    mockTx(99, {
+      state_blob: gzipSync(new Uint8Array([1, 2, 4])),
+      compressed: 1,
+    })
+
+    expect(await docVersionRepo.createAutoWithPrune(baseInput)).toBe(99)
+  })
+
+  it('inserts a recoverable snapshot when the previous blob cannot be decoded', async () => {
+    mockTx(99, { state_blob: Buffer.from('invalid gzip'), compressed: 1 })
+
+    expect(await docVersionRepo.createAutoWithPrune(baseInput)).toBe(99)
+  })
+
   it('inserts the KIND_AUTO row and returns the DB-assigned id', async () => {
     const calls = mockTx(99)
     const id = await docVersionRepo.createAutoWithPrune(baseInput)
@@ -91,9 +125,9 @@ describe('docVersionRepo.createAutoWithPrune', () => {
     const calls = mockTx()
     await docVersionRepo.createAutoWithPrune({ ...baseInput, retainDays: 7 })
 
-    const agePrune = calls.find((c) => c.sql.includes('INTERVAL'))
-    expect(agePrune).toBeDefined()
-    expect(agePrune!.sql).toContain('INTERVAL 7 DAY')
+    expect(calls.find((c) => c.sql.includes('FROM doc_meta'))?.sql).toContain('INTERVAL 7 DAY')
+    expect(calls.find((c) => c.sql.includes('created_at >= ?'))?.params).toContain(cutoff)
+    expect(calls.find((c) => c.sql.includes('created_at < ?'))?.params).toContain(cutoff)
   })
 
   it('clamps a non-positive retainCount to keep at least 1', async () => {
