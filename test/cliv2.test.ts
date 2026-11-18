@@ -11,8 +11,9 @@ import * as liveSheet from '../src/collab/liveSheetWrite.js'
 import * as editSheet from '../src/api/services/editDocSheet.js'
 import * as objectStore from '../src/storage/objectStore.js'
 import { config } from '../src/config/env.js'
-import { SHEET_DATA_VALIDATIONS_FIELD, SHEET_YMAP_FIELD } from '../src/agent/sheetConversion.js'
+import { SHEET_DATA_VALIDATIONS_FIELD, SHEET_LIST_FIELD, SHEET_YMAP_FIELD } from '../src/agent/sheetConversion.js'
 import { encodeBaseVersion } from '../src/collab/docBodyEdit.js'
+import { sanitizeSvg } from '../src/util/sanitizeSvg.js'
 import { errorForStatus } from '../src/api/cliv2/adapter.js'
 import { docAttachmentRepo } from '../src/db/repos/docAttachmentRepo.js'
 import { docCommentRepo, type DocComment } from '../src/db/repos/docCommentRepo.js'
@@ -25,7 +26,16 @@ import { docMemberRepo } from '../src/db/repos/docMemberRepo.js'
 import { docMetaRepo, type DocMeta } from '../src/db/repos/docMetaRepo.js'
 
 type ReadSchemas = {
-  ErrorResponse: { properties: { error: { properties: { code: { enum: string[] } } } } }
+  ErrorResponse: {
+    properties: {
+      error: {
+        properties: {
+          code: { enum: string[] }
+          details: { properties: { candidates: { items: { required: string[] } } } }
+        }
+      }
+    }
+  }
   CursorPagination: { required: string[] }
   DocsShareGetResponse: {
     properties: { data: { properties: Record<'share_scope' | 'share_role', { enum: string[] }> } }
@@ -371,6 +381,54 @@ describe('Docs CLI v2 workflows', () => {
       .not.toHaveProperty('details')
   })
 
+  it('returns duplicate-name worksheet candidates and accepts each candidate ID', async () => {
+    const sheet = new Y.Doc()
+    const name = '重复表名'
+    for (const [order, sheetId] of ['sheet_alpha', 'sheet_beta'].entries()) {
+      sheet.getMap(SHEET_LIST_FIELD).set(sheetId, { name, order })
+      sheet.getMap(SHEET_YMAP_FIELD).set(`${sheetId}!0:0`, { v: sheetId })
+    }
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue({ ...doc, doc_type: 'sheet' })
+    vi.spyOn(liveSheet, 'readLiveSheet').mockImplementation(async () => ({
+      state: Y.encodeStateAsUpdate(sheet), baseSV: Y.encodeStateVector(sheet),
+    }))
+    try {
+      const query = new URLSearchParams({ sheet_name: name, limit: '1' })
+      const ambiguous = await read(endpoint + '/d_same/sheet?' + query, 'workflows')
+      expect(ambiguous.status).toBe(409)
+      const error = (await ambiguous.json()).error
+      expect(error).toMatchObject({
+        code: 'CONFLICT',
+        details: {
+          reason: 'ambiguous_sheet_name',
+          candidates: [{ sheet_id: 'sheet_alpha', name }, { sheet_id: 'sheet_beta', name }],
+        },
+      })
+      for (const candidate of error.details.candidates) {
+        const required = schemas.ErrorResponse.properties.error.properties.details.properties.candidates.items.required
+        expect(Object.keys(candidate)).toEqual(expect.arrayContaining(required))
+        const selection = new URLSearchParams({ sheet_id: candidate.sheet_id, limit: '1' })
+        const selected = await read(endpoint + '/d_same/sheet?' + selection, 'workflows')
+        expect(selected.status).toBe(200)
+        const body = await selected.json()
+        expect(body.data.sheet_id).toBe(candidate.sheet_id)
+        expect(body.data.sheet_cells[`${candidate.sheet_id}!0:0`]).toEqual({ v: candidate.sheet_id })
+      }
+    } finally {
+      sheet.destroy()
+    }
+  })
+
+  it('projects only valid public worksheet candidate fields', () => {
+    const error = errorForStatus(409, {
+      error: 'ambiguous_sheet_name',
+      candidates: [{ sheetId: 'sheet_alpha', name: 'Repeated', private: 'hidden' }, null, { sheetId: 'bad', name: 1 }],
+    })
+    expect(error.envelope.error.details).toEqual({
+      reason: 'ambiguous_sheet_name', candidates: [{ sheet_id: 'sheet_alpha', name: 'Repeated' }],
+    })
+  })
+
   it('resolves whiteboard element anchors from live state only after both Actions', async () => {
     const readState = vi.spyOn(liveRead, 'readLiveDocState').mockResolvedValue(boardState([
       { id: 'shape', type: 'rectangle', x: 15, y: 24, width: 20, height: 12 },
@@ -471,9 +529,22 @@ describe('Docs CLI v2 workflows', () => {
     ['image/jpg', 'image/jpeg'],
     ['image/pjpeg', 'image/jpeg'],
     ['image/jpeg; charset=binary', 'image/jpeg'],
+    ['image/webp', 'image/webp'],
+    ['IMAGE/WEBP; charset=binary', 'image/webp'],
+    ['image/svg+xml', 'image/svg+xml'],
   ])('round-trips a portable attachment declared as %s', async (declaredMime, normalizedMime) => {
     const canvas = createCanvas(1, 1)
-    const image = normalizedMime === 'image/png' ? canvas.toBuffer('image/png') : canvas.toBuffer('image/jpeg')
+    let image: Buffer
+    if (normalizedMime === 'image/svg+xml') {
+      image = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script><rect width="1" height="1"/></svg>')
+    } else if (normalizedMime === 'image/png') {
+      image = canvas.toBuffer('image/png')
+    } else if (normalizedMime === 'image/webp') {
+      image = canvas.toBuffer('image/webp')
+    } else {
+      image = canvas.toBuffer('image/jpeg')
+    }
+    const portableBytes = normalizedMime === 'image/svg+xml' ? sanitizeSvg(image) : image
     vi.spyOn(liveRead, 'readLiveDocState').mockResolvedValue(boardState([
       { id: 'image', type: 'image', index: 'a0', x: 0, y: 0, width: 1, height: 1, fileId: 'BinaryId' },
     ], { BinaryId: { attachId: 'att_A' } }))
@@ -489,15 +560,32 @@ describe('Docs CLI v2 workflows', () => {
     expect(result.status).toBe(200)
     const scene = await result.json()
     expect(scene.files.BinaryId).toMatchObject({
-      mimeType: normalizedMime, dataURL: `data:${normalizedMime};base64,${image.toString('base64')}`,
+      mimeType: normalizedMime, dataURL: `data:${normalizedMime};base64,${portableBytes.toString('base64')}`,
     })
 
     const upload = vi.fn(async () => 'att_reimported')
     const imported = await prepareExcalidrawImport({
       scene, docId: board.doc_id, uid: 'user_a', existingElements: [], existingFiles: {}, upload,
     })
-    expect(upload).toHaveBeenCalledWith(image, normalizedMime, expect.any(String))
+    expect(upload).toHaveBeenCalledWith(portableBytes, normalizedMime, expect.any(String))
     expect(imported.files.BinaryId).toMatchObject({ attachId: 'att_reimported', mimeType: normalizedMime })
+  })
+
+  it.each(['image/png', 'image/svg+xml'])('rejects WebP bytes declared as %s', async declaredMime => {
+    const image = createCanvas(1, 1).toBuffer('image/webp')
+    vi.spyOn(liveRead, 'readLiveDocState').mockResolvedValue(boardState([
+      { id: 'image', type: 'image', index: 'a0', x: 0, y: 0, width: 1, height: 1, fileId: 'BinaryId' },
+    ], { BinaryId: { attachId: 'att_A' } }))
+    vi.spyOn(docAttachmentRepo, 'listByDoc').mockResolvedValue([{
+      attachId: 'att_A', docId: board.doc_id, objectKey: 'b_same/att_A/image',
+      mime: declaredMime, sizeBytes: image.length, fileName: 'image', createdBy: 'user_a', createdAt: date,
+    }])
+    vi.spyOn(objectStore, 'getObjectStore').mockReturnValue({
+      download: vi.fn().mockResolvedValue(image),
+    } as unknown as objectStore.ObjectStore)
+    const result = await read(endpoint + '/b_same/scene/_export?format=excalidraw', 'workflows')
+    expect(result.status).toBe(409)
+    expect(await result.json()).toMatchObject({ error: { code: 'CONFLICT', details: { reason: 'portable_attachment_invalid' } } })
   })
 
   it('preserves the web anchor geometry for a rounded connector with bound text', () => {

@@ -3115,6 +3115,19 @@ components:
               properties:
                 reason:
                   type: string
+                candidates:
+                  type: array
+                  description: Worksheets matching an ambiguous sheet name. Retry the read with one returned sheet_id.
+                  items:
+                    type: object
+                    required:
+                      - sheet_id
+                      - name
+                    properties:
+                      sheet_id:
+                        type: string
+                      name:
+                        type: string
                 base_version:
                   type: string
                   description: Current sheet state vector for a repair PATCH supplied through If-Match.

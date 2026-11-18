@@ -98,6 +98,12 @@ export function errorForStatus(status: number, body: JsonRecord) {
       if (typeof body[key] === 'number' && Number.isFinite(body[key])) details[snake(key)] = body[key]
     }
   }
+  if (status === 409 && details?.reason === 'ambiguous_sheet_name' && Array.isArray(body.candidates)) {
+    details.candidates = body.candidates.flatMap(candidate => {
+      if (!plainObject(candidate) || typeof candidate.sheetId !== 'string' || typeof candidate.name !== 'string') return []
+      return [{ sheet_id: candidate.sheetId, name: candidate.name }]
+    })
+  }
   switch (status) {
     case 401: return new CliError('AUTH_REQUIRED')
     case 403: return new CliError('FORBIDDEN', details)

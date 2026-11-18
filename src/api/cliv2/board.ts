@@ -4,8 +4,9 @@ import { BoardSnapshotInvalidError, decodeBoardSnapshot, WHITEBOARD_DOC_TYPE } f
 import { config } from '../../config/env.js'
 import { docAttachmentRepo } from '../../db/repos/docAttachmentRepo.js'
 import { getObjectStore } from '../../storage/objectStore.js'
+import { sniffImageMime } from '../../import/docx/media.js'
+import { sanitizeSvg } from '../../util/sanitizeSvg.js'
 import { requireDocRole } from '../guard.js'
-import { sanitizeSceneImage } from '../routes/boardExport.js'
 import { parseBoardAnchor, validElementId, type BoardAnchor } from '../services/commentAnchors.js'
 import { CliError } from './auth.js'
 import { boardCoordinateLimit, selectionAnchor } from './boardGeometry.js'
@@ -140,11 +141,18 @@ export async function exportExcalidraw(req: Request, res: Response): Promise<voi
       } catch {
         throw new CliError('UPSTREAM_UNAVAILABLE', { reason: 'portable_attachment_unavailable' })
       }
-      const image = sanitizeSceneImage(Buffer.from(bytes))
-      if (!image || image.mime !== mime) {
+      let image: Buffer = Buffer.from(bytes)
+      const detectedMime = sniffImageMime(image)
+      const isSvg = mime === 'image/svg+xml'
+      // SVG roots without attributes are validated by the XML sanitizer.
+      if (detectedMime !== mime && !(isSvg && detectedMime === null)) {
         throw new CliError('CONFLICT', { reason: 'portable_attachment_invalid' })
       }
-      const encoded = image.bytes.toString('base64')
+      if (isSvg) {
+        try { image = sanitizeSvg(image) }
+        catch { throw new CliError('CONFLICT', { reason: 'portable_attachment_invalid' }) }
+      }
+      const encoded = image.toString('base64')
       used += overhead + encoded.length
       if (used > limit) throw new CliError('PAYLOAD_TOO_LARGE')
       entry.dataURL += encoded
