@@ -109,7 +109,7 @@ async function writeAutoSnapshot(
   const target = deriveSnapshotTarget(documentName)
   if (!target) return false
   const state = Y.encodeStateAsUpdate(liveDoc)
-  await docVersionRepo.createAutoWithPrune({
+  const versionId = await docVersionRepo.createAutoWithPrune({
     docId: target.docId,
     documentName,
     state,
@@ -118,7 +118,7 @@ async function writeAutoSnapshot(
     retainCount: config.autoSnapshot.retainCount,
     retainDays: config.autoSnapshot.retainDays,
   })
-  return true
+  return versionId !== null
 }
 
 /**
