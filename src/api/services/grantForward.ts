@@ -20,9 +20,11 @@
  * success (per-uid 200), matching the権限 matrix §7.
  */
 import { docMemberRepo } from '../../db/repos/docMemberRepo.js'
+import { docMetaRepo } from '../../db/repos/docMetaRepo.js'
+import type { Tx } from '../../db/pool.js'
 import { resolveRole } from '../../permission/resolveRole.js'
 import { bumpEpoch } from '../../permission/epoch.js'
-import { roleAtLeast, roleFromNumber, type Role } from '../../permission/role.js'
+import { roleAtLeast, roleFromNumber, type ResolvedRole, type Role } from '../../permission/role.js'
 
 export interface GrantForwardParams {
   docId: string
@@ -42,26 +44,40 @@ export interface GrantForwardResult {
   changed: boolean
 }
 
-export async function grantForwardAccess(params: GrantForwardParams): Promise<GrantForwardResult> {
+/** A transaction caller locks/authorizes the document and publishes the epoch after commit. */
+export async function grantForwardAccess(
+  params: GrantForwardParams,
+  context?: { tx: Tx; ownerId: string; ownerSpaceId: string },
+): Promise<GrantForwardResult> {
   const granted = roleFromNumber(params.roleNum)
   if (!granted || (granted === 'admin' && params.allowAdmin !== true)) {
     throw new Error(`invalid forward role ${params.roleNum}`)
   }
-  const current = await resolveRole(params.uid, params.docId, params.principalSpaceId)
+  let current: ResolvedRole
+  if (context) {
+    const owner = params.uid === context.ownerId && params.principalSpaceId === context.ownerSpaceId
+    current = owner ? 'admin' : ((await docMemberRepo.getRoleTx(context.tx, params.docId, params.uid, params.principalSpaceId, true)) ?? 'none')
+  } else {
+    current = await resolveRole(params.uid, params.docId, params.principalSpaceId)
+  }
   // owner (=> admin) or existing admin: keep as-is, no write, no misleading audit row.
   if (current === 'admin') {
     return { finalRole: 'admin', changed: false }
   }
 
-  const changed = await docMemberRepo.upsertGrantMax({
+  const write = {
     docId: params.docId,
     uid: params.uid,
     principalSpaceId: params.principalSpaceId,
     roleNum: params.roleNum,
     grantedBy: params.grantedBy,
-  })
+  }
+  const changed = context
+    ? await docMemberRepo.upsertGrantMaxTx(context.tx, write)
+    : await docMemberRepo.upsertGrantMax(write)
   if (changed) {
-    await bumpEpoch(params.docId, params.documentName, params.uid)
+    if (context) await docMetaRepo.bumpEpochTx(context.tx, params.docId)
+    else await bumpEpoch(params.docId, params.documentName, params.uid)
   }
 
   // Effective role = the more privileged of existing vs granted (never a

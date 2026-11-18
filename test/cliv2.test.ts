@@ -7,7 +7,13 @@ import * as Y from 'yjs'
 import * as editDoc from '../src/api/services/editDocBody.js'
 import * as liveWrite from '../src/collab/liveDocWrite.js'
 import * as liveRead from '../src/collab/liveDocRead.js'
+import * as liveSheet from '../src/collab/liveSheetWrite.js'
+import * as editSheet from '../src/api/services/editDocSheet.js'
 import * as objectStore from '../src/storage/objectStore.js'
+import { config } from '../src/config/env.js'
+import { SHEET_DATA_VALIDATIONS_FIELD, SHEET_YMAP_FIELD } from '../src/agent/sheetConversion.js'
+import { encodeBaseVersion } from '../src/collab/docBodyEdit.js'
+import { errorForStatus } from '../src/api/cliv2/adapter.js'
 import { docAttachmentRepo } from '../src/db/repos/docAttachmentRepo.js'
 import { docCommentRepo, type DocComment } from '../src/db/repos/docCommentRepo.js'
 import { prepareExcalidrawImport } from '../src/import/excalidraw.js'
@@ -19,6 +25,7 @@ import { docMemberRepo } from '../src/db/repos/docMemberRepo.js'
 import { docMetaRepo, type DocMeta } from '../src/db/repos/docMetaRepo.js'
 
 type ReadSchemas = {
+  ErrorResponse: { properties: { error: { properties: { code: { enum: string[] } } } } }
   CursorPagination: { required: string[] }
   DocsShareGetResponse: {
     properties: { data: { properties: Record<'share_scope' | 'share_role', { enum: string[] }> } }
@@ -78,7 +85,10 @@ beforeEach(async () => {
         ...(body.token === 'workflows' ? [
           { domain: 'docs.content', actions: ['docs.content:*'] },
           { domain: 'docs.access', actions: ['docs.access:read'] },
+          { domain: 'docs.attachments', actions: ['docs.attachments:read'] },
         ] : []),
+        ...(body.token === 'content-only' ? [{ domain: 'docs.content', actions: ['docs.content:read'] }] : []),
+        ...(body.token === 'attachments-only' ? [{ domain: 'docs.attachments', actions: ['docs.attachments:read'] }] : []),
       ],
       bot_bindings: [{ bot_id: 'bot_a' }],
     } }))
@@ -285,6 +295,9 @@ describe('Docs CLI v2 workflows', () => {
     const edit = vi.spyOn(editDoc, 'editDocBody').mockResolvedValue({ ok: true, baseVersion: 'next', bytes: 28, newDocVersionSeq: 3 })
     const wrongMedia = await post('/d_same/_import_markdown', '# Heading', 'text/plain')
     expect(wrongMedia.status).toBe(415)
+    const mediaError = await wrongMedia.json()
+    expect(mediaError.error.code).toBe('UNSUPPORTED_MEDIA_TYPE')
+    expect(schemas.ErrorResponse.properties.error.properties.code.enum).toContain(mediaError.error.code)
     const otherSpace = await post('/d_foreign/_import_markdown', '# Heading', 'text/markdown')
     expect(otherSpace.status).toBe(404)
     const allowed = await post('/d_same/_import_markdown', '# Heading', 'text/markdown')
@@ -296,6 +309,66 @@ describe('Docs CLI v2 workflows', () => {
     expect(edit).toHaveBeenCalledWith(expect.objectContaining({
       uid: 'user_a', docId: 'd_same', principalSpaceId: 'space_a', isBot: false, ops: [expect.objectContaining({ type: 'replace' })],
     }))
+  })
+
+  it('carries sheet recovery details through a failed read, repair PATCH and successful reread', async () => {
+    const sheet = new Y.Doc()
+    const validationKey = 'default!checkbox_needs_repair'
+    sheet.getMap(SHEET_YMAP_FIELD).set('default!0:0', { v: 'cell' })
+    sheet.getMap(SHEET_DATA_VALIDATIONS_FIELD).set(validationKey, {
+      uid: 'checkbox_needs_repair', type: 'checkbox', allowBlank: true,
+      ranges: Array.from({ length: 40 }, (_, row) => ({ startRow: row, endRow: row, startColumn: 0, endColumn: 0 })),
+    })
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue({ ...doc, doc_type: 'sheet' })
+    vi.spyOn(liveSheet, 'readLiveSheet').mockImplementation(async () => ({
+      state: Y.encodeStateAsUpdate(sheet), baseSV: Y.encodeStateVector(sheet),
+    }))
+    const edit = vi.spyOn(editSheet, 'editDocSheet').mockImplementation(async input => {
+      expect(input.clientBaseVersion).toEqual(Y.encodeStateVector(sheet))
+      expect(input.dataValidations).toEqual({ [validationKey]: null })
+      sheet.getMap(SHEET_DATA_VALIDATIONS_FIELD).delete(validationKey)
+      return { ok: true, baseVersion: encodeBaseVersion(Y.encodeStateVector(sheet)), bytes: 100, newDocVersionSeq: 3 }
+    })
+    const readLimits = config.sheetRead as { maxCellBytes: number }
+    const previousLimit = readLimits.maxCellBytes
+    readLimits.maxCellBytes = 800
+    try {
+      const failed = await read(endpoint + '/d_same/sheet?limit=1', 'workflows')
+      expect(failed.status).toBe(413)
+      const error = (await failed.json()).error
+      expect(error).toMatchObject({
+        code: 'PAYLOAD_TOO_LARGE',
+        details: {
+          reason: 'sheet_too_large', base_version: encodeBaseVersion(Y.encodeStateVector(sheet)),
+          repair_data_validation_key: validationKey, hint: expect.any(String), limit: 800,
+        },
+      })
+      const repaired = await fetch(appOrigin + endpoint + '/d_same/sheet', {
+        method: 'PATCH',
+        headers: {
+          authorization: 'Bearer workflows', 'content-type': 'application/json', 'if-match': error.details.base_version,
+        },
+        body: JSON.stringify({ data_validations: { [error.details.repair_data_validation_key]: null } }),
+      })
+      expect(repaired.status).toBe(200)
+      expect(edit).toHaveBeenCalledOnce()
+      const reread = await read(endpoint + '/d_same/sheet?limit=1', 'workflows')
+      expect(reread.status).toBe(200)
+      expect((await reread.json()).data.sheet_data_validations).toEqual({})
+    } finally {
+      readLimits.maxCellBytes = previousLimit
+      sheet.destroy()
+    }
+  })
+
+  it('limits sheet recovery details to published scalar fields', () => {
+    const error = errorForStatus(413, {
+      error: 'sheet_too_large', baseVersion: { token: 'private' }, repairDataValidationKey: ['private'],
+      hint: 5, payloadBytes: NaN, limit: Infinity, stack: 'private', secret: 'private',
+    })
+    expect(error.envelope.error.details).toEqual({ reason: 'sheet_too_large' })
+    expect(errorForStatus(500, { error: 'sheet_too_large', baseVersion: 'private', hint: 'private' }).envelope.error)
+      .not.toHaveProperty('details')
   })
 
   it('resolves whiteboard element anchors from live state only after both Actions', async () => {
@@ -354,6 +427,42 @@ describe('Docs CLI v2 workflows', () => {
     const invalid = await read(endpoint + '/b_same/scene/_export?format=excalidraw', 'workflows')
     expect(invalid.status).toBe(409)
     expect(download).toHaveBeenCalledOnce()
+  })
+
+  it.each(['content-only', 'attachments-only'])('rejects portable images for %s before attachment lookup or download', async token => {
+    vi.spyOn(liveRead, 'readLiveDocState').mockResolvedValue(boardState([
+      { id: 'image', type: 'image', index: 'a0', fileId: 'BinaryId', x: 0, y: 0, width: 1, height: 1 },
+    ], { BinaryId: { attachId: 'att_A' } }))
+    const attachments = vi.spyOn(docAttachmentRepo, 'listByDoc')
+    const download = vi.fn()
+    vi.spyOn(objectStore, 'getObjectStore').mockReturnValue({ download } as unknown as objectStore.ObjectStore)
+
+    const result = await read(endpoint + '/b_same/scene/_export?format=excalidraw', token)
+    expect(result.status).toBe(403)
+    expect(await result.json()).toMatchObject({ error: { code: 'FORBIDDEN' } })
+    expect(attachments).not.toHaveBeenCalled()
+    expect(download).not.toHaveBeenCalled()
+  })
+
+  it('requires a document reader role even with both portable export Actions', async () => {
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue({ ...board, owner_id: 'different-user' })
+    const scene = vi.spyOn(liveRead, 'readLiveDocState')
+    const attachments = vi.spyOn(docAttachmentRepo, 'listByDoc')
+    const result = await read(endpoint + '/b_same/scene/_export?format=excalidraw', 'workflows')
+    expect(result.status).toBe(403)
+    expect(scene).not.toHaveBeenCalled()
+    expect(attachments).not.toHaveBeenCalled()
+  })
+
+  it.each([false, true])('exports without attachment permission when the board has no live image (deleted=%s)', async deleted => {
+    vi.spyOn(liveRead, 'readLiveDocState').mockResolvedValue(boardState(deleted ? [
+      { id: 'gone', type: 'image', index: 'a0', fileId: 'BinaryId', isDeleted: true },
+    ] : [], { BinaryId: { attachId: 'att_A' } }))
+    const attachments = vi.spyOn(docAttachmentRepo, 'listByDoc')
+    const result = await read(endpoint + '/b_same/scene/_export?format=excalidraw', 'content-only')
+    expect(result.status).toBe(200)
+    expect(await result.json()).toMatchObject({ elements: [], files: {} })
+    expect(attachments).not.toHaveBeenCalled()
   })
 
   it.each([

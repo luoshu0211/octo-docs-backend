@@ -19,7 +19,8 @@ describe('docMemberRepo.removePrincipalExact', () => {
       .mockResolvedValueOnce([])
       .mockResolvedValueOnce([{ permission_epoch: 12 }])
 
-    await expect(docMemberRepo.removePrincipalExact({
+    const remove = docMemberRepo.removePrincipalExact
+    await expect(remove({
       docId: 'd1', principalSpaceId: 'sp1', uid: 'human',
     })).resolves.toEqual({ changed: true, removedUids: ['human'], newEpoch: 12 })
 

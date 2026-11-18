@@ -904,7 +904,9 @@ paths:
     get:
       operationId: docs.scene.export
       summary: Export the live whiteboard as PNG, SVG or Excalidraw
-      description: Use --image-format png, svg or excalidraw. Excalidraw exports include referenced board images.
+      description: >-
+        Use --image-format png, svg or excalidraw. Excalidraw exports include referenced board images.
+        Embedding images requires docs.attachments:read in addition to docs.content:read and the document reader role.
       x-octo-risk: read
       x-octo-binary-response: true
       parameters:
@@ -3101,11 +3103,32 @@ components:
                 - CONFLICT
                 - VALIDATION_ERROR
                 - PAYLOAD_TOO_LARGE
+                - UNSUPPORTED_MEDIA_TYPE
                 - RATE_LIMITED
                 - INTERNAL_ERROR
                 - UPSTREAM_UNAVAILABLE
             message:
               type: string
+            details:
+              type: object
+              additionalProperties: true
+              properties:
+                reason:
+                  type: string
+                base_version:
+                  type: string
+                  description: Current sheet state vector for a repair PATCH supplied through If-Match.
+                repair_data_validation_key:
+                  type: string
+                  description: Exact opaque validation map key to delete when repairing an oversized sheet.
+                hint:
+                  type: string
+                payload_bytes:
+                  type: integer
+                  minimum: 0
+                limit:
+                  type: integer
+                  minimum: 0
     OffsetPagination:
       type: object
       required:

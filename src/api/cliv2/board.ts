@@ -115,6 +115,7 @@ export async function exportExcalidraw(req: Request, res: Response): Promise<voi
   if (fileIds.size > maxPortableAttachments || used > limit) throw new CliError('PAYLOAD_TOO_LARGE')
 
   if (fileIds.size > 0) {
+    if (res.locals.cliCanReadAttachments !== true) throw new CliError('FORBIDDEN')
     const attachments = await docAttachmentRepo.listByDoc(guard.meta.doc_id)
     const byId = new Map(attachments.map(attachment => [attachment.attachId, attachment]))
     const signal = AbortSignal.timeout(30_000)

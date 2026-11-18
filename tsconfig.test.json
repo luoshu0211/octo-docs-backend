@@ -28,6 +28,7 @@
     "test/botDocDelete.test.ts",
     "test/botMentionAuthorGate.test.ts",
     "test/cliv2.test.ts",
+    "test/cliv2Access.test.ts",
     "test/liveBoardWrite.test.ts",
     "test/importExcalidrawRoute.test.ts",
     "test/excalidrawAttachmentRetention.test.ts",

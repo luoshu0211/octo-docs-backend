@@ -87,9 +87,17 @@ function mapKeys(body: unknown, decode: boolean, id: string): unknown {
 }
 
 export function errorForStatus(status: number, body: JsonRecord) {
-  const details = typeof body.error === 'string' && /^[a-z][a-z0-9_]{0,79}$/.test(body.error)
+  const details: JsonRecord | undefined = typeof body.error === 'string' && /^[a-z][a-z0-9_]{0,79}$/.test(body.error)
     ? { reason: body.error }
     : undefined
+  if (status === 413 && details?.reason === 'sheet_too_large') {
+    for (const key of ['baseVersion', 'repairDataValidationKey', 'hint']) {
+      if (typeof body[key] === 'string') details[snake(key)] = body[key]
+    }
+    for (const key of ['payloadBytes', 'limit']) {
+      if (typeof body[key] === 'number' && Number.isFinite(body[key])) details[snake(key)] = body[key]
+    }
+  }
   switch (status) {
     case 401: return new CliError('AUTH_REQUIRED')
     case 403: return new CliError('FORBIDDEN', details)
