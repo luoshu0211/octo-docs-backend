@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from 'vitest'
 import { generateKeyBetween } from 'fractional-indexing'
+import { config } from '../src/config/env.js'
 import { prepareExcalidrawImport, ExcalidrawImportError } from '../src/import/excalidraw.js'
+import { sanitizeSvg } from '../src/util/sanitizeSvg.js'
 
 const PNG = `data:image/png;base64,${Buffer.from([0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a,0,0,0,0]).toString('base64')}`
 const rect = (id: string, extra: Record<string, unknown> = {}) => ({ id, type: 'rectangle', version: 1, versionNonce: 1, x: 0, y: 0, width: 10, height: 10, ...extra })
@@ -56,6 +58,44 @@ describe('prepareExcalidrawImport', () => {
     await expect(prepareExcalidrawImport({ ...base, scene: { type: 'excalidraw', version: 2, elements: [rect('x'), rect('x')], files: {} } })).rejects.toMatchObject({ code: 'duplicate_element_id' })
     await expect(prepareExcalidrawImport({ ...base, scene: { type: 'excalidraw', version: 2, elements: [rect('x', { custom: 'data:text/plain;base64,QQ==' })], files: {} } })).rejects.toBeInstanceOf(ExcalidrawImportError)
     await expect(prepareExcalidrawImport({ ...base, scene: { type: 'excalidraw', version: 2, elements: [{ id: 'i', type: 'image', fileId: 'f' }], files: { f: { dataURL: 'data:image/png;base64,!!!!' } } } })).rejects.toMatchObject({ code: 'invalid_embedded_file' })
+  })
+
+  it('checks file metadata and decoded image size independently before uploading', async () => {
+    const upload = vi.fn()
+    const base = { docId: 'd1', uid: 'u1', upload, existingElements: [], existingFiles: {} }
+    const scene = { type: 'excalidraw', version: 2, elements: [{ id: 'i', type: 'image', fileId: 'f' }] }
+    await expect(prepareExcalidrawImport({
+      ...base,
+      scene: { ...scene, files: { f: { dataURL: PNG, extra: 'x'.repeat(config.boardSceneWrite.maxElementContentBytes) } } },
+    })).rejects.toMatchObject({ code: 'board_file_invalid' })
+
+    const oversized = Buffer.alloc(config.attachments.maxImageSizeBytes + 1)
+    Buffer.from(PNG.split(',')[1]!, 'base64').copy(oversized)
+    await expect(prepareExcalidrawImport({
+      ...base,
+      scene: { ...scene, files: { f: { dataURL: 'data:image/png;base64,' + oversized.toString('base64') } } },
+    })).rejects.toMatchObject({ code: 'embedded_file_too_large', status: 413 })
+    expect(upload).not.toHaveBeenCalled()
+  })
+
+  it('enforces the configured image size after expanding SVG markup during sanitation', async () => {
+    const upload = vi.fn()
+    const svg = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" style="fill:red"><circle r="1" /></svg>')
+    expect(sanitizeSvg(svg).length).toBeGreaterThan(svg.length)
+    const originalLimit = config.attachments.maxImageSizeBytes
+    config.attachments.maxImageSizeBytes = svg.length
+    try {
+      await expect(prepareExcalidrawImport({
+        docId: 'd1', uid: 'u1', upload, existingElements: [], existingFiles: {},
+        scene: {
+          type: 'excalidraw', version: 2, elements: [{ id: 'i', type: 'image', fileId: 'f' }],
+          files: { f: { dataURL: 'data:image/svg+xml;base64,' + svg.toString('base64') } },
+        },
+      })).rejects.toMatchObject({ code: 'embedded_file_too_large', status: 413 })
+    } finally {
+      config.attachments.maxImageSizeBytes = originalLimit
+    }
+    expect(upload).not.toHaveBeenCalled()
   })
 
   it('strictly requires Excalidraw type and version 2', async () => {

@@ -17,10 +17,13 @@ async function requireSpaceUser(uid: string, spaceId: string) {
     { 'x-internal-token': secret }, { user_id: uid, space_id: spaceId },
   ))().catch(() => { throw new CliError('UPSTREAM_UNAVAILABLE') })
   if (result.status === 404) throw new CliError('NOT_FOUND')
-  const body = result.body as { data?: { user?: { user_id?: string }; space?: { space_id?: string } } } | null
-  if (result.status !== 200 || body?.data?.user?.user_id !== uid || body.data.space?.space_id !== spaceId) {
+  const body = result.body as { data?: { user?: { user_id?: string; principal_type?: unknown }; space?: { space_id?: string } } } | null
+  const user = body?.data?.user
+  if (result.status !== 200 || user?.user_id !== uid || body?.data?.space?.space_id !== spaceId) {
     throw new CliError('UPSTREAM_UNAVAILABLE')
   }
+  if (user.principal_type === 'user_bot' || user.principal_type === 'app_bot') throw new CliError('NOT_FOUND')
+  if (user.principal_type !== 'human') throw new CliError('UPSTREAM_UNAVAILABLE')
 }
 
 async function requireCliAdminTx(tx: Tx, req: Request, authorized: DocMeta): Promise<DocMeta> {
@@ -34,6 +37,13 @@ async function requireCliAdminTx(tx: Tx, req: Request, authorized: DocMeta): Pro
     throw new CliError('CONFLICT', { reason: 'epoch_changed' })
   }
   return meta
+}
+
+export async function renameCliDoc(req: Request, authorized: DocMeta, title: string): Promise<void> {
+  await memberTransaction(async tx => {
+    const meta = await requireCliAdminTx(tx, req, authorized)
+    await docMetaRepo.rename(meta.doc_id, title, req.uid!, tx)
+  })
 }
 
 export async function setCliMember(req: Request, res: Response) {

@@ -674,7 +674,9 @@ paths:
         '503':
           $ref: '#/components/responses/UPSTREAM_UNAVAILABLE'
       x-octo-risk: read
-      description: The server selects the export renderer from the format and document type.
+      description: >-
+        The server selects the export renderer from the format and document type.
+        Embedding whiteboard images in SVG requires docs.attachments:read in addition to docs.content:read and the document reader role.
   /v2/cli/docs/{doc_id}/content:
     get:
       operationId: docs.content.get
@@ -906,7 +908,7 @@ paths:
       summary: Export the live whiteboard as PNG, SVG or Excalidraw
       description: >-
         Use --image-format png, svg or excalidraw. Excalidraw exports include referenced board images.
-        Embedding images requires docs.attachments:read in addition to docs.content:read and the document reader role.
+        Embedding images in SVG or Excalidraw requires docs.attachments:read in addition to docs.content:read and the document reader role.
       x-octo-risk: read
       x-octo-binary-response: true
       parameters:
@@ -1782,8 +1784,8 @@ paths:
       operationId: docs.members.set
       summary: Add or change a member's role by uid (upsert; needs admin)
       description: >-
-        Grant or update a verified user in the Token's Space. An explicitly supplied principal_space_id must match
-        that Space.
+        Grant or update a verified human user in the Token's Space. An explicitly supplied principal_space_id
+        must match that Space.
       x-octo-risk: write
       parameters:
         - name: doc_id
@@ -1983,8 +1985,8 @@ paths:
       operationId: docs.forward_grant
       summary: Grant or increase a user’s document access
       description: >-
-        Max-merge grant used when forwarding a doc to a chat recipient. Only reader, commenter, or writer is
-        grantable here; admin is not forward-grantable.
+        Max-merge grant used when forwarding a doc to a verified human recipient in the document's Space.
+        Reader, commenter, and writer are the supported grant roles.
       x-octo-risk: write
       parameters:
         - name: doc_id

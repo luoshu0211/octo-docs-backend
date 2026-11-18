@@ -392,8 +392,9 @@ export const docMetaRepo = {
     return rows[0]?.document_name ?? null
   },
 
-  async rename(docId: string, title: string, updatedBy = ''): Promise<void> {
-    await query('UPDATE doc_meta SET title = ?, updated_by = ? WHERE doc_id = ?', [title, updatedBy, docId])
+  async rename(docId: string, title: string, updatedBy = '', tx?: Tx): Promise<void> {
+    const db = tx ?? { query }
+    await db.query('UPDATE doc_meta SET title = ?, updated_by = ? WHERE doc_id = ?', [title, updatedBy, docId])
   },
 
   /**

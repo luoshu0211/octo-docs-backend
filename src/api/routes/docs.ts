@@ -41,6 +41,7 @@ import { resolveRole } from '../../permission/resolveRole.js'
 import { resolveRequestPrincipalSpace } from '../../permission/principalSpace.js'
 import { editPptLive } from '../../ppt/liveEdit.js'
 import { PptApiError, PPT_ERROR_STATUS } from '../ppt/envelope.js'
+import { renameCliDoc } from '../cliv2/access.js'
 import { resolveEffectiveRole } from '../../permission/resolveEffectiveRole.js'
 import { issueCollabTokenByDocId } from '../../auth/issueCollabToken.js'
 import { recordVerifiedRecentView } from '../services/recordRecentView.js'
@@ -919,7 +920,11 @@ async function renameDocById(req: Request, res: Response, docId: string): Promis
       if (error instanceof PptApiError) { res.status(error.httpStatus).json({ error: error.code.toLowerCase(), message: error.message }); return }
       throw error
     }
-  } else await docMetaRepo.rename(docId, title, req.uid!)
+  } else if (req.docSpaceScope?.mode === 'cli') {
+    await renameCliDoc(req, guard.meta, title)
+  } else {
+    await docMetaRepo.rename(docId, title, req.uid!)
+  }
   // Title lives in the search index (matched as title^2, returned as _source.title),
   // so a rename must re-index or the new title is missed / the stale one keeps
   // showing until an unrelated body edit reindexes. Enqueue a body signal: the

@@ -130,20 +130,9 @@ async function tryDownload(
   }
 }
 
-/**
- * Resolve the bytes for the scene's image elements, keyed by the element's
- * fileId. Walks image elements → files[fileId].attachId → the doc's attachment
- * rows → ObjectStore's server-side download path (bounded by count / per-image /
- * aggregate budgets). Best-effort: an unresolvable or oversize image is simply
- * omitted (rendered as a placeholder), never fatal — matching the PDF path.
- */
-async function resolveSceneImages(
-  docId: string,
+function referencedSceneImages(
   scene: { elements: Array<Record<string, unknown>>; files: Record<string, Record<string, unknown>> },
-): Promise<Map<string, ResolvedSceneImage>> {
-  const out = new Map<string, ResolvedSceneImage>()
-
-  // fileId -> attachId, only for image elements actually present in the scene.
+): Map<string, string> {
   const fileIdToAttach = new Map<string, string>()
   for (const el of scene.elements) {
     if (el.isDeleted === true || el.type !== 'image') continue
@@ -153,6 +142,19 @@ async function resolveSceneImages(
     const attachId = ref && typeof ref.attachId === 'string' ? ref.attachId : ''
     if (attachId) fileIdToAttach.set(fileId, attachId)
   }
+  return fileIdToAttach
+}
+
+/**
+ * Resolve referenced attachment bytes by fileId through the server-side
+ * ObjectStore path (bounded by count, per-image and aggregate budgets).
+ * Unresolvable and oversize images render as placeholders.
+ */
+async function resolveSceneImages(
+  docId: string,
+  fileIdToAttach: ReadonlyMap<string, string>,
+): Promise<Map<string, ResolvedSceneImage>> {
+  const out = new Map<string, ResolvedSceneImage>()
   if (fileIdToAttach.size === 0) return out
 
   const store = getObjectStore()
@@ -210,7 +212,13 @@ export async function exportBoardHandler(req: Request, res: Response): Promise<v
     throw err
   }
 
-  const images = await resolveSceneImages(guard.meta.doc_id, scene)
+  const references = referencedSceneImages(scene)
+  if (format === 'svg' && req.docSpaceScope?.mode === 'cli' &&
+      references.size > 0 && res.locals.cliCanReadAttachments !== true) {
+    res.status(403).json({ error: 'forbidden' })
+    return
+  }
+  const images = await resolveSceneImages(guard.meta.doc_id, references)
   const svg = serializeSceneToSvg(scene, images, { maxDimension: config.boardExport.maxSvgDimension })
 
   const fileName = `${guard.meta.doc_id}.${format}`

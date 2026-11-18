@@ -91,7 +91,6 @@ export async function prepareBoardComment(req: Request, res: Response, body: Rec
 }
 
 const maxPortableAttachments = 100
-const maxPortableAttachmentBytes = 20 << 20
 
 function portableMimeType(value: string): string {
   const mime = value.split(';', 1)[0]!.trim().toLowerCase()
@@ -133,7 +132,7 @@ export async function exportExcalidraw(req: Request, res: Response): Promise<voi
         created: typeof ref?.createdAt === 'number' ? ref.createdAt : 0, lastRetrieved: 0,
       }
       const overhead = Buffer.byteLength(JSON.stringify(fileId) + ':' + JSON.stringify(entry)) + 1
-      const maxBytes = Math.min(maxPortableAttachmentBytes, 3 * Math.floor((limit - used - overhead) / 4))
+      const maxBytes = Math.min(config.attachments.maxImageSizeBytes, 3 * Math.floor((limit - used - overhead) / 4))
       if (maxBytes < 1 || attachment.sizeBytes > maxBytes) throw new CliError('PAYLOAD_TOO_LARGE')
       let bytes: Uint8Array
       try {
@@ -152,6 +151,7 @@ export async function exportExcalidraw(req: Request, res: Response): Promise<voi
         try { image = sanitizeSvg(image) }
         catch { throw new CliError('CONFLICT', { reason: 'portable_attachment_invalid' }) }
       }
+      if (image.byteLength > maxBytes) throw new CliError('PAYLOAD_TOO_LARGE')
       const encoded = image.toString('base64')
       used += overhead + encoded.length
       if (used > limit) throw new CliError('PAYLOAD_TOO_LARGE')

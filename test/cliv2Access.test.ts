@@ -38,6 +38,11 @@ function request(uid = 'target', role = 'writer'): Request {
   } as unknown as Request
 }
 function response() { return { json: vi.fn() } as unknown as Response }
+function directoryResult(uid: string, principalType: unknown = 'human') {
+  return {
+    status: 200, body: { data: { user: { user_id: uid, principal_type: principalType }, space: { space_id: 's1' } } },
+  }
+}
 
 beforeEach(() => {
   vi.resetAllMocks()
@@ -49,9 +54,8 @@ beforeEach(() => {
   vi.stubEnv('OCTO_SERVER_INTERNAL_URL', 'http://127.0.0.1')
   vi.stubEnv('OCTO_MEMBERSHIP_INTERNAL_TOKEN', 'fixture-internal-secret')
   vi.mocked(requireDocRole).mockImplementation(async () => ({ meta: { ...meta }, role: 'admin' }))
-  vi.mocked(postCliService).mockImplementation(async (_url, _headers, input) => ({
-    status: 200, body: { data: { user: { user_id: (input as { user_id: string }).user_id }, space: { space_id: 's1' } } },
-  }))
+  vi.mocked(postCliService).mockImplementation(async (_url, _headers, input) =>
+    directoryResult((input as { user_id: string }).user_id))
   vi.mocked(refreshAndPublish).mockImplementation(async () => { events.push('publish') })
   vi.mocked(transaction).mockImplementation(async action => {
     const before = { meta: { ...meta }, members: new Map(members), notifications: [...notifications] }
@@ -102,11 +106,35 @@ const grants = [
 afterEach(() => { vi.unstubAllEnvs() })
 
 describe('CLI access mutations recheck authorization in their write transaction', () => {
+  describe.each(grants)('CLI %s recipient eligibility', (_name, grant, role) => {
+    it.each([
+      ['User Bot', 'user_bot', 'NOT_FOUND'],
+      ['App Bot', 'app_bot', 'NOT_FOUND'],
+      ['unknown principal', 'unknown', 'UPSTREAM_UNAVAILABLE'],
+      ['unrecognized type', 'service_account', 'UPSTREAM_UNAVAILABLE'],
+      ['mistyped principal', true, 'UPSTREAM_UNAVAILABLE'],
+    ])('rejects a matched Space recipient classified as %s', async (_kind, principalType, code) => {
+      vi.mocked(postCliService).mockResolvedValueOnce(directoryResult('target', principalType))
+      await expect(grant(request('target', role), response())).rejects.toMatchObject({ code })
+      expect(transaction).not.toHaveBeenCalled()
+      expect(refreshAndPublish).not.toHaveBeenCalled()
+    })
+
+    it('requires the directory response to carry a principal type', async () => {
+      vi.mocked(postCliService).mockResolvedValueOnce({
+        status: 200, body: { data: { user: { user_id: 'target' }, space: { space_id: 's1' } } },
+      })
+      await expect(grant(request('target', role), response())).rejects.toMatchObject({ code: 'UPSTREAM_UNAVAILABLE' })
+      expect(transaction).not.toHaveBeenCalled()
+      expect(refreshAndPublish).not.toHaveBeenCalled()
+    })
+  })
+
   it.each(grants)('rejects %s to self after admin is revoked during identity lookup', async (_name, grant, role) => {
     vi.mocked(postCliService).mockImplementationOnce(async () => {
       members.delete('admin@s1')
       meta.permission_epoch += 1
-      return { status: 200, body: { data: { user: { user_id: 'admin' }, space: { space_id: 's1' } } } }
+      return directoryResult('admin')
     })
     const res = response()
     await expect(grant(request('admin', role), res)).rejects.toMatchObject({ code: 'FORBIDDEN', status: 403 })
@@ -122,7 +150,7 @@ describe('CLI access mutations recheck authorization in their write transaction'
   it.each(grants)('rejects %s when the epoch changes while the actor remains admin', async (_name, grant, role) => {
     vi.mocked(postCliService).mockImplementationOnce(async () => {
       meta.permission_epoch += 1
-      return { status: 200, body: { data: { user: { user_id: 'target' }, space: { space_id: 's1' } } } }
+      return directoryResult('target')
     })
     await expect(grant(request('target', role), response())).rejects.toMatchObject({
       code: 'CONFLICT', details: { reason: 'epoch_changed' },
@@ -134,7 +162,7 @@ describe('CLI access mutations recheck authorization in their write transaction'
   it('rejects a role downgrade even before the revocation epoch is updated', async () => {
     vi.mocked(postCliService).mockImplementationOnce(async () => {
       members.set('admin@s1', 1)
-      return { status: 200, body: { data: { user: { user_id: 'admin' }, space: { space_id: 's1' } } } }
+      return directoryResult('admin')
     })
     await expect(setCliMember(request('admin', 'admin'), response())).rejects.toMatchObject({ code: 'FORBIDDEN' })
     expect(members.get('admin@s1')).toBe(1)

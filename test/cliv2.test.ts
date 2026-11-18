@@ -24,6 +24,7 @@ import { docsOperations } from '../src/api/cliv2/operations.js'
 import { createApp } from '../src/api/app.js'
 import { docMemberRepo } from '../src/db/repos/docMemberRepo.js'
 import { docMetaRepo, type DocMeta } from '../src/db/repos/docMetaRepo.js'
+import * as pool from '../src/db/pool.js'
 
 type ReadSchemas = {
   ErrorResponse: {
@@ -176,20 +177,61 @@ describe('Docs CLI v2 read pilot', () => {
     expect(requests).toHaveLength(token ? 1 : 0)
   })
 
-  it('uses the existing rename transaction with the token user and skips writes outside its Space', async () => {
-    const rename = vi.spyOn(docMetaRepo, 'rename').mockResolvedValue(undefined)
-    const patch = (id: string) => fetch(appOrigin + endpoint + '/' + id, {
+  function patchTitle(id: string, token = 'valid') {
+    return fetch(appOrigin + endpoint + '/' + id, {
       method: 'PATCH',
-      headers: { authorization: 'Bearer valid', 'content-type': 'application/json', 'x-space-id': 'space_b' },
+      headers: { authorization: 'Bearer ' + token, 'content-type': 'application/json', 'x-space-id': 'space_b' },
       body: JSON.stringify({ title: 'New name' }),
     })
-    const ok = await patch(doc.doc_id)
+  }
+
+  function mockRenameTransaction(current: DocMeta | null, memberRole?: number) {
+    const query = vi.fn().mockImplementation(async (sql: string) => {
+      if (sql.startsWith('SELECT * FROM doc_meta') && sql.endsWith('FOR UPDATE')) return current ? [current] : []
+      if (sql.startsWith('SELECT role FROM doc_member') && sql.endsWith('FOR UPDATE')) {
+        return memberRole === undefined ? [] : [{ role: memberRole }]
+      }
+      if (sql.startsWith('UPDATE doc_meta SET title')) return []
+      throw new Error('Unexpected query: ' + sql)
+    })
+    const transaction = vi.spyOn(pool, 'transaction').mockImplementation(fn => fn({ query, execute: vi.fn() }))
+    return { query, transaction }
+  }
+
+  it.each([
+    ['owner', 'valid', 'user_a'],
+    ['member admin', 'other-user', 'user_b'],
+  ])('renames as the %s in the transaction and skips writes outside the token Space', async (_role, token, uid) => {
+    vi.mocked(docMemberRepo.getRole).mockResolvedValue('admin')
+    const { query, transaction } = mockRenameTransaction(doc, 3)
+    const ok = await patchTitle(doc.doc_id, token)
     expect(ok.status).toBe(200)
     expect(await ok.json()).toEqual({ data: { doc_id: doc.doc_id, title: 'New name' } })
-    const other = await patch(foreign.doc_id)
+    const other = await patchTitle(foreign.doc_id, token)
     expect(other.status).toBe(404)
-    expect(rename).toHaveBeenCalledTimes(1)
-    expect(rename).toHaveBeenCalledWith(doc.doc_id, 'New name', 'user_a')
+    expect(transaction).toHaveBeenCalledOnce()
+    expect(query).toHaveBeenNthCalledWith(1, expect.stringMatching(/^SELECT .* FOR UPDATE$/), [doc.doc_id])
+    if (uid === 'user_b') {
+      expect(query).toHaveBeenNthCalledWith(2, expect.stringMatching(/^SELECT role .* FOR UPDATE$/), [doc.doc_id, uid, 'space_a'])
+    }
+    expect(query).toHaveBeenLastCalledWith(expect.stringMatching(/^UPDATE doc_meta SET title/), ['New name', uid, doc.doc_id])
+  })
+
+  it.each([
+    ['the member is removed', doc, undefined, 403, 'FORBIDDEN'],
+    ['the member is downgraded', doc, 2, 403, 'FORBIDDEN'],
+    ['the document is deleted', { ...doc, status: 0 }, 3, 404, 'NOT_FOUND'],
+    ['the document is archived', { ...doc, status: 2 }, 3, 409, 'CONFLICT'],
+    ['the epoch changes', { ...doc, permission_epoch: 2 }, 3, 409, 'CONFLICT'],
+    ['the document changes Space', { ...doc, space_id: 'space_b' }, 3, 404, 'NOT_FOUND'],
+  ] as const)('skips renaming when %s after the initial guard', async (_reason, current, role, status, code) => {
+    vi.mocked(docMemberRepo.getRole).mockResolvedValue('admin')
+    const { query, transaction } = mockRenameTransaction(current, role)
+    const response = await patchTitle(doc.doc_id, 'other-user')
+    expect(response.status).toBe(status)
+    expect(await response.json()).toMatchObject({ error: { code } })
+    expect(transaction).toHaveBeenCalledOnce()
+    expect(query.mock.calls.every(([sql]) => sql.startsWith('SELECT'))).toBe(true)
   })
 
   it('gates generated and workflow routes with the same authentication', async () => {
@@ -502,6 +544,37 @@ describe('Docs CLI v2 workflows', () => {
     expect(download).not.toHaveBeenCalled()
   })
 
+  it.each(['/scene/_export', '/_export'])('checks attachment permission before SVG embedding at %s', async path => {
+    const png = createCanvas(1, 1).toBuffer('image/png')
+    const image = { id: 'image', type: 'image', index: 'a0', fileId: 'BinaryId', x: 0, y: 0, width: 1, height: 1 }
+    const refs = { BinaryId: { attachId: 'att_A' } }
+    const state = vi.spyOn(liveRead, 'readLiveDocState').mockResolvedValue(boardState([image], refs))
+    const attachments = vi.spyOn(docAttachmentRepo, 'listByDoc').mockResolvedValue([{
+      attachId: 'att_A', docId: board.doc_id, objectKey: 'b_same/att_A/image.png',
+      mime: 'image/png', sizeBytes: png.length, fileName: 'image.png', createdBy: 'user_a', createdAt: date,
+    }])
+    const download = vi.fn().mockResolvedValue(png)
+    vi.spyOn(objectStore, 'getObjectStore').mockReturnValue({ download } as unknown as objectStore.ObjectStore)
+    const url = endpoint + '/b_same' + path + '?format=svg'
+
+    const denied = await read(url, 'content-only')
+    expect(denied.status).toBe(403)
+    expect(await denied.json()).toMatchObject({ error: { code: 'FORBIDDEN' } })
+    expect(attachments).not.toHaveBeenCalled()
+    expect(download).not.toHaveBeenCalled()
+
+    const allowed = await read(url, 'workflows')
+    expect(allowed.status).toBe(200)
+    expect(await allowed.text()).toContain('data:image/png;base64,' + png.toString('base64'))
+
+    state.mockResolvedValue(boardState([{ ...image, isDeleted: true }], refs))
+    const withoutImage = await read(url, 'content-only')
+    expect(withoutImage.status).toBe(200)
+    expect(await withoutImage.text()).not.toContain('data:image/png;base64,')
+    expect(attachments).toHaveBeenCalledOnce()
+    expect(download).toHaveBeenCalledOnce()
+  })
+
   it('requires a document reader role even with both portable export Actions', async () => {
     vi.mocked(docMetaRepo.getByDocId).mockResolvedValue({ ...board, owner_id: 'different-user' })
     const scene = vi.spyOn(liveRead, 'readLiveDocState')
@@ -524,16 +597,27 @@ describe('Docs CLI v2 workflows', () => {
   })
 
   it.each([
-    ['image/x-png', 'image/png'],
-    ['IMAGE/PNG; charset=binary', 'image/png'],
-    ['image/jpg', 'image/jpeg'],
-    ['image/pjpeg', 'image/jpeg'],
-    ['image/jpeg; charset=binary', 'image/jpeg'],
-    ['image/webp', 'image/webp'],
-    ['IMAGE/WEBP; charset=binary', 'image/webp'],
-    ['image/svg+xml', 'image/svg+xml'],
-  ])('round-trips a portable attachment declared as %s', async (declaredMime, normalizedMime) => {
-    const canvas = createCanvas(1, 1)
+    ['image/x-png', 'image/png', 1],
+    ['IMAGE/PNG; charset=binary', 'image/png', 1],
+    ['image/png', 'image/png', 256],
+    ['image/jpg', 'image/jpeg', 1],
+    ['image/pjpeg', 'image/jpeg', 1],
+    ['image/jpeg; charset=binary', 'image/jpeg', 1],
+    ['image/webp', 'image/webp', 1],
+    ['IMAGE/WEBP; charset=binary', 'image/webp', 1],
+    ['image/svg+xml', 'image/svg+xml', 1],
+  ])('round-trips a portable attachment declared as %s (%s, %ipx)', async (declaredMime, normalizedMime, size) => {
+    const canvas = createCanvas(size, size)
+    if (size > 1) {
+      const ctx = canvas.getContext('2d')
+      const pixels = ctx.createImageData(size, size)
+      let seed = 1
+      for (let i = 0; i < pixels.data.length; i++) {
+        seed = Math.imul(seed, 1664525) + 1013904223
+        pixels.data[i] = i % 4 === 3 ? 255 : seed >>> 24
+      }
+      ctx.putImageData(pixels, 0, 0)
+    }
     let image: Buffer
     if (normalizedMime === 'image/svg+xml') {
       image = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script><rect width="1" height="1"/></svg>')
@@ -545,6 +629,7 @@ describe('Docs CLI v2 workflows', () => {
       image = canvas.toBuffer('image/jpeg')
     }
     const portableBytes = normalizedMime === 'image/svg+xml' ? sanitizeSvg(image) : image
+    if (size > 1) expect(image.length).toBeGreaterThan(config.boardSceneWrite.maxElementContentBytes)
     vi.spyOn(liveRead, 'readLiveDocState').mockResolvedValue(boardState([
       { id: 'image', type: 'image', index: 'a0', x: 0, y: 0, width: 1, height: 1, fileId: 'BinaryId' },
     ], { BinaryId: { attachId: 'att_A' } }))

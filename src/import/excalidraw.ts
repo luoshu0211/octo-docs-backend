@@ -82,11 +82,14 @@ function decodeDataUrl(raw: string): { bytes: Buffer; mime: string } {
   if (!match || !match[1] || match[2] === undefined || match[2].length === 0 || match[2].length % 4 === 1) {
     throw new ExcalidrawImportError('invalid_embedded_file')
   }
+  const base64 = match[2].replace(/=+$/, '')
+  if (Math.floor(base64.length * 3 / 4) > config.attachments.maxImageSizeBytes) {
+    throw new ExcalidrawImportError('embedded_file_too_large', 413)
+  }
   const bytes = Buffer.from(match[2], 'base64')
-  if (bytes.length === 0 || bytes.toString('base64').replace(/=+$/, '') !== match[2].replace(/=+$/, '')) {
+  if (bytes.length === 0 || bytes.toString('base64').replace(/=+$/, '') !== base64) {
     throw new ExcalidrawImportError('invalid_embedded_file')
   }
-  if (bytes.length > config.attachments.maxImageSizeBytes) throw new ExcalidrawImportError('embedded_file_too_large', 413)
   let mime = sniffImageMime(bytes)
   let clean: Buffer<ArrayBufferLike> = bytes
   // An SVG root is only a format candidate, not proof that the active XML is
@@ -94,6 +97,7 @@ function decodeDataUrl(raw: string): { bytes: Buffer; mime: string } {
   // identified by sniffImageMime.
   if (!mime || mime === 'image/svg+xml') {
     try { clean = sanitizeSvg(bytes); mime = 'image/svg+xml' } catch { throw new ExcalidrawImportError('invalid_embedded_file') }
+    if (clean.length > config.attachments.maxImageSizeBytes) throw new ExcalidrawImportError('embedded_file_too_large', 413)
   }
   if (match[1].toLowerCase() !== mime) {
     const jpegAlias = match[1].toLowerCase() === 'image/jpg' && mime === 'image/jpeg'
@@ -193,14 +197,15 @@ export async function prepareExcalidrawImport(input: {
   // has normalized successfully and passed the no-inline-data assertion.
   const stagedFiles = new Map<string, { bytes: Buffer; mime: string; createdAt?: number }>()
   for (const [oldFid, raw] of Object.entries(rawFiles)) {
-    if (!raw || typeof raw !== 'object' || Array.isArray(raw) || byteSize(raw) > config.boardSceneWrite.maxElementContentBytes) throw new ExcalidrawImportError('board_file_invalid')
-    const source = raw as Record<string, unknown>
-    if (typeof source.dataURL !== 'string') throw new ExcalidrawImportError('invalid_embedded_file')
-    const { bytes, mime } = decodeDataUrl(source.dataURL)
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new ExcalidrawImportError('board_file_invalid')
+    const { dataURL, ...metadata } = raw as Record<string, unknown>
+    if (byteSize(metadata) > config.boardSceneWrite.maxElementContentBytes) throw new ExcalidrawImportError('board_file_invalid')
+    if (typeof dataURL !== 'string') throw new ExcalidrawImportError('invalid_embedded_file')
+    const { bytes, mime } = decodeDataUrl(dataURL)
     stagedFiles.set(oldFid, {
       bytes,
       mime,
-      ...(typeof source.created === 'number' && Number.isFinite(source.created) ? { createdAt: source.created } : {}),
+      ...(typeof metadata.created === 'number' && Number.isFinite(metadata.created) ? { createdAt: metadata.created } : {}),
     })
   }
 
