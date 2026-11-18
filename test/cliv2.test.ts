@@ -12,6 +12,7 @@ import * as liveSheet from '../src/collab/liveSheetWrite.js'
 import * as editSheet from '../src/api/services/editDocSheet.js'
 import * as objectStore from '../src/storage/objectStore.js'
 import { config } from '../src/config/env.js'
+import { prosemirrorJSONToYDocState } from '../src/agent/conversion.js'
 import { SHEET_DATA_VALIDATIONS_FIELD, SHEET_LIST_FIELD, SHEET_YMAP_FIELD } from '../src/agent/sheetConversion.js'
 import { encodeBaseVersion } from '../src/collab/docBodyEdit.js'
 import { sanitizeSvg } from '../src/util/sanitizeSvg.js'
@@ -92,7 +93,9 @@ beforeEach(async () => {
         subject_id: body.token === 'malformed' ? 'wrong-user' : owner, space_id: 'space_a',
       },
       permissions: [
-        { domain: 'docs.documents', actions: body.token === 'no-action' ? ['docs.content:*'] : ['docs.documents:*'] },
+        ...(body.token === 'content-only' ? [] : [
+          { domain: 'docs.documents', actions: body.token === 'no-action' ? ['docs.content:*'] : ['docs.documents:*'] },
+        ]),
         ...(['workflows', 'comment-only'].includes(body.token) ? [{
           domain: 'docs.comments', actions: body.token === 'workflows' ? ['docs.comments:*'] : ['docs.comments:write'],
         }] : []),
@@ -282,6 +285,50 @@ function boardState(elements: Array<Record<string, unknown>>, files: Record<stri
 }
 
 describe('Docs CLI v2 workflows', () => {
+  it('includes signed file links in content-only exports and requires attachment access for direct URLs', async () => {
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue({ ...doc, owner_id: 'different-user' })
+    vi.mocked(docMemberRepo.getRole).mockResolvedValue('reader')
+    vi.spyOn(liveRead, 'readLiveDocState').mockResolvedValue(prosemirrorJSONToYDocState({
+      type: 'doc',
+      content: [{ type: 'fileAttachment', attrs: { attachId: 'att_ref', fileName: 'report.txt' } }],
+    }))
+    const attachment = {
+      attachId: 'att_ref', docId: doc.doc_id, objectKey: doc.doc_id + '/att_ref/report.txt',
+      fileName: 'report.txt', mime: 'text/plain', sizeBytes: 12, createdBy: 'user_a', createdAt: date,
+    }
+    vi.spyOn(docAttachmentRepo, 'listByDoc').mockResolvedValue([attachment, {
+      ...attachment, attachId: 'att_unused', objectKey: doc.doc_id + '/att_unused/report.txt',
+    }])
+    const lookup = vi.spyOn(docAttachmentRepo, 'getById').mockResolvedValue(attachment)
+    const signed = 'https://attachments.example.test/report.txt?signature=fixture'
+    const presignGet = vi.fn().mockReturnValue(signed)
+    vi.spyOn(objectStore, 'getObjectStore').mockReturnValue({ presignGet } as unknown as objectStore.ObjectStore)
+
+    const docUrl = endpoint + '/' + doc.doc_id
+    const markdown = await read(docUrl + '/_export?format=md', 'content-only')
+    expect(markdown.status).toBe(200)
+    expect(await markdown.text()).toContain(signed)
+    const docx = await read(docUrl + '/_export?format=docx', 'content-only')
+    expect(docx.status).toBe(200)
+    const JSZip = (await import('jszip')).default
+    const zip = await JSZip.loadAsync(await docx.arrayBuffer())
+    expect(await zip.file('word/_rels/document.xml.rels')?.async('string')).toContain(signed)
+
+    const single = await read(docUrl + '/attachments/att_ref', 'content-only')
+    const batch = await post('/' + doc.doc_id + '/attachments/_resolve', JSON.stringify({
+      attach_ids: ['att_ref'],
+    }), 'application/json', 'content-only')
+    for (const response of [single, batch]) {
+      expect(response.status).toBe(403)
+      expect(await response.json()).toMatchObject({ error: { code: 'FORBIDDEN' } })
+    }
+    expect(lookup).not.toHaveBeenCalled()
+    expect(presignGet.mock.calls.map(([key, ttl]) => [key, ttl])).toEqual([
+      [attachment.objectKey, config.attachments.readUrlTtlSeconds],
+      [attachment.objectKey, config.attachments.readUrlTtlSeconds],
+    ])
+  })
+
   it.each([false, true])('matches the cursor contract with has_more=%s', async hasMore => {
     const comment: DocComment = {
       id: 71, docId: doc.doc_id, documentName: doc.document_name, parentId: null,

@@ -676,6 +676,12 @@ paths:
       x-octo-risk: read
       description: >-
         The server selects the export renderer from the format and document type.
+        For Markdown (`md`) and DOCX (`docx`), `docs.content:read` and the document reader role also
+        authorize exports to sign temporary URLs for attachments that belong to and are referenced by the document.
+        Markdown may include signed image and file URLs. DOCX may include signed file download links and
+        embed supported images. A signed URL grants access to the original attachment until it expires.
+        Requesting signed URLs directly through
+        `docs.attachments.get` or `docs.attachments.resolve` requires `docs.attachments:read` and the document reader role.
         Embedding whiteboard images in SVG requires docs.attachments:read in addition to docs.content:read and the document reader role.
   /v2/cli/docs/{doc_id}/content:
     get:
