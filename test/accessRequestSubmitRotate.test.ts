@@ -11,12 +11,12 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 // ON DUPLICATE KEY UPDATE so every submission rotates to a fresh id; a stale
 // card's request_id then matches no row and the callback resolves not_found.
 //
-// We mock the pool's `query` so the SQL + bind order are asserted and the
-// read-back-authoritative-row contract is locked without a DB.
+// The transaction mock captures the request SQL and the matching inbox write.
 const query = vi.fn()
 vi.mock('../src/db/pool.js', () => ({
   query: (...args: unknown[]) => query(...args),
   getPool: () => ({ execute: vi.fn() }),
+  transaction: async (fn: (tx: { execute: typeof query }) => Promise<unknown>) => fn({ execute: query }),
 }))
 // Deterministic id so we can assert it flows into the INSERT bind AND the update.
 vi.mock('../src/util/ids.js', () => ({ newRequestId: () => 'rotated-id-2' }))
@@ -85,7 +85,7 @@ describe('docAccessRequestRepo.submit — request_id rotation on re-submit', () 
     expect(insertSql).toContain('ON DUPLICATE KEY UPDATE')
   })
 
-  it('returns the read-back authoritative request_id (the rotated value)', async () => {
+  it('records the rotated request_id in the same transaction as its approver event', async () => {
     query
       .mockResolvedValueOnce(undefined)
       .mockResolvedValueOnce([{ request_id: 'rotated-id-2', status: REQUEST_STATUS_PENDING }])
@@ -93,6 +93,7 @@ describe('docAccessRequestRepo.submit — request_id rotation on re-submit', () 
     const out = await docAccessRequestRepo.submit(params)
     expect(out.requestId).toBe('rotated-id-2')
     expect(out.status).toBe(REQUEST_STATUS_PENDING)
+    expect(query.mock.calls[1]?.[1]).toContain(out.requestId)
   })
 
   it('binds a normalized bot_uids JSON snapshot and rotates it via VALUES(bot_uids)', async () => {

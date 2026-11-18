@@ -349,6 +349,7 @@ describe("PUT /api/v1/docs/:docId/members — anti ghost-member check", () => {
       principalSpaceId: "s_other",
       roleNum: 2,
       grantedBy: "u_admin",
+      notifyRecipient: true,
     });
     expect(docMemberRepo.upsertDirect).not.toHaveBeenCalled();
   });
@@ -834,6 +835,7 @@ describe("DELETE /api/v1/docs/:docId/members/:uid — Human creator Bot cascade"
       uid: "u_human",
       principalSpaceId: "s_home",
       botUids: ["bot_a", "bot_b"],
+      notifyFromUid: "u_admin",
     });
     expect(docMemberRepo.removePrincipalExact).not.toHaveBeenCalled();
     expect(refreshAndPublish).toHaveBeenCalledWith("doc-d_1", 8);
@@ -935,6 +937,7 @@ describe("DELETE /api/v1/docs/:docId/members/:uid — Human creator Bot cascade"
       uid: "u_admin",
       principalSpaceId: "s_other",
       botUids: [],
+      notifyFromUid: "u_admin",
     });
   });
 });
