@@ -19,6 +19,7 @@ import { errorForStatus } from '../src/api/cliv2/adapter.js'
 import { docAttachmentRepo } from '../src/db/repos/docAttachmentRepo.js'
 import { docCommentRepo, type DocComment } from '../src/db/repos/docCommentRepo.js'
 import { prepareExcalidrawImport } from '../src/import/excalidraw.js'
+import { validateBoardOps } from '../src/whiteboard/boardEdit.js'
 import { selectionAnchor } from '../src/api/cliv2/boardGeometry.js'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { docsOperations } from '../src/api/cliv2/operations.js'
@@ -657,6 +658,56 @@ describe('Docs CLI v2 workflows', () => {
     expect(attachments).not.toHaveBeenCalled()
     expect(download).not.toHaveBeenCalled()
     expect(upload).not.toHaveBeenCalled()
+  })
+
+  it.each(['text', 'line'] as const)('enforces the portable element byte limit after preparing a %s for export', async type => {
+    const elementSize = (element: unknown) => Buffer.byteLength(JSON.stringify(element))
+    const asExported = (element: Record<string, unknown>) => type === 'line'
+      ? { ...element, lastCommittedPoint: null }
+      : element
+    function prepare(payload: string) {
+      const fields = type === 'text' ? { text: payload } : {
+        points: [[0, 0], [10, 10]], customData: { payload },
+      }
+      const input = { id: 'large', type, index: 'a0', ...fields }
+      const [stored] = validateBoardOps({ elements: [input] }).upserts
+      return { input, stored: stored! }
+    }
+
+    const limit = config.boardSceneWrite.maxElementContentBytes
+    const padding = limit - elementSize(asExported(prepare('').stored))
+    const payload = '白'.repeat(Math.floor(padding / 3)) + 'x'.repeat(padding % 3)
+    const atLimit = prepare(payload).stored
+    const oversized = prepare(payload + 'x')
+    expect(elementSize(oversized.input)).toBeLessThanOrEqual(limit)
+    expect(elementSize(asExported(oversized.stored))).toBe(limit + 1)
+    expect(elementSize(oversized.stored)).toBe(type === 'text' ? limit + 1 : limit + 1 - Buffer.byteLength(',"lastCommittedPoint":null'))
+
+    const deleted = { ...oversized.stored, id: 'deleted', isDeleted: true }
+    const state = vi.spyOn(liveRead, 'readLiveDocState').mockResolvedValue(boardState([atLimit, deleted]))
+    const url = endpoint + '/b_same/scene/_export?format=excalidraw'
+    const allowed = await read(url, 'workflows')
+    expect(allowed.status).toBe(200)
+    const scene = await allowed.json()
+    expect(scene.elements).toHaveLength(1)
+    expect(elementSize(scene.elements[0])).toBe(limit)
+    const importInput = { docId: board.doc_id, uid: 'user_a', existingElements: [], existingFiles: {} }
+    const imported = await prepareExcalidrawImport({ ...importInput, scene })
+    expect(imported.elements.map(element => element.id)).toEqual([atLimit.id])
+
+    const attachments = vi.spyOn(docAttachmentRepo, 'listByDoc').mockResolvedValue([])
+    state.mockResolvedValue(boardState([
+      oversized.stored, { id: 'image', type: 'image', index: 'a1', fileId: 'f1' },
+    ], { f1: { attachId: 'att_A' } }))
+    const denied = await read(url, 'workflows')
+    expect(denied.status).toBe(413)
+    expect(await denied.json()).toMatchObject({
+      error: { code: 'PAYLOAD_TOO_LARGE', details: { reason: 'element_too_large' } },
+    })
+    expect(attachments).not.toHaveBeenCalled()
+    await expect(prepareExcalidrawImport({
+      ...importInput, scene: { ...scene, elements: [asExported(oversized.stored)] },
+    })).rejects.toMatchObject({ code: 'element_too_large', status: 413 })
   })
 
   it.each(['content-only', 'attachments-only'])('rejects portable images for %s before attachment lookup or download', async token => {

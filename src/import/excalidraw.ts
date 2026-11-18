@@ -37,6 +37,10 @@ function byteSize(v: unknown): number {
   try { return Buffer.byteLength(JSON.stringify(v)) } catch { throw new ExcalidrawImportError('invalid_excalidraw') }
 }
 
+export function exceedsExcalidrawElementSizeLimit(element: unknown): boolean {
+  return byteSize(element) > config.boardSceneWrite.maxElementContentBytes
+}
+
 function remapReferences(el: Record<string, unknown>, elementIds: Map<string, string>, fileIds: Map<string, string>): void {
   const mapElement = (v: unknown) => typeof v === 'string' ? (elementIds.get(v) ?? v) : v
   if (typeof el.frameId === 'string') el.frameId = mapElement(el.frameId)
@@ -220,7 +224,7 @@ export async function prepareExcalidrawImport(input: {
   const allImportedIds = new Set(elementIds.values())
   const allFileIds = new Set(fileIds.values())
   const elements = scene.elements.map((raw, i) => {
-    if (byteSize(raw) > config.boardSceneWrite.maxElementContentBytes) throw new ExcalidrawImportError('element_too_large', 413)
+    if (exceedsExcalidrawElementSizeLimit(raw)) throw new ExcalidrawImportError('element_too_large', 413)
     const out = { ...(raw as Record<string, unknown>), id: elementIds.get((raw as Record<string, unknown>).id as string)!, index: indices[i] }
     remapReferences(out, elementIds, fileIds)
     remapGroups(out, groupIds)
