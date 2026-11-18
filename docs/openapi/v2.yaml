@@ -150,6 +150,46 @@ paths:
       x-octo-principal: token_user
       x-octo-action: docs.documents:write
       x-octo-retry: never
+  /v2/cli/docs/_metadata:
+    post:
+      tags:
+        - docs
+      operationId: docs.metadata.get
+      summary: Read document actor metadata in a batch
+      description: Return metadata for up to 500 IDs, omitting documents outside the token Space or without reader access.
+      x-octo-action: docs.documents:read
+      x-octo-principal: token_user
+      x-octo-risk: read
+      x-octo-cli-hidden: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DocsMetadataRequest'
+      responses:
+        '200':
+          description: Actor metadata for readable active documents.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocsMetadataResponse'
+        '400':
+          $ref: '#/components/responses/VALIDATION_ERROR'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          $ref: '#/components/responses/FORBIDDEN'
+        '404':
+          $ref: '#/components/responses/NOT_FOUND'
+        '413':
+          $ref: '#/components/responses/PAYLOAD_TOO_LARGE'
+        '429':
+          $ref: '#/components/responses/RATE_LIMITED'
+        '500':
+          $ref: '#/components/responses/INTERNAL_ERROR'
+        '503':
+          $ref: '#/components/responses/UPSTREAM_UNAVAILABLE'
   /v2/cli/docs/{doc_id}:
     get:
       tags:
@@ -2907,6 +2947,45 @@ components:
           schema:
             $ref: '#/components/schemas/ErrorResponse'
   schemas:
+    DocsMetadataRequest:
+      type: object
+      required:
+        - doc_ids
+      properties:
+        doc_ids:
+          type: array
+          maxItems: 500
+          items:
+            type: string
+    DocsMetadataResponse:
+      type: object
+      required:
+        - data
+      properties:
+        data:
+          type: object
+          required:
+            - items
+          properties:
+            items:
+              type: array
+              items:
+                type: object
+                required:
+                  - doc_id
+                  - created_by
+                  - updated_by
+                  - updated_at
+                properties:
+                  doc_id:
+                    type: string
+                  created_by:
+                    type: string
+                  updated_by:
+                    type: string
+                  updated_at:
+                    type: string
+                    format: date-time
     DocsImportDocxResponse:
       type: object
       properties:
@@ -3021,6 +3100,7 @@ components:
                 - NOT_FOUND
                 - CONFLICT
                 - VALIDATION_ERROR
+                - PAYLOAD_TOO_LARGE
                 - RATE_LIMITED
                 - INTERNAL_ERROR
                 - UPSTREAM_UNAVAILABLE

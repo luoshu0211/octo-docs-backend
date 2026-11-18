@@ -173,7 +173,7 @@ describe('Docs CLI v2 read pilot', () => {
   })
 
   it('gates generated and workflow routes with the same authentication', async () => {
-    expect(docsOperations).toHaveLength(48)
+    expect(docsOperations).toHaveLength(49)
     const responses = await Promise.all(docsOperations.map(async ([method, path]) =>
       fetch(appOrigin + '/v2/cli' + path.replace(/:[a-z_]+/g, 'fixture_id'), { method: method.toUpperCase() })))
     expect(responses.map(response => response.status)).toEqual(docsOperations.map(() => 401))
@@ -246,6 +246,38 @@ describe('Docs CLI v2 workflows', () => {
     const properties = schemas.DocsShareGetResponse.properties.data.properties
     expect(properties.share_scope.enum).toContain(body.data.share_scope)
     expect(properties.share_role.enum).toContain(body.data.share_role)
+  })
+
+  it('reads a metadata batch as the token user and omits unreadable or foreign documents', async () => {
+    const ids = Array.from({ length: 301 }, (_, index) => 'batch-' + index)
+    vi.mocked(docMetaRepo.getByDocId).mockImplementation(async (id) => {
+      if (id.startsWith('batch-')) return { ...doc, doc_id: id }
+      if (id === 'denied') return { ...doc, doc_id: id, owner_id: 'user_b' }
+      if (id === 'archived') return { ...doc, doc_id: id, status: 2 }
+      if (id === foreign.doc_id) return foreign
+      return null
+    })
+    const response = await post('/_metadata', JSON.stringify({
+      doc_ids: [...ids, ids[0], foreign.doc_id, 'denied', 'archived', 'missing'],
+    }), 'application/json', 'valid')
+    expect(response.status).toBe(200)
+    const body = await response.json() as { data: { items: Array<Record<string, unknown>> } }
+    expect(body.data.items).toHaveLength(ids.length)
+    expect(body.data.items.map(item => item.doc_id)).toEqual(ids)
+    expect(body.data.items[0]).toEqual({
+      doc_id: ids[0], created_by: 'user_a', updated_by: 'user_a', updated_at: date.toISOString(),
+    })
+    expect(requests).toHaveLength(1)
+    expect(docMemberRepo.getRole).not.toHaveBeenCalledWith(foreign.doc_id, expect.anything(), expect.anything())
+  })
+
+  it('rejects invalid metadata batches before document reads', async () => {
+    for (const docIds of [Array(501).fill('d_same'), ['d_same', 42]]) {
+      const response = await post('/_metadata', JSON.stringify({ doc_ids: docIds }), 'application/json', 'valid')
+      expect(response.status).toBe(400)
+      expect(await response.json()).toMatchObject({ error: { code: 'VALIDATION_ERROR' } })
+    }
+    expect(docMetaRepo.getByDocId).not.toHaveBeenCalled()
   })
 
   it('applies raw Markdown as the token user, even if the client sends the legacy preview header', async () => {
