@@ -5,6 +5,7 @@ import { config } from '../../config/env.js'
 import { docAttachmentRepo } from '../../db/repos/docAttachmentRepo.js'
 import { getObjectStore } from '../../storage/objectStore.js'
 import { sniffImageMime } from '../../import/docx/media.js'
+import { exceedsExcalidrawEntryLimit } from '../../import/excalidraw.js'
 import { sanitizeSvg } from '../../util/sanitizeSvg.js'
 import { requireDocRole } from '../guard.js'
 import { parseBoardAnchor, validElementId, type BoardAnchor } from '../services/commentAnchors.js'
@@ -108,6 +109,9 @@ export async function exportExcalidraw(req: Request, res: Response): Promise<voi
     element.type === 'arrow' || element.type === 'line' ? { ...element, lastCommittedPoint: null } : element)
   const fileIds = new Set(elements.flatMap(element =>
     typeof element.fileId === 'string' && element.fileId !== '' ? [element.fileId] : []))
+  if (exceedsExcalidrawEntryLimit(elements.length, fileIds.size)) {
+    throw new CliError('PAYLOAD_TOO_LARGE', { reason: 'too_many_elements' })
+  }
   const files: Record<string, unknown> = Object.create(null)
   const exported = { type: 'excalidraw', version: 2, source: 'octo-cli', elements, appState: {}, files }
   const limit = Math.min(config.docxImport.maxUploadBytes, 25 << 20)

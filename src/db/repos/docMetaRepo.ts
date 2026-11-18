@@ -415,42 +415,50 @@ export const docMetaRepo = {
     spaceSearchable: boolean,
     expectedPermissionEpoch: number,
   ): Promise<SetShareSettingsResult> {
-    return transaction(async (tx) => {
-      const update = await tx.query<{ affectedRows?: number }>(
-        `UPDATE doc_meta
-         SET share_scope = ?, share_role = ?, discoverability_scope = ?,
-             permission_epoch = permission_epoch + 1
-         WHERE doc_id = ? AND permission_epoch = ?`,
-        [
-          scopeNum,
-          roleNum,
-          spaceSearchable ? DISCOVERABILITY_SPACE : DISCOVERABILITY_HIDDEN,
-          docId,
-          expectedPermissionEpoch,
-        ],
-      )
-      const rows = await tx.query<Pick<DocMeta,
-        'share_scope' | 'share_role' | 'discoverability_scope' | 'permission_epoch'
-      >>(
-        `SELECT share_scope, share_role, discoverability_scope, permission_epoch
-         FROM doc_meta WHERE doc_id = ? LIMIT 1 FOR UPDATE`,
-        [docId],
-      )
-      const row = rows[0]
-      const settings = row
-        ? {
-            shareScope: Number(row.share_scope),
-            shareRole: Number(row.share_role),
-            spaceSearchable: row.discoverability_scope === DISCOVERABILITY_SPACE,
-            permissionEpoch: Number(row.permission_epoch),
-          }
-        : null
-      if ((update as unknown as { affectedRows?: number }).affectedRows !== 1) {
-        return { updated: false, current: settings }
-      }
-      if (!settings) throw new Error('share settings update succeeded but row could not be reloaded')
-      return { updated: true, settings }
-    })
+    return transaction(tx => this.setShareSettingsTx(tx, docId, scopeNum, roleNum, spaceSearchable, expectedPermissionEpoch))
+  },
+
+  async setShareSettingsTx(
+    tx: Tx,
+    docId: string,
+    scopeNum: number,
+    roleNum: number,
+    spaceSearchable: boolean,
+    expectedPermissionEpoch: number,
+  ): Promise<SetShareSettingsResult> {
+    const update = await tx.query<{ affectedRows?: number }>(
+      `UPDATE doc_meta
+       SET share_scope = ?, share_role = ?, discoverability_scope = ?,
+           permission_epoch = permission_epoch + 1
+       WHERE doc_id = ? AND permission_epoch = ?`,
+      [
+        scopeNum,
+        roleNum,
+        spaceSearchable ? DISCOVERABILITY_SPACE : DISCOVERABILITY_HIDDEN,
+        docId,
+        expectedPermissionEpoch,
+      ],
+    )
+    const [row] = await tx.query<Pick<DocMeta,
+      'share_scope' | 'share_role' | 'discoverability_scope' | 'permission_epoch'
+    >>(
+      `SELECT share_scope, share_role, discoverability_scope, permission_epoch
+       FROM doc_meta WHERE doc_id = ? LIMIT 1 FOR UPDATE`,
+      [docId],
+    )
+    const settings = row
+      ? {
+          shareScope: Number(row.share_scope),
+          shareRole: Number(row.share_role),
+          spaceSearchable: row.discoverability_scope === DISCOVERABILITY_SPACE,
+          permissionEpoch: Number(row.permission_epoch),
+        }
+      : null
+    if ((update as unknown as { affectedRows?: number }).affectedRows !== 1) {
+      return { updated: false, current: settings }
+    }
+    if (!settings) throw new Error('share settings update succeeded but row could not be reloaded')
+    return { updated: true, settings }
   },
 
   /**

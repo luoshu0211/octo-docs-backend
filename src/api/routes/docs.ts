@@ -41,7 +41,8 @@ import { resolveRole } from '../../permission/resolveRole.js'
 import { resolveRequestPrincipalSpace } from '../../permission/principalSpace.js'
 import { editPptLive } from '../../ppt/liveEdit.js'
 import { PptApiError, PPT_ERROR_STATUS } from '../ppt/envelope.js'
-import { renameCliDoc } from '../cliv2/access.js'
+import { renameCliDoc, setCliShareSettings } from '../cliv2/access.js'
+import { CliError } from '../cliv2/auth.js'
 import { resolveEffectiveRole } from '../../permission/resolveEffectiveRole.js'
 import { issueCollabTokenByDocId } from '../../auth/issueCollabToken.js'
 import { recordVerifiedRecentView } from '../services/recordRecentView.js'
@@ -1051,6 +1052,8 @@ export async function getShareHandler(req: Request, res: Response) {
 export async function putShareHandler(req: Request, res: Response) {
   const guard = await requireDocRole(req, res, req.params.docId!, 'admin')
   if (!guard) return
+  const isCliRequest = req.docSpaceScope?.mode === 'cli'
+  if (isCliRequest && guard.meta.share_scope === SHARE_SCOPE_AUTHENTICATED) throw new CliError('FORBIDDEN')
   const { shareScope, shareRole, spaceSearchable, permissionEpoch } = req.body ?? {}
   if (!Number.isInteger(permissionEpoch) || permissionEpoch < 0) {
     res.status(400).json({ error: 'invalid_permission_epoch' })
@@ -1108,13 +1111,9 @@ export async function putShareHandler(req: Request, res: Response) {
   // refresh caches + publish the doc-wide invalidation (no uid) so every
   // non-member's live session re-derives access (§3.2 / §5.3), mirroring the
   // softDelete -> refreshAndPublish path.
-  const result = await docMetaRepo.setShareSettings(
-    guard.meta.doc_id,
-    scopeNum,
-    roleNum,
-    searchable,
-    permissionEpoch,
-  )
+  const result = isCliRequest
+    ? await setCliShareSettings(req, guard.meta.doc_id, scopeNum, roleNum, permissionEpoch)
+    : await docMetaRepo.setShareSettings(guard.meta.doc_id, scopeNum, roleNum, searchable, permissionEpoch)
   if (!result.updated) {
     res.status(409).json({
       error: 'share_settings_conflict',
@@ -1146,7 +1145,7 @@ export async function putShareHandler(req: Request, res: Response) {
       : {
           shareScope: shareScopeName(scopeNum),
           shareRole: shareRoleName(roleNum),
-          spaceSearchable: searchable,
+          spaceSearchable: isCliRequest ? result.settings.spaceSearchable : searchable,
           permissionEpoch: result.settings.permissionEpoch,
         }),
   })

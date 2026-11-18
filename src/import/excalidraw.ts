@@ -12,6 +12,10 @@ export class ExcalidrawImportError extends Error {
   constructor(readonly code: string, readonly status = 422) { super(code) }
 }
 
+export function exceedsExcalidrawEntryLimit(elementCount: number, fileCount: number): boolean {
+  return elementCount + fileCount > config.boardSceneWrite.maxElements
+}
+
 export interface PreparedExcalidrawImport {
   elements: Array<Record<string, unknown>>
   files: Record<string, Record<string, unknown>>
@@ -149,7 +153,9 @@ export async function prepareExcalidrawImport(input: {
     throw new ExcalidrawImportError('invalid_excalidraw', 400)
   }
   const rawFiles = scene.files as Record<string, unknown>
-  if (scene.elements.length + Object.keys(rawFiles).length > config.boardSceneWrite.maxElements) throw new ExcalidrawImportError('too_many_elements', 413)
+  if (exceedsExcalidrawEntryLimit(scene.elements.length, Object.keys(rawFiles).length)) {
+    throw new ExcalidrawImportError('too_many_elements', 413)
+  }
 
   const usedElementIds = new Set(input.existingElements.map((e) => e.id).filter((v): v is string => typeof v === 'string'))
   const usedFileIds = new Set(Object.keys(input.existingFiles))

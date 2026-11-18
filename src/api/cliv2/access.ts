@@ -4,6 +4,7 @@ import { docMetaRepo, type DocMeta } from '../../db/repos/docMetaRepo.js'
 import type { Tx } from '../../db/pool.js'
 import { refreshAndPublish } from '../../permission/epoch.js'
 import { isMemberRole, roleToNumber } from '../../permission/role.js'
+import { DISCOVERABILITY_SPACE, SHARE_SCOPE_AUTHENTICATED } from '../../permission/shareScope.js'
 import { requireDocRole } from '../guard.js'
 import { grantForwardAccess } from '../services/grantForward.js'
 import { CliError, cliServiceURL, postCliService } from './auth.js'
@@ -26,13 +27,18 @@ async function requireSpaceUser(uid: string, spaceId: string) {
   if (user.principal_type !== 'human') throw new CliError('UPSTREAM_UNAVAILABLE')
 }
 
-async function requireCliAdminTx(tx: Tx, req: Request, authorized: DocMeta): Promise<DocMeta> {
-  const [meta] = await tx.query<DocMeta>('SELECT * FROM doc_meta WHERE doc_id = ? FOR UPDATE', [authorized.doc_id])
+async function lockCliAdminDoc(tx: Tx, req: Request, docId: string): Promise<DocMeta> {
+  const [meta] = await tx.query<DocMeta>('SELECT * FROM doc_meta WHERE doc_id = ? FOR UPDATE', [docId])
   if (!meta || meta.status === 0 || meta.space_id !== req.spaceId) throw new CliError('NOT_FOUND')
   const owner = meta.owner_id === req.uid && meta.owner_space_id === req.principalSpaceId
   const role = owner ? 'admin' : await docMemberRepo.getRoleTx(tx, meta.doc_id, req.uid!, req.principalSpaceId!, true)
   if (role !== 'admin') throw new CliError('FORBIDDEN')
   if (meta.status !== 1) throw new CliError('CONFLICT')
+  return meta
+}
+
+async function requireCliAdminTx(tx: Tx, req: Request, authorized: DocMeta): Promise<DocMeta> {
+  const meta = await lockCliAdminDoc(tx, req, authorized.doc_id)
   if (Number(meta.permission_epoch) !== Number(authorized.permission_epoch)) {
     throw new CliError('CONFLICT', { reason: 'epoch_changed' })
   }
@@ -43,6 +49,18 @@ export async function renameCliDoc(req: Request, authorized: DocMeta, title: str
   await memberTransaction(async tx => {
     const meta = await requireCliAdminTx(tx, req, authorized)
     await docMetaRepo.rename(meta.doc_id, title, req.uid!, tx)
+  })
+}
+
+export async function setCliShareSettings(
+  req: Request, docId: string, scopeNum: number, roleNum: number, expectedPermissionEpoch: number,
+) {
+  return memberTransaction(async tx => {
+    const meta = await lockCliAdminDoc(tx, req, docId)
+    if (meta.share_scope === SHARE_SCOPE_AUTHENTICATED) throw new CliError('FORBIDDEN')
+    return docMetaRepo.setShareSettingsTx(
+      tx, meta.doc_id, scopeNum, roleNum, meta.discoverability_scope === DISCOVERABILITY_SPACE, expectedPermissionEpoch,
+    )
   })
 }
 

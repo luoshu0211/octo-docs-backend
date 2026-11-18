@@ -1,8 +1,6 @@
 import { json, type Request, type RequestHandler, type Response, type Router } from 'express'
 import type { ILayer, IRoute } from 'express-serve-static-core'
-import { SHARE_SCOPE_AUTHENTICATED } from '../../permission/shareScope.js'
 import { config } from '../../config/env.js'
-import { requireDocRole } from '../guard.js'
 import { createBotPptRouter } from '../ppt/live.js'
 import { createPptExportRouter } from '../ppt/export.js'
 import { attachmentsRouter } from '../routes/attachments.js'
@@ -188,9 +186,6 @@ export function docsBusinessHandlers() {
         if (id === 'docs.share.set') {
           if (!plainObject(body) || !['restricted', 'anyone_in_space'].includes(String(body.shareScope)) ||
               Object.hasOwn(body, 'spaceSearchable')) throw new CliError('VALIDATION_ERROR')
-          const guard = await requireDocRole(req, res, req.params.docId!, 'admin')
-          if (!guard) return
-          if (guard.meta.share_scope === SHARE_SCOPE_AUTHENTICATED) throw new CliError('FORBIDDEN')
         }
         if (id === 'docs.comments.add' && plainObject(body) && !await prepareBoardComment(req, res, body)) return
         if (id === 'docs.scene.export' && req.query.format === 'excalidraw') {

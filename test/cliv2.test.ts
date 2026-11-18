@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import type { AddressInfo } from 'node:net'
 import { createCanvas } from '@napi-rs/canvas'
+import { generateNKeysBetween } from 'fractional-indexing'
 import * as Y from 'yjs'
 import * as editDoc from '../src/api/services/editDocBody.js'
 import * as liveWrite from '../src/collab/liveDocWrite.js'
@@ -25,6 +26,7 @@ import { createApp } from '../src/api/app.js'
 import { docMemberRepo } from '../src/db/repos/docMemberRepo.js'
 import { docMetaRepo, type DocMeta } from '../src/db/repos/docMetaRepo.js'
 import * as pool from '../src/db/pool.js'
+import * as epoch from '../src/permission/epoch.js'
 
 type ReadSchemas = {
   ErrorResponse: {
@@ -100,6 +102,7 @@ beforeEach(async () => {
         ] : []),
         ...(body.token === 'content-only' ? [{ domain: 'docs.content', actions: ['docs.content:read'] }] : []),
         ...(body.token === 'attachments-only' ? [{ domain: 'docs.attachments', actions: ['docs.attachments:read'] }] : []),
+        ...(body.token === 'other-user' ? [{ domain: 'docs.access', actions: ['docs.access:write'] }] : []),
       ],
       bot_bindings: [{ bot_id: 'bot_a' }],
     } }))
@@ -308,6 +311,84 @@ describe('Docs CLI v2 workflows', () => {
     const properties = schemas.DocsShareGetResponse.properties.data.properties
     expect(properties.share_scope.enum).toContain(body.data.share_scope)
     expect(properties.share_role.enum).toContain(body.data.share_role)
+  })
+
+  function putShare() {
+    return fetch(appOrigin + endpoint + '/d_same/share', {
+      method: 'PUT',
+      headers: { authorization: 'Bearer other-user', 'content-type': 'application/json' },
+      body: JSON.stringify({ share_scope: 'anyone_in_space', share_role: 'read', permission_epoch: doc.permission_epoch }),
+    })
+  }
+
+  function mockShareTransaction(current: DocMeta, memberRole?: number) {
+    let saved = current
+    const query = vi.fn().mockImplementation(async (sql: string, params: unknown[]) => {
+      if (sql.startsWith('SELECT * FROM doc_meta') && sql.endsWith('FOR UPDATE')) return [current]
+      if (sql.startsWith('SELECT role FROM doc_member') && sql.endsWith('FOR UPDATE')) {
+        return memberRole === undefined ? [] : [{ role: memberRole }]
+      }
+      if (sql.startsWith('UPDATE doc_meta') && sql.includes('SET share_scope')) {
+        if (params[4] !== current.permission_epoch) return { affectedRows: 0 }
+        saved = {
+          ...current, share_scope: Number(params[0]), share_role: Number(params[1]),
+          discoverability_scope: Number(params[2]), permission_epoch: current.permission_epoch + 1,
+        }
+        return { affectedRows: 1 }
+      }
+      if (sql.startsWith('SELECT share_scope')) return [saved]
+      throw new Error('Unexpected query: ' + sql)
+    })
+    const transaction = vi.spyOn(pool, 'transaction').mockImplementation(fn => fn({ query, execute: vi.fn() }))
+    const publish = vi.spyOn(epoch, 'refreshAndPublish').mockResolvedValue(undefined)
+    vi.mocked(docMemberRepo.getRole).mockResolvedValue('admin')
+    return { query, transaction, publish }
+  }
+
+  it.each([
+    ['a v1 downgrade committed before its epoch bump', {}, 2, 403, 'FORBIDDEN'],
+    ['membership was removed', {}, undefined, 403, 'FORBIDDEN'],
+    ['the document was archived', { status: 2 }, 3, 409, 'CONFLICT'],
+    ['the document was deleted', { status: 0 }, 3, 404, 'NOT_FOUND'],
+    ['the scope became authenticated', { share_scope: 2 }, 3, 403, 'FORBIDDEN'],
+  ] as const)('rejects CLI share changes when %s after the entry guard', async (_reason, overrides, role, status, code) => {
+    const { query, transaction, publish } = mockShareTransaction({ ...doc, ...overrides }, role)
+    const response = await putShare()
+    expect(response.status).toBe(status)
+    expect(await response.json()).toMatchObject({ error: { code } })
+    expect(transaction).toHaveBeenCalledOnce()
+    expect(query.mock.calls.every(([sql]) => sql.startsWith('SELECT') && sql.endsWith('FOR UPDATE'))).toBe(true)
+    expect(publish).not.toHaveBeenCalled()
+  })
+
+  it('returns a share conflict when the explicit client epoch is stale for a current admin', async () => {
+    const { query, publish } = mockShareTransaction({ ...doc, permission_epoch: 2 }, 3)
+    const response = await putShare()
+    expect(response.status).toBe(409)
+    expect(await response.json()).toMatchObject({ error: { code: 'CONFLICT', details: { reason: 'share_settings_conflict' } } })
+    expect(query).toHaveBeenCalledWith(expect.stringContaining('WHERE doc_id = ? AND permission_epoch = ?'), [1, 1, 0, doc.doc_id, 1])
+    expect(publish).not.toHaveBeenCalled()
+  })
+
+  it('writes CLI share settings with the locked admin and publishes only after commit', async () => {
+    const current = { ...doc, discoverability_scope: 1 }
+    const { query, transaction, publish } = mockShareTransaction(current, 3)
+    let committed = false
+    transaction.mockImplementation(async fn => {
+      const result = await fn({ query, execute: vi.fn() })
+      committed = true
+      return result
+    })
+    publish.mockImplementation(async () => { expect(committed).toBe(true) })
+    const response = await putShare()
+    expect(response.status).toBe(200)
+    expect(await response.json()).toEqual({ data: {
+      doc_id: doc.doc_id, share_scope: 'anyone_in_space', share_role: 'read', space_searchable: true, permission_epoch: 2,
+    } })
+    expect(query).toHaveBeenNthCalledWith(2, expect.stringMatching(/^SELECT role .* FOR UPDATE$/), [doc.doc_id, 'user_b', 'space_a'])
+    expect(query).toHaveBeenNthCalledWith(3, expect.stringContaining('WHERE doc_id = ? AND permission_epoch = ?'), [1, 1, 1, doc.doc_id, 1])
+    expect(publish).toHaveBeenCalledOnce()
+    expect(publish).toHaveBeenCalledWith(doc.document_name, 2)
   })
 
   it('reads a metadata batch as the token user and omits unreadable or foreign documents', async () => {
@@ -527,6 +608,55 @@ describe('Docs CLI v2 workflows', () => {
     const invalid = await read(endpoint + '/b_same/scene/_export?format=excalidraw', 'workflows')
     expect(invalid.status).toBe(409)
     expect(download).toHaveBeenCalledOnce()
+  })
+
+  it.each([false, true])('enforces the shared portable scene entry limit with files=%s', async withFile => {
+    const elementCount = config.boardSceneWrite.maxElements - (withFile ? 1 : 0)
+    const indexes = generateNKeysBetween(null, null, elementCount + 1)
+    const elements = indexes.slice(0, elementCount).map((index, i) => ({
+      id: 'shape' + i, index, ...(withFile && i === 0 ? { type: 'image', fileId: 'BinaryId' } : { type: 'rectangle' }),
+    }))
+    const deleted = { id: 'deleted', type: 'image', fileId: 'unused', isDeleted: true }
+    const files = { unused: { attachId: 'att_unused' }, ...(withFile ? { BinaryId: { attachId: 'att_A' } } : {}) }
+    const extra = { id: 'extra', type: 'rectangle', index: indexes.at(-1)! }
+    const state = vi.spyOn(liveRead, 'readLiveDocState')
+    const png = createCanvas(1, 1).toBuffer('image/png')
+    const attachments = vi.spyOn(docAttachmentRepo, 'listByDoc').mockResolvedValue([{
+      attachId: 'att_A', docId: board.doc_id, objectKey: 'b_same/att_A/image.png',
+      mime: 'image/png', sizeBytes: png.length, fileName: 'image.png', createdBy: 'user_a', createdAt: date,
+    }])
+    const download = vi.fn().mockResolvedValue(png)
+    vi.spyOn(objectStore, 'getObjectStore').mockReturnValue({ download } as unknown as objectStore.ObjectStore)
+    const upload = vi.fn(async () => 'att_reimported')
+    const importInput = { docId: board.doc_id, uid: 'user_a', existingElements: [], existingFiles: {}, upload }
+    const url = endpoint + '/b_same/scene/_export?format=excalidraw'
+    state.mockResolvedValue(boardState([...elements, deleted], files))
+    const allowed = await read(url, 'workflows')
+    expect(allowed.status).toBe(200)
+    const scene = await allowed.json()
+    expect(scene.elements).toHaveLength(elementCount)
+    expect(Object.keys(scene.files)).toHaveLength(withFile ? 1 : 0)
+    const imported = await prepareExcalidrawImport({ ...importInput, scene })
+    expect(imported.elements).toHaveLength(elementCount)
+    expect(attachments).toHaveBeenCalledTimes(withFile ? 1 : 0)
+    expect(download).toHaveBeenCalledTimes(withFile ? 1 : 0)
+    expect(upload).toHaveBeenCalledTimes(withFile ? 1 : 0)
+    attachments.mockClear()
+    download.mockClear()
+    upload.mockClear()
+
+    state.mockResolvedValue(boardState([...elements, deleted, extra], files))
+    const denied = await read(url, 'workflows')
+    expect(denied.status).toBe(413)
+    expect(await denied.json()).toMatchObject({
+      error: { code: 'PAYLOAD_TOO_LARGE', details: { reason: 'too_many_elements' } },
+    })
+    await expect(prepareExcalidrawImport({
+      ...importInput, scene: { ...scene, elements: [...scene.elements, extra] },
+    })).rejects.toMatchObject({ code: 'too_many_elements', status: 413 })
+    expect(attachments).not.toHaveBeenCalled()
+    expect(download).not.toHaveBeenCalled()
+    expect(upload).not.toHaveBeenCalled()
   })
 
   it.each(['content-only', 'attachments-only'])('rejects portable images for %s before attachment lookup or download', async token => {
