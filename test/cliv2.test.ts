@@ -1,18 +1,33 @@
 import { createServer, type Server } from 'node:http'
+import { readFileSync } from 'node:fs'
+import { createRequire } from 'node:module'
 import type { AddressInfo } from 'node:net'
+import { createCanvas } from '@napi-rs/canvas'
 import * as Y from 'yjs'
 import * as editDoc from '../src/api/services/editDocBody.js'
 import * as liveWrite from '../src/collab/liveDocWrite.js'
 import * as liveRead from '../src/collab/liveDocRead.js'
 import * as objectStore from '../src/storage/objectStore.js'
 import { docAttachmentRepo } from '../src/db/repos/docAttachmentRepo.js'
-import { docCommentRepo } from '../src/db/repos/docCommentRepo.js'
+import { docCommentRepo, type DocComment } from '../src/db/repos/docCommentRepo.js'
+import { prepareExcalidrawImport } from '../src/import/excalidraw.js'
 import { selectionAnchor } from '../src/api/cliv2/boardGeometry.js'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { docsOperations } from '../src/api/cliv2/operations.js'
 import { createApp } from '../src/api/app.js'
 import { docMemberRepo } from '../src/db/repos/docMemberRepo.js'
 import { docMetaRepo, type DocMeta } from '../src/db/repos/docMetaRepo.js'
+
+type ReadSchemas = {
+  CursorPagination: { required: string[] }
+  DocsShareGetResponse: {
+    properties: { data: { properties: Record<'share_scope' | 'share_role', { enum: string[] }> } }
+  }
+}
+const { load } = createRequire(import.meta.url)('js-yaml') as {
+  load(text: string): { components: { schemas: ReadSchemas } }
+}
+const schemas = load(readFileSync(new URL('../docs/openapi/v2.yaml', import.meta.url), 'utf8')).components.schemas
 
 const secret = 'fixture-service-secret-with-minimum-length'
 const date = new Date('2026-11-17T00:00:00Z')
@@ -57,8 +72,13 @@ beforeEach(async () => {
       },
       permissions: [
         { domain: 'docs.documents', actions: body.token === 'no-action' ? ['docs.content:*'] : ['docs.documents:*'] },
-        ...(['workflows', 'comment-only'].includes(body.token) ? [{ domain: 'docs.comments', actions: ['docs.comments:write'] }] : []),
-        ...(body.token === 'workflows' ? [{ domain: 'docs.content', actions: ['docs.content:*'] }] : []),
+        ...(['workflows', 'comment-only'].includes(body.token) ? [{
+          domain: 'docs.comments', actions: body.token === 'workflows' ? ['docs.comments:*'] : ['docs.comments:write'],
+        }] : []),
+        ...(body.token === 'workflows' ? [
+          { domain: 'docs.content', actions: ['docs.content:*'] },
+          { domain: 'docs.access', actions: ['docs.access:read'] },
+        ] : []),
       ],
       bot_bindings: [{ bot_id: 'bot_a' }],
     } }))
@@ -196,6 +216,38 @@ function boardState(elements: Array<Record<string, unknown>>, files: Record<stri
 }
 
 describe('Docs CLI v2 workflows', () => {
+  it.each([false, true])('matches the cursor contract with has_more=%s', async hasMore => {
+    const comment: DocComment = {
+      id: 71, docId: doc.doc_id, documentName: doc.document_name, parentId: null,
+      authorUid: 'user_a', body: 'A comment', anchorStart: null, anchorEnd: null,
+      anchorText: '', resolved: false, resolvedBy: null, resolvedAt: null,
+      deleted: false, createdAt: date, updatedAt: date,
+    }
+    vi.spyOn(docCommentRepo, 'listRoots').mockResolvedValue(hasMore ? [comment] : [])
+    vi.spyOn(docCommentRepo, 'listRepliesForRoots').mockResolvedValue([])
+
+    const result = await read(endpoint + '/d_same/comments?limit=1', 'workflows')
+    expect(result.status).toBe(200)
+    const body = await result.json()
+    expect(body.pagination).toEqual(hasMore ? { has_more: true, next_cursor: '71' } : { has_more: false })
+    expect(Object.keys(body.pagination)).toEqual(expect.arrayContaining(schemas.CursorPagination.required))
+  })
+
+  it.each([
+    [0, 1, 'restricted', 'read'],
+    [1, 4, 'anyone_in_space', 'comment'],
+    [2, 4, 'authenticated', 'comment'],
+  ] as const)('matches the share read contract for stored scope=%s and role=%s', async (scope, role, scopeName, roleName) => {
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue({ ...doc, share_scope: scope, share_role: role })
+    const result = await read(endpoint + '/d_same/share', 'workflows')
+    expect(result.status).toBe(200)
+    const body = await result.json()
+    expect(body.data).toMatchObject({ share_scope: scopeName, share_role: roleName })
+    const properties = schemas.DocsShareGetResponse.properties.data.properties
+    expect(properties.share_scope.enum).toContain(body.data.share_scope)
+    expect(properties.share_role.enum).toContain(body.data.share_role)
+  })
+
   it('applies raw Markdown as the token user, even if the client sends the legacy preview header', async () => {
     vi.spyOn(liveWrite, 'readLiveForEdit').mockResolvedValue({ pmDoc: { childCount: 1 }, baseSV: new Uint8Array([1]) } as Awaited<ReturnType<typeof liveWrite.readLiveForEdit>>)
     const edit = vi.spyOn(editDoc, 'editDocBody').mockResolvedValue({ ok: true, baseVersion: 'next', bytes: 28, newDocVersionSeq: 3 })
@@ -270,6 +322,41 @@ describe('Docs CLI v2 workflows', () => {
     const invalid = await read(endpoint + '/b_same/scene/_export?format=excalidraw', 'workflows')
     expect(invalid.status).toBe(409)
     expect(download).toHaveBeenCalledOnce()
+  })
+
+  it.each([
+    ['image/x-png', 'image/png'],
+    ['IMAGE/PNG; charset=binary', 'image/png'],
+    ['image/jpg', 'image/jpeg'],
+    ['image/pjpeg', 'image/jpeg'],
+    ['image/jpeg; charset=binary', 'image/jpeg'],
+  ])('round-trips a portable attachment declared as %s', async (declaredMime, normalizedMime) => {
+    const canvas = createCanvas(1, 1)
+    const image = normalizedMime === 'image/png' ? canvas.toBuffer('image/png') : canvas.toBuffer('image/jpeg')
+    vi.spyOn(liveRead, 'readLiveDocState').mockResolvedValue(boardState([
+      { id: 'image', type: 'image', index: 'a0', x: 0, y: 0, width: 1, height: 1, fileId: 'BinaryId' },
+    ], { BinaryId: { attachId: 'att_A' } }))
+    vi.spyOn(docAttachmentRepo, 'listByDoc').mockResolvedValue([{
+      attachId: 'att_A', docId: board.doc_id, objectKey: 'b_same/att_A/image',
+      mime: declaredMime, sizeBytes: image.length, fileName: 'image', createdBy: 'user_a', createdAt: date,
+    }])
+    vi.spyOn(objectStore, 'getObjectStore').mockReturnValue({
+      download: vi.fn().mockResolvedValue(image),
+    } as unknown as objectStore.ObjectStore)
+
+    const result = await read(endpoint + '/b_same/scene/_export?format=excalidraw', 'workflows')
+    expect(result.status).toBe(200)
+    const scene = await result.json()
+    expect(scene.files.BinaryId).toMatchObject({
+      mimeType: normalizedMime, dataURL: `data:${normalizedMime};base64,${image.toString('base64')}`,
+    })
+
+    const upload = vi.fn(async () => 'att_reimported')
+    const imported = await prepareExcalidrawImport({
+      scene, docId: board.doc_id, uid: 'user_a', existingElements: [], existingFiles: {}, upload,
+    })
+    expect(upload).toHaveBeenCalledWith(image, normalizedMime, expect.any(String))
+    expect(imported.files.BinaryId).toMatchObject({ attachId: 'att_reimported', mimeType: normalizedMime })
   })
 
   it('preserves the web anchor geometry for a rounded connector with bound text', () => {

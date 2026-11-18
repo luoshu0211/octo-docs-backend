@@ -3051,9 +3051,9 @@ components:
           type: boolean
         next_cursor:
           type: string
+          description: Opaque cursor for the next page, omitted when has_more is false.
       required:
         - has_more
-        - next_cursor
     Comment:
       type: object
       properties:
@@ -4333,13 +4333,16 @@ components:
               type: string
             share_scope:
               type: string
+              description: Current stored scope. Authenticated-link sharing is readable through this endpoint.
               enum:
                 - restricted
                 - anyone_in_space
+                - authenticated
             share_role:
               type: string
               enum:
                 - read
+                - comment
                 - edit
       required:
         - data

@@ -63,6 +63,7 @@ export async function commitLiveBoardEdit(
   uid: string,
   clientBaseVersion: Uint8Array,
   ops: ValidatedBoardOps,
+  onWriteStarted?: () => void,
 ): Promise<{ newSV: Uint8Array; bytes: number }> {
   const server = getCollabServer()
   const connection = await server.hocuspocus.openDirectConnection(documentName, { user: { id: uid } })
@@ -78,6 +79,7 @@ export async function commitLiveBoardEdit(
       }
       // (2) The single, last content mutation. applyBoardOpsToDoc only touches
       //     the ids named in the batch (element-level upsert/delete, CAS-guarded).
+      onWriteStarted?.()
       applyBoardOpsToDoc(doc, ops)
       // (3) Advance the edit-version counter so a delete-only tombstone batch also
       //     moves the state vector forward; the token is read AFTER this bump.

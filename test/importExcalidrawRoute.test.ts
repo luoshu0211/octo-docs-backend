@@ -106,7 +106,10 @@ describe('POST /:docId/import/excalidraw', () => {
     vi.mocked(prepareExcalidrawImport).mockResolvedValue({
       elements: [], files: {}, elementIdMap: {}, fileIdMap: {}, uploadedAttachments: uploads,
     })
-    vi.mocked(editBoardScene).mockRejectedValueOnce(new Error('edit failed'))
+    vi.mocked(editBoardScene).mockImplementationOnce(async input => {
+      input.onWriteStarted?.()
+      throw new Error('edit failed after scene mutation started')
+    })
     const res = response()
     await importExcalidrawHandler(request('replace'), res as unknown as Response)
     expect(res.statusCode).toBe(500)

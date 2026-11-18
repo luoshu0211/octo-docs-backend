@@ -146,7 +146,6 @@ export async function importExcalidrawHandler(req: Request, res: Response): Prom
       ? current.elements.filter((el) => typeof el.id === 'string').map((el) => el.id as string)
       : undefined
     const deletedFileIds = mode === 'replace' ? Object.keys(current.files) : undefined
-    sceneWriteStarted = true
     const result = await editBoardScene({
       uid: req.uid,
       docId: guard.meta.doc_id,
@@ -157,6 +156,7 @@ export async function importExcalidrawHandler(req: Request, res: Response): Prom
       authorizedEpoch: guard.meta.permission_epoch,
       isBot: req.botToken !== undefined,
       token: req.octoToken,
+      onWriteStarted: () => { sceneWriteStarted = true },
     })
     if (!result.ok) {
       await cleanupExcalidrawAttachments(prepared.uploadedAttachments ?? [])
@@ -166,6 +166,7 @@ export async function importExcalidrawHandler(req: Request, res: Response): Prom
       res.status(result.status).json(body)
       return
     }
+    sceneWriteStarted = true
     // Removed live file references remain reachable from the safety snapshot
     // and named versions. Keep their attachment rows and bytes for restoration.
     res.status(200).json({
@@ -180,9 +181,8 @@ export async function importExcalidrawHandler(req: Request, res: Response): Prom
       newDocVersionSeq: result.newDocVersionSeq,
     })
   } catch (err) {
-    // A thrown commit may follow apply/broadcast. Preserve prepared attachments
-    // on an uncertain write or response failure; only explicit rejection above
-    // proves the scene did not adopt them.
+    // Prechecks and connection failures leave the scene unchanged. Once live
+    // mutation starts, a failed commit or response may still leave file refs.
     if (!sceneWriteStarted) await cleanupExcalidrawAttachments(prepared?.uploadedAttachments ?? [])
     if (err instanceof ExcalidrawImportError) {
       res.status(err.status).json({ error: err.code })

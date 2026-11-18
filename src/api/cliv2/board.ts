@@ -127,7 +127,7 @@ export async function exportExcalidraw(req: Request, res: Response): Promise<voi
       const mime = portableMimeType(attachment.mime)
       const entry = {
         id: fileId, mimeType: mime,
-        dataURL: `data:${attachment.mime};base64,`,
+        dataURL: `data:${mime};base64,`,
         created: typeof ref?.createdAt === 'number' ? ref.createdAt : 0, lastRetrieved: 0,
       }
       const overhead = Buffer.byteLength(JSON.stringify(fileId) + ':' + JSON.stringify(entry)) + 1
