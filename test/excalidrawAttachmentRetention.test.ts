@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import * as Y from 'yjs'
 import type { Request, Response } from 'express'
 import type { DocAttachment, RegisterAttachmentInput } from '../src/db/repos/docAttachmentRepo.js'
@@ -45,6 +45,7 @@ import { decodeBoardSnapshot, restoreReconcileBoard } from '../src/collab/versio
 import { applyBoardOpsToDoc, validateBoardOps } from '../src/whiteboard/boardEdit.js'
 import { docAttachmentRepo } from '../src/db/repos/docAttachmentRepo.js'
 import { getObjectStore } from '../src/storage/objectStore.js'
+import * as pool from '../src/db/pool.js'
 
 const OLD = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Z4QAAAABJRU5ErkJggg==', 'base64')
 const NEW = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAFAAAAAoCAIAAADmAupWAAAAS0lEQVR4nO3PAQkAIBDAQMuYzPiWMIawP1iA3drnjmp9PwAGBgYGBgYeE3A94HrA9YDrAdcDrgdcD7gecD3gesD1gOsB1wOuB1zvAeVbHo9A+DXnAAAAAElFTkSuQmCC', 'base64')
@@ -52,12 +53,16 @@ const NEW = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAFAAAAAoCAIAAADmAupWAAAAS0lEQVR
 function response() {
   return { statusCode: 0, body: undefined as unknown, status(code: number) { this.statusCode = code; return this }, json(body: unknown) { this.body = body; return this } }
 }
-function request(): Request {
-  return { uid: 'u1', principalSpaceId: 's1', params: { docId: 'b1' }, originalUrl: '/b1/import/excalidraw?mode=replace', body: Buffer.from(JSON.stringify({
+const callers = ['human', 'bot', 'cli'] as const
+function request(caller: (typeof callers)[number]): Request {
+  const req = { uid: 'u1', principalSpaceId: 's1', params: { docId: 'b1' }, originalUrl: '/b1/import/excalidraw?mode=replace', body: Buffer.from(JSON.stringify({
     type: 'excalidraw', version: 2,
     elements: [{ id: 'new', type: 'image', fileId: 'new-file', x: 0, y: 0, width: 80, height: 40, version: 1, versionNonce: 1 }],
     files: { 'new-file': { dataURL: `data:image/png;base64,${NEW.toString('base64')}` } },
   })) } as unknown as Request
+  req.docSpaceScope = caller === 'human' ? { mode: 'human' } : { mode: caller, spaceId: 's1' }
+  if (caller === 'bot') req.botToken = 'test-bot-token'
+  return req
 }
 async function expectReadableImage(id: string, bytes: Buffer) {
   const res = response()
@@ -84,6 +89,7 @@ beforeEach(() => {
   vi.mocked(readLiveBoard).mockImplementation(async () => ({ state: state.live, baseSV: new Uint8Array([9]) }))
   vi.mocked(editBoardScene).mockImplementation(async input => {
     state.safety = state.live
+    input.onWriteStarted?.()
     const live = new Y.Doc()
     Y.applyUpdate(live, state.live)
     live.transact(() => applyBoardOpsToDoc(live, validateBoardOps(input.ops)))
@@ -93,11 +99,36 @@ beforeEach(() => {
   })
 })
 
+afterEach(() => { vi.restoreAllMocks() })
+
 describe('Excalidraw attachment lifetime through import and version restore', () => {
-  it('can read old image bytes after restoring the safety snapshot, then read the replacement after undo', async () => {
+  it.each(['preflight', 'transaction'] as const)('cleans new attachments when the real edit core fails during %s', async phase => {
+    const actual = await vi.importActual<typeof import('../src/api/services/editBoardScene.js')>('../src/api/services/editBoardScene.js')
+    const original = state.live
+    if (phase === 'preflight') {
+      vi.mocked(readLiveBoard)
+        .mockResolvedValueOnce({ state: state.live, baseSV: new Uint8Array([9]) })
+        .mockRejectedValueOnce(new Error('preflight read failed'))
+    } else {
+      vi.spyOn(pool, 'transaction').mockRejectedValueOnce(new Error('snapshot transaction failed'))
+    }
+    vi.mocked(editBoardScene).mockImplementationOnce(actual.editBoardScene)
+
+    const res = response()
+    await importExcalidrawHandler(request('cli'), res as unknown as Response)
+
+    expect(res.statusCode).toBe(500)
+    expect(state.live).toEqual(original)
+    expect([...state.rows.keys()]).toEqual(['att_old'])
+    expect([...state.objects.keys()]).toEqual(['b1/att_old/old.png'])
+    expect(docAttachmentRepo.deleteById).toHaveBeenCalledOnce()
+    await expectReadableImage('att_old', OLD)
+  })
+
+  it.each(callers)('%s can read the old image after restoring the safety snapshot and the replacement after undo', async caller => {
     const original = decodeBoardSnapshot(state.live)
     const res = response()
-    await importExcalidrawHandler(request(), res as unknown as Response)
+    await importExcalidrawHandler(request(caller), res as unknown as Response)
     expect(res.statusCode).toBe(200)
     const replaced = state.live
     const newRef = decodeBoardSnapshot(replaced).files['new-file']!
@@ -113,14 +144,14 @@ describe('Excalidraw attachment lifetime through import and version restore', ()
     expect(state.objects.size).toBe(2)
   })
 
-  it('keeps an image already referenced by the scene if commit throws after applying the edit', async () => {
+  it.each(callers)('%s keeps an image already referenced by the scene if commit throws after applying the edit', async caller => {
     const commit = vi.mocked(editBoardScene).getMockImplementation()!
     vi.mocked(editBoardScene).mockImplementationOnce(async input => {
       await commit(input)
       throw new Error('persistence acknowledgement failed after apply')
     })
     const res = response()
-    await importExcalidrawHandler(request(), res as unknown as Response)
+    await importExcalidrawHandler(request(caller), res as unknown as Response)
     expect(res.statusCode).toBe(500)
     const ref = decodeBoardSnapshot(state.live).files['new-file']!
     const row = await docAttachmentRepo.getById(ref.attachId as string)

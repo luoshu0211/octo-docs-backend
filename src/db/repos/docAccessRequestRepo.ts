@@ -8,7 +8,8 @@
  * single row back to pending rather than piling up duplicate rows (mirrors
  * doc_member / doc_invite_redemption dedup范式).
  */
-import { query, type Tx } from '../pool.js'
+import { query, transaction, type Tx } from '../pool.js'
+import { docLibraryEventRepo } from './docLibraryEventRepo.js'
 import { newRequestId } from '../../util/ids.js'
 import { parseStoredBotUids } from '../../util/botUids.js'
 
@@ -91,30 +92,28 @@ export const docAccessRequestRepo = {
     // Re-check fail-closed at the DB boundary (the route already strict-validated)
     // and store canonical JSON text so the column value is stable/order-independent.
     const botUidsJson = JSON.stringify(parseStoredBotUids(params.botUids ?? []))
-    await query(
-      `INSERT INTO doc_access_request (doc_id, uid, principal_space_id, requested_role, reason, status, request_id, bot_uids)
-       VALUES (?, ?, ?, ?, ?, ${REQUEST_STATUS_PENDING}, ?, CAST(? AS JSON))
-       ON DUPLICATE KEY UPDATE
-         requested_role = VALUES(requested_role),
-         reason         = VALUES(reason),
-         status         = ${REQUEST_STATUS_PENDING},
-         decided_by     = '',
-         decided_by_space_id = '',
-         decision_note  = '',
-         decided_at_unix = NULL,
-         request_id     = VALUES(request_id),
-         bot_uids       = VALUES(bot_uids)`,
-      [params.docId, params.uid, params.principalSpaceId, params.requestedRoleNum, params.reason, candidateId, botUidsJson],
-    )
-    // request_id is now rotated to candidateId on both insert and duplicate-update,
-    // but read back the authoritative row to return the real stored id + status
-    // (defensive against any trigger/collation surprise on the write path).
-    const rows = await query<{ request_id: string; status: number }>(
-      'SELECT request_id, status FROM doc_access_request WHERE doc_id = ? AND uid = ? AND principal_space_id = ? LIMIT 1',
-      [params.docId, params.uid, params.principalSpaceId],
-    )
-    const row = rows[0]
-    return { requestId: row?.request_id ?? candidateId, status: Number(row?.status ?? REQUEST_STATUS_PENDING) }
+    return transaction(async (tx) => {
+      await tx.execute(
+        `INSERT INTO doc_access_request (doc_id, uid, principal_space_id, requested_role, reason, status, request_id, bot_uids)
+         VALUES (?, ?, ?, ?, ?, ${REQUEST_STATUS_PENDING}, ?, CAST(? AS JSON))
+         ON DUPLICATE KEY UPDATE
+           requested_role = VALUES(requested_role),
+           reason         = VALUES(reason),
+           status         = ${REQUEST_STATUS_PENDING},
+           decided_by     = '',
+           decided_by_space_id = '',
+           decision_note  = '',
+           decided_at_unix = NULL,
+           request_id     = VALUES(request_id),
+           bot_uids       = VALUES(bot_uids)`,
+        [params.docId, params.uid, params.principalSpaceId, params.requestedRoleNum, params.reason, candidateId, botUidsJson],
+      )
+      await docLibraryEventRepo.notifyApprovers(tx, {
+        docId: params.docId, requestId: candidateId, uid: params.uid, spaceId: params.principalSpaceId,
+        requestedRole: params.requestedRoleNum,
+      })
+      return { requestId: candidateId, status: REQUEST_STATUS_PENDING }
+    })
   },
 
   /** List requests for a doc filtered by status (admin pull; default pending). */
@@ -130,6 +129,14 @@ export const docAccessRequestRepo = {
       bot_uids: parseStoredBotUids((r as { bot_uids?: unknown }).bot_uids),
       decided_at_unix: normalizeDecidedAt((r as { decided_at_unix?: unknown }).decided_at_unix),
     }))
+  },
+
+  async getMine(docId: string, uid: string, spaceId: string): Promise<DocAccessRequestRow | null> {
+    const rows = await query<DocAccessRequestRow>(
+      'SELECT * FROM doc_access_request WHERE doc_id = ? AND uid = ? AND principal_space_id = ? LIMIT 1',
+      [docId, uid, spaceId],
+    )
+    return rows[0] ?? null
   },
 
   /** Fetch a single request by (doc_id, request_id) for approve/deny addressing. */
@@ -162,18 +169,20 @@ export const docAccessRequestRepo = {
     decidedAtUnix: number
     note?: string
   }): Promise<boolean> {
-    // decided_by, decided_by_space_id, decided_at_unix and decision_note are all
-    // written in the SAME CAS-guarded UPDATE as the status flip, so the winning
-    // decider's identity/Space/time are recorded atomically with (and only on)
-    // the pending→approved/denied transition — a losing racer / replay that finds
-    // the row already decided flips nothing and cannot clobber them.
-    const rows = await query<{ affectedRows?: number }>(
-      `UPDATE doc_access_request
-         SET status = ?, decided_by = ?, decided_by_space_id = ?, decided_at_unix = ?, decision_note = ?
-       WHERE doc_id = ? AND request_id = ? AND status = ${REQUEST_STATUS_PENDING}`,
-      [params.status, params.decidedBy, params.decidedBySpaceId, params.decidedAtUnix, params.note ?? '', params.docId, params.requestId],
-    )
-    return (rows as unknown as { affectedRows?: number }).affectedRows! > 0
+    return transaction(async (tx) => {
+      const transitioned = await this.decideTx(tx, params)
+      if (transitioned && params.status === REQUEST_STATUS_DENIED) {
+        const [row] = await tx.query<{ uid: string; principal_space_id: string }>(
+          'SELECT uid, principal_space_id FROM doc_access_request WHERE doc_id = ? AND request_id = ?',
+          [params.docId, params.requestId],
+        )
+        if (!row) throw new Error('Decided access request disappeared')
+        await docLibraryEventRepo.record(tx, { uid: row.uid, spaceId: row.principal_space_id }, {
+          kind: 'access_denied', docId: params.docId, requestId: params.requestId, actorUid: params.decidedBy,
+        })
+      }
+      return transitioned
+    })
   },
 
   /** Transaction-scoped pending -> terminal CAS. */

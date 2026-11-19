@@ -232,17 +232,32 @@ sync_code:
 
       if git diff --cached --quiet; then
         echo "No changes to commit"
-        exit 0
+      else
+        git commit -m "Update octo-docs-backend ${DEPLOY_ENV} to ${IMAGE_TAG} (@${IMAGE_DIGEST})"
+        git push --force "$DEPLOY_REPO_URL" "HEAD:$TARGET_BRANCH"
       fi
+      echo "DEPLOY_REVISION=$(git rev-parse HEAD)" > "$CI_PROJECT_DIR/deploy.env"
+  artifacts:
+    reports:
+      dotenv: deploy.env
 
-      git commit -m "Update octo-docs-backend ${DEPLOY_ENV} to ${IMAGE_TAG} (@${IMAGE_DIGEST})"
-      git push --force "$DEPLOY_REPO_URL" "HEAD:$TARGET_BRANCH"
+argocd_sync_test:
+  stage: deploy
+  only:
+    - test
+  tags:
+    - tke-deepmining-runner
+  image: $NODE_IMAGE
+  needs:
+    - package_test
+    - sync_code
+  script:
+    - node scripts/syncTestDeployment.mjs
 
 argocd_sync:
   stage: deploy
   only:
     - develop
-    - test
     - tags
   tags:
     - tke-deepmining-runner
@@ -255,11 +270,8 @@ argocd_sync:
     if [[ -n "$CI_COMMIT_TAG" ]]; then
       echo "Tag build: skipping auto ArgoCD sync for prod"
       exit 0
-    elif [[ "$CI_COMMIT_REF_NAME" == "test" ]]; then
-      ARGOCD_APP="octo-docs-backend-test"
-    else
-      ARGOCD_APP="octo-docs-backend-dev"
     fi
+    ARGOCD_APP="octo-docs-backend-dev"
 
     echo "Syncing ArgoCD app: $ARGOCD_APP"
     SYNC_RESP=$(curl -s -w "\n%{http_code}" -X POST \

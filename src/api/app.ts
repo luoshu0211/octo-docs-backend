@@ -82,6 +82,7 @@ import { internalDocRoleRouter } from './routes/internalDocRole.js'
 import { internalSourceInvalidationsRouter } from './routes/internalSourceInvalidations.js'
 import { membersRouter } from './routes/members.js'
 import { memberNotificationsRouter } from './routes/memberNotifications.js'
+import { libraryEventsRouter } from './routes/libraryEvents.js'
 import { forwardGrantRouter } from './routes/forwardGrant.js'
 import { accessRequestsRouter } from './routes/accessRequests.js'
 import { cardActionDecideHandler, CARD_ACTION_DECIDE_PATH } from './routes/cardActionDecide.js'
@@ -102,6 +103,7 @@ import { importRouter } from './routes/import.js'
 import { createPptRouter, pptErrorHandler } from './ppt/envelope.js'
 import { createBotPptRouter } from './ppt/live.js'
 import { sanitizeUrlForLog } from './accessLog.js'
+import { createCliV2Router } from './cliv2/router.js'
 
 /** Which audience's routes a given listener serves. See the module comment. */
 export type AppSurface = 'public' | 'internal' | 'all'
@@ -155,6 +157,11 @@ export function createApp(
   // Origin for the configured origin(s). Covers both the metadata API and the
   // local-hmac attachment blob gateway below.
   app.use(corsMiddleware)
+
+  if (servePublic) {
+    const cliV2 = createCliV2Router(opts.rateLimit)
+    if (cliV2) app.use('/v2/cli', cliV2)
+  }
 
   // Self-hosted attachment blob gateway (XIN-717). Only relevant for the
   // local-hmac driver, where the browser PUTs/GETs the binary directly at this
@@ -294,6 +301,7 @@ export function createApp(
   //     `/recent/creators`) are never shadowed by the router's `/:docId`.
   api.use(spaceCollectionRouter)
   api.use(memberNotificationsRouter)
+  api.use(libraryEventsRouter)
 
   // 4b. DocumentResourceRouter (remove-sp §6): every single-document operation,
   //     located by path docId with NO spaceContextMiddleware — open-context, the

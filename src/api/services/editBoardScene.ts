@@ -64,6 +64,8 @@ export interface EditBoardSceneInput {
    * short-circuits on isBot and carries no token, so it is omitted there.
    */
   token?: string
+  /** Called immediately before mutating the live scene, after all prechecks. */
+  onWriteStarted?: () => void
 }
 
 export type EditBoardSceneResult =
@@ -192,6 +194,7 @@ export async function editBoardScene(input: EditBoardSceneInput): Promise<EditBo
       input.uid,
       input.clientBaseVersion,
       validated,
+      input.onWriteStarted,
     )
     bytes = committed.bytes
     newSV = committed.newSV
@@ -201,9 +204,8 @@ export async function editBoardScene(input: EditBoardSceneInput): Promise<EditBo
     // (BaseVersionStaleError) is its FIRST statement and throws with nothing
     // applied or broadcast, so the safety snapshot is then an orphan restore
     // point for an edit that never touched the board — compensating-delete it.
-    // Any OTHER failure is thrown AFTER the batch already applied + broadcast to
-    // peers, so the safety snapshot is the ONLY undo record for a change peers
-    // have seen: preserve it and surface 500.
+    // Other failures may follow apply/broadcast, so preserve the safety snapshot
+    // as the undo record for a change peers may already have seen.
     const mapped = mapEditError(err)
     if (mapped) {
       try {

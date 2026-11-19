@@ -20,7 +20,7 @@ mysqlDescribe('member notifications against isolated MySQL 8', () => {
     // This suite intentionally truncates its fixtures: never run against a shared database.
     if (!process.env.MYSQL_DATABASE?.startsWith('member_notification_test_')) throw new Error('isolated test database required')
     const schema = readFileSync(new URL('../migrations/schema.sql', import.meta.url), 'utf8')
-    for (const table of ['doc_meta', 'doc_member', 'doc_member_notification']) {
+    for (const table of ['doc_meta', 'doc_member', 'doc_member_notification', 'doc_library_event']) {
       const sql = schema.match(new RegExp(`CREATE TABLE ${table} \\([\\s\\S]*?\\) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`))?.[0]
       if (!sql) throw new Error(`missing schema: ${table}`)
       await query(sql)
@@ -29,7 +29,7 @@ mysqlDescribe('member notifications against isolated MySQL 8', () => {
     expect((rows as Array<{ isolation_level: string }>)[0]?.isolation_level).toBe('REPEATABLE-READ')
   })
   beforeEach(async () => {
-    for (const table of ['doc_member_notification', 'doc_member', 'doc_meta']) await query(`TRUNCATE TABLE ${table}`)
+    for (const table of ['doc_library_event', 'doc_member_notification', 'doc_member', 'doc_meta']) await query(`TRUNCATE TABLE ${table}`)
   })
   afterAll(async () => { await closePool() })
 
@@ -52,7 +52,7 @@ mysqlDescribe('member notifications against isolated MySQL 8', () => {
     }
   })
 
-  it('commits simultaneous first additions once and keeps role edits silent', async () => {
+  it('commits simultaneous first additions once and preserves the original reminder on role edits', async () => {
     for (let i = 0; i < 24; i += 1) {
       const docId = `same_${i}`
       await document(docId)
@@ -65,6 +65,8 @@ mysqlDescribe('member notifications against isolated MySQL 8', () => {
       const after = await query<{ event_at: Date; read_at: Date }>('SELECT event_at, read_at FROM doc_member_notification WHERE doc_id=?', [docId])
       expect(after[0]?.event_at).toEqual(before[0]?.event_at)
       expect(after[0]?.read_at).not.toBeNull()
+      expect(await query('SELECT kind, previous_role, new_role FROM doc_library_event WHERE doc_id=?', [docId]))
+        .toEqual([{ kind: 'member_role_changed', previous_role: 2, new_role: 1 }])
     }
   }, 30_000)
 
@@ -76,6 +78,18 @@ mysqlDescribe('member notifications against isolated MySQL 8', () => {
     }
     expect(await query('SELECT 1 FROM doc_member_notification')).toHaveLength(64)
   }, 30_000)
+
+  it('rolls back a transactional role change if its library event fails', async () => {
+    await document('role_event')
+    await docMemberRepo.upsertDirectWithNotification(grant('role_event'))
+    await getPool().query("CREATE TRIGGER fail_role_event BEFORE INSERT ON doc_library_event FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='forced event failure'")
+    try {
+      await expect(transaction(tx => docMemberRepo.upsertDirectWithNotificationTx(tx, {
+        ...grant('role_event'), roleNum: 1,
+      }))).rejects.toThrow('forced event failure')
+      expect(await docMemberRepo.getRole('role_event', principal.recipientUid, principal.recipientSpaceId)).toBe('writer')
+    } finally { await getPool().query('DROP TRIGGER fail_role_event') }
+  })
 
   it('returns a consistent count while additions commit, including totals above the page limit', async () => {
     const writer = (async () => {

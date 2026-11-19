@@ -14,7 +14,7 @@ import { confirmSpaceMembership } from '../../permission/spaceMembership.js'
 
 export type DocSpaceScope =
   | { mode: 'human' }
-  | { mode: 'bot'; spaceId: string }
+  | { mode: 'bot' | 'cli'; spaceId: string }
 
 declare global {
   // eslint-disable-next-line @typescript-eslint/no-namespace

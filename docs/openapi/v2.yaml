@@ -1,0 +1,5071 @@
+openapi: 3.1.0
+info:
+  title: OCTO Docs CLI API
+  version: 2.0.0
+  description: >-
+    Operations scoped to the unified token user and Space. Configure OCTO_AUTH_SERVER_URL and
+    OCTO_AUTH_SERVICE_SECRET to enable the CLI routes.
+servers:
+  - url: /
+    description: Docs service origin. The gateway supplies its own mount prefix.
+tags:
+  - name: docs
+    description: Document metadata.
+security:
+  - bearerAuth: []
+paths:
+  /v2/cli/docs:
+    get:
+      tags:
+        - docs
+      operationId: docs.list
+      summary: List visible documents
+      description: List documents owned by or accessible to the token user within its Space.
+      x-octo-action: docs.documents:read
+      x-octo-principal: token_user
+      parameters:
+        - name: folder_id
+          in: query
+          schema:
+            type: string
+        - name: owner
+          in: query
+          schema:
+            type: string
+            enum:
+              - me
+        - name: q
+          in: query
+          schema:
+            type: string
+        - name: type
+          in: query
+          description: Repeat this parameter to include multiple document types.
+          style: form
+          explode: true
+          schema:
+            type: array
+            items:
+              type: string
+              enum:
+                - doc
+                - sheet
+                - board
+                - html
+                - html_ppt
+        - name: sort
+          in: query
+          schema:
+            type: string
+            enum:
+              - updatedAt:asc
+              - updatedAt:desc
+            default: updatedAt:desc
+        - name: page
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 2147483647
+            default: 1
+        - name: page_size
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+      responses:
+        '200':
+          description: Document metadata and pagination.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocsListResponse'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/AuthenticationRequired'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/UpstreamUnavailable'
+    post:
+      operationId: docs.create
+      summary: Create a document or a presentation from a template
+      description: >-
+        Create a document in the verified caller Space. Use docType=html_ppt, title, optional templateId (blank by
+        default), and Idempotency-Key for PPT. Content initialization, metadata and member grants commit
+        atomically.
+      x-octo-risk: write
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DocsCreateRequest'
+      responses:
+        '201':
+          description: Created document metadata
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocsCreateResponse'
+        '400':
+          $ref: '#/components/responses/VALIDATION_ERROR'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          $ref: '#/components/responses/FORBIDDEN'
+        '404':
+          $ref: '#/components/responses/NOT_FOUND'
+        '409':
+          $ref: '#/components/responses/CONFLICT'
+        '413':
+          $ref: '#/components/responses/PAYLOAD_TOO_LARGE'
+        '429':
+          $ref: '#/components/responses/RATE_LIMITED'
+        '500':
+          $ref: '#/components/responses/INTERNAL_ERROR'
+        '503':
+          $ref: '#/components/responses/UPSTREAM_UNAVAILABLE'
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          x-octo-flag: idempotency-key
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 255
+          description: Required for PPT creation, comments and version writes; preserve on an uncertain retry.
+      tags:
+        - docs
+      x-octo-principal: token_user
+      x-octo-action: docs.documents:write
+      x-octo-retry: never
+  /v2/cli/docs/_metadata:
+    post:
+      tags:
+        - docs
+      operationId: docs.metadata.get
+      summary: Read document actor metadata in a batch
+      description: Return metadata for up to 500 IDs, omitting documents outside the token Space or without reader access.
+      x-octo-action: docs.documents:read
+      x-octo-principal: token_user
+      x-octo-risk: read
+      x-octo-cli-hidden: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DocsMetadataRequest'
+      responses:
+        '200':
+          description: Actor metadata for readable active documents.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocsMetadataResponse'
+        '400':
+          $ref: '#/components/responses/VALIDATION_ERROR'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          $ref: '#/components/responses/FORBIDDEN'
+        '404':
+          $ref: '#/components/responses/NOT_FOUND'
+        '413':
+          $ref: '#/components/responses/PAYLOAD_TOO_LARGE'
+        '429':
+          $ref: '#/components/responses/RATE_LIMITED'
+        '500':
+          $ref: '#/components/responses/INTERNAL_ERROR'
+        '503':
+          $ref: '#/components/responses/UPSTREAM_UNAVAILABLE'
+  /v2/cli/docs/{doc_id}:
+    get:
+      tags:
+        - docs
+      operationId: docs.get
+      summary: Get document metadata
+      description: Read an active document in the token's Space with reader access or higher.
+      x-octo-action: docs.documents:read
+      x-octo-principal: token_user
+      parameters:
+        - name: doc_id
+          in: path
+          required: true
+          schema:
+            type: string
+            minLength: 1
+      responses:
+        '200':
+          description: Document metadata and the token user's current role.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocsGetResponse'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/AuthenticationRequired'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Archived'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/UpstreamUnavailable'
+    patch:
+      operationId: docs.rename
+      summary: Rename a document (needs admin)
+      x-octo-risk: write
+      parameters:
+        - name: doc_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DocsRenameRequest'
+      responses:
+        '200':
+          description: Renamed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocsRenameResponse'
+        '400':
+          $ref: '#/components/responses/VALIDATION_ERROR'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          $ref: '#/components/responses/FORBIDDEN'
+        '404':
+          $ref: '#/components/responses/NOT_FOUND'
+        '409':
+          $ref: '#/components/responses/CONFLICT'
+        '413':
+          $ref: '#/components/responses/PAYLOAD_TOO_LARGE'
+        '429':
+          $ref: '#/components/responses/RATE_LIMITED'
+        '500':
+          $ref: '#/components/responses/INTERNAL_ERROR'
+        '503':
+          $ref: '#/components/responses/UPSTREAM_UNAVAILABLE'
+      tags:
+        - docs
+      x-octo-principal: token_user
+      x-octo-action: docs.documents:write
+      x-octo-retry: never
+      description: An administrator can set the title of a document in the token’s Space.
+    delete:
+      operationId: docs.delete
+      summary: Document deletion is disabled for CLI tokens
+      description: >-
+        After authentication the service refuses this operation with 403 FORBIDDEN and
+        details.reason=cli_delete_disabled, regardless of the document's existence or the caller's role. Manage
+        deletion from Octo.
+      x-octo-risk: write
+      parameters:
+        - name: doc_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          description: FORBIDDEN. CLI tokens cannot delete documents.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RATE_LIMITED'
+        '500':
+          $ref: '#/components/responses/INTERNAL_ERROR'
+        '503':
+          $ref: '#/components/responses/UPSTREAM_UNAVAILABLE'
+      tags:
+        - docs
+      x-octo-principal: token_user
+      x-octo-retry: never
+      x-octo-action: docs.documents:write
+  /v2/cli/docs/_search:
+    post:
+      operationId: docs.search
+      summary: Search accessible documents by full-text content
+      description: >-
+        Searches documents the Token user can read. Use --keyword and repeat --doc-type to filter by kind. Pass
+        --page-all to collect all pages.
+      x-octo-risk: read
+      x-octo-pagination:
+        cursorParam: cursor
+        rejectCursorRepeats: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DocsSearchRequest'
+      responses:
+        '200':
+          description: Search results
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocsSearchResponse'
+        '400':
+          $ref: '#/components/responses/VALIDATION_ERROR'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          $ref: '#/components/responses/FORBIDDEN'
+        '404':
+          $ref: '#/components/responses/NOT_FOUND'
+        '413':
+          $ref: '#/components/responses/PAYLOAD_TOO_LARGE'
+        '429':
+          $ref: '#/components/responses/RATE_LIMITED'
+        '500':
+          $ref: '#/components/responses/INTERNAL_ERROR'
+        '503':
+          $ref: '#/components/responses/UPSTREAM_UNAVAILABLE'
+      tags:
+        - docs
+      x-octo-principal: token_user
+      x-octo-action: docs.documents:read
+      parameters:
+        - name: cursor
+          in: query
+          schema:
+            type: string
+            description: opaque cursor from the previous page
+          description: Opaque cursor from the previous page.
+        - name: page_size
+          in: query
+          schema:
+            type: integer
+          description: items per page
+  /v2/cli/docs/{doc_id}/_import_docx:
+    post:
+      operationId: docs.import.docx
+      summary: Import DOCX content
+      description: Atomically replace rich text with the imported Word document.
+      tags:
+        - docs
+      x-octo-principal: token_user
+      x-octo-action: docs.content:write
+      x-octo-cli-hidden: true
+      x-octo-retry: never
+      parameters:
+        - name: doc_id
+          in: path
+          schema:
+            type: string
+          required: true
+          description: Document ID.
+      requestBody:
+        required: true
+        description: Raw file bytes.
+        content:
+          application/vnd.openxmlformats-officedocument.wordprocessingml.document:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '200':
+          description: Import completed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocsImportDocxResponse'
+        '400':
+          $ref: '#/components/responses/VALIDATION_ERROR'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          $ref: '#/components/responses/FORBIDDEN'
+        '404':
+          $ref: '#/components/responses/NOT_FOUND'
+        '409':
+          $ref: '#/components/responses/CONFLICT'
+        '413':
+          $ref: '#/components/responses/PAYLOAD_TOO_LARGE'
+        '415':
+          $ref: '#/components/responses/UNSUPPORTED_MEDIA_TYPE'
+        '429':
+          $ref: '#/components/responses/RATE_LIMITED'
+        '500':
+          $ref: '#/components/responses/INTERNAL_ERROR'
+        '503':
+          $ref: '#/components/responses/UPSTREAM_UNAVAILABLE'
+      x-octo-risk: write
+  /v2/cli/docs/{doc_id}/_import_markdown:
+    post:
+      operationId: docs.import.markdown
+      summary: Import MARKDOWN content
+      description: Atomically replace rich text with the imported Markdown file.
+      tags:
+        - docs
+      x-octo-principal: token_user
+      x-octo-action: docs.content:write
+      x-octo-cli-hidden: true
+      x-octo-retry: never
+      parameters:
+        - name: doc_id
+          in: path
+          schema:
+            type: string
+          required: true
+          description: Document ID.
+      requestBody:
+        required: true
+        description: Raw file bytes.
+        content:
+          text/markdown:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '200':
+          description: Import completed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocsImportMarkdownResponse'
+        '400':
+          $ref: '#/components/responses/VALIDATION_ERROR'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          $ref: '#/components/responses/FORBIDDEN'
+        '404':
+          $ref: '#/components/responses/NOT_FOUND'
+        '409':
+          $ref: '#/components/responses/CONFLICT'
+        '413':
+          $ref: '#/components/responses/PAYLOAD_TOO_LARGE'
+        '415':
+          $ref: '#/components/responses/UNSUPPORTED_MEDIA_TYPE'
+        '429':
+          $ref: '#/components/responses/RATE_LIMITED'
+        '500':
+          $ref: '#/components/responses/INTERNAL_ERROR'
+        '503':
+          $ref: '#/components/responses/UPSTREAM_UNAVAILABLE'
+      x-octo-risk: write
+  /v2/cli/docs/{doc_id}/_import_xlsx:
+    post:
+      operationId: docs.import.xlsx
+      summary: Import XLSX content
+      description: Import the first visible worksheet and replace the target sheet content.
+      tags:
+        - docs
+      x-octo-principal: token_user
+      x-octo-action: docs.content:write
+      x-octo-cli-hidden: true
+      x-octo-retry: never
+      parameters:
+        - name: doc_id
+          in: path
+          schema:
+            type: string
+          required: true
+          description: Document ID.
+      requestBody:
+        required: true
+        description: Raw file bytes.
+        content:
+          application/vnd.openxmlformats-officedocument.spreadsheetml.sheet:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '200':
+          description: Import completed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocsImportXlsxResponse'
+        '400':
+          $ref: '#/components/responses/VALIDATION_ERROR'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          $ref: '#/components/responses/FORBIDDEN'
+        '404':
+          $ref: '#/components/responses/NOT_FOUND'
+        '409':
+          $ref: '#/components/responses/CONFLICT'
+        '413':
+          $ref: '#/components/responses/PAYLOAD_TOO_LARGE'
+        '415':
+          $ref: '#/components/responses/UNSUPPORTED_MEDIA_TYPE'
+        '429':
+          $ref: '#/components/responses/RATE_LIMITED'
+        '500':
+          $ref: '#/components/responses/INTERNAL_ERROR'
+        '503':
+          $ref: '#/components/responses/UPSTREAM_UNAVAILABLE'
+      x-octo-risk: write
+  /v2/cli/docs/{doc_id}/_import_excalidraw:
+    post:
+      operationId: docs.import.excalidraw
+      summary: Import EXCALIDRAW content
+      description: Import a native Excalidraw file in merge or replace mode.
+      tags:
+        - docs
+      x-octo-principal: token_user
+      x-octo-action: docs.content:write
+      x-octo-cli-hidden: true
+      x-octo-retry: never
+      parameters:
+        - name: doc_id
+          in: path
+          schema:
+            type: string
+          required: true
+          description: Document ID.
+        - name: mode
+          in: query
+          schema:
+            type: string
+            enum:
+              - merge
+              - replace
+            default: merge
+          description: Import mode.
+      requestBody:
+        required: true
+        description: Raw file bytes.
+        content:
+          application/json:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '200':
+          description: Import completed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocsImportExcalidrawResponse'
+        '400':
+          $ref: '#/components/responses/VALIDATION_ERROR'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          $ref: '#/components/responses/FORBIDDEN'
+        '404':
+          $ref: '#/components/responses/NOT_FOUND'
+        '409':
+          $ref: '#/components/responses/CONFLICT'
+        '413':
+          $ref: '#/components/responses/PAYLOAD_TOO_LARGE'
+        '415':
+          $ref: '#/components/responses/UNSUPPORTED_MEDIA_TYPE'
+        '429':
+          $ref: '#/components/responses/RATE_LIMITED'
+        '500':
+          $ref: '#/components/responses/INTERNAL_ERROR'
+        '503':
+          $ref: '#/components/responses/UPSTREAM_UNAVAILABLE'
+      x-octo-risk: write
+  /v2/cli/docs/{doc_id}/_export:
+    get:
+      operationId: docs.file.export
+      summary: Export a document or board to a file
+      tags:
+        - docs
+      x-octo-principal: token_user
+      x-octo-action: docs.content:read
+      x-octo-cli-hidden: true
+      x-octo-binary-response: true
+      parameters:
+        - name: doc_id
+          in: path
+          schema:
+            type: string
+          required: true
+          description: Document ID.
+        - name: format
+          in: query
+          schema:
+            type: string
+            enum:
+              - md
+              - docx
+              - pdf
+              - xlsx
+              - png
+              - svg
+          required: true
+      responses:
+        '200':
+          description: Exported document bytes
+          headers:
+            Content-Disposition:
+              description: Attachment filename.
+              schema:
+                type: string
+          content:
+            text/markdown:
+              schema:
+                type: string
+                format: binary
+            application/vnd.openxmlformats-officedocument.wordprocessingml.document:
+              schema:
+                type: string
+                format: binary
+            application/pdf:
+              schema:
+                type: string
+                format: binary
+            application/vnd.openxmlformats-officedocument.spreadsheetml.sheet:
+              schema:
+                type: string
+                format: binary
+            image/png:
+              schema:
+                type: string
+                format: binary
+            image/svg+xml:
+              schema:
+                type: string
+                format: binary
+        '400':
+          $ref: '#/components/responses/VALIDATION_ERROR'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          $ref: '#/components/responses/FORBIDDEN'
+        '404':
+          $ref: '#/components/responses/NOT_FOUND'
+        '413':
+          $ref: '#/components/responses/PAYLOAD_TOO_LARGE'
+        '429':
+          $ref: '#/components/responses/RATE_LIMITED'
+        '500':
+          $ref: '#/components/responses/INTERNAL_ERROR'
+        '503':
+          $ref: '#/components/responses/UPSTREAM_UNAVAILABLE'
+      x-octo-risk: read
+      description: >-
+        The server selects the export renderer from the format and document type.
+        For Markdown (`md`) and DOCX (`docx`), `docs.content:read` and the document reader role also
+        authorize exports to sign temporary URLs for attachments that belong to and are referenced by the document.
+        Markdown may include signed image and file URLs. DOCX may include signed file download links and
+        embed supported images. A signed URL grants access to the original attachment until it expires.
+        Requesting signed URLs directly through
+        `docs.attachments.get` or `docs.attachments.resolve` requires `docs.attachments:read` and the document reader role.
+        Embedding whiteboard images in SVG requires docs.attachments:read in addition to docs.content:read and the document reader role.
+  /v2/cli/docs/{doc_id}/content:
+    get:
+      operationId: docs.content.get
+      summary: Read a document's live body + its base version (needs reader)
+      description: >-
+        Reads the LIVE ProseMirror body of a doc_type 'doc' plus the base-version token that pins the read. Pass
+        that token to `docs content edit` as --base-version so the optimistic-concurrency guard can prove the body
+        did not change between read and write. board / whiteboard bodies are a different Y.Doc shape and return 409
+        CONFLICT (details.reason=unsupported_doc_type) here.
+      x-octo-risk: read
+      parameters:
+        - name: doc_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Live body + base version
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocsContentGetResponse'
+              example:
+                data:
+                  doc_id: example-doc
+                  base_version: example-base-version
+                  schema_version: 1
+                  doc:
+                    type: doc
+                    content:
+                      - type: paragraph
+        '400':
+          $ref: '#/components/responses/VALIDATION_ERROR'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          $ref: '#/components/responses/FORBIDDEN'
+        '404':
+          $ref: '#/components/responses/NOT_FOUND'
+        '409':
+          $ref: '#/components/responses/CONFLICT'
+        '429':
+          $ref: '#/components/responses/RATE_LIMITED'
+        '500':
+          $ref: '#/components/responses/INTERNAL_ERROR'
+        '503':
+          $ref: '#/components/responses/UPSTREAM_UNAVAILABLE'
+      tags:
+        - docs
+      x-octo-principal: token_user
+      x-octo-action: docs.content:read
+    patch:
+      operationId: docs.content.edit
+      summary: Apply an incremental block-op edit to a document body (needs writer)
+      description: >-
+        Apply a batch of block operations using If-Match and a JSON ops array. A stale version returns 409 CONFLICT
+        and requires a fresh read.
+      x-octo-risk: write
+      parameters:
+        - name: doc_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: If-Match
+          in: header
+          required: true
+          x-octo-flag: base-version
+          schema:
+            type: string
+          description: >-
+            base-version token from 'docs content get' (sent as the If-Match header for optimistic concurrency;
+            required)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DocsContentEditRequest'
+      responses:
+        '200':
+          description: Edit applied; carries the new base version
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocsContentEditResponse'
+        '400':
+          $ref: '#/components/responses/VALIDATION_ERROR'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          $ref: '#/components/responses/FORBIDDEN'
+        '404':
+          $ref: '#/components/responses/NOT_FOUND'
+        '409':
+          $ref: '#/components/responses/CONFLICT'
+        '413':
+          $ref: '#/components/responses/PAYLOAD_TOO_LARGE'
+        '429':
+          $ref: '#/components/responses/RATE_LIMITED'
+        '500':
+          $ref: '#/components/responses/INTERNAL_ERROR'
+        '503':
+          $ref: '#/components/responses/UPSTREAM_UNAVAILABLE'
+      tags:
+        - docs
+      x-octo-principal: token_user
+      x-octo-action: docs.content:write
+      x-octo-retry: never
+  /v2/cli/docs/{doc_id}/scene:
+    get:
+      operationId: docs.scene.get
+      summary: Read a whiteboard's live scene + its base version (needs reader)
+      description: >-
+        Reads the LIVE Excalidraw scene of a doc_type 'board' — its `elements` in fractional-index (z-order), the
+        `files` map of image/file refs, and the base-version token that pins the read. Pass that token to `docs
+        scene edit` as --base-version so the optimistic-concurrency guard can prove the scene did not change
+        between read and write. doc / sheet bodies are a different Y.Doc shape and return 409 CONFLICT
+        (details.reason=unsupported_doc_type) here; a live scene that decodes to a wrong-kind / corrupt blob
+        returns 409 CONFLICT (details.reason=board_snapshot_invalid).
+      x-octo-risk: read
+      parameters:
+        - name: doc_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Live scene + base version
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocsSceneGetResponse'
+        '400':
+          $ref: '#/components/responses/VALIDATION_ERROR'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          $ref: '#/components/responses/FORBIDDEN'
+        '404':
+          $ref: '#/components/responses/NOT_FOUND'
+        '409':
+          $ref: '#/components/responses/CONFLICT'
+        '429':
+          $ref: '#/components/responses/RATE_LIMITED'
+        '500':
+          $ref: '#/components/responses/INTERNAL_ERROR'
+        '503':
+          $ref: '#/components/responses/UPSTREAM_UNAVAILABLE'
+      tags:
+        - docs
+      x-octo-principal: token_user
+      x-octo-action: docs.content:read
+    patch:
+      operationId: docs.scene.edit
+      summary: Apply an element upsert/delete batch to a whiteboard scene (needs writer)
+      description: >-
+        Applies a batch of element upserts and soft-deletes to a doc_type 'board' scene under a mandatory
+        optimistic-concurrency guard. Pass the base-version token from `docs scene get` via --base-version (sent as
+        the If-Match header); the server rejects with 409 CONFLICT (base_version_stale) if the live scene moved
+        since that read. `elements` are full elements to upsert (CAS: the higher `version` wins),
+        `deletedElementIds` are soft-delete tombstones, and `files` upserts file refs; the batch is a structured
+        object, so pass it as JSON through --data. Every element in `elements` must carry a valid fractional-index
+        `index` (z-order key); the CLI rejects an index-less or malformed-index element locally before sending.
+        Only doc_type 'board' is accepted (doc / sheet return 409 CONFLICT (details.reason=unsupported_doc_type)).
+        Gates: element count over the max → 413 PAYLOAD_TOO_LARGE (details.reason=too_many_elements), a single
+        element too large → 413 PAYLOAD_TOO_LARGE (details.reason=element_too_large), whole scene over the cap →
+        413 PAYLOAD_TOO_LARGE (details.reason=doc_too_large), an element failing the whitelist → 400
+        VALIDATION_ERROR (details.reason=board_element_invalid), a file ref with no usable attachId → 400
+        VALIDATION_ERROR (details.reason=board_file_invalid), missing base version or malformed shape → 400
+        invalid_body.
+      x-octo-risk: write
+      parameters:
+        - name: doc_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: If-Match
+          in: header
+          required: true
+          x-octo-flag: base-version
+          schema:
+            type: string
+          description: >-
+            base-version token from 'docs scene get' (sent as the If-Match header for optimistic concurrency;
+            required)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DocsSceneEditRequest'
+      responses:
+        '200':
+          description: Edit applied; carries the new base version
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocsSceneEditResponse'
+        '400':
+          $ref: '#/components/responses/VALIDATION_ERROR'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          $ref: '#/components/responses/FORBIDDEN'
+        '404':
+          $ref: '#/components/responses/NOT_FOUND'
+        '409':
+          $ref: '#/components/responses/CONFLICT'
+        '413':
+          $ref: '#/components/responses/PAYLOAD_TOO_LARGE'
+        '429':
+          $ref: '#/components/responses/RATE_LIMITED'
+        '500':
+          $ref: '#/components/responses/INTERNAL_ERROR'
+        '503':
+          $ref: '#/components/responses/UPSTREAM_UNAVAILABLE'
+      tags:
+        - docs
+      x-octo-principal: token_user
+      x-octo-action: docs.content:write
+      x-octo-retry: never
+  /v2/cli/docs/{doc_id}/scene/_export:
+    get:
+      operationId: docs.scene.export
+      summary: Export the live whiteboard as PNG, SVG or Excalidraw
+      description: >-
+        Use --image-format png, svg or excalidraw. Excalidraw exports include referenced board images.
+        Embedding images in SVG or Excalidraw requires docs.attachments:read in addition to docs.content:read and the document reader role.
+      x-octo-risk: read
+      x-octo-binary-response: true
+      parameters:
+        - name: doc_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: format
+          in: query
+          x-octo-flag: image-format
+          schema:
+            type: string
+            enum:
+              - png
+              - svg
+              - excalidraw
+            default: png
+          description: Board export format. Defaults to png.
+      responses:
+        '200':
+          description: Rendered image or portable Excalidraw file
+          content:
+            image/png:
+              schema:
+                type: string
+                format: binary
+            image/svg+xml:
+              schema:
+                type: string
+                format: binary
+            application/vnd.excalidraw+json:
+              schema:
+                type: string
+                format: binary
+          headers:
+            Content-Disposition:
+              description: Attachment filename.
+              schema:
+                type: string
+        '400':
+          $ref: '#/components/responses/VALIDATION_ERROR'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          $ref: '#/components/responses/FORBIDDEN'
+        '404':
+          $ref: '#/components/responses/NOT_FOUND'
+        '409':
+          $ref: '#/components/responses/CONFLICT'
+        '413':
+          $ref: '#/components/responses/PAYLOAD_TOO_LARGE'
+        '429':
+          $ref: '#/components/responses/RATE_LIMITED'
+        '500':
+          $ref: '#/components/responses/INTERNAL_ERROR'
+        '503':
+          $ref: '#/components/responses/UPSTREAM_UNAVAILABLE'
+      tags:
+        - docs
+      x-octo-principal: token_user
+      x-octo-action: docs.content:read
+  /v2/cli/docs/{doc_id}/ppt:
+    get:
+      operationId: docs.ppt.get
+      summary: Read the current PPT deck and its base revision
+      description: >-
+        Reads the live deck, base_revision and content_hash. Pass the revision and an updated deck to docs ppt
+        edit. Keep the deck's native field names.
+      x-octo-risk: read
+      parameters:
+        - name: doc_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Live deck
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocsPptGetResponse'
+              example:
+                data:
+                  doc_id: example-doc
+                  base_revision: 3
+                  content_hash: example-hash
+                  deck:
+                    docId: example-doc
+                    slides: []
+        '400':
+          $ref: '#/components/responses/VALIDATION_ERROR'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          $ref: '#/components/responses/FORBIDDEN'
+        '404':
+          $ref: '#/components/responses/NOT_FOUND'
+        '429':
+          $ref: '#/components/responses/RATE_LIMITED'
+        '500':
+          $ref: '#/components/responses/INTERNAL_ERROR'
+        '503':
+          $ref: '#/components/responses/UPSTREAM_UNAVAILABLE'
+      tags:
+        - docs
+      x-octo-principal: token_user
+      x-octo-action: docs.content:read
+    patch:
+      operationId: docs.ppt.edit
+      x-octo-strict-request-schema: true
+      summary: Apply a PPT edit under a mandatory base revision
+      description: >-
+        Submit base_revision and the updated native deck from a fresh read. A revision conflict requires reading
+        the latest deck before applying the intended changes.
+      x-octo-risk: write
+      parameters:
+        - name: doc_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DocsPptEditRequest'
+            example:
+              base_revision: 3
+              deck:
+                docId: example-doc
+                slides: []
+      responses:
+        '200':
+          description: Durably committed edit
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocsPptEditResponse'
+        '400':
+          $ref: '#/components/responses/VALIDATION_ERROR'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          $ref: '#/components/responses/FORBIDDEN'
+        '404':
+          $ref: '#/components/responses/NOT_FOUND'
+        '409':
+          $ref: '#/components/responses/CONFLICT'
+        '413':
+          $ref: '#/components/responses/PAYLOAD_TOO_LARGE'
+        '429':
+          $ref: '#/components/responses/RATE_LIMITED'
+        '500':
+          $ref: '#/components/responses/INTERNAL_ERROR'
+        '503':
+          $ref: '#/components/responses/UPSTREAM_UNAVAILABLE'
+      tags:
+        - docs
+      x-octo-principal: token_user
+      x-octo-action: docs.content:write
+      x-octo-retry: never
+  /v2/cli/docs/{doc_id}/ppt/_export:
+    get:
+      operationId: docs.ppt.export
+      summary: Save the live PPT as a self-contained HTML presentation (reader or higher)
+      description: >-
+        Pass --output slides.html to save the actual file bytes. Without --output, only response metadata is
+        printed. HTML is an offline player, not editable PPTX or PDF. On a compatible backend, document-owned
+        ppt-media: attachments are embedded into the export without changing the saved deck. Arbitrary external
+        URLs are not fetched and collaboration credentials are not included. Missing, unauthorized or oversized
+        media causes export failure.
+      x-octo-risk: read
+      x-octo-binary-response: true
+      parameters:
+        - name: doc_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: format
+          in: query
+          x-octo-flag: file-format
+          schema:
+            type: string
+            enum:
+              - html
+            default: html
+      responses:
+        '200':
+          description: Offline presentation file
+          content:
+            text/html:
+              schema:
+                type: string
+                format: binary
+          headers:
+            Content-Disposition:
+              description: Attachment filename.
+              schema:
+                type: string
+        '400':
+          $ref: '#/components/responses/VALIDATION_ERROR'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          $ref: '#/components/responses/FORBIDDEN'
+        '404':
+          $ref: '#/components/responses/NOT_FOUND'
+        '409':
+          $ref: '#/components/responses/CONFLICT'
+        '413':
+          $ref: '#/components/responses/PAYLOAD_TOO_LARGE'
+        '429':
+          $ref: '#/components/responses/RATE_LIMITED'
+        '500':
+          $ref: '#/components/responses/INTERNAL_ERROR'
+        '503':
+          $ref: '#/components/responses/UPSTREAM_UNAVAILABLE'
+      tags:
+        - docs
+      x-octo-principal: token_user
+      x-octo-action: docs.content:read
+  /v2/cli/docs/{doc_id}/sheets:
+    get:
+      operationId: docs.sheet.list
+      summary: List worksheet IDs and names without downloading cells (needs reader)
+      description: >-
+        Returns the worksheet directory in tab order: sheetId (the persistent logicalId), name, order, rowCount and
+        columnCount. Does not return cells or a base_version. Use this to discover a worksheet before docs sheet
+        get --sheet-id or --sheet-name. An old workbook without sheetList exposes its implicit default / Sheet1
+        worksheet. Counts describe declared grid size, not populated cells. Requires the worksheet-directory
+        backend; do not fall back to downloading the entire workbook when this endpoint is unavailable.
+      x-octo-risk: read
+      x-octo-strict-response-schema: true
+      parameters:
+        - name: doc_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Worksheet directory, without cell content
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocsSheetListResponse'
+        '400':
+          $ref: '#/components/responses/VALIDATION_ERROR'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          $ref: '#/components/responses/FORBIDDEN'
+        '404':
+          $ref: '#/components/responses/NOT_FOUND'
+        '429':
+          $ref: '#/components/responses/RATE_LIMITED'
+        '500':
+          $ref: '#/components/responses/INTERNAL_ERROR'
+        '503':
+          $ref: '#/components/responses/UPSTREAM_UNAVAILABLE'
+      tags:
+        - docs
+      x-octo-principal: token_user
+      x-octo-action: docs.content:read
+  /v2/cli/docs/{doc_id}/sheet:
+    get:
+      operationId: docs.sheet.get
+      summary: Read live spreadsheet cells and worksheet metadata
+      description: >-
+        Reads a versioned sheet snapshot. Use --sheet-id or --sheet-name to select one tab. In paged mode continue
+        using pagination.next_cursor and reread if the snapshot changes. Pass data.base_version to sheet writes
+        using --base-version.
+      x-octo-risk: read
+      parameters:
+        - name: doc_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+          description: >-
+            max cells per page; opts into paged reads. Bounded by the server byte cap regardless. Omit for a
+            whole-sheet read.
+        - name: cursor
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Opaque cursor from the previous page.
+        - name: sheet_id
+          in: query
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 64
+          description: >-
+            read only this persistent worksheet logicalId, discovered via docs sheet list. Mutually exclusive with
+            --sheet-name. Filters cells and associated metadata before pagination and byte limits. Omit both
+            selectors for the whole workbook. Requires worksheet-scoped read backend support.
+        - name: sheet_name
+          in: query
+          schema:
+            type: string
+            minLength: 1
+          description: >-
+            read only the worksheet with this exact display name. Mutually exclusive with --sheet-id. Missing names
+            return sheet_not_found; duplicates return ambiguous_sheet_name with match IDs. Never guesses or falls
+            back to all worksheets.
+      responses:
+        '200':
+          description: Live cells + dims + base version (paged when --limit/--cursor is set)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocsSheetGetResponse'
+        '400':
+          $ref: '#/components/responses/VALIDATION_ERROR'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          $ref: '#/components/responses/FORBIDDEN'
+        '404':
+          $ref: '#/components/responses/NOT_FOUND'
+        '409':
+          $ref: '#/components/responses/CONFLICT'
+        '413':
+          $ref: '#/components/responses/PAYLOAD_TOO_LARGE'
+        '429':
+          $ref: '#/components/responses/RATE_LIMITED'
+        '500':
+          $ref: '#/components/responses/INTERNAL_ERROR'
+        '503':
+          $ref: '#/components/responses/UPSTREAM_UNAVAILABLE'
+      tags:
+        - docs
+      x-octo-principal: token_user
+      x-octo-action: docs.content:read
+    patch:
+      operationId: docs.sheet.edit
+      summary: Apply an atomic batch of spreadsheet changes
+      description: >-
+        Apply one atomic batch with --base-version from a fresh sheet read. Top-level fields use snake_case; keep
+        native worksheet maps and rules unchanged. A stale version returns 409 CONFLICT.
+      x-octo-risk: write
+      parameters:
+        - name: doc_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: If-Match
+          in: header
+          required: true
+          x-octo-flag: base-version
+          schema:
+            type: string
+          description: >-
+            base-version token from 'docs sheet get' (sent as the If-Match header for optimistic concurrency;
+            required)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DocsSheetEditRequest'
+      responses:
+        '200':
+          description: Edit applied; carries the new base version
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocsSheetEditResponse'
+        '400':
+          $ref: '#/components/responses/VALIDATION_ERROR'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          $ref: '#/components/responses/FORBIDDEN'
+        '404':
+          $ref: '#/components/responses/NOT_FOUND'
+        '409':
+          $ref: '#/components/responses/CONFLICT'
+        '413':
+          $ref: '#/components/responses/PAYLOAD_TOO_LARGE'
+        '429':
+          $ref: '#/components/responses/RATE_LIMITED'
+        '500':
+          $ref: '#/components/responses/INTERNAL_ERROR'
+        '503':
+          $ref: '#/components/responses/UPSTREAM_UNAVAILABLE'
+      tags:
+        - docs
+      x-octo-principal: token_user
+      x-octo-action: docs.content:write
+      x-octo-retry: never
+  /v2/cli/docs/{doc_id}/sheet/rows/_insert:
+    post:
+      operationId: docs.sheet_rows.insert
+      x-octo-strict-request-schema: true
+      summary: Insert rows after an existing spreadsheet row (needs writer)
+      description: >-
+        Insert count blank rows after the zero-based after_row of one worksheet. Use --base-version from a fresh
+        sheet read. The edit is atomic and shifts worksheet resources anchored after the insertion point.
+      x-octo-risk: write
+      parameters:
+        - name: doc_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: If-Match
+          in: header
+          required: true
+          x-octo-flag: base-version
+          schema:
+            type: string
+          description: base-version token from docs sheet get (sent as If-Match; required)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DocsSheetRowsInsertRequest'
+      responses:
+        '200':
+          description: Inserted row count, resulting rowCount, and fresh base version
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocsSheetRowsInsertResponse'
+        '400':
+          $ref: '#/components/responses/VALIDATION_ERROR'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          $ref: '#/components/responses/FORBIDDEN'
+        '404':
+          $ref: '#/components/responses/NOT_FOUND'
+        '409':
+          $ref: '#/components/responses/CONFLICT'
+        '413':
+          $ref: '#/components/responses/PAYLOAD_TOO_LARGE'
+        '429':
+          $ref: '#/components/responses/RATE_LIMITED'
+        '500':
+          $ref: '#/components/responses/INTERNAL_ERROR'
+        '503':
+          $ref: '#/components/responses/UPSTREAM_UNAVAILABLE'
+      x-octo-command-path:
+        - sheet
+        - rows
+        - insert
+      tags:
+        - docs
+      x-octo-principal: token_user
+      x-octo-action: docs.content:write
+      x-octo-retry: never
+  /v2/cli/docs/{doc_id}/sheet/rows/_delete:
+    post:
+      operationId: docs.sheet_rows.delete
+      x-octo-strict-request-schema: true
+      summary: Delete spreadsheet rows (needs writer)
+      description: >-
+        Delete count rows starting at the zero-based start_row of one worksheet. Use --base-version from a fresh
+        sheet read. The edit is atomic and must leave at least one row.
+      x-octo-risk: write
+      parameters:
+        - name: doc_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: If-Match
+          in: header
+          required: true
+          x-octo-flag: base-version
+          schema:
+            type: string
+          description: base-version token from docs sheet get (sent as If-Match; required)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DocsSheetRowsDeleteRequest'
+      responses:
+        '200':
+          description: Deleted row count, resulting rowCount, and fresh base version
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocsSheetRowsDeleteResponse'
+        '400':
+          $ref: '#/components/responses/VALIDATION_ERROR'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          $ref: '#/components/responses/FORBIDDEN'
+        '404':
+          $ref: '#/components/responses/NOT_FOUND'
+        '409':
+          $ref: '#/components/responses/CONFLICT'
+        '413':
+          $ref: '#/components/responses/PAYLOAD_TOO_LARGE'
+        '429':
+          $ref: '#/components/responses/RATE_LIMITED'
+        '500':
+          $ref: '#/components/responses/INTERNAL_ERROR'
+        '503':
+          $ref: '#/components/responses/UPSTREAM_UNAVAILABLE'
+      x-octo-command-path:
+        - sheet
+        - rows
+        - delete
+      tags:
+        - docs
+      x-octo-principal: token_user
+      x-octo-action: docs.content:write
+      x-octo-retry: never
+  /v2/cli/docs/{doc_id}/sheet/columns/_insert:
+    post:
+      operationId: docs.sheet_columns.insert
+      x-octo-strict-request-schema: true
+      summary: Insert columns after an existing spreadsheet column (needs writer)
+      description: >-
+        Insert count blank columns after the zero-based after_column of one worksheet. Use --base-version from a
+        fresh sheet read. The edit is atomic and shifts worksheet resources anchored after the insertion point.
+      x-octo-risk: write
+      parameters:
+        - name: doc_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: If-Match
+          in: header
+          required: true
+          x-octo-flag: base-version
+          schema:
+            type: string
+          description: base-version token from docs sheet get (sent as If-Match; required)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DocsSheetColumnsInsertRequest'
+      responses:
+        '200':
+          description: Inserted column count, resulting columnCount, and fresh base version
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocsSheetColumnsInsertResponse'
+        '400':
+          $ref: '#/components/responses/VALIDATION_ERROR'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          $ref: '#/components/responses/FORBIDDEN'
+        '404':
+          $ref: '#/components/responses/NOT_FOUND'
+        '409':
+          $ref: '#/components/responses/CONFLICT'
+        '413':
+          $ref: '#/components/responses/PAYLOAD_TOO_LARGE'
+        '429':
+          $ref: '#/components/responses/RATE_LIMITED'
+        '500':
+          $ref: '#/components/responses/INTERNAL_ERROR'
+        '503':
+          $ref: '#/components/responses/UPSTREAM_UNAVAILABLE'
+      x-octo-command-path:
+        - sheet
+        - columns
+        - insert
+      tags:
+        - docs
+      x-octo-principal: token_user
+      x-octo-action: docs.content:write
+      x-octo-retry: never
+  /v2/cli/docs/{doc_id}/sheet/columns/_delete:
+    post:
+      operationId: docs.sheet_columns.delete
+      x-octo-strict-request-schema: true
+      summary: Delete spreadsheet columns (needs writer)
+      description: >-
+        Delete count columns starting at the zero-based start_column of one worksheet. Use --base-version from a
+        fresh sheet read. The edit is atomic and must leave at least one column.
+      x-octo-risk: write
+      parameters:
+        - name: doc_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: If-Match
+          in: header
+          required: true
+          x-octo-flag: base-version
+          schema:
+            type: string
+          description: base-version token from docs sheet get (sent as If-Match; required)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DocsSheetColumnsDeleteRequest'
+      responses:
+        '200':
+          description: Deleted column count, resulting columnCount, and fresh base version
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocsSheetColumnsDeleteResponse'
+        '400':
+          $ref: '#/components/responses/VALIDATION_ERROR'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          $ref: '#/components/responses/FORBIDDEN'
+        '404':
+          $ref: '#/components/responses/NOT_FOUND'
+        '409':
+          $ref: '#/components/responses/CONFLICT'
+        '413':
+          $ref: '#/components/responses/PAYLOAD_TOO_LARGE'
+        '429':
+          $ref: '#/components/responses/RATE_LIMITED'
+        '500':
+          $ref: '#/components/responses/INTERNAL_ERROR'
+        '503':
+          $ref: '#/components/responses/UPSTREAM_UNAVAILABLE'
+      x-octo-command-path:
+        - sheet
+        - columns
+        - delete
+      tags:
+        - docs
+      x-octo-principal: token_user
+      x-octo-action: docs.content:write
+      x-octo-retry: never
+  /v2/cli/docs/{doc_id}/sheet/_replace:
+    post:
+      operationId: docs.sheet.replace
+      summary: Find and replace spreadsheet values or formulas atomically (needs writer)
+      description: >-
+        Apply one atomic find and replace with --base-version. Omit logical_id to search the whole workbook or use
+        logical_id and an optional zero-based range to narrow the operation.
+      x-octo-risk: write
+      parameters:
+        - name: doc_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: If-Match
+          in: header
+          required: true
+          x-octo-flag: base-version
+          schema:
+            type: string
+          description: base-version token from 'docs sheet get' (sent as the If-Match header; required)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DocsSheetReplaceRequest'
+      responses:
+        '200':
+          description: Replacement result and current/new base version
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocsSheetReplaceResponse'
+        '400':
+          $ref: '#/components/responses/VALIDATION_ERROR'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          $ref: '#/components/responses/FORBIDDEN'
+        '404':
+          $ref: '#/components/responses/NOT_FOUND'
+        '409':
+          $ref: '#/components/responses/CONFLICT'
+        '413':
+          $ref: '#/components/responses/PAYLOAD_TOO_LARGE'
+        '429':
+          $ref: '#/components/responses/RATE_LIMITED'
+        '500':
+          $ref: '#/components/responses/INTERNAL_ERROR'
+        '503':
+          $ref: '#/components/responses/UPSTREAM_UNAVAILABLE'
+      tags:
+        - docs
+      x-octo-principal: token_user
+      x-octo-action: docs.content:write
+      x-octo-retry: never
+  /v2/cli/docs/{doc_id}/sheet/_split:
+    post:
+      x-octo-strict-request-schema: true
+      operationId: docs.sheet.split
+      summary: Preview or apply literal text-to-columns (needs writer)
+      description: >-
+        Defaults to server-side preview; --dry-run only prints the HTTP request and is not a data preview. Read a
+        fresh base_version, preview, then apply with --preview=false and that same token. Both input and output are
+        bounded to 20000 cells (or the lower deployed write limit). Active filters, source formulas, intersecting
+        merges, drawings, hyperlinks, validations and comments are refused; protection and authorization are
+        checked server-side. Apply is one atomic guarded sheet edit with an automatic safety snapshot. Preserves
+        leading zeros, long numbers, empty fields and formula-looking text; writes strings with text number format
+        @, while retaining destination styles. Overwriting nonempty destinations requires --overwrite.
+      parameters:
+        - name: doc_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: If-Match
+          in: header
+          required: true
+          x-octo-flag: base-version
+          schema:
+            type: string
+          description: base-version token from 'docs sheet get' (sent as the If-Match header; required)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DocsSheetSplitRequest'
+      responses:
+        '200':
+          description: Read-only preview or atomic application result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocsSheetSplitResponse'
+        '400':
+          $ref: '#/components/responses/VALIDATION_ERROR'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          $ref: '#/components/responses/FORBIDDEN'
+        '404':
+          $ref: '#/components/responses/NOT_FOUND'
+        '409':
+          $ref: '#/components/responses/CONFLICT'
+        '413':
+          $ref: '#/components/responses/PAYLOAD_TOO_LARGE'
+        '429':
+          $ref: '#/components/responses/RATE_LIMITED'
+        '500':
+          $ref: '#/components/responses/INTERNAL_ERROR'
+        '503':
+          $ref: '#/components/responses/UPSTREAM_UNAVAILABLE'
+      x-octo-risk: write
+      tags:
+        - docs
+      x-octo-principal: token_user
+      x-octo-action: docs.content:write
+      x-octo-retry: never
+  /v2/cli/docs/{doc_id}/sheet/_deduplicate:
+    post:
+      x-octo-strict-request-schema: true
+      operationId: docs.sheet.deduplicate
+      summary: Preview or apply duplicate removal inside a selection (needs writer)
+      description: >-
+        Defaults to server-side preview; --dry-run only prints the HTTP request and is not a data preview. Read a
+        fresh base_version, preview, then apply with --preview=false and that same token. Both input and output are
+        bounded to 20000 cells (or the lower deployed write limit). Active filters, source formulas, intersecting
+        merges, drawings, hyperlinks, validations and comments are refused; protection and authorization are
+        checked server-side. Apply is one atomic guarded sheet edit with an automatic safety snapshot. Compares all
+        selected columns, keeps the first record and blank rows, compacts only selected values and clears trailing
+        contents. Does not delete whole rows; destination formatting stays fixed.
+      parameters:
+        - name: doc_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: If-Match
+          in: header
+          required: true
+          x-octo-flag: base-version
+          schema:
+            type: string
+          description: base-version token from 'docs sheet get' (sent as the If-Match header; required)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DocsSheetDeduplicateRequest'
+      responses:
+        '200':
+          description: Read-only preview or atomic application result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocsSheetDeduplicateResponse'
+        '400':
+          $ref: '#/components/responses/VALIDATION_ERROR'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          $ref: '#/components/responses/FORBIDDEN'
+        '404':
+          $ref: '#/components/responses/NOT_FOUND'
+        '409':
+          $ref: '#/components/responses/CONFLICT'
+        '413':
+          $ref: '#/components/responses/PAYLOAD_TOO_LARGE'
+        '429':
+          $ref: '#/components/responses/RATE_LIMITED'
+        '500':
+          $ref: '#/components/responses/INTERNAL_ERROR'
+        '503':
+          $ref: '#/components/responses/UPSTREAM_UNAVAILABLE'
+      x-octo-risk: write
+      tags:
+        - docs
+      x-octo-principal: token_user
+      x-octo-action: docs.content:write
+      x-octo-retry: never
+  /v2/cli/docs/{doc_id}/members:
+    get:
+      operationId: docs.members.list
+      summary: List a document's members (needs reader or higher)
+      x-octo-risk: read
+      parameters:
+        - name: doc_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Members
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocsMembersListResponse'
+        '400':
+          $ref: '#/components/responses/VALIDATION_ERROR'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          $ref: '#/components/responses/FORBIDDEN'
+        '404':
+          $ref: '#/components/responses/NOT_FOUND'
+        '429':
+          $ref: '#/components/responses/RATE_LIMITED'
+        '500':
+          $ref: '#/components/responses/INTERNAL_ERROR'
+        '503':
+          $ref: '#/components/responses/UPSTREAM_UNAVAILABLE'
+      tags:
+        - docs
+      x-octo-principal: token_user
+      x-octo-action: docs.access:read
+      description: Returns the explicit members of a readable document and their Space-qualified roles.
+    put:
+      operationId: docs.members.set
+      summary: Add or change a member's role by uid (upsert; needs admin)
+      description: >-
+        Grant or update a verified human user in the Token's Space. An explicitly supplied principal_space_id
+        must match that Space.
+      x-octo-risk: write
+      parameters:
+        - name: doc_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DocsMembersSetRequest'
+      responses:
+        '200':
+          description: Upserted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocsMembersSetResponse'
+        '400':
+          $ref: '#/components/responses/VALIDATION_ERROR'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          $ref: '#/components/responses/FORBIDDEN'
+        '404':
+          $ref: '#/components/responses/NOT_FOUND'
+        '409':
+          $ref: '#/components/responses/CONFLICT'
+        '413':
+          $ref: '#/components/responses/PAYLOAD_TOO_LARGE'
+        '429':
+          $ref: '#/components/responses/RATE_LIMITED'
+        '500':
+          $ref: '#/components/responses/INTERNAL_ERROR'
+        '503':
+          $ref: '#/components/responses/UPSTREAM_UNAVAILABLE'
+      tags:
+        - docs
+      x-octo-principal: token_user
+      x-octo-action: docs.access:write
+      x-octo-retry: never
+  /v2/cli/docs/{doc_id}/members/{member_id}:
+    delete:
+      operationId: docs.members.remove
+      summary: Remove a Space-qualified member (needs admin; the owner cannot be removed)
+      description: >-
+        Removes the exact member and principal Space recorded in the ACL. The service protects the document owner
+        and the caller.
+      x-octo-risk: write
+      parameters:
+        - name: doc_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: member_id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Identifier of the member to update or remove.
+        - name: principal_space_id
+          in: query
+          required: true
+          schema:
+            type: string
+          description: >-
+            principal Space id of the membership to remove; identifies the Space-qualified membership when the same
+            uid has memberships in multiple Spaces
+      responses:
+        '200':
+          description: Removed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocsMembersRemoveResponse'
+        '400':
+          $ref: '#/components/responses/VALIDATION_ERROR'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          $ref: '#/components/responses/FORBIDDEN'
+        '404':
+          $ref: '#/components/responses/NOT_FOUND'
+        '409':
+          $ref: '#/components/responses/CONFLICT'
+        '429':
+          $ref: '#/components/responses/RATE_LIMITED'
+        '500':
+          $ref: '#/components/responses/INTERNAL_ERROR'
+        '503':
+          $ref: '#/components/responses/UPSTREAM_UNAVAILABLE'
+      tags:
+        - docs
+      x-octo-principal: token_user
+      x-octo-action: docs.access:write
+      x-octo-retry: never
+  /v2/cli/docs/{doc_id}/share:
+    get:
+      operationId: docs.share.get
+      summary: Read a document's space-level share scope (needs reader)
+      description: >-
+        Returns current share_scope, share_role and permission_epoch. Pass the epoch back when changing share
+        settings.
+      x-octo-risk: read
+      parameters:
+        - name: doc_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Current share settings
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocsShareGetResponse'
+              example:
+                data:
+                  doc_id: example-doc
+                  permission_epoch: 4
+                  share_scope: restricted
+                  share_role: read
+        '400':
+          $ref: '#/components/responses/VALIDATION_ERROR'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          $ref: '#/components/responses/FORBIDDEN'
+        '404':
+          $ref: '#/components/responses/NOT_FOUND'
+        '429':
+          $ref: '#/components/responses/RATE_LIMITED'
+        '500':
+          $ref: '#/components/responses/INTERNAL_ERROR'
+        '503':
+          $ref: '#/components/responses/UPSTREAM_UNAVAILABLE'
+      tags:
+        - docs
+      x-octo-principal: token_user
+      x-octo-action: docs.access:read
+    put:
+      operationId: docs.share.set
+      summary: Set a document's space-level share scope (needs admin)
+      description: >-
+        Use the epoch from docs share get. A 409 CONFLICT requires rereading and re-evaluating the change. Use
+        --scope restricted or --scope anyone_in_space --role read|edit.
+      x-octo-strict-request-schema: true
+      x-octo-risk: write
+      parameters:
+        - name: doc_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DocsShareSetRequest'
+      responses:
+        '200':
+          description: Updated share settings
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocsShareSetResponse'
+        '400':
+          $ref: '#/components/responses/VALIDATION_ERROR'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          $ref: '#/components/responses/FORBIDDEN'
+        '404':
+          $ref: '#/components/responses/NOT_FOUND'
+        '409':
+          $ref: '#/components/responses/CONFLICT'
+        '413':
+          $ref: '#/components/responses/PAYLOAD_TOO_LARGE'
+        '429':
+          $ref: '#/components/responses/RATE_LIMITED'
+        '500':
+          $ref: '#/components/responses/INTERNAL_ERROR'
+        '503':
+          $ref: '#/components/responses/UPSTREAM_UNAVAILABLE'
+      tags:
+        - docs
+      x-octo-principal: token_user
+      x-octo-action: docs.access:write
+      x-octo-retry: never
+  /v2/cli/docs/{doc_id}/_forward_grant:
+    post:
+      operationId: docs.forward_grant
+      summary: Grant or increase a user’s document access
+      description: >-
+        Max-merge grant used when forwarding a doc to a verified human recipient in the document's Space.
+        Reader, commenter, and writer are the supported grant roles.
+      x-octo-risk: write
+      parameters:
+        - name: doc_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DocsForwardGrantRequest'
+      responses:
+        '200':
+          description: Grant result (final role + changed flag)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocsForwardGrantResponse'
+        '400':
+          $ref: '#/components/responses/VALIDATION_ERROR'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          $ref: '#/components/responses/FORBIDDEN'
+        '404':
+          $ref: '#/components/responses/NOT_FOUND'
+        '409':
+          $ref: '#/components/responses/CONFLICT'
+        '413':
+          $ref: '#/components/responses/PAYLOAD_TOO_LARGE'
+        '429':
+          $ref: '#/components/responses/RATE_LIMITED'
+        '500':
+          $ref: '#/components/responses/INTERNAL_ERROR'
+        '503':
+          $ref: '#/components/responses/UPSTREAM_UNAVAILABLE'
+      tags:
+        - docs
+      x-octo-principal: token_user
+      x-octo-action: docs.access:write
+      x-octo-retry: never
+  /v2/cli/docs/{doc_id}/comments:
+    get:
+      operationId: docs.comments.list
+      summary: List comment thread roots with their replies (needs reader)
+      description: >-
+        The response carries thread roots and their replies. Pass pagination.next_cursor back as --cursor when
+        has_more is true.
+      x-octo-risk: read
+      parameters:
+        - name: doc_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: include_resolved
+          in: query
+          schema:
+            type: string
+          description: set to 1 to include resolved threads
+          x-octo-flag: includeResolved
+        - name: cursor
+          in: query
+          schema:
+            type: string
+          description: Opaque cursor from the previous page.
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+            maximum: 100
+          description: page size (1-100, default 50)
+      responses:
+        '200':
+          description: A page of comment threads
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocsCommentsListResponse'
+        '400':
+          $ref: '#/components/responses/VALIDATION_ERROR'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          $ref: '#/components/responses/FORBIDDEN'
+        '404':
+          $ref: '#/components/responses/NOT_FOUND'
+        '429':
+          $ref: '#/components/responses/RATE_LIMITED'
+        '500':
+          $ref: '#/components/responses/INTERNAL_ERROR'
+        '503':
+          $ref: '#/components/responses/UPSTREAM_UNAVAILABLE'
+      tags:
+        - docs
+      x-octo-principal: token_user
+      x-octo-action: docs.comments:read
+    post:
+      operationId: docs.comments.add
+      summary: Add an anchored root or reply (commenter or higher)
+      description: >-
+        For a reply use parent_id and omit anchors. For a root, pass a document selection, a sheet cell anchor, a
+        board anchor, or a PPT anchor through the JSON contract. Pass Idempotency-Key when required by the document
+        type. For a whiteboard root, point or element_ids can replace the explicit anchor fields. Resolving
+        element_ids also requires docs.content:read.
+      x-octo-risk: write
+      parameters:
+        - name: doc_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: Idempotency-Key
+          in: header
+          required: false
+          x-octo-flag: idempotency-key
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 128
+            pattern: ^[\x21-\x7e]+$
+          description: >-
+            Required for PPT comments: 1–128 printable ASCII characters without spaces. Preserve the identical key and
+            body on an uncertain retry. The CLI rejects an explicitly blank key; length and character bounds are
+            backend-enforced.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DocsCommentsAddRequest'
+      responses:
+        '201':
+          description: Created (returns the new comment id)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocsCommentsAddResponse'
+        '400':
+          $ref: '#/components/responses/VALIDATION_ERROR'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          $ref: '#/components/responses/FORBIDDEN'
+        '404':
+          $ref: '#/components/responses/NOT_FOUND'
+        '409':
+          $ref: '#/components/responses/CONFLICT'
+        '413':
+          $ref: '#/components/responses/PAYLOAD_TOO_LARGE'
+        '429':
+          $ref: '#/components/responses/RATE_LIMITED'
+        '500':
+          $ref: '#/components/responses/INTERNAL_ERROR'
+        '503':
+          $ref: '#/components/responses/UPSTREAM_UNAVAILABLE'
+      tags:
+        - docs
+      x-octo-principal: token_user
+      x-octo-action: docs.comments:write
+      x-octo-retry: never
+  /v2/cli/docs/{doc_id}/comments/{comment_id}:
+    get:
+      operationId: docs.comments.get
+      summary: Read a comment and its authoritative root anchor
+      x-octo-risk: read
+      parameters:
+        - name: doc_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: comment_id
+          in: path
+          required: true
+          schema:
+            type: string
+            minimum: 1
+      responses:
+        '200':
+          description: Comment and root records; replies inherit root.anchor
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocsCommentsGetResponse'
+        '400':
+          $ref: '#/components/responses/VALIDATION_ERROR'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          $ref: '#/components/responses/FORBIDDEN'
+        '404':
+          $ref: '#/components/responses/NOT_FOUND'
+        '429':
+          $ref: '#/components/responses/RATE_LIMITED'
+        '500':
+          $ref: '#/components/responses/INTERNAL_ERROR'
+        '503':
+          $ref: '#/components/responses/UPSTREAM_UNAVAILABLE'
+      x-octo-strict-response-schema: true
+      description: Returns the comment and its authoritative root record. A reply inherits its root anchor.
+      tags:
+        - docs
+      x-octo-principal: token_user
+      x-octo-action: docs.comments:read
+    patch:
+      operationId: docs.comments.edit
+      summary: Edit a comment body (author) or resolve/reopen a thread (writer)
+      description: >-
+        Pass --body to edit your own comment's text, or --resolved to resolve/reopen a thread root. Provide exactly
+        one.
+      x-octo-risk: write
+      parameters:
+        - name: doc_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: comment_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DocsCommentsEditRequest'
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocsCommentsEditResponse'
+        '400':
+          $ref: '#/components/responses/VALIDATION_ERROR'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          $ref: '#/components/responses/FORBIDDEN'
+        '404':
+          $ref: '#/components/responses/NOT_FOUND'
+        '409':
+          $ref: '#/components/responses/CONFLICT'
+        '413':
+          $ref: '#/components/responses/PAYLOAD_TOO_LARGE'
+        '429':
+          $ref: '#/components/responses/RATE_LIMITED'
+        '500':
+          $ref: '#/components/responses/INTERNAL_ERROR'
+        '503':
+          $ref: '#/components/responses/UPSTREAM_UNAVAILABLE'
+      tags:
+        - docs
+      x-octo-principal: token_user
+      x-octo-action: docs.comments:write
+      x-octo-retry: never
+    delete:
+      operationId: docs.comments.delete
+      summary: Soft-delete your own comment, or hard-delete as admin
+      x-octo-risk: write
+      parameters:
+        - name: doc_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: comment_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: hard
+          in: query
+          schema:
+            type: string
+          description: set to 1 for an admin hard delete (default is a soft delete by the author)
+        - name: revision
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+          description: Required current row revision for PPT comments.
+      responses:
+        '200':
+          description: Deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocsCommentsDeleteResponse'
+        '400':
+          $ref: '#/components/responses/VALIDATION_ERROR'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          $ref: '#/components/responses/FORBIDDEN'
+        '404':
+          $ref: '#/components/responses/NOT_FOUND'
+        '409':
+          $ref: '#/components/responses/CONFLICT'
+        '429':
+          $ref: '#/components/responses/RATE_LIMITED'
+        '500':
+          $ref: '#/components/responses/INTERNAL_ERROR'
+        '503':
+          $ref: '#/components/responses/UPSTREAM_UNAVAILABLE'
+      tags:
+        - docs
+      x-octo-principal: token_user
+      x-octo-action: docs.comments:write
+      x-octo-retry: never
+      description: The author can soft-delete a comment. Hard deletion requires document administrator access.
+  /v2/cli/docs/{doc_id}/comments/{comment_id}/replies:
+    get:
+      operationId: docs.comments.replies
+      summary: Read a root's reply page (reader or higher)
+      x-octo-risk: read
+      x-octo-pagination:
+        cursorParam: cursor
+        rejectCursorRepeats: true
+      parameters:
+        - name: doc_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: comment_id
+          in: path
+          required: true
+          schema:
+            type: string
+            minimum: 1
+        - name: cursor
+          in: query
+          description: Opaque cursor from the previous page.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: A page of replies and its continuation cursor.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocsCommentsRepliesResponse'
+        '400':
+          $ref: '#/components/responses/VALIDATION_ERROR'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          $ref: '#/components/responses/FORBIDDEN'
+        '404':
+          $ref: '#/components/responses/NOT_FOUND'
+        '429':
+          $ref: '#/components/responses/RATE_LIMITED'
+        '500':
+          $ref: '#/components/responses/INTERNAL_ERROR'
+        '503':
+          $ref: '#/components/responses/UPSTREAM_UNAVAILABLE'
+      x-octo-strict-response-schema: true
+      description: Pass pagination.next_cursor as --cursor, or use --page-all to collect all reply pages.
+      tags:
+        - docs
+      x-octo-principal: token_user
+      x-octo-action: docs.comments:read
+  /v2/cli/docs/{doc_id}/versions:
+    get:
+      operationId: docs.versions.list
+      summary: List saved versions/snapshots (needs reader)
+      description: Lists version metadata and counts in data. Follow pagination.next_cursor with --cursor.
+      x-octo-risk: read
+      parameters:
+        - name: doc_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: cursor
+          in: query
+          schema:
+            type: string
+          description: Opaque cursor from the previous page.
+        - name: limit
+          in: query
+          schema:
+            type: integer
+          description: page size
+        - name: kind
+          in: query
+          schema:
+            type: string
+            enum:
+              - manual
+              - auto
+              - all
+          description: filter by snapshot kind
+        - name: include_auto
+          in: query
+          schema:
+            type: string
+          description: back-compat alias honoured only when kind is absent; set to 1 to include auto snapshots
+          x-octo-flag: includeAuto
+      responses:
+        '200':
+          description: A page of versions
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocsVersionsListResponse'
+        '400':
+          $ref: '#/components/responses/VALIDATION_ERROR'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          $ref: '#/components/responses/FORBIDDEN'
+        '404':
+          $ref: '#/components/responses/NOT_FOUND'
+        '429':
+          $ref: '#/components/responses/RATE_LIMITED'
+        '500':
+          $ref: '#/components/responses/INTERNAL_ERROR'
+        '503':
+          $ref: '#/components/responses/UPSTREAM_UNAVAILABLE'
+      tags:
+        - docs
+      x-octo-principal: token_user
+      x-octo-action: docs.versions:read
+    post:
+      operationId: docs.versions.create
+      summary: Take a named snapshot of the live document (needs writer)
+      x-octo-risk: write
+      parameters:
+        - name: doc_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: Idempotency-Key
+          in: header
+          required: false
+          x-octo-flag: idempotency-key
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 255
+          description: Required for PPT creation, comments and version writes; preserve on an uncertain retry.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DocsVersionsCreateRequest'
+      responses:
+        '201':
+          description: Created (returns docVersionSeq)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocsVersionsCreateResponse'
+        '400':
+          $ref: '#/components/responses/VALIDATION_ERROR'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          $ref: '#/components/responses/FORBIDDEN'
+        '404':
+          $ref: '#/components/responses/NOT_FOUND'
+        '409':
+          $ref: '#/components/responses/CONFLICT'
+        '413':
+          $ref: '#/components/responses/PAYLOAD_TOO_LARGE'
+        '429':
+          $ref: '#/components/responses/RATE_LIMITED'
+        '500':
+          $ref: '#/components/responses/INTERNAL_ERROR'
+        '503':
+          $ref: '#/components/responses/UPSTREAM_UNAVAILABLE'
+      description: >-
+        For PPT, include the current base_revision and an Idempotency-Key. If the result is unknown, check the
+        version list before issuing another write.
+      tags:
+        - docs
+      x-octo-principal: token_user
+      x-octo-action: docs.versions:write
+      x-octo-retry: never
+  /v2/cli/docs/{doc_id}/versions/{version_id}/state:
+    get:
+      operationId: docs.versions.state
+      summary: Read a version's decoded content snapshot (read-only preview; needs reader)
+      description: >-
+        Returns the version decoded to structured content, kind-selected by the doc's doc_type. A document/sheet
+        decodes to ProseMirror JSON plus the spreadsheet maps exposed by this endpoint ({kind:'document', doc,
+        sheetCells, sheetDims, sheetList, sheetFreeze, sheetFilters, sheetDataValidations, schemaVersion,
+        docVersionSeq}); every sheet map is an empty {} for a text document. A board decodes to an Excalidraw scene
+        ({kind:'board', scene, schemaVersion, docVersionSeq}). A PPT decodes to its immutable presentation deck
+        ({kind:'ppt', deck, schemaVersion, docVersionSeq}). This is a read-only preview of a past snapshot, not the
+        live document, and cannot be written.
+      x-octo-risk: read
+      parameters:
+        - name: doc_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: version_id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: >-
+            the version's docVersionSeq (the integer returned by `docs versions create` and shown as
+            `docVersionSeq` in `docs versions list`); there is no separate id field
+      responses:
+        '200':
+          description: Decoded snapshot content (document/sheet, board scene or PPT deck, selected by kind)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocsVersionsStateResponse'
+        '400':
+          $ref: '#/components/responses/VALIDATION_ERROR'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          $ref: '#/components/responses/FORBIDDEN'
+        '404':
+          $ref: '#/components/responses/NOT_FOUND'
+        '429':
+          $ref: '#/components/responses/RATE_LIMITED'
+        '500':
+          $ref: '#/components/responses/INTERNAL_ERROR'
+        '503':
+          $ref: '#/components/responses/UPSTREAM_UNAVAILABLE'
+      tags:
+        - docs
+      x-octo-principal: token_user
+      x-octo-action: docs.versions:read
+  /v2/cli/docs/{doc_id}/versions/{version_id}:
+    patch:
+      operationId: docs.versions.rename
+      summary: Rename a saved version (needs writer)
+      x-octo-risk: write
+      parameters:
+        - name: doc_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: version_id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: >-
+            the version's docVersionSeq (the integer returned by `docs versions create` and shown as
+            `docVersionSeq` in `docs versions list`); there is no separate id field
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DocsVersionsRenameRequest'
+      responses:
+        '200':
+          description: Renamed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocsVersionsRenameResponse'
+        '400':
+          $ref: '#/components/responses/VALIDATION_ERROR'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          $ref: '#/components/responses/FORBIDDEN'
+        '404':
+          $ref: '#/components/responses/NOT_FOUND'
+        '409':
+          $ref: '#/components/responses/CONFLICT'
+        '413':
+          $ref: '#/components/responses/PAYLOAD_TOO_LARGE'
+        '429':
+          $ref: '#/components/responses/RATE_LIMITED'
+        '500':
+          $ref: '#/components/responses/INTERNAL_ERROR'
+        '503':
+          $ref: '#/components/responses/UPSTREAM_UNAVAILABLE'
+      tags:
+        - docs
+      x-octo-principal: token_user
+      x-octo-action: docs.versions:write
+      x-octo-retry: never
+      description: Updates the label of a saved version with writer access.
+    delete:
+      operationId: docs.versions.delete
+      summary: Delete a saved version (needs admin)
+      x-octo-risk: write
+      parameters:
+        - name: doc_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: version_id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: >-
+            the version's docVersionSeq (the integer returned by `docs versions create` and shown as
+            `docVersionSeq` in `docs versions list`); there is no separate id field
+      responses:
+        '200':
+          description: Deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocsVersionsDeleteResponse'
+        '400':
+          $ref: '#/components/responses/VALIDATION_ERROR'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          $ref: '#/components/responses/FORBIDDEN'
+        '404':
+          $ref: '#/components/responses/NOT_FOUND'
+        '409':
+          $ref: '#/components/responses/CONFLICT'
+        '429':
+          $ref: '#/components/responses/RATE_LIMITED'
+        '500':
+          $ref: '#/components/responses/INTERNAL_ERROR'
+        '503':
+          $ref: '#/components/responses/UPSTREAM_UNAVAILABLE'
+      tags:
+        - docs
+      x-octo-principal: token_user
+      x-octo-action: docs.versions:write
+      x-octo-retry: never
+      description: Deletes a saved version with administrator access.
+  /v2/cli/docs/{doc_id}/versions/{version_id}/_restore:
+    post:
+      operationId: docs.versions.restore
+      summary: Restore the document to a saved version (needs admin)
+      description: >-
+        The service rechecks permissions and records a safety snapshot before restoring. If the result is unknown,
+        read the live state and version history before trying again.
+      x-octo-risk: write
+      parameters:
+        - name: doc_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: version_id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: >-
+            the version's docVersionSeq (the integer returned by `docs versions create` and shown as
+            `docVersionSeq` in `docs versions list`); there is no separate id field
+        - name: Idempotency-Key
+          in: header
+          required: false
+          x-octo-flag: idempotency-key
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 255
+          description: Required for PPT creation, comments and version writes; preserve on an uncertain retry.
+      responses:
+        '200':
+          description: Restored (returns restoredFrom + newDocVersionSeq)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocsVersionsRestoreResponse'
+        '400':
+          $ref: '#/components/responses/VALIDATION_ERROR'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          $ref: '#/components/responses/FORBIDDEN'
+        '404':
+          $ref: '#/components/responses/NOT_FOUND'
+        '409':
+          $ref: '#/components/responses/CONFLICT'
+        '413':
+          $ref: '#/components/responses/PAYLOAD_TOO_LARGE'
+        '429':
+          $ref: '#/components/responses/RATE_LIMITED'
+        '500':
+          $ref: '#/components/responses/INTERNAL_ERROR'
+        '503':
+          $ref: '#/components/responses/UPSTREAM_UNAVAILABLE'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DocsVersionsRestoreRequest'
+      tags:
+        - docs
+      x-octo-principal: token_user
+      x-octo-action: docs.versions:write
+      x-octo-retry: never
+  /v2/cli/docs/{doc_id}/attachments/_presign:
+    post:
+      operationId: docs.attachments.presign
+      summary: Register an attachment and get a presigned upload URL (needs writer)
+      description: >-
+        Registers metadata and returns a signed PUT URL and headers. This operation does not transfer the file
+        bytes.
+      x-octo-strict-request-schema: true
+      x-octo-risk: write
+      parameters:
+        - name: doc_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DocsAttachmentsPresignRequest'
+      responses:
+        '200':
+          description: Presigned upload target
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocsAttachmentsPresignResponse'
+        '400':
+          $ref: '#/components/responses/VALIDATION_ERROR'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          $ref: '#/components/responses/FORBIDDEN'
+        '404':
+          $ref: '#/components/responses/NOT_FOUND'
+        '409':
+          $ref: '#/components/responses/CONFLICT'
+        '413':
+          $ref: '#/components/responses/PAYLOAD_TOO_LARGE'
+        '429':
+          $ref: '#/components/responses/RATE_LIMITED'
+        '500':
+          $ref: '#/components/responses/INTERNAL_ERROR'
+        '503':
+          $ref: '#/components/responses/UPSTREAM_UNAVAILABLE'
+      tags:
+        - docs
+      x-octo-principal: token_user
+      x-octo-action: docs.attachments:write
+      x-octo-retry: never
+  /v2/cli/docs/{doc_id}/attachments/{attach_id}:
+    get:
+      operationId: docs.attachments.get
+      summary: Get a signed attachment download URL
+      x-octo-risk: read
+      parameters:
+        - name: doc_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: attach_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Signed download URL + metadata
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocsAttachmentsGetResponse'
+        '400':
+          $ref: '#/components/responses/VALIDATION_ERROR'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          $ref: '#/components/responses/FORBIDDEN'
+        '404':
+          $ref: '#/components/responses/NOT_FOUND'
+        '429':
+          $ref: '#/components/responses/RATE_LIMITED'
+        '500':
+          $ref: '#/components/responses/INTERNAL_ERROR'
+        '503':
+          $ref: '#/components/responses/UPSTREAM_UNAVAILABLE'
+      tags:
+        - docs
+      x-octo-principal: token_user
+      x-octo-action: docs.attachments:read
+      description: Signs a temporary URL after checking read access and attachment ownership.
+  /v2/cli/docs/{doc_id}/attachments/_resolve:
+    post:
+      operationId: docs.attachments.resolve
+      summary: Batch-resolve attachIds to freshly signed download URLs (needs reader)
+      x-octo-risk: read
+      parameters:
+        - name: doc_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DocsAttachmentsResolveRequest'
+      responses:
+        '200':
+          description: Signed URLs + not-found ids
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocsAttachmentsResolveResponse'
+        '400':
+          $ref: '#/components/responses/VALIDATION_ERROR'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          $ref: '#/components/responses/FORBIDDEN'
+        '404':
+          $ref: '#/components/responses/NOT_FOUND'
+        '413':
+          $ref: '#/components/responses/PAYLOAD_TOO_LARGE'
+        '429':
+          $ref: '#/components/responses/RATE_LIMITED'
+        '500':
+          $ref: '#/components/responses/INTERNAL_ERROR'
+        '503':
+          $ref: '#/components/responses/UPSTREAM_UNAVAILABLE'
+      tags:
+        - docs
+      x-octo-principal: token_user
+      x-octo-action: docs.attachments:read
+      description: Returns signatures for attachments associated with the readable document and identifies missing IDs.
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  responses:
+    VALIDATION_ERROR:
+      description: VALIDATION_ERROR. One or more request values are invalid.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    AUTH_REQUIRED:
+      description: AUTH_REQUIRED. A valid unified Token is required.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    FORBIDDEN:
+      description: FORBIDDEN. The action or resource role is insufficient.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    NOT_FOUND:
+      description: NOT_FOUND. The resource does not exist or is not visible in the Token's Space.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    CONFLICT:
+      description: CONFLICT. The request conflicts with the current resource state.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    PAYLOAD_TOO_LARGE:
+      description: PAYLOAD_TOO_LARGE. The request or result exceeds the operation limit.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    UNSUPPORTED_MEDIA_TYPE:
+      description: UNSUPPORTED_MEDIA_TYPE. Use a media type declared for this operation.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    RATE_LIMITED:
+      description: RATE_LIMITED. The service rate limit was reached.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    INTERNAL_ERROR:
+      description: INTERNAL_ERROR. The service could not complete the request.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    UPSTREAM_UNAVAILABLE:
+      description: UPSTREAM_UNAVAILABLE. A required upstream service is unavailable.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    ValidationError:
+      description: VALIDATION_ERROR. The supplied parameters are invalid.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    AuthenticationRequired:
+      description: AUTH_REQUIRED. The bearer token is missing, invalid or expired.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Forbidden:
+      description: FORBIDDEN. The action or resource permission was denied.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    NotFound:
+      description: NOT_FOUND. The resource is absent from the token's Space.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    RateLimited:
+      description: RATE_LIMITED. Retry after the request rate drops.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    InternalError:
+      description: INTERNAL_ERROR. The service could not finish the request.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    UpstreamUnavailable:
+      description: UPSTREAM_UNAVAILABLE. A required service could not verify access.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Archived:
+      description: CONFLICT. The document is archived.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+  schemas:
+    DocsMetadataRequest:
+      type: object
+      required:
+        - doc_ids
+      properties:
+        doc_ids:
+          type: array
+          maxItems: 500
+          items:
+            type: string
+    DocsMetadataResponse:
+      type: object
+      required:
+        - data
+      properties:
+        data:
+          type: object
+          required:
+            - items
+          properties:
+            items:
+              type: array
+              items:
+                type: object
+                required:
+                  - doc_id
+                  - created_by
+                  - updated_by
+                  - updated_at
+                properties:
+                  doc_id:
+                    type: string
+                  created_by:
+                    type: string
+                  updated_by:
+                    type: string
+                  updated_at:
+                    type: string
+                    format: date-time
+    DocsImportDocxResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            doc_id:
+              type: string
+            base_version:
+              type: string
+            bytes:
+              type: integer
+            new_doc_version_seq:
+              type: integer
+            warnings:
+              type: array
+              items:
+                type: string
+          required:
+            - base_version
+      required:
+        - data
+    DocsImportMarkdownResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            doc_id:
+              type: string
+            base_version:
+              type: string
+            bytes:
+              type: integer
+            new_doc_version_seq:
+              type: integer
+            warnings:
+              type: array
+              items:
+                type: string
+          required:
+            - base_version
+      required:
+        - data
+    DocsImportXlsxResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            base_version:
+              type: string
+            warnings:
+              type: array
+              items:
+                type: string
+          required:
+            - base_version
+      required:
+        - data
+    DocsImportExcalidrawResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            doc_id:
+              type: string
+            base_version:
+              type: string
+            bytes:
+              type: integer
+            new_doc_version_seq:
+              type: integer
+            mode:
+              type: string
+              enum:
+                - merge
+                - replace
+            imported_elements:
+              type: integer
+            imported_files:
+              type: integer
+            element_id_map:
+              type: object
+              additionalProperties:
+                type: string
+            file_id_map:
+              type: object
+              additionalProperties:
+                type: string
+          required:
+            - base_version
+      required:
+        - data
+    ErrorResponse:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: object
+          required:
+            - code
+            - message
+          properties:
+            code:
+              type: string
+              enum:
+                - AUTH_REQUIRED
+                - FORBIDDEN
+                - NOT_FOUND
+                - CONFLICT
+                - VALIDATION_ERROR
+                - PAYLOAD_TOO_LARGE
+                - UNSUPPORTED_MEDIA_TYPE
+                - RATE_LIMITED
+                - INTERNAL_ERROR
+                - UPSTREAM_UNAVAILABLE
+            message:
+              type: string
+            details:
+              type: object
+              additionalProperties: true
+              properties:
+                reason:
+                  type: string
+                candidates:
+                  type: array
+                  description: Worksheets matching an ambiguous sheet name. Retry the read with one returned sheet_id.
+                  items:
+                    type: object
+                    required:
+                      - sheet_id
+                      - name
+                    properties:
+                      sheet_id:
+                        type: string
+                      name:
+                        type: string
+                base_version:
+                  type: string
+                  description: Current sheet state vector for a repair PATCH supplied through If-Match.
+                repair_data_validation_key:
+                  type: string
+                  description: Exact opaque validation map key to delete when repairing an oversized sheet.
+                hint:
+                  type: string
+                payload_bytes:
+                  type: integer
+                  minimum: 0
+                limit:
+                  type: integer
+                  minimum: 0
+    OffsetPagination:
+      type: object
+      required:
+        - total
+        - page
+        - page_size
+      properties:
+        total:
+          type: integer
+          minimum: 0
+        page:
+          type: integer
+          minimum: 1
+          maximum: 2147483647
+        page_size:
+          type: integer
+          minimum: 1
+          maximum: 100
+    CursorPagination:
+      type: object
+      properties:
+        has_more:
+          type: boolean
+        next_cursor:
+          type: string
+          description: Opaque cursor for the next page, omitted when has_more is false.
+      required:
+        - has_more
+    Comment:
+      type: object
+      properties:
+        comment_id:
+          type: integer
+        doc_id:
+          type: string
+        parent_id:
+          type:
+            - integer
+            - 'null'
+        author_id:
+          type: string
+        author_space_id:
+          type: string
+        body:
+          type: string
+        revision:
+          type: integer
+        anchor:
+          type:
+            - object
+            - 'null'
+          additionalProperties: true
+        anchor_start:
+          type:
+            - string
+            - 'null'
+        anchor_end:
+          type:
+            - string
+            - 'null'
+        anchor_text:
+          type: string
+        resolved:
+          type: boolean
+        deleted:
+          type: boolean
+        resolved_by:
+          type:
+            - string
+            - 'null'
+        resolved_at:
+          type:
+            - string
+            - 'null'
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        replies:
+          type: array
+          items:
+            $ref: '#/components/schemas/Comment'
+    Version:
+      type: object
+      properties:
+        doc_version_seq:
+          type: integer
+        kind:
+          type: integer
+        label:
+          type: string
+        created_by:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        size_bytes:
+          type: integer
+        schema_version:
+          type: integer
+        restored_from:
+          type:
+            - integer
+            - 'null'
+    DocsCreateRequest:
+      type: object
+      properties:
+        title:
+          type: string
+          description: initial title (optional; defaults to empty)
+        folder_id:
+          type: string
+          description: target folder id (optional; defaults to the space default folder)
+          x-octo-flag: folderId
+        doc_type:
+          type: string
+          description: document type (optional; defaults to 'doc')
+          x-octo-flag: docType
+        template_id:
+          type: string
+          x-octo-enum-hint: >-
+            The CLI retires pitch/report/lesson for new creation by product policy; existing presentations remain
+            readable/editable. Deploy the matching backend catalogue before using signal/terra/orbital/picnic;
+            until then only blank is compatible. A timed-out create with a retired template cannot be replayed
+            through this CLI: reconcile with docs list / docs search first; do not automatically create with a new
+            key. Run octo-cli skills octo-docs and read ppt.md for rollout prerequisites.
+          description: >-
+            PPT template: blank (server default) or signal, terra, orbital, picnic. The four gallery choices
+            require the matching backend catalogue to be deployed first. The CLI rejects pitch/report/lesson for
+            new creation by product policy (octo-cli issue #174); this is not a claim that a deployed backend
+            rejects them. Existing presentations can still be read and edited.
+          enum:
+            - blank
+            - signal
+            - terra
+            - orbital
+            - picnic
+          x-octo-flag: templateId
+    DocsCreateResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          description: >-
+            Flat creation receipt, not wrapped in data. PPT-specific fields are optional on this shared endpoint.
+            The example is a synthetic fixture of the backend PPT creation contract; see docs/ppt-release-gate.md
+            for source provenance.
+          properties:
+            doc_id:
+              type: string
+              description: >-
+                Server-generated document ID. New PPT IDs have the form d_ followed by 24 hexadecimal characters;
+                existing document IDs remain opaque to callers.
+            doc_type:
+              type: string
+              description: Document type; html_ppt for PPT creation.
+            template_id:
+              type: string
+              description: >-
+                PPT only: the selected template ID. Historical Idempotency-Key replay may return a retired ID; this
+                response field is not constrained by the new-creation enum.
+            draft_revision:
+              type: integer
+              description: 'PPT only: initial draft revision (0 on creation).'
+            snapshot_version:
+              type: integer
+              description: 'PPT only: initial snapshot version (0 on creation).'
+            document_name:
+              type: string
+            title:
+              type: string
+            space_id:
+              type: string
+            folder_id:
+              type: string
+            owner_id:
+              type: string
+            role:
+              type: string
+            created_at:
+              type: string
+            editor_url:
+              type: string
+              description: Editor URL; returned for html_ppt only.
+            share_url:
+              type: string
+              description: Presentation URL subject to document access rules; returned for html_ppt only.
+          example:
+            docId: d_000000000000000000000001
+            docType: html_ppt
+            templateId: blank
+            draftRevision: 0
+            snapshotVersion: 0
+            documentName: octo:acceptance-space:f_default:ppt:d_000000000000000000000001
+            title: CLI contract probe
+            spaceId: acceptance-space
+            folderId: f_default
+            ownerId: release_probe_bot
+            role: admin
+            createdAt: '2026-01-01T00:00:00.000Z'
+            editorUrl: https://octo.example/d/d_000000000000000000000001
+            shareUrl: https://octo.example/d/d_000000000000000000000001
+      required:
+        - data
+    DocsListResponse:
+      type: object
+      required:
+        - data
+        - pagination
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/DocumentItem'
+        pagination:
+          $ref: '#/components/schemas/OffsetPagination'
+    DocsSearchRequest:
+      type: object
+      required:
+        - q
+      properties:
+        q:
+          type: string
+          x-octo-flag: keyword
+          description: full-text search keyword
+        doc_type:
+          type: array
+          items:
+            type: string
+            enum:
+              - doc
+              - sheet
+              - board
+              - html
+              - html_ppt
+          description: document type filter; repeat for multiple types (doc, sheet, board, html, html_ppt)
+    DocsSearchResponse:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            type: object
+            properties:
+              doc_id:
+                type: string
+              title:
+                type: string
+              doc_type:
+                type: string
+              updated_at:
+                type:
+                  - integer
+                  - 'null'
+              space_id:
+                type: string
+              highlight:
+                type: string
+        pagination:
+          $ref: '#/components/schemas/CursorPagination'
+      required:
+        - data
+        - pagination
+    DocsGetResponse:
+      type: object
+      required:
+        - data
+      properties:
+        data:
+          $ref: '#/components/schemas/Document'
+    DocsRenameRequest:
+      type: object
+      required:
+        - title
+      properties:
+        title:
+          type: string
+          description: new non-empty title
+    DocsRenameResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            doc_id:
+              type: string
+            title:
+              type: string
+      required:
+        - data
+    DocsContentGetResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            doc_id:
+              type: string
+            doc:
+              type: object
+              description: the live body as ProseMirror document JSON
+              additionalProperties: true
+            schema_version:
+              type: integer
+              description: ProseMirror schema version the body was decoded with
+            base_version:
+              type: string
+              description: opaque base64 base-version token; pass to `docs content edit --base-version`
+      required:
+        - data
+    DocsContentEditRequest:
+      type: object
+      required:
+        - ops
+      properties:
+        ops:
+          type: array
+          description: >-
+            ordered batch of incremental block edit ops. Each op is one of: insert
+            {"type":"insert","at":{"path":[i,...],"position":"before|after|inside_start|inside_end"},"content":[<ProseMirror
+            block nodes>],"expect":{"type":"<nodeType>"}?}; replace
+            {"type":"replace","range":{"from":{"path":[...]},"to":{"path":[...]}},"content":[...],"expect":?};
+            delete {"type":"delete","range":{"from":{"path":[...]},"to":{"path":[...]}},"expect":?}. `path` is
+            child indices from the doc root; range endpoints must share a parent. Pass via --data.
+          items:
+            type: object
+            additionalProperties: true
+    DocsContentEditResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            doc_id:
+              type: string
+            bytes:
+              type: integer
+              description: encoded size of the doc after the edit
+            base_version:
+              type: string
+              description: new base-version token for the next edit
+            new_doc_version_seq:
+              type: integer
+              description: sequence of the auto safety snapshot taken before the edit
+      required:
+        - data
+    DocsSceneGetResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            doc_id:
+              type: string
+            elements:
+              type: array
+              items:
+                type: object
+                additionalProperties: true
+              description: >-
+                the live Excalidraw elements in fractional-index (z-order); each element is a whiteboard-schema
+                node
+            files:
+              type: object
+              description: map of fileId -> file ref (e.g. {attachId}) for images/files referenced by the scene
+              additionalProperties: true
+            app_state:
+              type: object
+              description: live Excalidraw application state, including portable board appearance fields
+              additionalProperties: true
+            base_version:
+              type: string
+              description: opaque base64 base-version token; pass to `docs scene edit --base-version`
+            schema_version:
+              type: integer
+              description: whiteboard schema version the scene was decoded with
+      required:
+        - data
+    DocsSceneEditRequest:
+      type: object
+      properties:
+        elements:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+          description: >-
+            full Excalidraw elements to upsert; on a key collision the element with the higher `version` (then
+            smaller `versionNonce`) wins the CAS. Each element MUST carry a valid fractional-index `index` (z-order
+            key produced by the fractional-indexing / Excalidraw rules, e.g. `a0`); an index-less or
+            malformed-index element is rejected locally before sending. Pass via --data.
+        deleted_element_ids:
+          type: array
+          items:
+            type: string
+          description: >-
+            element ids to soft-delete; each becomes a tombstone with a superseding version so it converges under
+            CAS. Supply with --deletedElementIds or in --data.
+          x-octo-flag: deletedElementIds
+        files:
+          type: object
+          description: >-
+            map of fileId -> file ref (e.g. {"attachId":"…"}) to upsert for images/files referenced by the scene.
+            Pass via --data.
+          additionalProperties: true
+    DocsSceneEditResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            doc_id:
+              type: string
+            bytes:
+              type: integer
+              description: encoded size of the scene after the edit
+            base_version:
+              type: string
+              description: new base-version token for the next edit
+            new_doc_version_seq:
+              type: integer
+              description: sequence of the auto safety snapshot taken before the edit
+      required:
+        - data
+    DocsPptGetResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            doc_id:
+              type: string
+            deck:
+              type: object
+              description: >-
+                Authoritative Bento deck. The current backend format contract is format=bento/slides and version=1
+                (BENTO_FORMAT_VERSION). Release probes reject unknown versions; a format upgrade requires a
+                coordinated contract/probe update.
+              additionalProperties: true
+            base_revision:
+              type: integer
+            content_hash:
+              type: string
+              description: Advisory content digest; may be absent or empty. Use revision fields for concurrency control.
+          required:
+            - doc_id
+            - deck
+            - base_revision
+      required:
+        - data
+    DocsPptEditRequest:
+      type: object
+      required:
+        - base_revision
+        - deck
+      additionalProperties: false
+      properties:
+        base_revision:
+          type: integer
+          minimum: 0
+          maximum: 9007199254740991
+          description: The baseRevision returned by the immediately preceding PPT get
+          x-octo-flag: baseRevision
+        deck:
+          type: object
+          description: >-
+            The edited bento/slides JSON; preserve document identity and stable slide/element IDs. Text elements
+            use html; code elements use content (never code), grammarName (js/ts/py), fontSize, align, valign and
+            lineHeight. Read back the actual rendered fields.
+          additionalProperties: true
+    DocsPptEditResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            revision:
+              type: integer
+            content_hash:
+              type: string
+              description: Advisory content digest; may be absent or empty. Use revision fields for concurrency control.
+            changed:
+              type: boolean
+          required:
+            - revision
+            - changed
+      required:
+        - data
+    DocsSheetListResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          required:
+            - doc_id
+            - items
+          properties:
+            doc_id:
+              type: string
+            items:
+              type: array
+              items:
+                type: object
+                required:
+                  - sheet_id
+                  - name
+                  - order
+                  - row_count
+                  - column_count
+                properties:
+                  sheet_id:
+                    type: string
+                    description: Persistent worksheet logicalId; prefer this over a mutable display name for subsequent reads.
+                  name:
+                    type: string
+                  order:
+                    type: number
+                  row_count:
+                    type: integer
+                  column_count:
+                    type: integer
+      required:
+        - data
+    DocsSheetGetResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            doc_id:
+              type: string
+            sheet_id:
+              type: string
+              description: >-
+                resolved logicalId on worksheet-scoped reads and their continuation pages; absent on whole-workbook
+                reads
+            sheet_cells:
+              type: object
+              description: >-
+                flat cell map keyed `sheetId!row:col`; each value is {v?,f?,s?,p?,t?}. Rows are 0-based and may be
+                0..9999; columns are 0-based and may be 0..99. A page slice in paged mode. Shrinking rowCount or
+                columnCount retains cells beyond the visible boundary for undo/regrowth, so renderers and exporters
+                should ignore rows >= the effective rowCount and columns >= the effective columnCount.
+              additionalProperties: true
+            sheet_dims:
+              type: object
+              description: >-
+                column-width / row-height overrides in one workbook-level map. Keys `${logicalId}:c<idx>` /
+                `${logicalId}:r<idx>` target a specific tab; bare `c<idx>` / `r<idx>` address the legacy default
+                sheet. Reads return keys exactly as stored. Returned on the first page only in paged mode.
+              additionalProperties: true
+            sheet_hyperlinks:
+              type: object
+              description: >-
+                cell hyperlinks keyed `${sheetId}!${linkId}`; each value is {id,row,column,payload,display?}.
+                Returned on the first page only in paged mode.
+              additionalProperties: true
+            sheet_merges:
+              type: object
+              description: >-
+                merged cell ranges keyed `${logicalId}:sr:sc:er:ec` (0-based startRow:startCol:endRow:endCol); each
+                value is true. Returned on the first page only in paged mode.
+              additionalProperties: true
+            sheet_list:
+              type: object
+              description: >-
+                sheet tabs / pages keyed by logicalId; each value is {name,order,rowCount?,columnCount?}. rowCount
+                is 1..10000 and columnCount is 1..100. The current backend stores explicit counts when it creates a
+                new sheet, defaulting to 200 rows by 20 columns (A-T); missing stored counts therefore identify a
+                pre-existing legacy 1000-row by 100-column sheet. The first tab's logicalId is 'default'. Returned
+                on the first page only in paged mode.
+              additionalProperties: true
+            sheet_freeze:
+              type: object
+              description: >-
+                freeze panes keyed by logicalId; each value is {startRow,startColumn,xSplit,ySplit}. An unfrozen
+                axis reads back with startRow/startColumn -1 even when the write used 0. Returned on the first page
+                only in paged mode.
+              additionalProperties: true
+            sheet_filters:
+              type: object
+              description: >-
+                shared auto-filter state keyed by logicalId; each value is {ref,filterColumns?:[{"colId":<absolute
+                0-based column>,"filters":{"filters":[<raw values>]}}],enabledColumns?:[<absolute 0-based
+                column>]}. ref.startRow is the header row and stays visible; criteria apply to rows below it.
+                enabledColumns is non-empty when present, contains only columns inside ref, and identifies the
+                exact columns with visible filter buttons; every filterColumns colId also appears in
+                enabledColumns. It is deduplicated and sorted on readback. For example, ref G:M plus
+                enabledColumns:[6,12] enables only G and M, not H-L. This controls filter-button visibility only,
+                not read or write access. Omitted enabledColumns identifies a legacy snapshot where every column in
+                ref is enabled. An empty filterColumns array is omitted on readback. Returned on the first page
+                only in paged mode.
+              additionalProperties: true
+            sheet_data_validations:
+              type: object
+              description: >-
+                data-validation arrays keyed by logicalId; each array can contain every returned validation family,
+                including `list`, `listMultiple`, and `checkbox`. This public shape is not the internal flat
+                `${logicalId}!${uid}` Y.Map. Dropdown formula1 is the serialized option list and formula2 is the
+                comma-separated option-color list. Returned on the first page only in paged mode.
+              additionalProperties: true
+            base_version:
+              type: string
+              description: opaque base64 base-version token; pass to `docs sheet edit --base-version`
+            sheet_conditional_formats:
+              type: object
+              additionalProperties:
+                type: object
+                additionalProperties: true
+              description: >-
+                Compact conditional-format rules keyed by logicalId!cfId. Each value is
+                {priority,rule:{cfId,stopIfTrue,ranges,rule}}; the inner rule uses Univer highlightCell,
+                colorScale, dataBar or iconSet. Never expand a rule into per-cell styles. Requires the paired
+                conditional-format API backend. Returned on the first page only in paged mode.
+        pagination:
+          $ref: '#/components/schemas/CursorPagination'
+      required:
+        - data
+        - pagination
+    DocsSheetEditRequest:
+      type: object
+      properties:
+        cells:
+          type: object
+          description: >-
+            batch of cell ops keyed by cell key `sheetId!row:col` (e.g. `default!0:0`). Rows are 0-based and may be
+            0..9999; columns are 0-based and may be 0..99. Each value is either
+            {"v":<string|number|boolean|null>,"f":"<formula>"?,"s":<style object>?,"p":<rich-text
+            object>?,"t":<number>?} to set the cell, or null to delete it. At least one of v/f/s/p/t must be
+            present on a set. A non-null write at a row index >= rowCount or column index >= columnCount grows that
+            sheet atomically, capped at 10000 rows and 100 columns; a write past either cap is rejected with 422
+            sheet_cell_invalid. Pass via --data.
+          additionalProperties: true
+        dims:
+          type: object
+          description: >-
+            batch of column-width / row-height ops in one workbook-level map. Use `${logicalId}:c<idx>` /
+            `${logicalId}:r<idx>` to target a specific tab; bare `c<idx>` / `r<idx>` address the legacy default
+            sheet. Bare and prefixed default-sheet keys are separate stored entries: read sheetDims first and clear
+            the bare twin while migrating, for example `{"c0":null,"default:c0":200}`. Each value is a positive
+            pixel number to set, or null to delete that dim. Optional. Pass via --data.
+          additionalProperties: true
+        drawings:
+          type: object
+          description: >-
+            batch of floating-image ops keyed `${sheetId}!${drawingId}` (e.g. `default!img1`). Each value is a
+            serialized Univer ISheetImage — {drawingId (== the key's id), drawingType:0, imageSourceType:"BASE64",
+            source:"data:image/png;base64,…", transform:{left,top,width,height,angle,flipX,flipY,skewX,skewY},
+            sheetTransform:{from:{column,row,columnOffset,rowOffset},to:{…}}, axisAlignSheetTransform} — or null to
+            delete it. The image bytes ride inline in `source`. A MATH FORMULA is written here too, as a float-DOM
+            drawing: {drawingId, drawingType:8, componentKey:"octo-math-formula", data:{latex,id,fontSize},
+            transform, sheetTransform} (latex in data.latex; data.id == drawingId). Optional. Pass via --data.
+          additionalProperties: true
+        hyperlinks:
+          type: object
+          description: >-
+            batch of cell-hyperlink ops keyed `${sheetId}!${linkId}` (e.g. `default!lnk1`). Each value is {id (==
+            the key's linkId), row, column (0-based cell anchor), payload:"<url>" (http/https/mailto or an internal
+            #jump), display?:"<label>"} to set, or null to delete. The link lives outside cell data and points at a
+            cell by row/column; put the cell's visible text in that cell's `v`. Optional. Pass via --data.
+          additionalProperties: true
+        merges:
+          type: object
+          description: >-
+            batch of merged-cell-range ops keyed `${logicalId}:sr:sc:er:ec` (0-based
+            startRow:startCol:endRow:endCol, e.g. `default:0:0:1:2` merges the A1:C2 block). Value true to merge
+            that range, or null to un-merge it. Optional. Pass via --data.
+          additionalProperties: true
+        sheets:
+          type: object
+          description: >-
+            batch of sheet-TAB (page) ops keyed by logicalId. Value {name,order,rowCount?,columnCount?} to create /
+            rename / reorder / resize a tab, or null to delete it; name and order are required on every non-null
+            entry, and deleting a tab also removes its validation rules. rowCount is an integer 1..10000 and
+            columnCount is an integer 1..100. The backend stores explicit counts for new tabs, defaulting to 200
+            rows by 20 columns (A-T); pre-existing legacy tabs without stored counts remain 1000 by 100. On an
+            existing tab, omitting either count preserves that dimension, but a resize payload must still resend
+            name and order. Read the current tabs from `docs sheet get`'s sheetList; the first tab's logicalId is
+            'default'. To ADD a sheet: set a NEW logicalId here AND write that sheet's cells with keys
+            `${logicalId}!row:col`. Optional. Pass via --data.
+          additionalProperties: true
+        freeze:
+          type: object
+          description: >-
+            batch of freeze-pane configs keyed by logicalId. Value {startRow,startColumn,xSplit,ySplit};
+            startRow/startColumn are the first scrollable row/column and normally equal ySplit/xSplit when freezing
+            the first N rows/columns. Use -1 for the start coordinate of an unfrozen axis; 0 is accepted there but
+            normalizes to -1 on readback. null unfreezes that sheet. Optional. Pass via --data.
+          additionalProperties: true
+        filters:
+          type: object
+          description: >-
+            batch of replace-style shared auto-filter snapshots keyed by logicalId. Value
+            {ref:{startRow,startColumn,endRow,endColumn},filterColumns?:[{"colId":<absolute 0-based
+            column>,"filters":{"filters":[<raw values>]}}],enabledColumns?:[<absolute 0-based column>]}.
+            ref.startRow is the header row and stays visible; criteria apply to rows below it. colId is not an
+            offset from ref.startColumn. Sending filterColumns:[] keeps the range but omits filterColumns on
+            readback. When enabledColumns is present it must be non-empty, contain only columns inside ref, and
+            select exactly which columns show filter buttons; every filterColumns colId must also appear in
+            enabledColumns. A mismatch or enabledColumns:[] is rejected with 422 sheet_cell_invalid. The server
+            deduplicates and sorts enabledColumns. For example, ref G:M plus enabledColumns:[6,12] enables only G
+            and M, not H-L. This controls filter-button visibility only, not read or write access; use protected
+            ranges for access control. Read sheetFilters first and resend the complete filter object, including
+            enabledColumns, when changing criteria. Omitting enabledColumns invokes legacy all-columns-in-ref
+            behavior and silently widens the visible controls. null removes the filter and all controls. Optional.
+            Pass via --data.
+          additionalProperties: true
+        data_validations:
+          type: object
+          description: >-
+            replace-style data-validation arrays keyed by logicalId. This public REST shape covers every validation
+            family, including list, listMultiple, and checkbox; do not use the internal flat `${logicalId}!${uid}`
+            Y.Map shape except when the server returns repairDataValidationKey and explicitly requests one
+            deletion-only repair. The server requires each rule to have a uid unique within that sheet (1–128
+            characters, no `!` or control characters) and at least one non-empty
+            ranges:[{startRow,startColumn,endRow,endColumn}] entry. Checkbox ranges must not overlap another
+            checkbox rule after the complete edit; list and listMultiple overlaps are accepted by the backend and
+            should be sent only when intentional. It replaces that sheet's entire rule set, so read
+            sheetDataValidations first and resend every rule to keep; do not write if the deployed read surface
+            omits any validation family. Checkbox formula1/formula2 are optional distinct literal strings that
+            default to "1"/"0", and the server normalizes allowBlank to true. For a working colored dropdown, use
+            type 'list' or 'listMultiple', formula1 as a JSON string array of labels, formula2 as the same number
+            of comma-separated colors, showDropDown:true, renderMode:2, and no operator. These dropdown fields are
+            recommended rendering inputs, not additional server-required fields. A listMultiple cell stores
+            selected labels in v as a JSON-array string; a list cell stores the label directly. The server strips
+            operator from otherwise-valid list rules. null or [] removes all rules for the sheet. Optional. Pass
+            via --data.
+          additionalProperties: true
+        conditional_formats:
+          type: object
+          additionalProperties:
+            type:
+              - object
+              - 'null'
+            additionalProperties: true
+          description: >-
+            Compact conditional-format rules keyed by logicalId!cfId. Each value is
+            {priority,rule:{cfId,stopIfTrue,ranges,rule}}; the inner rule uses Univer highlightCell, colorScale,
+            dataBar or iconSet. Never expand a rule into per-cell styles. Requires the paired conditional-format
+            API backend. Sparse upserts: send a complete value to create/update one rule, null to delete it;
+            unrelated rules survive. Read a fresh baseVersion first. Maximum 1000 rules/1 MiB per workbook and 64
+            KiB per rule. Protected worksheets are checked server-side. Pass via --data.
+    DocsSheetEditResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            doc_id:
+              type: string
+            bytes:
+              type: integer
+              description: encoded size of the sheet after the edit
+            base_version:
+              type: string
+              description: new base-version token for the next edit
+            new_doc_version_seq:
+              type: integer
+              description: sequence of the auto safety snapshot taken before the edit
+      required:
+        - data
+    DocsSheetRowsInsertRequest:
+      type: object
+      required:
+        - logical_id
+        - after_row
+        - count
+      properties:
+        logical_id:
+          type: string
+          description: logical worksheet id, normally default for the first tab
+        after_row:
+          type: integer
+          minimum: 0
+          maximum: 9999
+          description: zero-based existing row after which blank rows are inserted
+        count:
+          type: integer
+          minimum: 1
+          maximum: 9999
+          description: number of blank rows to insert; resulting rowCount must remain at most 10000
+    DocsSheetRowsInsertResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            doc_id:
+              type: string
+            logical_id:
+              type: string
+            after_row:
+              type: integer
+            inserted_rows:
+              type: integer
+            row_count:
+              type: integer
+            bytes:
+              type: integer
+            base_version:
+              type: string
+            new_doc_version_seq:
+              type: integer
+      required:
+        - data
+    DocsSheetRowsDeleteRequest:
+      type: object
+      required:
+        - logical_id
+        - start_row
+        - count
+      properties:
+        logical_id:
+          type: string
+          description: logical worksheet id, normally default for the first tab
+        start_row:
+          type: integer
+          minimum: 0
+          maximum: 9999
+          description: zero-based first row to delete
+        count:
+          type: integer
+          minimum: 1
+          maximum: 9999
+          description: number of contiguous rows to delete; at least one row must remain
+    DocsSheetRowsDeleteResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            doc_id:
+              type: string
+            logical_id:
+              type: string
+            start_row:
+              type: integer
+            deleted_rows:
+              type: integer
+            row_count:
+              type: integer
+            bytes:
+              type: integer
+            base_version:
+              type: string
+            new_doc_version_seq:
+              type: integer
+      required:
+        - data
+    DocsSheetColumnsInsertRequest:
+      type: object
+      required:
+        - logical_id
+        - after_column
+        - count
+      properties:
+        logical_id:
+          type: string
+          description: logical worksheet id, normally default for the first tab
+        after_column:
+          type: integer
+          minimum: 0
+          maximum: 99
+          description: zero-based existing column after which blank columns are inserted
+        count:
+          type: integer
+          minimum: 1
+          maximum: 99
+          description: number of blank columns to insert; resulting columnCount must remain at most 100
+    DocsSheetColumnsInsertResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            doc_id:
+              type: string
+            logical_id:
+              type: string
+            after_column:
+              type: integer
+            inserted_columns:
+              type: integer
+            column_count:
+              type: integer
+            bytes:
+              type: integer
+            base_version:
+              type: string
+            new_doc_version_seq:
+              type: integer
+      required:
+        - data
+    DocsSheetColumnsDeleteRequest:
+      type: object
+      required:
+        - logical_id
+        - start_column
+        - count
+      properties:
+        logical_id:
+          type: string
+          description: logical worksheet id, normally default for the first tab
+        start_column:
+          type: integer
+          minimum: 0
+          maximum: 99
+          description: zero-based first column to delete
+        count:
+          type: integer
+          minimum: 1
+          maximum: 99
+          description: number of contiguous columns to delete; at least one column must remain
+    DocsSheetColumnsDeleteResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            doc_id:
+              type: string
+            logical_id:
+              type: string
+            start_column:
+              type: integer
+            deleted_columns:
+              type: integer
+            column_count:
+              type: integer
+            bytes:
+              type: integer
+            base_version:
+              type: string
+            new_doc_version_seq:
+              type: integer
+      required:
+        - data
+    DocsSheetReplaceRequest:
+      type: object
+      required:
+        - find_string
+        - replace_string
+      properties:
+        find_string:
+          type: string
+          description: literal text to find; leading/trailing whitespace is trimmed and the result must be non-empty
+        replace_string:
+          type: string
+          description: literal replacement text; may be empty
+        find_by:
+          type: string
+          enum:
+            - value
+            - formula
+          default: value
+          description: search displayed/raw values or formula source text
+        case_sensitive:
+          type: boolean
+          default: false
+          description: match letter case exactly; defaults to false
+        matches_the_whole_cell:
+          type: boolean
+          default: false
+          description: >-
+            require the complete stored value to match; rich-text streams include paragraph terminators and
+            therefore do not match
+        logical_id:
+          type: string
+          description: optional worksheet logical id; omit for the whole workbook
+        range:
+          type: object
+          description: optional inclusive 0-based selection; requires logicalId
+          required:
+            - start_row
+            - start_column
+            - end_row
+            - end_column
+          properties:
+            start_row:
+              type: integer
+              minimum: 0
+            start_column:
+              type: integer
+              minimum: 0
+            end_row:
+              type: integer
+              minimum: 0
+            end_column:
+              type: integer
+              minimum: 0
+    DocsSheetReplaceResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            doc_id:
+              type: string
+            matched_cells:
+              type: integer
+            replaced_cells:
+              type: integer
+            replacements:
+              type: integer
+            bytes:
+              type: integer
+              description: present when the sheet changed
+            base_version:
+              type: string
+            new_doc_version_seq:
+              type: integer
+              description: present when the sheet changed
+      required:
+        - data
+    DocsSheetSplitRequest:
+      type: object
+      required:
+        - logical_id
+        - range
+        - delimiter
+      properties:
+        logical_id:
+          type: string
+          description: Required logical worksheet ID from docs sheet get.
+        range:
+          type: object
+          description: Zero-based source rectangle; split accepts exactly one column. Pass the structured range via --data.
+          required:
+            - start_row
+            - start_column
+            - end_row
+            - end_column
+          properties:
+            start_row:
+              type: integer
+              minimum: 0
+            start_column:
+              type: integer
+              minimum: 0
+            end_row:
+              type: integer
+              minimum: 0
+            end_column:
+              type: integer
+              minimum: 0
+        preview:
+          type: boolean
+          default: true
+          description: >-
+            Defaults to true: return planned cells and counts without writing. Explicitly pass --preview=false to
+            apply with the same base-version.
+        delimiter:
+          type: string
+          minLength: 1
+          maxLength: 16
+          description: Literal delimiter, not CSV quoting or displayed number formatting.
+        overwrite:
+          type: boolean
+          default: false
+          description: Explicit consent to replace nonempty cells to the right; inspect the server preview first.
+    DocsSheetSplitResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            doc_id:
+              type: string
+            preview:
+              type: boolean
+            base_version:
+              type: string
+            range:
+              type: object
+              description: Zero-based affected rectangle of the planned or applied output.
+              required:
+                - start_row
+                - start_column
+                - end_row
+                - end_column
+              properties:
+                start_row:
+                  type: integer
+                  minimum: 0
+                start_column:
+                  type: integer
+                  minimum: 0
+                end_row:
+                  type: integer
+                  minimum: 0
+                end_column:
+                  type: integer
+                  minimum: 0
+            rows:
+              type: integer
+            columns:
+              type: integer
+            removed_rows:
+              type: integer
+            overwritten_cells:
+              type: integer
+            cells:
+              type: object
+              description: >-
+                Planned replacement cells, returned in preview mode only, keyed by logicalId!row:column
+                (zero-based). Values are complete cell objects, or null to clear the cell.
+              additionalProperties: true
+            bytes:
+              type: integer
+            new_doc_version_seq:
+              type: integer
+      required:
+        - data
+    DocsSheetDeduplicateRequest:
+      type: object
+      required:
+        - logical_id
+        - range
+      properties:
+        logical_id:
+          type: string
+          description: Required logical worksheet ID from docs sheet get.
+        range:
+          type: object
+          description: >-
+            Zero-based source rectangle spanning every column of each record to compact together. Deduplication
+            compares all selected columns; unselected columns do not move. Pass the structured range via --data.
+          required:
+            - start_row
+            - start_column
+            - end_row
+            - end_column
+          properties:
+            start_row:
+              type: integer
+              minimum: 0
+            start_column:
+              type: integer
+              minimum: 0
+            end_row:
+              type: integer
+              minimum: 0
+            end_column:
+              type: integer
+              minimum: 0
+        preview:
+          type: boolean
+          default: true
+          description: >-
+            Defaults to true: return planned cells and counts without writing. Explicitly pass --preview=false to
+            apply with the same base-version.
+        header:
+          type: boolean
+          default: false
+          description: Keep the first selected row out of duplicate comparisons.
+        case_sensitive:
+          type: boolean
+          default: false
+          description: Compare text case exactly; default is case-insensitive.
+    DocsSheetDeduplicateResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            doc_id:
+              type: string
+            preview:
+              type: boolean
+            base_version:
+              type: string
+            range:
+              type: object
+              description: Zero-based affected rectangle of the planned or applied output.
+              required:
+                - start_row
+                - start_column
+                - end_row
+                - end_column
+              properties:
+                start_row:
+                  type: integer
+                  minimum: 0
+                start_column:
+                  type: integer
+                  minimum: 0
+                end_row:
+                  type: integer
+                  minimum: 0
+                end_column:
+                  type: integer
+                  minimum: 0
+            rows:
+              type: integer
+            columns:
+              type: integer
+            removed_rows:
+              type: integer
+            overwritten_cells:
+              type: integer
+            cells:
+              type: object
+              description: >-
+                Planned replacement cells, returned in preview mode only, keyed by logicalId!row:column
+                (zero-based). Values are complete cell objects, or null to clear the cell.
+              additionalProperties: true
+            bytes:
+              type: integer
+            new_doc_version_seq:
+              type: integer
+      required:
+        - data
+    DocsMembersListResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            items:
+              type: array
+              items:
+                type: object
+                properties:
+                  user_id:
+                    type: string
+                  principal_space_id:
+                    type: string
+                    description: principal Space id that qualifies this membership
+                  role:
+                    type: string
+                  source:
+                    type: string
+                  granted_by:
+                    oneOf:
+                      - type: string
+                      - type: 'null'
+      required:
+        - data
+    DocsMembersSetRequest:
+      type: object
+      required:
+        - user_id
+        - role
+      properties:
+        user_id:
+          type: string
+          description: uid in the Space-qualified membership key
+          x-octo-flag: uid
+        principal_space_id:
+          type: string
+          description: Optional exact principal Space ID. Must match the Space of the verified Token user.
+        role:
+          type: string
+          enum:
+            - reader
+            - commenter
+            - writer
+            - admin
+          description: >-
+            role to grant. Matches octo-docs-backend isMemberRole (src/permission/role.ts); commenter is a stored
+            role ranked between reader and writer, so omitting it made the local enum gate reject a call the
+            backend accepts
+    DocsMembersSetResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            ok:
+              type: boolean
+            created:
+              type: boolean
+            notified:
+              type: boolean
+      required:
+        - data
+    DocsMembersRemoveResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            ok:
+              type: boolean
+            removed_user_ids:
+              type: array
+              items:
+                type: string
+      required:
+        - data
+    DocsShareGetResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            permission_epoch:
+              type: integer
+              minimum: 0
+              description: Current permission version; supply to docs share set
+            doc_id:
+              type: string
+            share_scope:
+              type: string
+              description: Current stored scope. Authenticated-link sharing is readable through this endpoint.
+              enum:
+                - restricted
+                - anyone_in_space
+                - authenticated
+            share_role:
+              type: string
+              enum:
+                - read
+                - comment
+                - edit
+      required:
+        - data
+    DocsShareSetRequest:
+      type: object
+      required:
+        - share_scope
+        - permission_epoch
+      properties:
+        permission_epoch:
+          type: integer
+          minimum: 0
+          maximum: 9007199254740991
+          description: >-
+            Current permissionEpoch from docs share get; required optimistic concurrency token, not a PPT content
+            revision
+          x-octo-flag: permissionEpoch
+        share_scope:
+          type: string
+          x-octo-flag: scope
+          enum:
+            - restricted
+            - anyone_in_space
+          description: share scope to set
+        share_role:
+          type: string
+          x-octo-flag: role
+          enum:
+            - read
+            - edit
+          description: >-
+            share role for anyone_in_space (required when scope=anyone_in_space; ignored and stored as read when
+            scope=restricted)
+    DocsShareSetResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            permission_epoch:
+              type: integer
+              minimum: 0
+              description: Permission version after this update; re-read before the next change
+            doc_id:
+              type: string
+            share_scope:
+              type: string
+              enum:
+                - restricted
+                - anyone_in_space
+            share_role:
+              type: string
+              enum:
+                - read
+                - edit
+      required:
+        - data
+    DocsForwardGrantRequest:
+      type: object
+      required:
+        - user_id
+        - role
+      properties:
+        user_id:
+          type: string
+          description: target user uid
+          x-octo-flag: uid
+        role:
+          type: string
+          enum:
+            - reader
+            - commenter
+            - writer
+          description: >-
+            role to grant (grant-only, never downgrades). Matches octo-docs-backend isForwardGrantRole
+            (src/permission/role.ts) = the member roles minus admin
+    DocsForwardGrantResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            ok:
+              type: boolean
+            role:
+              type: string
+            changed:
+              type: boolean
+      required:
+        - data
+    DocsCommentsListResponse:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Comment'
+        pagination:
+          $ref: '#/components/schemas/CursorPagination'
+      required:
+        - data
+        - pagination
+    DocsCommentsGetResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            comment:
+              $ref: '#/components/schemas/Comment'
+            root:
+              $ref: '#/components/schemas/Comment'
+          required:
+            - comment
+            - root
+      required:
+        - data
+    DocsCommentsRepliesResponse:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Comment'
+        pagination:
+          $ref: '#/components/schemas/CursorPagination'
+      required:
+        - data
+        - pagination
+    DocsCommentsAddRequest:
+      type: object
+      required:
+        - body
+      properties:
+        body:
+          type: string
+          description: comment text
+        parent_id:
+          type: integer
+          description: thread root id to reply to (omit for a root comment)
+          x-octo-flag: parentId
+        anchor_start:
+          type: string
+          description: >-
+            root only: opaque base64 anchor start; accepts a Yjs editor position, sheet cell key, or canonical versioned
+            Board anchor
+          x-octo-flag: anchorStart
+        anchor_end:
+          type: string
+          description: >-
+            root only: opaque base64 anchor end; accepts a Yjs editor position, sheet cell key, or canonical versioned
+            Board anchor
+          x-octo-flag: anchorEnd
+        anchor_text:
+          type: string
+          description: >-
+            root only: the exact selected text; the backend resolves it to an anchor. Use instead of
+            anchorStart/anchorEnd when you have no live editor positions (e.g. a bot)
+          x-octo-flag: anchorText
+        block_path:
+          type: string
+          description: >-
+            root only: disambiguate anchorText by block, as a comma-separated child-index path from the doc root (e.g.
+            0,2)
+          x-octo-flag: blockPath
+        occurrence:
+          type: integer
+          description: 'root only: disambiguate anchorText by picking the Nth match (1-based) among the remaining matches'
+        anchor:
+          type: object
+          additionalProperties: false
+          required:
+            - kind
+          properties:
+            kind:
+              type: string
+              enum:
+                - document
+                - slide
+                - element
+                - point
+            slide_id:
+              type: string
+              minLength: 1
+              maxLength: 128
+            version_seq:
+              type:
+                - integer
+                - 'null'
+              description: Explicit null for live; positive integer for fixed version
+            base_revision:
+              type: integer
+              minimum: 0
+            element_id:
+              type: string
+            element_ids:
+              type: array
+              items:
+                type: string
+            x:
+              type: number
+              minimum: 0
+              maximum: 1
+            'y':
+              type: number
+              minimum: 0
+              maximum: 1
+          description: >-
+            PPT anchor contract. The CLI checks required fields and enums; coordinate bounds, identifiers,
+            version/revision values and unknown fields are validated by the backend.
+        point:
+          type: string
+          maxLength: 128
+          description: Whiteboard point in X,Y coordinates.
+          x-octo-flag: point
+        element_ids:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items:
+            type: string
+            minLength: 1
+            maxLength: 256
+          description: Live whiteboard element IDs. Repeat --element-id to select multiple elements.
+          x-octo-flag: element-id
+    DocsCommentsAddResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            comment_id:
+              type: integer
+          required:
+            - comment_id
+      required:
+        - data
+    DocsCommentsEditRequest:
+      type: object
+      properties:
+        body:
+          type: string
+          description: new comment text (author only)
+        resolved:
+          type: boolean
+          description: resolve (true) or reopen (false) a thread root (writer only)
+        revision:
+          type: integer
+          minimum: 1
+          description: Required for PPT comments. Use the revision returned by comments get; refresh after a conflict.
+    DocsCommentsEditResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            comment_id:
+              type: integer
+          required:
+            - comment_id
+      required:
+        - data
+    DocsCommentsDeleteResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            comment_id:
+              type: integer
+          required:
+            - comment_id
+      required:
+        - data
+    DocsVersionsListResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            items:
+              type: array
+              items:
+                $ref: '#/components/schemas/Version'
+            counts:
+              type: object
+              additionalProperties: true
+        pagination:
+          $ref: '#/components/schemas/CursorPagination'
+      required:
+        - data
+        - pagination
+    DocsVersionsCreateRequest:
+      type: object
+      properties:
+        label:
+          type: string
+          description: human label for the snapshot (optional)
+        base_revision:
+          type: integer
+          minimum: 0
+          description: >-
+            PPT only: required revision from the immediately preceding docs ppt get. Integer type, range and
+            freshness are validated by the PPT backend, including when supplied through --data.
+          maximum: 9007199254740991
+          x-octo-flag: baseRevision
+    DocsVersionsCreateResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            doc_version_seq:
+              type: integer
+      required:
+        - data
+    DocsVersionsStateResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            kind:
+              type: string
+              enum:
+                - document
+                - board
+                - ppt
+              description: >-
+                which content line was decoded: 'document' (doc/sheet -> doc + sheet maps), 'board' (whiteboard ->
+                scene), or 'ppt' (html_ppt -> deck)
+            doc:
+              type: object
+              description: 'document/sheet only: the snapshot body as ProseMirror document JSON'
+              additionalProperties: true
+            sheet_cells:
+              type: object
+              description: 'document/sheet only: flat cell map keyed `sheetId!row:col` (empty {} for a text document)'
+              additionalProperties: true
+            sheet_dims:
+              type: object
+              description: 'document/sheet only: column-width / row-height overrides (empty {} for a text document)'
+              additionalProperties: true
+            sheet_list:
+              type: object
+              description: >-
+                document/sheet only: sheet tabs keyed by logicalId with {name,order,rowCount?,columnCount?};
+                rowCount is 1..10000 and columnCount is 1..100, with missing counts meaning a legacy 1000-row by
+                100-column tab. It is empty {} for a text document or a legacy single-sheet document; an empty
+                sheetList does not mean sheetDataValidations should be filtered out
+              additionalProperties: true
+            sheet_freeze:
+              type: object
+              description: 'document/sheet only: freeze panes keyed by logicalId (empty {} for a text document)'
+              additionalProperties: true
+            sheet_filters:
+              type: object
+              description: >-
+                document/sheet only: shared filter range and criteria keyed by logicalId (empty {} for a text
+                document)
+              additionalProperties: true
+            sheet_data_validations:
+              type: object
+              description: >-
+                document/sheet only: per-sheet arrays containing every data-validation family, including dropdowns
+                and checkboxes (empty {} for a text document)
+              additionalProperties: true
+            scene:
+              type: object
+              description: 'board only: the decoded Excalidraw scene ({elements in z-order, files})'
+              additionalProperties: true
+            schema_version:
+              type: integer
+            doc_version_seq:
+              type: integer
+            deck:
+              type: object
+              description: 'PPT only: the immutable presentation deck, including stable slide and element IDs'
+              additionalProperties: true
+      required:
+        - data
+    DocsVersionsRenameRequest:
+      type: object
+      required:
+        - label
+      properties:
+        label:
+          type: string
+          description: new non-empty label
+    DocsVersionsRenameResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            doc_version_seq:
+              type: integer
+      required:
+        - data
+    DocsVersionsDeleteResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            doc_version_seq:
+              type: integer
+      required:
+        - data
+    DocsVersionsRestoreRequest:
+      type: object
+      properties:
+        base_revision:
+          type: integer
+          minimum: 0
+          description: >-
+            PPT only: required revision from the immediately preceding docs ppt get. Integer type, range and
+            freshness are validated by the PPT backend, including when supplied through --data.
+          maximum: 9007199254740991
+          x-octo-flag: baseRevision
+    DocsVersionsRestoreResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            restored_from:
+              type: integer
+            new_doc_version_seq:
+              type: integer
+      required:
+        - data
+    DocsAttachmentsPresignRequest:
+      type: object
+      required:
+        - file_name
+        - mime
+        - size_bytes
+      properties:
+        file_name:
+          type: string
+          description: original file name
+          x-octo-flag: fileName
+        mime:
+          type: string
+          description: MIME type (must pass the backend allow/deny list)
+        size_bytes:
+          type: integer
+          minimum: 1
+          description: positive integer file size in bytes (must be within the MIME-specific tier cap)
+          x-octo-flag: sizeBytes
+    DocsAttachmentsPresignResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            attach_id:
+              type: string
+            object_key:
+              type: string
+            bucket:
+              type: string
+            mime:
+              type: string
+            size_bytes:
+              type: integer
+            upload_url:
+              type: string
+              x-octo-secret: true
+            headers:
+              type: object
+              additionalProperties: true
+            expires_in_sec:
+              type: integer
+      required:
+        - data
+    AttachmentDownload:
+      type: object
+      properties:
+        attach_id:
+          type: string
+        object_key:
+          type: string
+        mime:
+          type: string
+        size_bytes:
+          type: integer
+        file_name:
+          type: string
+        url:
+          type: string
+          x-octo-secret: true
+        expires_in_sec:
+          type: integer
+        headers:
+          type: object
+          additionalProperties:
+            type: string
+          description: Request headers required by the signed URL, when present.
+    DocsAttachmentsGetResponse:
+      type: object
+      properties:
+        data:
+          $ref: '#/components/schemas/AttachmentDownload'
+      required:
+        - data
+    DocsAttachmentsResolveRequest:
+      type: object
+      required:
+        - attach_ids
+      properties:
+        attach_ids:
+          type: array
+          items:
+            type: string
+          description: attachment ids to resolve (non-empty; capped by the backend batch limit)
+          x-octo-flag: attachIds
+    DocsAttachmentsResolveResponse:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            items:
+              type: array
+              items:
+                $ref: '#/components/schemas/AttachmentDownload'
+            not_found:
+              type: array
+              items:
+                type: string
+      required:
+        - data
+    DocumentItem:
+      type: object
+      required:
+        - doc_id
+        - title
+        - doc_type
+        - owner_id
+        - role
+        - updated_at
+      properties:
+        doc_id:
+          type: string
+        title:
+          type: string
+        doc_type:
+          type: string
+        owner_id:
+          type: string
+        created_by:
+          type: string
+        updated_by:
+          type: string
+        octo_doc_slug:
+          type: string
+        role:
+          type: string
+          enum:
+            - reader
+            - commenter
+            - writer
+            - admin
+        updated_at:
+          type: string
+          format: date-time
+    Document:
+      allOf:
+        - $ref: '#/components/schemas/DocumentItem'
+        - type: object
+          required:
+            - document_name
+            - space_id
+            - folder_id
+            - created_at
+            - share_url
+            - share_scope
+            - share_role
+            - is_space_searchable
+            - permission_epoch
+          properties:
+            document_name:
+              type: string
+            space_id:
+              type: string
+            folder_id:
+              type: string
+            created_at:
+              type: string
+              format: date-time
+            share_url:
+              type: string
+            share_scope:
+              type: string
+            share_role:
+              type: string
+            is_space_searchable:
+              type: boolean
+            permission_epoch:
+              type: integer
