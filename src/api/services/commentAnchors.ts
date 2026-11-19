@@ -17,7 +17,7 @@ function decodeStrictBase64(raw: unknown): Buffer | null {
   return decoded.toString('base64') === raw ? decoded : null
 }
 
-function validElementId(value: unknown): value is string {
+export function validElementId(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0 && value.length <= MAX_BOARD_ID_LENGTH &&
     // IDs are opaque, but controls/whitespace are never valid Excalidraw ids.
     !Array.from(value).some((char) => {

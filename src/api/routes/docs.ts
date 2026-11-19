@@ -41,6 +41,8 @@ import { resolveRole } from '../../permission/resolveRole.js'
 import { resolveRequestPrincipalSpace } from '../../permission/principalSpace.js'
 import { editPptLive } from '../../ppt/liveEdit.js'
 import { PptApiError, PPT_ERROR_STATUS } from '../ppt/envelope.js'
+import { renameCliDoc, setCliShareSettings } from '../cliv2/access.js'
+import { CliError } from '../cliv2/auth.js'
 import { resolveEffectiveRole } from '../../permission/resolveEffectiveRole.js'
 import { issueCollabTokenByDocId } from '../../auth/issueCollabToken.js'
 import { recordVerifiedRecentView } from '../services/recordRecentView.js'
@@ -89,7 +91,7 @@ function toStringArray(v: unknown): string[] {
  * symmetric with the write side and closing the cross-space metadata leak.
  */
 async function resolveViewerSpaceMembership(req: Request): Promise<boolean> {
-  if (req.botToken !== undefined) return true
+  if (req.botToken !== undefined || req.docSpaceScope?.mode === 'cli') return true
   // isSpaceMember documents a fail-closed `false` on lookup errors, but a rejected
   // promise would still bubble to a 500 on /docs, /docs/recent and
   // /docs/recent/creators instead of merely dropping the share branch. Catch it
@@ -919,7 +921,11 @@ async function renameDocById(req: Request, res: Response, docId: string): Promis
       if (error instanceof PptApiError) { res.status(error.httpStatus).json({ error: error.code.toLowerCase(), message: error.message }); return }
       throw error
     }
-  } else await docMetaRepo.rename(docId, title, req.uid!)
+  } else if (req.docSpaceScope?.mode === 'cli') {
+    await renameCliDoc(req, guard.meta, title)
+  } else {
+    await docMetaRepo.rename(docId, title, req.uid!)
+  }
   // Title lives in the search index (matched as title^2, returned as _source.title),
   // so a rename must re-index or the new title is missed / the stale one keeps
   // showing until an unrelated body edit reindexes. Enqueue a body signal: the
@@ -1046,6 +1052,8 @@ export async function getShareHandler(req: Request, res: Response) {
 export async function putShareHandler(req: Request, res: Response) {
   const guard = await requireDocRole(req, res, req.params.docId!, 'admin')
   if (!guard) return
+  const isCliRequest = req.docSpaceScope?.mode === 'cli'
+  if (isCliRequest && guard.meta.share_scope === SHARE_SCOPE_AUTHENTICATED) throw new CliError('FORBIDDEN')
   const { shareScope, shareRole, spaceSearchable, permissionEpoch } = req.body ?? {}
   if (!Number.isInteger(permissionEpoch) || permissionEpoch < 0) {
     res.status(400).json({ error: 'invalid_permission_epoch' })
@@ -1103,13 +1111,9 @@ export async function putShareHandler(req: Request, res: Response) {
   // refresh caches + publish the doc-wide invalidation (no uid) so every
   // non-member's live session re-derives access (§3.2 / §5.3), mirroring the
   // softDelete -> refreshAndPublish path.
-  const result = await docMetaRepo.setShareSettings(
-    guard.meta.doc_id,
-    scopeNum,
-    roleNum,
-    searchable,
-    permissionEpoch,
-  )
+  const result = isCliRequest
+    ? await setCliShareSettings(req, guard.meta.doc_id, scopeNum, roleNum, permissionEpoch)
+    : await docMetaRepo.setShareSettings(guard.meta.doc_id, scopeNum, roleNum, searchable, permissionEpoch)
   if (!result.updated) {
     res.status(409).json({
       error: 'share_settings_conflict',
@@ -1141,7 +1145,7 @@ export async function putShareHandler(req: Request, res: Response) {
       : {
           shareScope: shareScopeName(scopeNum),
           shareRole: shareRoleName(roleNum),
-          spaceSearchable: searchable,
+          spaceSearchable: isCliRequest ? result.settings.spaceSearchable : searchable,
           permissionEpoch: result.settings.permissionEpoch,
         }),
   })

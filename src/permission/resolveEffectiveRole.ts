@@ -1,3 +1,4 @@
+import { verifiedCliSpace } from './cliSpace.js'
 /**
  * The single membership-aware effective-role resolver (#64, design §5.1).
  *
@@ -113,6 +114,8 @@ export async function resolveEffectiveRoleWithMembership(
   meta: ShareResolvable,
   caller: ShareCaller = {},
 ): Promise<EffectiveRoleWithMembership> {
+  const cliSpace = verifiedCliSpace(uid)
+  if (cliSpace !== undefined && cliSpace !== meta.space_id) return { role: 'none', spaceMember: false }
   let role: ResolvedRole
   let member = false
   if (![SHARE_SCOPE_ANYONE, SHARE_SCOPE_AUTHENTICATED].includes(meta.share_scope) || roleAtLeast(direct, 'writer')) {
@@ -123,7 +126,7 @@ export async function resolveEffectiveRoleWithMembership(
     role = direct
   } else {
     try {
-      member = caller.verifiedSpaceId === meta.space_id
+      member = (caller.verifiedSpaceId === meta.space_id || cliSpace === meta.space_id)
         ? true
         : caller.isBot
           ? true
@@ -162,6 +165,8 @@ export async function resolveEffectiveRole(
   meta: ShareResolvable,
   caller: ShareCaller = {},
 ): Promise<ResolvedRole> {
+  const cliSpace = verifiedCliSpace(uid)
+  if (cliSpace !== undefined && cliSpace !== meta.space_id) return 'none'
   // Sources 1+2 — direct role and the space-share grant (#64). Membership is
   // resolved WITHOUT the relay path's fail-closed swallow, so an unexpected
   // identity-service throw PROPAGATES (byte-identical to merge-base) rather than
@@ -176,7 +181,7 @@ export async function resolveEffectiveRole(
   } else {
     const member = meta.share_scope === SHARE_SCOPE_AUTHENTICATED
       ? false
-      : caller.verifiedSpaceId === meta.space_id
+      : (caller.verifiedSpaceId === meta.space_id || cliSpace === meta.space_id)
         ? true
         : caller.isBot
           ? true

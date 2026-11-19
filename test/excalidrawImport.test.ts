@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from 'vitest'
 import { generateKeyBetween } from 'fractional-indexing'
-import { cleanupReplacedExcalidrawAttachments, prepareExcalidrawImport, ExcalidrawImportError } from '../src/import/excalidraw.js'
+import { config } from '../src/config/env.js'
+import { sanitizeSvg } from '../src/util/sanitizeSvg.js'
+import { preparePortableExcalidrawImport, prepareExcalidrawImport, ExcalidrawImportError } from '../src/import/excalidraw.js'
 
 const PNG = `data:image/png;base64,${Buffer.from([0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a,0,0,0,0]).toString('base64')}`
 const rect = (id: string, extra: Record<string, unknown> = {}) => ({ id, type: 'rectangle', version: 1, versionNonce: 1, x: 0, y: 0, width: 10, height: 10, ...extra })
@@ -58,6 +60,59 @@ describe('prepareExcalidrawImport', () => {
     await expect(prepareExcalidrawImport({ ...base, scene: { type: 'excalidraw', version: 2, elements: [{ id: 'i', type: 'image', fileId: 'f' }], files: { f: { dataURL: 'data:image/png;base64,!!!!' } } } })).rejects.toMatchObject({ code: 'invalid_embedded_file' })
   })
 
+  it('counts the inline image in the v1 file limit and accepts it under the CLI image limit', async () => {
+    const upload = vi.fn().mockResolvedValue('attachment')
+    const png = Buffer.alloc(config.boardSceneWrite.maxElementContentBytes)
+    Buffer.from(PNG.split(',')[1]!, 'base64').copy(png)
+    const input = {
+      docId: 'd1', uid: 'u1', upload, existingElements: [], existingFiles: {},
+      scene: { type: 'excalidraw', version: 2, elements: [{ id: 'i', type: 'image', fileId: 'f' }],
+        files: { f: { dataURL: 'data:image/png;base64,' + png.toString('base64') } } },
+    }
+    await expect(prepareExcalidrawImport(input)).rejects.toMatchObject({ code: 'board_file_invalid', status: 422 })
+    expect(upload).not.toHaveBeenCalled()
+    await expect(preparePortableExcalidrawImport(input)).resolves.toMatchObject({ files: { f: { attachId: 'attachment' } } })
+    expect(upload).toHaveBeenCalledOnce()
+  })
+
+  it('checks file metadata and decoded image size independently before uploading', async () => {
+    const upload = vi.fn()
+    const base = { docId: 'd1', uid: 'u1', upload, existingElements: [], existingFiles: {} }
+    const scene = { type: 'excalidraw', version: 2, elements: [{ id: 'i', type: 'image', fileId: 'f' }] }
+    await expect(preparePortableExcalidrawImport({
+      ...base,
+      scene: { ...scene, files: { f: { dataURL: PNG, extra: 'x'.repeat(config.boardSceneWrite.maxElementContentBytes) } } },
+    })).rejects.toMatchObject({ code: 'board_file_invalid' })
+
+    const oversized = Buffer.alloc(config.attachments.maxImageSizeBytes + 1)
+    Buffer.from(PNG.split(',')[1]!, 'base64').copy(oversized)
+    await expect(preparePortableExcalidrawImport({
+      ...base,
+      scene: { ...scene, files: { f: { dataURL: 'data:image/png;base64,' + oversized.toString('base64') } } },
+    })).rejects.toMatchObject({ code: 'embedded_file_too_large', status: 413 })
+    expect(upload).not.toHaveBeenCalled()
+  })
+
+  it('enforces the configured image size after expanding SVG markup during sanitation', async () => {
+    const upload = vi.fn()
+    const svg = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" style="fill:red"><circle r="1" /></svg>')
+    expect(sanitizeSvg(svg).length).toBeGreaterThan(svg.length)
+    const originalLimit = config.attachments.maxImageSizeBytes
+    config.attachments.maxImageSizeBytes = svg.length
+    try {
+      await expect(preparePortableExcalidrawImport({
+        docId: 'd1', uid: 'u1', upload, existingElements: [], existingFiles: {},
+        scene: {
+          type: 'excalidraw', version: 2, elements: [{ id: 'i', type: 'image', fileId: 'f' }],
+          files: { f: { dataURL: 'data:image/svg+xml;base64,' + svg.toString('base64') } },
+        },
+      })).rejects.toMatchObject({ code: 'embedded_file_too_large', status: 413 })
+    } finally {
+      config.attachments.maxImageSizeBytes = originalLimit
+    }
+    expect(upload).not.toHaveBeenCalled()
+  })
+
   it('strictly requires Excalidraw type and version 2', async () => {
     const base = { docId: 'd1', uid: 'u1', upload: vi.fn(), existingElements: [], existingFiles: {} }
     for (const scene of [
@@ -113,38 +168,5 @@ describe('prepareExcalidrawImport', () => {
     })
     expect(upload).not.toHaveBeenCalled()
     expect(result.files).toEqual({})
-  })
-})
-
-
-describe('cleanupReplacedExcalidrawAttachments', () => {
-  it('deletes only attachments authoritatively owned by the replaced board and keeps rows on object failure', async () => {
-    const { docAttachmentRepo } = await import('../src/db/repos/docAttachmentRepo.js')
-    const { getObjectStore } = await import('../src/storage/objectStore.js')
-    const getById = vi.spyOn(docAttachmentRepo, 'getById')
-      .mockImplementation(async (attachId) => {
-        if (attachId === 'att_owned') return { attachId, docId: 'b1', objectKey: 'b1/att_owned/a.png' } as never
-        if (attachId === 'att_retry') return { attachId, docId: 'b1', objectKey: 'b1/att_retry/b.png' } as never
-        if (attachId === 'att_foreign') return { attachId, docId: 'other', objectKey: 'other/att_foreign/c.png' } as never
-        return null
-      })
-    const deleteById = vi.spyOn(docAttachmentRepo, 'deleteById').mockResolvedValue()
-    const deleteObject = vi.spyOn(getObjectStore(), 'delete')
-      .mockImplementation(async (key) => { if (key.includes('att_retry')) throw new Error('transient') })
-
-    await cleanupReplacedExcalidrawAttachments('b1', {
-      one: { attachId: 'att_owned' },
-      duplicate: { attachId: 'att_owned' },
-      retry: { attachId: 'att_retry' },
-      foreign: { attachId: 'att_foreign' },
-      external: { dataURL: 'https://example.test/image.png' },
-    })
-
-    expect(getById).toHaveBeenCalledTimes(3)
-    expect(deleteObject).toHaveBeenCalledWith('b1/att_owned/a.png')
-    expect(deleteById).toHaveBeenCalledWith('att_owned')
-    expect(deleteById).not.toHaveBeenCalledWith('att_retry')
-    expect(deleteObject).not.toHaveBeenCalledWith('other/att_foreign/c.png')
-    expect(deleteById).not.toHaveBeenCalledWith('att_foreign')
   })
 })

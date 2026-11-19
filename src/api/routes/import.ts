@@ -52,8 +52,8 @@ import { decodeBoardSnapshot, WHITEBOARD_DOC_TYPE } from '../../collab/versionRe
 import { editBoardScene } from '../services/editBoardScene.js'
 import {
   prepareExcalidrawImport,
+  preparePortableExcalidrawImport,
   cleanupExcalidrawAttachments,
-  cleanupReplacedExcalidrawAttachments,
   ExcalidrawImportError,
 } from '../../import/excalidraw.js'
 import { cleanupCopiedAttachment, copyStoredObject } from './attachments.js'
@@ -130,12 +130,15 @@ export async function importExcalidrawHandler(req: Request, res: Response): Prom
   }
 
   let prepared: Awaited<ReturnType<typeof prepareExcalidrawImport>> | undefined
+  const portable = req.docSpaceScope?.mode === 'cli'
+  const prepare = portable ? preparePortableExcalidrawImport : prepareExcalidrawImport
+  let sceneMayReferenceUploads = false
   try {
     // The state vector from this exact live read is the import's concurrency
     // base. editBoardScene re-reads/rechecks it and creates the safety snapshot.
     const live = await readLiveBoard(guard.meta.document_name)
     const current = decodeBoardSnapshot(live.state)
-    prepared = await prepareExcalidrawImport({
+    prepared = await prepare({
       scene,
       existingElements: current.elements,
       existingFiles: current.files,
@@ -146,6 +149,8 @@ export async function importExcalidrawHandler(req: Request, res: Response): Prom
       ? current.elements.filter((el) => typeof el.id === 'string').map((el) => el.id as string)
       : undefined
     const deletedFileIds = mode === 'replace' ? Object.keys(current.files) : undefined
+    // v1 keeps uploads once the edit is attempted. CLI v2 signals the first live mutation.
+    sceneMayReferenceUploads = !portable
     const result = await editBoardScene({
       uid: req.uid,
       docId: guard.meta.doc_id,
@@ -156,6 +161,7 @@ export async function importExcalidrawHandler(req: Request, res: Response): Prom
       authorizedEpoch: guard.meta.permission_epoch,
       isBot: req.botToken !== undefined,
       token: req.octoToken,
+      ...(portable && { onWriteStarted: () => { sceneMayReferenceUploads = true } }),
     })
     if (!result.ok) {
       await cleanupExcalidrawAttachments(prepared.uploadedAttachments ?? [])
@@ -165,9 +171,8 @@ export async function importExcalidrawHandler(req: Request, res: Response): Prom
       res.status(result.status).json(body)
       return
     }
-    if (mode === 'replace') {
-      await cleanupReplacedExcalidrawAttachments(guard.meta.doc_id, current.files)
-    }
+    // A successful edit owns the uploads. Older snapshots still own their image references.
+    sceneMayReferenceUploads = true
     res.status(200).json({
       docId: guard.meta.doc_id,
       mode,
@@ -180,7 +185,7 @@ export async function importExcalidrawHandler(req: Request, res: Response): Prom
       newDocVersionSeq: result.newDocVersionSeq,
     })
   } catch (err) {
-    await cleanupExcalidrawAttachments(prepared?.uploadedAttachments ?? [])
+    if (!sceneMayReferenceUploads) await cleanupExcalidrawAttachments(prepared?.uploadedAttachments ?? [])
     if (err instanceof ExcalidrawImportError) {
       res.status(err.status).json({ error: err.code })
       return

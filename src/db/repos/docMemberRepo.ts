@@ -23,6 +23,14 @@ export interface DocMemberRow {
 export const SOURCE_DIRECT = 1
 export const SOURCE_INVITE = 2
 
+type DirectMemberInput = {
+  docId: string
+  uid: string
+  principalSpaceId: string
+  roleNum: number
+  grantedBy: string
+}
+
 /**
  * SQL rank of a stored role value — mirrors roleRank() in permission/role.ts.
  * The stored TINYINT (1=reader 2=writer 3=admin 4=commenter) is NOT ordered by
@@ -36,7 +44,7 @@ export const SOURCE_INVITE = 2
 const roleRankSql = (col: string): string => `FIELD(${col}, 1, 4, 2, 3)`
 
 /** Retry only rolled-back database transactions; never replay external side effects. */
-async function memberTransaction<R>(fn: (tx: Tx) => Promise<R>): Promise<R> {
+export async function memberTransaction<R>(fn: (tx: Tx) => Promise<R>): Promise<R> {
   for (let attempt = 1; ; attempt += 1) {
     try {
       return await transaction(fn)
@@ -91,42 +99,37 @@ export const docMemberRepo = {
    * role edit emits a change event while a new grant atomically creates
    * or resets the existing unread reminder.
    */
-  async upsertDirectWithNotification(params: {
-    docId: string
-    uid: string
-    principalSpaceId: string
-    roleNum: number
-    grantedBy: string
-    notifyRecipient: boolean
-  }): Promise<{ created: boolean }> {
-    return memberTransaction(async (tx) => {
-      const [existing] = await tx.query<{ role: number }>(
-        `SELECT role FROM doc_member
-         WHERE doc_id = ? AND uid = ? AND principal_space_id = ?
-         LIMIT 1 FOR UPDATE`,
-        [params.docId, params.uid, params.principalSpaceId],
+  async upsertDirectWithNotification(params: DirectMemberInput & { notifyRecipient: boolean }): Promise<{ created: boolean }> {
+    return memberTransaction(tx => this.upsertDirectWithNotificationTx(tx, params))
+  },
+
+  async upsertDirectWithNotificationTx(tx: Tx, params: DirectMemberInput & { notifyRecipient: boolean }): Promise<{ created: boolean }> {
+    const [existing] = await tx.query<{ role: number }>(
+      `SELECT role FROM doc_member
+       WHERE doc_id = ? AND uid = ? AND principal_space_id = ?
+       LIMIT 1 FOR UPDATE`,
+      [params.docId, params.uid, params.principalSpaceId],
+    )
+    await this.upsertDirectTx(tx, params)
+    const created = existing === undefined
+    if (created && params.notifyRecipient) {
+      await tx.query(
+        `INSERT INTO doc_member_notification
+           (recipient_uid, recipient_space_id, doc_id, granted_by, role, event_at, read_at)
+         VALUES (?, ?, ?, ?, ?, NOW(3), NULL)
+         ON DUPLICATE KEY UPDATE
+           granted_by = VALUES(granted_by), role = VALUES(role),
+           event_at = VALUES(event_at), read_at = NULL`,
+        [params.uid, params.principalSpaceId, params.docId, params.grantedBy, params.roleNum],
       )
-      await this.upsertDirectTx(tx, params)
-      const created = existing === undefined
-      if (created && params.notifyRecipient) {
-        await tx.query(
-          `INSERT INTO doc_member_notification
-             (recipient_uid, recipient_space_id, doc_id, granted_by, role, event_at, read_at)
-           VALUES (?, ?, ?, ?, ?, NOW(3), NULL)
-           ON DUPLICATE KEY UPDATE
-             granted_by = VALUES(granted_by), role = VALUES(role),
-             event_at = VALUES(event_at), read_at = NULL`,
-          [params.uid, params.principalSpaceId, params.docId, params.grantedBy, params.roleNum],
-        )
-      }
-      if (params.notifyRecipient && existing && Number(existing.role) !== params.roleNum) {
-        await docLibraryEventRepo.record(tx, { uid: params.uid, spaceId: params.principalSpaceId }, {
-          docId: params.docId, actorUid: params.grantedBy, kind: 'member_role_changed',
-          previousRole: Number(existing.role), newRole: params.roleNum,
-        })
-      }
-      return { created }
-    })
+    }
+    if (params.notifyRecipient && existing && Number(existing.role) !== params.roleNum) {
+      await docLibraryEventRepo.record(tx, { uid: params.uid, spaceId: params.principalSpaceId }, {
+        docId: params.docId, actorUid: params.grantedBy, kind: 'member_role_changed',
+        previousRole: Number(existing.role), newRole: params.roleNum,
+      })
+    }
+    return { created }
   },
 
   /**
@@ -187,38 +190,44 @@ export const docMemberRepo = {
     principalSpaceId: string
     uid: string
   }): Promise<{ changed: boolean; removedUids: string[]; newEpoch?: number }> {
-    return memberTransaction(async (tx) => {
-      const present = await tx.query<{ uid: string }>(
-        `SELECT uid FROM doc_member
-         WHERE doc_id = ? AND uid = ? AND principal_space_id = ?
-         FOR UPDATE`,
-        [params.docId, params.uid, params.principalSpaceId],
-      )
-      // Clean historical reminders even when the member was already removed.
-      await tx.query(
-        'DELETE FROM doc_member_notification WHERE doc_id = ? AND recipient_uid = ? AND recipient_space_id = ?',
-        [params.docId, params.uid, params.principalSpaceId],
-      )
-      if (present.length === 0) return { changed: false, removedUids: [] }
+    return memberTransaction(tx => docMemberRepo.removePrincipalExactTx(tx, params))
+  },
 
-      await tx.query(
-        'DELETE FROM doc_member WHERE doc_id = ? AND uid = ? AND principal_space_id = ?',
-        [params.docId, params.uid, params.principalSpaceId],
-      )
-      await tx.query(
-        'UPDATE doc_meta SET permission_epoch = permission_epoch + 1 WHERE doc_id = ?',
-        [params.docId],
-      )
-      const epochRows = await tx.query<{ permission_epoch: number }>(
-        'SELECT permission_epoch FROM doc_meta WHERE doc_id = ? LIMIT 1',
-        [params.docId],
-      )
-      return {
-        changed: true,
-        removedUids: [params.uid],
-        newEpoch: Number(epochRows[0]?.permission_epoch ?? 0),
-      }
-    })
+  async removePrincipalExactTx(tx: Tx, params: {
+    docId: string
+    principalSpaceId: string
+    uid: string
+  }): Promise<{ changed: boolean; removedUids: string[]; newEpoch?: number }> {
+    const present = await tx.query<{ uid: string }>(
+      `SELECT uid FROM doc_member
+       WHERE doc_id = ? AND uid = ? AND principal_space_id = ?
+       FOR UPDATE`,
+      [params.docId, params.uid, params.principalSpaceId],
+    )
+    // Clean historical reminders even when the member was already removed.
+    await tx.query(
+      'DELETE FROM doc_member_notification WHERE doc_id = ? AND recipient_uid = ? AND recipient_space_id = ?',
+      [params.docId, params.uid, params.principalSpaceId],
+    )
+    if (present.length === 0) return { changed: false, removedUids: [] }
+
+    await tx.query(
+      'DELETE FROM doc_member WHERE doc_id = ? AND uid = ? AND principal_space_id = ?',
+      [params.docId, params.uid, params.principalSpaceId],
+    )
+    await tx.query(
+      'UPDATE doc_meta SET permission_epoch = permission_epoch + 1 WHERE doc_id = ?',
+      [params.docId],
+    )
+    const epochRows = await tx.query<{ permission_epoch: number }>(
+      'SELECT permission_epoch FROM doc_meta WHERE doc_id = ? LIMIT 1',
+      [params.docId],
+    )
+    return {
+      changed: true,
+      removedUids: [params.uid],
+      newEpoch: Number(epochRows[0]?.permission_epoch ?? 0),
+    }
   },
 
   /**
@@ -347,9 +356,9 @@ export const docMemberRepo = {
 
   // ── transaction-scoped variants for the invite accept flow (§4.6) ──────────
 
-  async getRoleTx(tx: Tx, docId: string, uid: string, principalSpaceId: string): Promise<Role | undefined> {
+  async getRoleTx(tx: Tx, docId: string, uid: string, principalSpaceId: string, forUpdate = false): Promise<Role | undefined> {
     const rows = await tx.query<{ role: number }>(
-      'SELECT role FROM doc_member WHERE doc_id = ? AND uid = ? AND principal_space_id = ? LIMIT 1',
+      'SELECT role FROM doc_member WHERE doc_id = ? AND uid = ? AND principal_space_id = ? LIMIT 1' + (forUpdate ? ' FOR UPDATE' : ''),
       [docId, uid, principalSpaceId],
     )
     if (rows.length === 0) return undefined

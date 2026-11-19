@@ -50,7 +50,9 @@ export async function resolveDocRole(
   if (!req.docSpaceScope) return { ok: false, status: 404, error: 'not_found' }
   const scope = docScopeOf(req)
   const meta = await docMetaRepo.getByDocId(docId)
-  if (!meta || meta.status === 0) return { ok: false, status: 404, error: 'not_found' }
+  if (!meta || meta.status === 0 || (scope.mode === 'cli' && meta.space_id !== scope.spaceId)) {
+    return { ok: false, status: 404, error: 'not_found' }
+  }
   if (scope.mode === 'human') {
     const currentSpace = await resolveHumanCurrentSpace(req)
     if (!currentSpace.verified) {

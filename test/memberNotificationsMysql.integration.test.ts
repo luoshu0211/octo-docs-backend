@@ -79,6 +79,18 @@ mysqlDescribe('member notifications against isolated MySQL 8', () => {
     expect(await query('SELECT 1 FROM doc_member_notification')).toHaveLength(64)
   }, 30_000)
 
+  it('rolls back a transactional role change if its library event fails', async () => {
+    await document('role_event')
+    await docMemberRepo.upsertDirectWithNotification(grant('role_event'))
+    await getPool().query("CREATE TRIGGER fail_role_event BEFORE INSERT ON doc_library_event FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='forced event failure'")
+    try {
+      await expect(transaction(tx => docMemberRepo.upsertDirectWithNotificationTx(tx, {
+        ...grant('role_event'), roleNum: 1,
+      }))).rejects.toThrow('forced event failure')
+      expect(await docMemberRepo.getRole('role_event', principal.recipientUid, principal.recipientSpaceId)).toBe('writer')
+    } finally { await getPool().query('DROP TRIGGER fail_role_event') }
+  })
+
   it('returns a consistent count while additions commit, including totals above the page limit', async () => {
     const writer = (async () => {
       for (let i = 0; i < 105; i += 1) {
