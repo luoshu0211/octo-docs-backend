@@ -85,19 +85,20 @@ function assertNoInlineData(value: unknown, seen = new Set<object>()): void {
   seen.delete(value as object)
 }
 
-function decodeDataUrl(raw: string): { bytes: Buffer; mime: string } {
+function decodeDataUrl(raw: string, limits: FileLimits): { bytes: Buffer; mime: string } {
   const match = /^data:([a-z0-9.+-]+\/[a-z0-9.+-]+);base64,([A-Za-z0-9+/]*={0,2})$/i.exec(raw)
   if (!match || !match[1] || match[2] === undefined || match[2].length === 0 || match[2].length % 4 === 1) {
     throw new ExcalidrawImportError('invalid_embedded_file')
   }
   const base64 = match[2].replace(/=+$/, '')
-  if (Math.floor(base64.length * 3 / 4) > config.attachments.maxImageSizeBytes) {
+  if (limits === 'portable' && Math.floor(base64.length * 3 / 4) > config.attachments.maxImageSizeBytes) {
     throw new ExcalidrawImportError('embedded_file_too_large', 413)
   }
   const bytes = Buffer.from(match[2], 'base64')
   if (bytes.length === 0 || bytes.toString('base64').replace(/=+$/, '') !== base64) {
     throw new ExcalidrawImportError('invalid_embedded_file')
   }
+  if (bytes.length > config.attachments.maxImageSizeBytes) throw new ExcalidrawImportError('embedded_file_too_large', 413)
   let mime = sniffImageMime(bytes)
   let clean: Buffer<ArrayBufferLike> = bytes
   // An SVG root is only a format candidate, not proof that the active XML is
@@ -105,7 +106,7 @@ function decodeDataUrl(raw: string): { bytes: Buffer; mime: string } {
   // identified by sniffImageMime.
   if (!mime || mime === 'image/svg+xml') {
     try { clean = sanitizeSvg(bytes); mime = 'image/svg+xml' } catch { throw new ExcalidrawImportError('invalid_embedded_file') }
-    if (clean.length > config.attachments.maxImageSizeBytes) throw new ExcalidrawImportError('embedded_file_too_large', 413)
+    if (limits === 'portable' && clean.length > config.attachments.maxImageSizeBytes) throw new ExcalidrawImportError('embedded_file_too_large', 413)
   }
   if (match[1].toLowerCase() !== mime) {
     const jpegAlias = match[1].toLowerCase() === 'image/jpg' && mime === 'image/jpeg'
@@ -142,14 +143,46 @@ export async function cleanupExcalidrawAttachments(uploads: Array<{ attachId: st
   }))
 }
 
-export async function prepareExcalidrawImport(input: {
+/** Delete persisted files removed by a committed replace-mode board import. */
+export async function cleanupReplacedExcalidrawAttachments(
+  docId: string,
+  files: Record<string, Record<string, unknown>>,
+): Promise<void> {
+  const attachIds = new Set<string>()
+  for (const file of Object.values(files)) {
+    if (typeof file.attachId === 'string' && file.attachId.length > 0) attachIds.add(file.attachId)
+  }
+  await Promise.allSettled([...attachIds].map(async (attachId) => {
+    const attachment = await docAttachmentRepo.getById(attachId)
+    // Attachment ids are durable capabilities. Only delete rows authoritatively
+    // owned by the board that just committed the replacement.
+    if (!attachment || attachment.docId !== docId) return
+    // Keep the row as a retry cursor when object deletion fails.
+    await getObjectStore().delete(attachment.objectKey)
+    await docAttachmentRepo.deleteById(attachId)
+  }))
+}
+
+interface ExcalidrawImportInput {
   scene: unknown
   existingElements: Array<Record<string, unknown>>
   existingFiles: Record<string, Record<string, unknown>>
   docId: string
   uid: string
   upload?: Upload
-}): Promise<PreparedExcalidrawImport> {
+}
+
+export function prepareExcalidrawImport(input: ExcalidrawImportInput): Promise<PreparedExcalidrawImport> {
+  return prepareImport(input, 'legacy')
+}
+
+export function preparePortableExcalidrawImport(input: ExcalidrawImportInput): Promise<PreparedExcalidrawImport> {
+  return prepareImport(input, 'portable')
+}
+
+type FileLimits = 'legacy' | 'portable'
+
+async function prepareImport(input: ExcalidrawImportInput, limits: FileLimits): Promise<PreparedExcalidrawImport> {
   if (!input.scene || typeof input.scene !== 'object' || Array.isArray(input.scene)) throw new ExcalidrawImportError('invalid_excalidraw', 400)
   const scene = input.scene as Record<string, unknown>
   if (scene.type !== 'excalidraw' || scene.version !== 2) throw new ExcalidrawImportError('invalid_excalidraw')
@@ -209,9 +242,9 @@ export async function prepareExcalidrawImport(input: {
   for (const [oldFid, raw] of Object.entries(rawFiles)) {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new ExcalidrawImportError('board_file_invalid')
     const { dataURL, ...metadata } = raw as Record<string, unknown>
-    if (byteSize(metadata) > config.boardSceneWrite.maxElementContentBytes) throw new ExcalidrawImportError('board_file_invalid')
+    if (byteSize(limits === 'portable' ? metadata : raw) > config.boardSceneWrite.maxElementContentBytes) throw new ExcalidrawImportError('board_file_invalid')
     if (typeof dataURL !== 'string') throw new ExcalidrawImportError('invalid_embedded_file')
-    const { bytes, mime } = decodeDataUrl(dataURL)
+    const { bytes, mime } = decodeDataUrl(dataURL, limits)
     stagedFiles.set(oldFid, {
       bytes,
       mime,

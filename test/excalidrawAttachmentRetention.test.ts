@@ -54,7 +54,7 @@ function response() {
   return { statusCode: 0, body: undefined as unknown, status(code: number) { this.statusCode = code; return this }, json(body: unknown) { this.body = body; return this } }
 }
 function request(): Request {
-  return { uid: 'u1', principalSpaceId: 's1', params: { docId: 'b1' }, originalUrl: '/b1/import/excalidraw?mode=replace', body: Buffer.from(JSON.stringify({
+  return { uid: 'u1', docSpaceScope: { mode: 'cli', spaceId: 's1' }, principalSpaceId: 's1', params: { docId: 'b1' }, originalUrl: '/b1/import/excalidraw?mode=replace', body: Buffer.from(JSON.stringify({
     type: 'excalidraw', version: 2,
     elements: [{ id: 'new', type: 'image', fileId: 'new-file', x: 0, y: 0, width: 80, height: 40, version: 1, versionNonce: 1 }],
     files: { 'new-file': { dataURL: `data:image/png;base64,${NEW.toString('base64')}` } },

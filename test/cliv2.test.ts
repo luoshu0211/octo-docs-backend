@@ -19,7 +19,7 @@ import { sanitizeSvg } from '../src/util/sanitizeSvg.js'
 import { errorForStatus } from '../src/api/cliv2/adapter.js'
 import { docAttachmentRepo } from '../src/db/repos/docAttachmentRepo.js'
 import { docCommentRepo, type DocComment } from '../src/db/repos/docCommentRepo.js'
-import { prepareExcalidrawImport } from '../src/import/excalidraw.js'
+import { preparePortableExcalidrawImport } from '../src/import/excalidraw.js'
 import { validateBoardOps } from '../src/whiteboard/boardEdit.js'
 import { selectionAnchor } from '../src/api/cliv2/boardGeometry.js'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -248,6 +248,24 @@ describe('Docs CLI v2 read pilot', () => {
     expect(responses.map(response => response.status)).toEqual(docsOperations.map(() => 401))
     const manual = await fetch(appOrigin + '/v2/cli/docs/d_same/import/docx', { method: 'POST' })
     expect(manual.status).toBe(404)
+    expect(requests).toHaveLength(0)
+  })
+
+  it.each([
+    ['', secret],
+    ['https://auth.example.invalid', ''],
+    ['https://auth.example.invalid', 'short'],
+    ['bad-url', secret],
+  ])('keeps v1 available with invalid CLI resolver configuration', async (url, credential) => {
+    vi.stubEnv('OCTO_AUTH_SERVER_URL', url)
+    vi.stubEnv('OCTO_AUTH_SERVICE_SECRET', credential)
+    const origin = await listen(createServer(createApp({ surface: 'public' })))
+    const legacy = await fetch(origin + '/api/v1/docs')
+    expect(legacy.status).toBe(401)
+    expect(await legacy.json()).toEqual({ error: 'unauthorized' })
+    const cli = await fetch(origin + endpoint)
+    expect(cli.status).toBe(503)
+    expect(await cli.json()).toMatchObject({ error: { code: 'UPSTREAM_UNAVAILABLE' } })
     expect(requests).toHaveLength(0)
   })
 
@@ -684,7 +702,7 @@ describe('Docs CLI v2 workflows', () => {
     const scene = await allowed.json()
     expect(scene.elements).toHaveLength(elementCount)
     expect(Object.keys(scene.files)).toHaveLength(withFile ? 1 : 0)
-    const imported = await prepareExcalidrawImport({ ...importInput, scene })
+    const imported = await preparePortableExcalidrawImport({ ...importInput, scene })
     expect(imported.elements).toHaveLength(elementCount)
     expect(attachments).toHaveBeenCalledTimes(withFile ? 1 : 0)
     expect(download).toHaveBeenCalledTimes(withFile ? 1 : 0)
@@ -699,7 +717,7 @@ describe('Docs CLI v2 workflows', () => {
     expect(await denied.json()).toMatchObject({
       error: { code: 'PAYLOAD_TOO_LARGE', details: { reason: 'too_many_elements' } },
     })
-    await expect(prepareExcalidrawImport({
+    await expect(preparePortableExcalidrawImport({
       ...importInput, scene: { ...scene, elements: [...scene.elements, extra] },
     })).rejects.toMatchObject({ code: 'too_many_elements', status: 413 })
     expect(attachments).not.toHaveBeenCalled()
@@ -739,7 +757,7 @@ describe('Docs CLI v2 workflows', () => {
     expect(scene.elements).toHaveLength(1)
     expect(elementSize(scene.elements[0])).toBe(limit)
     const importInput = { docId: board.doc_id, uid: 'user_a', existingElements: [], existingFiles: {} }
-    const imported = await prepareExcalidrawImport({ ...importInput, scene })
+    const imported = await preparePortableExcalidrawImport({ ...importInput, scene })
     expect(imported.elements.map(element => element.id)).toEqual([atLimit.id])
 
     const attachments = vi.spyOn(docAttachmentRepo, 'listByDoc').mockResolvedValue([])
@@ -752,7 +770,7 @@ describe('Docs CLI v2 workflows', () => {
       error: { code: 'PAYLOAD_TOO_LARGE', details: { reason: 'element_too_large' } },
     })
     expect(attachments).not.toHaveBeenCalled()
-    await expect(prepareExcalidrawImport({
+    await expect(preparePortableExcalidrawImport({
       ...importInput, scene: { ...scene, elements: [asExported(oversized.stored)] },
     })).rejects.toMatchObject({ code: 'element_too_large', status: 413 })
   })
@@ -877,7 +895,7 @@ describe('Docs CLI v2 workflows', () => {
     })
 
     const upload = vi.fn(async () => 'att_reimported')
-    const imported = await prepareExcalidrawImport({
+    const imported = await preparePortableExcalidrawImport({
       scene, docId: board.doc_id, uid: 'user_a', existingElements: [], existingFiles: {}, upload,
     })
     expect(upload).toHaveBeenCalledWith(portableBytes, normalizedMime, expect.any(String))

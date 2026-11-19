@@ -52,6 +52,8 @@ import { decodeBoardSnapshot, WHITEBOARD_DOC_TYPE } from '../../collab/versionRe
 import { editBoardScene } from '../services/editBoardScene.js'
 import {
   prepareExcalidrawImport,
+  preparePortableExcalidrawImport,
+  cleanupReplacedExcalidrawAttachments,
   cleanupExcalidrawAttachments,
   ExcalidrawImportError,
 } from '../../import/excalidraw.js'
@@ -129,13 +131,15 @@ export async function importExcalidrawHandler(req: Request, res: Response): Prom
   }
 
   let prepared: Awaited<ReturnType<typeof prepareExcalidrawImport>> | undefined
+  const portable = req.docSpaceScope?.mode === 'cli'
+  const prepare = portable ? preparePortableExcalidrawImport : prepareExcalidrawImport
   let sceneWriteStarted = false
   try {
     // The state vector from this exact live read is the import's concurrency
     // base. editBoardScene re-reads/rechecks it and creates the safety snapshot.
     const live = await readLiveBoard(guard.meta.document_name)
     const current = decodeBoardSnapshot(live.state)
-    prepared = await prepareExcalidrawImport({
+    prepared = await prepare({
       scene,
       existingElements: current.elements,
       existingFiles: current.files,
@@ -156,7 +160,7 @@ export async function importExcalidrawHandler(req: Request, res: Response): Prom
       authorizedEpoch: guard.meta.permission_epoch,
       isBot: req.botToken !== undefined,
       token: req.octoToken,
-      onWriteStarted: () => { sceneWriteStarted = true },
+      ...(portable && { onWriteStarted: () => { sceneWriteStarted = true } }),
     })
     if (!result.ok) {
       await cleanupExcalidrawAttachments(prepared.uploadedAttachments ?? [])
@@ -166,9 +170,12 @@ export async function importExcalidrawHandler(req: Request, res: Response): Prom
       res.status(result.status).json(body)
       return
     }
-    sceneWriteStarted = true
-    // Removed live file references remain reachable from the safety snapshot
-    // and named versions. Keep their attachment rows and bytes for restoration.
+    if (portable) {
+      // CLI snapshots must keep the images they reference, including after a failed response.
+      sceneWriteStarted = true
+    } else if (mode === 'replace') {
+      await cleanupReplacedExcalidrawAttachments(guard.meta.doc_id, current.files)
+    }
     res.status(200).json({
       docId: guard.meta.doc_id,
       mode,

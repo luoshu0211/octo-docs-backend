@@ -19,6 +19,18 @@ const readDocuments = 'docs.documents:read'
 type Handler = (req: Request, res: Response, principal: CliPrincipal) => Promise<void>
 
 export function createCliV2Router(rateOptions: RateLimiterOptions = {}): Router | null {
+  try {
+    return buildCliRouter(rateOptions)
+  } catch (err) {
+    // The CLI router is optional for the public Docs listener.
+    // eslint-disable-next-line no-console
+    console.error('[octo-docs] CLI v2 router unavailable:', err instanceof Error ? err.message : 'initialization failed')
+    const failure = new CliError('UPSTREAM_UNAVAILABLE')
+    return Router().use((_req, res) => { res.status(failure.status).json(failure.envelope) })
+  }
+}
+
+function buildCliRouter(rateOptions: RateLimiterOptions): Router | null {
   const resolve = createAuthResolver(process.env.OCTO_AUTH_SERVER_URL, process.env.OCTO_AUTH_SERVICE_SECRET)
   if (!resolve) return null
   const router = Router({ caseSensitive: true, strict: true })

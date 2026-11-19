@@ -54,8 +54,10 @@ beforeEach(() => {
   vi.stubEnv('OCTO_SERVER_INTERNAL_URL', 'http://127.0.0.1')
   vi.stubEnv('OCTO_MEMBERSHIP_INTERNAL_TOKEN', 'fixture-internal-secret')
   vi.mocked(requireDocRole).mockImplementation(async () => ({ meta: { ...meta }, role: 'admin' }))
-  vi.mocked(postCliService).mockImplementation(async (_url, _headers, input) =>
-    directoryResult((input as { user_id: string }).user_id))
+  vi.mocked(postCliService).mockImplementation(async (url, _headers, input) => {
+    expect(url.pathname).toBe('/v2/internal/auth/identity')
+    return directoryResult((input as { user_id: string }).user_id)
+  })
   vi.mocked(refreshAndPublish).mockImplementation(async () => { events.push('publish') })
   vi.mocked(transaction).mockImplementation(async action => {
     const before = { meta: { ...meta }, members: new Map(members), notifications: [...notifications] }

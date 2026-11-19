@@ -14,7 +14,7 @@ async function requireSpaceUser(uid: string, spaceId: string) {
   const secret = process.env.OCTO_MEMBERSHIP_INTERNAL_TOKEN?.trim()
   if (!origin || !secret) throw new CliError('UPSTREAM_UNAVAILABLE')
   const result = await (async () => postCliService(
-    cliServiceURL(origin, '/v1/internal/auth/identity'),
+    cliServiceURL(origin, '/v2/internal/auth/identity'),
     { 'x-internal-token': secret }, { user_id: uid, space_id: spaceId },
   ))().catch(() => { throw new CliError('UPSTREAM_UNAVAILABLE') })
   if (result.status === 404) throw new CliError('NOT_FOUND')

@@ -415,7 +415,7 @@ export const docMetaRepo = {
     spaceSearchable: boolean,
     expectedPermissionEpoch: number,
   ): Promise<SetShareSettingsResult> {
-    return transaction(tx => this.setShareSettingsTx(tx, docId, scopeNum, roleNum, spaceSearchable, expectedPermissionEpoch))
+    return transaction(tx => docMetaRepo.setShareSettingsTx(tx, docId, scopeNum, roleNum, spaceSearchable, expectedPermissionEpoch))
   },
 
   async setShareSettingsTx(
