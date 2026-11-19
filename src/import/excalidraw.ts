@@ -143,26 +143,6 @@ export async function cleanupExcalidrawAttachments(uploads: Array<{ attachId: st
   }))
 }
 
-/** Delete persisted files removed by a committed replace-mode board import. */
-export async function cleanupReplacedExcalidrawAttachments(
-  docId: string,
-  files: Record<string, Record<string, unknown>>,
-): Promise<void> {
-  const attachIds = new Set<string>()
-  for (const file of Object.values(files)) {
-    if (typeof file.attachId === 'string' && file.attachId.length > 0) attachIds.add(file.attachId)
-  }
-  await Promise.allSettled([...attachIds].map(async (attachId) => {
-    const attachment = await docAttachmentRepo.getById(attachId)
-    // Attachment ids are durable capabilities. Only delete rows authoritatively
-    // owned by the board that just committed the replacement.
-    if (!attachment || attachment.docId !== docId) return
-    // Keep the row as a retry cursor when object deletion fails.
-    await getObjectStore().delete(attachment.objectKey)
-    await docAttachmentRepo.deleteById(attachId)
-  }))
-}
-
 interface ExcalidrawImportInput {
   scene: unknown
   existingElements: Array<Record<string, unknown>>

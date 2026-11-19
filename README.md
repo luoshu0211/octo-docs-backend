@@ -74,9 +74,9 @@ Human deletion through `DELETE /api/v1/docs/:docId` retains its existing verifie
 Space and document-admin checks, soft deletion, and collaboration invalidation.
 This policy does not change bot creation, editing, or other resource operations.
 
-## CLI v2 whiteboard attachment lifetime
+## Whiteboard attachment lifetime
 
-A CLI v2 Excalidraw `replace` import removes old live file references and tombstones
+An Excalidraw `replace` import removes old live file references and tombstones
 old elements. It retains their attachment records and stored bytes because
 named versions and safety snapshots still reference them. A later restore can
 therefore resolve the original images, and its safety snapshot can recover the
