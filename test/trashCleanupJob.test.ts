@@ -125,6 +125,41 @@ describe('createTrashCleanupScheduler', () => {
     expect(listExpired).toHaveBeenCalledTimes(1)
   })
 
+  it('carries the scan cursor across runs so a failing head cannot starve the tail', async () => {
+    // Budget: one page of two rows per run. A and B keep failing; C is cleanable.
+    // With a per-run cursor the order was A,B / A,B / A,B and C was never tried.
+    const queue = [
+      { doc_id: 'A', deleted_at: new Date(NOW - 3000) },
+      { doc_id: 'B', deleted_at: new Date(NOW - 2000) },
+      { doc_id: 'C', deleted_at: new Date(NOW - 1000) },
+    ]
+    const listExpired = vi.fn(async (
+      _cutoff: Date,
+      limit: number,
+      after?: { deletedAt: Date; docId: string },
+    ) => {
+      const start = after
+        ? queue.findIndex((row) => row.deleted_at.getTime() === after.deletedAt.getTime() && row.doc_id === after.docId) + 1
+        : 0
+      return queue.slice(start, start + limit)
+    })
+    const purge = vi.fn(async (docId: string) => ({ ok: docId === 'C' }))
+    const scheduler = createTrashCleanupScheduler({
+      enabled: true, intervalMs: 1000, retentionDays: 30, now: () => NOW,
+      listExpired, purge, batchSize: 2, maxBatchesPerRun: 1, log: vi.fn(),
+    })
+
+    const first = await scheduler.runOnce()
+    expect(first).toMatchObject({ scanned: 2, purged: 0, failed: 2 })
+    const second = await scheduler.runOnce()
+    expect(second).toMatchObject({ scanned: 1, purged: 1, failed: 0 })
+    expect(purge).toHaveBeenCalledWith('C')
+    expect(listExpired).toHaveBeenNthCalledWith(2, expect.any(Date), 2, {
+      deletedAt: queue[1]!.deleted_at,
+      docId: 'B',
+    })
+  })
+
   it('swallows a thrown purge and keeps going', async () => {
     const listExpired = vi.fn()
       .mockResolvedValueOnce([{ doc_id: 'd1' }, { doc_id: 'd2' }])

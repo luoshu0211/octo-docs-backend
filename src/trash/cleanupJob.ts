@@ -93,6 +93,14 @@ export function createTrashCleanupScheduler(options: TrashCleanupOptions): Trash
 
   let timer: ReturnType<typeof setInterval> | null = null
   let running = false
+  /**
+   * Where the NEXT run starts. Kept across runs on purpose: with a per-run
+   * cursor, a page of permanently failing tombstones consumed the whole scan
+   * budget every time and the documents behind them were never attempted. When a
+   * run walks off the end of the queue the cursor resets, so the queue is retried
+   * from the head on the following run.
+   */
+  let resumeFrom: { deletedAt: Date; docId: string } | undefined
 
   async function runOnce(): Promise<TrashCleanupSummary> {
     if (!options.enabled) {
@@ -103,7 +111,7 @@ export function createTrashCleanupScheduler(options: TrashCleanupOptions): Trash
     let purged = 0
     let failed = 0
 
-    let cursor: { deletedAt: Date; docId: string } | undefined
+    let cursor: { deletedAt: Date; docId: string } | undefined = resumeFrom
     for (let batch = 0; batch < maxBatchesPerRun; batch += 1) {
       const rows = await listExpired(cutoff, batchSize, cursor)
       if (rows.length === 0) break
@@ -131,6 +139,10 @@ export function createTrashCleanupScheduler(options: TrashCleanupOptions): Trash
       }
       if (rows.length < batchSize) break
     }
+    // Remember where this run stopped so the next one continues instead of
+    // re-scanning the same failing head. Reaching the end of the queue (a short
+    // page or no more rows) resets it to the head for the next sweep.
+    resumeFrom = cursor
 
     return {
       skipped: false,
