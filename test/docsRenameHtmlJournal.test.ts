@@ -138,6 +138,15 @@ const h = vi.hoisted(() => {
       }
       return []
     }
+    if (q.startsWith('UPDATE doc_rename_operation SET status = 3, version = ? WHERE id = ? AND status = 0')) {
+      const op = state.ops.find((candidate) => candidate.id === String(args[1]))
+      if (op && op.status === 0) {
+        op.status = 3
+        op.version = args[0] === null ? null : Number(args[0])
+        op.updated_at = new Date()
+      }
+      return []
+    }
     if (q.startsWith('UPDATE doc_rename_operation SET status = 1, version = ? WHERE id = ? AND status = 0')) {
       if (state.failOpCompletion) throw new Error('journal completion failed')
       const op = state.ops.find((candidate) => candidate.id === String(args[1]))
@@ -1098,8 +1107,10 @@ describe('HTML rename journal — concurrency ordering', () => {
     const result = await renameHtmlDoc(input('B'))
     expect(result).toMatchObject({ ok: false, status: 409, error: 'rename_superseded' })
     expect(h.state.docs.get('d1')!.title).toBe('C')
+    // status 3 = superseded: terminal, but NOT the half-success state that
+    // would make the next rename demand a recovery of the replaced title.
     const supersededOp = h.state.ops.find((op) => op.id !== 'op-later')!
-    expect(supersededOp.status).toBe(2)
+    expect(supersededOp.status).toBe(3)
     // Superseded is non-resumable: its replay receipt is dropped.
     expect(closeCalls).toEqual([{
       slug: 'html_slug_1', doc_id: 'd1', space_id: 's1', idempotency_key: supersededOp.id,
@@ -1290,8 +1301,37 @@ describe('HTML rename journal — reverse interleaving (older rename vs newer ca
     // The newer title wins; the stale rename must not resurrect B.
     expect(h.state.docs.get('d1')!.title).toBe('A')
     expect(h.state.docs.get('d1')!.html_publish_seq).toBe(3)
-    // The journal is closed as superseded, so the operation is not left pending.
-    expect(h.state.ops[0]!.status).toBe(2)
+    // The journal is closed as superseded, so the operation is not left pending
+    // and is not recorded as a half-success either.
+    expect(h.state.ops[0]!.status).toBe(3)
+  })
+
+  it('a superseded rename does not block the next independent rename', async () => {
+    seedDoc('A')
+    let seq = 2
+    fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as { title: string }
+      return upstream(seq, body, seq)
+    })
+    setRepublish(fetchMock)
+
+    // A→B publishes seq 2, but a newer HTML publish (seq 3) already set the
+    // title back to A, so the delayed rename is superseded.
+    h.state.docs.get('d1')!.html_publish_seq = 3
+    h.state.docs.get('d1')!.html_publish_version = 3
+    const first = await renameHtmlDoc(input('B'))
+    expect(first).toMatchObject({ ok: false, status: 409, error: 'rename_superseded' })
+    expect(h.state.ops[0]!.status).toBe(3)
+
+    // The next A→C rename must actually reach HTML. If the dead journal row were
+    // left as a half-success (failed + version), prepare() would answer 409
+    // rename_recovery_required and ask the caller to restore the replaced B.
+    seq = 4
+    const second = await renameHtmlDoc(input('C'))
+    expect(second).toMatchObject({ ok: true, title: 'C' })
+    expect(h.state.docs.get('d1')!.title).toBe('C')
+    expect(h.state.docs.get('d1')!.html_publish_seq).toBe(4)
+    expect(h.state.ops.map((op) => op.status)).toEqual([3, 1])
   })
 
   it('still applies a rename whose own publish is the newest one', async () => {

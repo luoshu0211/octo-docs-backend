@@ -313,7 +313,9 @@ async function commit(
     // Our html version is now stale; never overwrite the newer local title.
     const newer = await docRenameOperationRepo.getLatestCompletedAfterTx(tx, input.docId, op.revision)
     if (newer) {
-      await docRenameOperationRepo.markFailedWithVersionTx(tx, opId, version)
+      // Terminal but NOT a half-success: a newer rename owns the title, so
+      // recovery must never resurrect this one (see markSupersededTx).
+      await docRenameOperationRepo.markSupersededTx(tx, opId, version)
       // Superseded by a newer completed rename: this operation can never be
       // resumed, so its html replay receipt may be dropped.
       return { ok: false, status: 409, error: 'rename_superseded', closeReceipt: true }
@@ -358,7 +360,10 @@ async function commit(
      */
     const appliedSeq = Number((meta as { html_publish_seq?: number | string }).html_publish_seq ?? 0)
     if (publishSeq !== null && publishSeq > 0 && publishSeq <= appliedSeq) {
-      await docRenameOperationRepo.markFailedWithVersionTx(tx, opId, version)
+      // A newer applied publish already owns the title. Recorded as superseded
+      // rather than failed-with-version: the next independent rename must not be
+      // told to "recover" a title that a newer write legitimately replaced.
+      await docRenameOperationRepo.markSupersededTx(tx, opId, version)
       // The html receipt for this operation is spent: a retry must allocate a new
       // operation (with a higher revision) instead of replaying a superseded one.
       return { ok: false, status: 409, error: 'rename_superseded', closeReceipt: true }
