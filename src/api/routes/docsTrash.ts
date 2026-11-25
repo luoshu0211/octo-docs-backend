@@ -177,6 +177,12 @@ export async function restoreDocHandler(req: Request, res: Response): Promise<vo
     res.status(410).json({ error: 'trash_expired' })
     return
   }
+  // Already active: not in the trash any more. The final contract answers 404
+  // for a repeated restore, matching "已恢复后再次调用 404".
+  if (meta.status === 1) {
+    res.status(404).json({ error: 'not_found' })
+    return
+  }
   const restored = await docTrashRepo.restoreDoc(docId)
   if (!restored.ok) {
     if (restored.reason === 'archived') res.status(409).json({ error: 'doc_archived' })
