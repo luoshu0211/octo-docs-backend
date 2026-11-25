@@ -203,9 +203,12 @@ async function restoreOne(
         return { ok: false, status: 404, error: 'not_found' }
     }
   }
-  if (restored.doc.changed) {
-    await afterRestored(restored.doc.documentName, restored.doc.permissionEpoch)
+  if (!restored.doc.changed) {
+    // Another request restored it between our pre-check and the row lock: this
+    // call did not restore anything, so it must not claim a fresh 200.
+    return { ok: false, status: 404, error: 'not_found' }
   }
+  await afterRestored(restored.doc.documentName, restored.doc.permissionEpoch)
   return { ok: true }
 }
 

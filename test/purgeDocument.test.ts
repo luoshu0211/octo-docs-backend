@@ -23,6 +23,9 @@ function meta(overrides: Record<string, unknown> = {}) {
 function deps(overrides: Partial<PurgeDeps> = {}): PurgeDeps {
   return {
     getMeta: vi.fn(async () => meta() as never),
+    // The instance CAN reach the html backend by default; only the dedicated
+    // "not configured" case flips this.
+    htmlPurgeConfigured: () => true,
     claimPurge: vi.fn(async () => ({
       ok: true, resumed: false,
       doc: { documentName: 'octo:s1:f1:d1', attachObjectKeys: [] },
@@ -90,6 +93,37 @@ describe('purgeDocument', () => {
     expect(result).toEqual({ ok: false, status: 503, error: 'html_purge_failed' })
     expect(d.purgeRepo).not.toHaveBeenCalled()
     expect(d.releasePurgeClaim).not.toHaveBeenCalled()
+  })
+
+  it('never takes a claim when the html backend is not configured', async () => {
+    const d = deps({
+      getMeta: vi.fn(async () => meta({ doc_type: 'html', octo_doc_slug: 'slug-1' }) as never),
+      htmlPurgeConfigured: () => false,
+    })
+    const result = await purgeDocument('d1', { mode: 'best_effort', deps: d })
+    expect(result).toEqual({ ok: false, status: 503, error: 'html_purge_failed' })
+    // The claim is taken only when it can be discharged: an undischargeable claim
+    // would leave the document un-restorable for no reason.
+    expect(d.claimPurge).not.toHaveBeenCalled()
+    expect(d.releasePurgeClaim).not.toHaveBeenCalled()
+    expect(d.purgeRepo).not.toHaveBeenCalled()
+  })
+
+  it('keeps a RESUMED claim when the retry cannot reach html: prior content may be gone', async () => {
+    const d = deps({
+      getMeta: vi.fn(async () => meta({ doc_type: 'html', octo_doc_slug: 'slug-1' }) as never),
+      claimPurge: vi.fn(async () => ({
+        ok: true, resumed: true,
+        doc: { documentName: 'octo:s1:f1:d1', attachObjectKeys: [] },
+      }) as never),
+      purgeHtml: vi.fn(async () => ({ ok: true, skipped: true, reason: 'config_missing' }) as never),
+    })
+    const result = await purgeDocument('d1', { mode: 'best_effort', deps: d })
+    expect(result).toEqual({ ok: false, status: 503, error: 'html_purge_failed' })
+    // Releasing here would let the user restore a record whose body an earlier run
+    // already deleted.
+    expect(d.releasePurgeClaim).not.toHaveBeenCalled()
+    expect(d.purgeRepo).not.toHaveBeenCalled()
   })
 
   it('releases the purge claim when the html backend is not configured', async () => {

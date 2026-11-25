@@ -39,7 +39,10 @@ describe('createTrashCleanupScheduler', () => {
 
   it('passes now - retentionDays as the cutoff and purges each expired doc', async () => {
     const listExpired = vi.fn()
-      .mockResolvedValueOnce([{ doc_id: 'd1' }, { doc_id: 'd2' }])
+      .mockResolvedValueOnce([
+        { doc_id: 'd1', deleted_at: new Date('2026-11-01T00:00:00.000Z') },
+        { doc_id: 'd2', deleted_at: new Date('2026-11-02T00:00:00.000Z') },
+      ])
       .mockResolvedValueOnce([])
     const purge = vi.fn(async () => ({ ok: true }))
     const scheduler = createTrashCleanupScheduler({
@@ -55,16 +58,19 @@ describe('createTrashCleanupScheduler', () => {
       purged: 2,
       failed: 0,
     })
-    expect(listExpired).toHaveBeenNthCalledWith(1, new Date(NOW - 30 * DAY), 100)
+    expect(listExpired).toHaveBeenNthCalledWith(1, new Date(NOW - 30 * DAY), 100, undefined)
     expect(purge).toHaveBeenCalledWith('d1')
     expect(purge).toHaveBeenCalledWith('d2')
   })
 
   it('keeps paging until a short/empty batch and respects page bounds', async () => {
-    const full = Array.from({ length: 100 }, (_, i) => ({ doc_id: `d${i}` }))
+    const full = Array.from({ length: 100 }, (_, i) => ({
+      doc_id: `d${i}`,
+      deleted_at: new Date(NOW - (1000 - i) * 1000),
+    }))
     const listExpired = vi.fn()
       .mockResolvedValueOnce(full)
-      .mockResolvedValueOnce([{ doc_id: 'd100' }])
+      .mockResolvedValueOnce([{ doc_id: 'd100', deleted_at: new Date(NOW - 1000) }])
     const purge = vi.fn(async () => ({ ok: true }))
     const scheduler = createTrashCleanupScheduler({
       enabled: true, intervalMs: 1000, retentionDays: 30, now: () => NOW,
@@ -75,6 +81,33 @@ describe('createTrashCleanupScheduler', () => {
     expect(summary.scanned).toBe(101)
     expect(summary.purged).toBe(101)
     // 第二批只有 1 条（< batchSize）=> 停止，不再发第三次查询。
+    expect(listExpired).toHaveBeenCalledTimes(2)
+    // 第二页从上一页最后一条的 (deleted_at, doc_id) 之后开始。
+    expect(listExpired).toHaveBeenNthCalledWith(2, new Date(NOW - 30 * DAY), 100, {
+      deletedAt: full[full.length - 1]!.deleted_at,
+      docId: 'd99',
+    })
+  })
+
+  it('pages past a permanently failing batch instead of retrying it forever', async () => {
+    // The first page always fails; without keyset paging every run re-read the
+    // same 100 rows and the 101st document was never attempted.
+    const failing = Array.from({ length: 100 }, (_, i) => ({
+      doc_id: `bad${i}`,
+      deleted_at: new Date(NOW - (2000 - i) * 1000),
+    }))
+    const listExpired = vi.fn()
+      .mockResolvedValueOnce(failing)
+      .mockResolvedValueOnce([{ doc_id: 'good', deleted_at: new Date(NOW - 1000) }])
+    const purge = vi.fn(async (docId: string) => ({ ok: docId === 'good' }))
+    const scheduler = createTrashCleanupScheduler({
+      enabled: true, intervalMs: 1000, retentionDays: 30, now: () => NOW,
+      listExpired, purge, batchSize: 100, log: vi.fn(),
+    })
+
+    const summary = await scheduler.runOnce()
+    expect(summary).toMatchObject({ scanned: 101, purged: 1, failed: 100 })
+    expect(purge).toHaveBeenCalledWith('good')
     expect(listExpired).toHaveBeenCalledTimes(2)
   })
 

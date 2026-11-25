@@ -29,6 +29,8 @@ const DAY_MS = 24 * 60 * 60 * 1000
 
 export interface TrashCleanupRow {
   doc_id: string
+  /** Cursor component: keyset paging so a failing page cannot block the rest. */
+  deleted_at?: Date | null
 }
 
 export type TrashCleanupLogger = (message: string, ...args: unknown[]) => void
@@ -47,7 +49,11 @@ export interface TrashCleanupOptions {
   /** 可注入时钟（单测用固定时间）。 */
   now?: () => number
   /** 可注入候选查询（单测用假仓储）。 */
-  listExpired?: (cutoff: Date, limit: number) => Promise<TrashCleanupRow[]>
+  listExpired?: (
+    cutoff: Date,
+    limit: number,
+    after?: { deletedAt: Date; docId: string },
+  ) => Promise<TrashCleanupRow[]>
   /** 可注入删除（默认走 purgeDocument best_effort）。 */
   purge?: (docId: string) => Promise<{ ok: boolean }>
   log?: TrashCleanupLogger
@@ -80,7 +86,8 @@ export function createTrashCleanupScheduler(options: TrashCleanupOptions): Trash
   const batchSize = Math.min(1000, Math.max(1, Math.floor(options.batchSize ?? 100)))
   const maxBatchesPerRun = Math.min(1000, Math.max(1, Math.floor(options.maxBatchesPerRun ?? 100)))
   const listExpired = options.listExpired
-    ?? ((cutoff: Date, limit: number) => docTrashRepo.listExpiredForCleanup(cutoff, limit))
+    ?? ((cutoff: Date, limit: number, after?: { deletedAt: Date; docId: string }) =>
+      docTrashRepo.listExpiredForCleanup(cutoff, limit, after))
   const purge = options.purge
     ?? ((docId: string) => purgeDocumentBestEffort(docId))
 
@@ -96,17 +103,16 @@ export function createTrashCleanupScheduler(options: TrashCleanupOptions): Trash
     let purged = 0
     let failed = 0
 
+    let cursor: { deletedAt: Date; docId: string } | undefined
     for (let batch = 0; batch < maxBatchesPerRun; batch += 1) {
-      const rows = await listExpired(cutoff, batchSize)
+      const rows = await listExpired(cutoff, batchSize, cursor)
       if (rows.length === 0) break
       scanned += rows.length
-      let purgedInBatch = 0
       for (const row of rows) {
         try {
           const result = await purge(row.doc_id)
           if (result.ok) {
             purged += 1
-            purgedInBatch += 1
           } else {
             failed += 1
           }
@@ -115,8 +121,14 @@ export function createTrashCleanupScheduler(options: TrashCleanupOptions): Trash
           log('[octo-docs] trash cleanup: purge failed for doc', row.doc_id, err)
         }
       }
-      // 同一批文档删不掉时，下一批查询还会原样返回它们；立即收手，等下一轮重试。
-      if (purgedInBatch === 0) break
+      // Advance by (deleted_at, doc_id) instead of stopping at the first failing
+      // page: a permanently failing row must not block every document behind it.
+      const last = rows[rows.length - 1]!
+      if (last.deleted_at) {
+        cursor = { deletedAt: last.deleted_at, docId: last.doc_id }
+      } else {
+        break
+      }
       if (rows.length < batchSize) break
     }
 

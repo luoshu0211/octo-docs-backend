@@ -59,7 +59,7 @@ describe('docMetaRepo.listSharedWithUser', () => {
     expect(sql).toContain('LIMIT 201')
     // JOIN dm.uid, dm.principal_space_id; JOIN dl.uid, dl.principal_space;
     // retention window; owner_id + owner_space_id (compound owner exclusion).
-    expect(lastParams()).toEqual(['u1', 's1', 'u1', 's1', 30, 'u1', 's1'])
+    expect(lastParams()).toEqual(['u1', 's1', 'u1', 's1', TRASH_RETENTION_DAYS, 'u1', 's1'])
   })
 
   it('defaults the window to the same configured retention every other projection uses', async () => {

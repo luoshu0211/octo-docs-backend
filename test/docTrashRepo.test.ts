@@ -115,7 +115,9 @@ describe('docTrashRepo.listTrash', () => {
 describe('docTrashRepo.restoreDoc', () => {
   it('flips status=1 / deleted_at=NULL and bumps the epoch in the same transaction', async () => {
     const { tx, calls } = txWith([
-      (sql) => (sql.startsWith('SELECT status') ? [{ status: 0, document_name: 'octo:s1:f1:d1' }] : undefined),
+      (sql) => (sql.startsWith('SELECT status')
+        ? [{ status: 0, document_name: 'octo:s1:f1:d1', deleted_at: new Date('2026-11-20T00:00:00.000Z') }]
+        : undefined),
       (sql) => (sql.startsWith('SELECT document_name') ? [{ document_name: 'octo:s1:f1:d1', permission_epoch: 8 }] : undefined),
     ])
     mockTransaction.mockImplementationOnce(async (fn: never) => (fn as never as (t: unknown) => unknown)(tx))
@@ -138,14 +140,28 @@ describe('docTrashRepo.restoreDoc', () => {
     expect(mockBumpEpochTx).not.toHaveBeenCalled()
   })
 
-  it('is idempotent for an already-active row (no epoch bump)', async () => {
+  it('reports a lost race when another request already restored the row', async () => {
+    // The pre-check ran outside the lock, so "already active" under the lock means
+    // someone else restored it: this call must not answer a fresh 200.
     const { tx } = txWith([
       (sql) => (sql.startsWith('SELECT status') ? [{ status: 1, document_name: 'octo:s1:f1:d1' }] : undefined),
-      (sql) => (sql.startsWith('SELECT document_name') ? [{ document_name: 'octo:s1:f1:d1', permission_epoch: 3 }] : undefined),
     ])
     mockTransaction.mockImplementationOnce(async (fn: never) => (fn as never as (t: unknown) => unknown)(tx))
-    const result = await docTrashRepo.restoreDoc('d1')
-    expect(result.ok && result.doc.changed).toBe(false)
+    expect(await docTrashRepo.restoreDoc('d1')).toEqual({ ok: false, reason: 'not_found' })
+    expect(mockBumpEpochTx).not.toHaveBeenCalled()
+  })
+
+  it('re-checks the retention deadline inside the lock', async () => {
+    // Still inside the window when the caller pre-checked, expired by the time the
+    // row lock was granted.
+    const { tx, calls } = txWith([
+      (sql) => (sql.startsWith('SELECT status')
+        ? [{ status: 0, document_name: 'octo:s1:f1:d1', deleted_at: new Date('2026-01-01T00:00:00.000Z') }]
+        : undefined),
+    ])
+    mockTransaction.mockImplementationOnce(async (fn: never) => (fn as never as (t: unknown) => unknown)(tx))
+    expect(await docTrashRepo.restoreDoc('d1')).toEqual({ ok: false, reason: 'expired' })
+    expect(calls.some((c) => c.sql.includes('SET status = 1'))).toBe(false)
     expect(mockBumpEpochTx).not.toHaveBeenCalled()
   })
 })

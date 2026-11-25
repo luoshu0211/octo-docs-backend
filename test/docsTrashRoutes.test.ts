@@ -157,6 +157,20 @@ describe('POST /api/v1/docs/{docId}/restore', () => {
     expect(refreshAndPublish).toHaveBeenCalledWith('octo:s1:f1:d1', 5)
   })
 
+  it('404s a restore that lost the race to a concurrent restore', async () => {
+    // The pre-check saw status=0, but the row was already active under the lock:
+    // nothing was restored by THIS call, so it must not answer 200.
+    vi.mocked(docTrashRepo.restoreDoc).mockResolvedValueOnce({
+      ok: true,
+      doc: { documentName: 'octo:s1:f1:d1', permissionEpoch: 6, changed: false },
+    } as never)
+    const res = response()
+    await restoreDocHandler(request() as never, res as never)
+    expect(res.statusCode).toBe(404)
+    expect(res.body).toMatchObject({ error: 'not_found' })
+    expect(refreshAndPublish).not.toHaveBeenCalled()
+  })
+
   it('404s a missing doc and 403s a non-admin observer (member viewers cannot act)', async () => {
     vi.mocked(docMetaRepo.getByDocId).mockResolvedValueOnce(null as never)
     const missing = response()

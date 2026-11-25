@@ -19,6 +19,7 @@
  */
 import { query, transaction } from '../pool.js'
 import { docMetaRepo, escapeLikeSubstring } from './docMetaRepo.js'
+import { isTrashExpired } from '../../permission/docRetention.js'
 import { ROLE_ADMIN } from '../../permission/role.js'
 
 /** 回收站列表默认/最大页大小。 */
@@ -98,6 +99,7 @@ export interface ExpiredTrashRow {
   document_name: string
   doc_type: string
   octo_doc_slug: string | null
+  deleted_at: Date | null
 }
 
 export const docTrashRepo = {
@@ -214,8 +216,16 @@ export const docTrashRepo = {
 
   async restoreDoc(docId: string): Promise<RestoreOutcome> {
     return transaction(async (tx) => {
-      const [meta] = await tx.query<{ status: number; document_name: string; purge_state: number | null }>(
-        'SELECT status, document_name, purge_state FROM doc_meta WHERE doc_id = ? FOR UPDATE',
+      // deleted_at is read under the SAME lock as the status: the caller's
+      // pre-check happens outside it, so the row can cross its retention deadline
+      // (or be restored by another request) while this one waits for the lock.
+      const [meta] = await tx.query<{
+        status: number
+        document_name: string
+        purge_state: number | null
+        deleted_at: Date | null
+      }>(
+        'SELECT status, document_name, purge_state, deleted_at FROM doc_meta WHERE doc_id = ? FOR UPDATE',
         [docId],
       )
       if (!meta) return { ok: false, reason: 'not_found' } as const
@@ -224,6 +234,10 @@ export const docTrashRepo = {
       // A purge has claimed this document: its content may already be gone, so it
       // must never be reactivated. The caller answers 409 instead.
       if (Number(meta.purge_state ?? 0) === 1) return { ok: false, reason: 'purging' } as const
+      // Another request already restored it: this one lost the race and must not
+      // report a fresh restore.
+      if (status === 1) return { ok: false, reason: 'not_found' } as const
+      if (isTrashExpired(meta.deleted_at)) return { ok: false, reason: 'expired' } as const
       const changed = status === 0
       if (changed) {
         await tx.query('UPDATE doc_meta SET status = 1, deleted_at = NULL WHERE doc_id = ?', [docId])
@@ -324,17 +338,34 @@ export const docTrashRepo = {
    * 保留期到期的候选（`deleted_at` 非 NULL 且严格早于 cutoff）。
    * `deleted_at IS NULL` 的历史行期限未知，**永不自动清理**（与灰行契约一致）。
    */
-  async listExpiredForCleanup(cutoff: Date, limit: number): Promise<ExpiredTrashRow[]> {
+  /**
+   * One keyset page of expired tombstones.
+   *
+   * `after` lets the cleanup job advance past rows that keep failing: without it
+   * every run re-read the same first page and documents behind a permanently
+   * failing block were never attempted.
+   */
+  async listExpiredForCleanup(
+    cutoff: Date,
+    limit: number,
+    after?: { deletedAt: Date; docId: string },
+  ): Promise<ExpiredTrashRow[]> {
     const bounded = Number.isInteger(limit) ? Math.min(1000, Math.max(1, limit)) : 100
+    const cursorSql = after
+      ? 'AND (deleted_at > ? OR (deleted_at = ? AND doc_id > ?))'
+      : ''
+    const params: unknown[] = [cutoff]
+    if (after) params.push(after.deletedAt, after.deletedAt, after.docId)
     return query<ExpiredTrashRow>(
-      `SELECT doc_id, document_name, doc_type, octo_doc_slug
+      `SELECT doc_id, document_name, doc_type, octo_doc_slug, deleted_at
        FROM doc_meta
        WHERE status = 0
          AND deleted_at IS NOT NULL
          AND deleted_at < ?
+         ${cursorSql}
        ORDER BY deleted_at ASC, doc_id ASC
        LIMIT ${bounded}`,
-      [cutoff],
+      params,
     )
   },
 }

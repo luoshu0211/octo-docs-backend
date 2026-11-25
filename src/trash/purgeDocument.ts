@@ -26,12 +26,14 @@ import { docTrashRepo, type PurgeClaimOutcome, type PurgeOutcome } from '../db/r
 import { getObjectStore } from '../storage/objectStore.js'
 import { enqueueDocIndex, isSearchIndexedDoc } from '../search/docIndexQueue.js'
 import { HTML_DOC_TYPE } from '../db/docType.js'
-import { purgeHtmlDocument, type HtmlPurgeResult } from '../api/services/htmlPurge.js'
+import { htmlPurgeConfigured, purgeHtmlDocument, type HtmlPurgeResult } from '../api/services/htmlPurge.js'
 
 export type PurgeMode = 'strict' | 'best_effort'
 
 export interface PurgeDeps {
   getMeta(docId: string): Promise<DocMeta | null>
+  /** 远端 html purge 是否配置（URL + token）。在认领前就要判断。 */
+  htmlPurgeConfigured(): boolean
   claimPurge(docId: string): Promise<PurgeClaimOutcome>
   releasePurgeClaim(docId: string): Promise<void>
   purgeHtml(slug: string, docId: string, spaceId: string): Promise<HtmlPurgeResult>
@@ -42,6 +44,7 @@ export interface PurgeDeps {
 
 const defaultDeps: PurgeDeps = {
   getMeta: (docId) => docMetaRepo.getByDocId(docId),
+  htmlPurgeConfigured: () => htmlPurgeConfigured(),
   claimPurge: (docId) => docTrashRepo.claimPurge(docId),
   releasePurgeClaim: (docId) => docTrashRepo.releasePurgeClaim(docId),
   purgeHtml: (slug, docId, spaceId) => purgeHtmlDocument(slug, docId, spaceId),
@@ -117,19 +120,32 @@ export async function purgeDocument(
   if (meta.status === 2) return { ok: false, status: 409, error: 'doc_archived' }
   if (meta.status !== 0) return { ok: false, status: 409, error: 'not_deleted' }
 
+  const htmlSlug = meta.doc_type === HTML_DOC_TYPE ? meta.octo_doc_slug : null
+  const htmlDoc = Boolean(htmlSlug)
+  // Check the instance configuration BEFORE taking the claim. A claim we cannot
+  // discharge would leave the row un-restorable, and — worse — a retry that hit
+  // this branch used to release the marker a previous run left behind, so a
+  // document whose content may already be gone became restorable again.
+  if (htmlDoc && !deps.htmlPurgeConfigured()) {
+    return { ok: false, status: 503, error: 'html_purge_failed' }
+  }
+
   // Persist the claim BEFORE the remote call. Restore refuses a claimed row, and a
   // retry resumes it, so the two operations can never interleave into
   // "restored metadata + deleted content".
   const claim = await deps.claimPurge(docId)
   if (!claim.ok) return mapClaim(claim)
 
-  if (meta.doc_type === HTML_DOC_TYPE && meta.octo_doc_slug) {
-    const purged = await deps.purgeHtml(meta.octo_doc_slug, meta.doc_id, meta.space_id)
+  if (htmlDoc) {
+    const purged = await deps.purgeHtml(htmlSlug!, meta.doc_id, meta.space_id)
     if (!purged.ok || purged.skipped) {
-      logHtmlPurgeFailure(meta.octo_doc_slug, purged)
-      if (purged.ok && purged.skipped) {
-        // Nothing was deleted remotely (endpoint not configured): release the
-        // claim so the document stays restorable.
+      logHtmlPurgeFailure(htmlSlug!, purged)
+      if (purged.ok && purged.skipped && !claim.resumed) {
+        // Nothing was deleted remotely and THIS run created the claim, so the
+        // document is still intact and must stay restorable. A RESUMED claim is
+        // different: an earlier run may already have removed the content, so the
+        // marker has to survive and the user must not be able to restore a
+        // record without a body.
         await deps.releasePurgeClaim(docId).catch(() => undefined)
       }
       // BOTH modes keep doc_meta. For strict it is fail-closed for the caller; for
