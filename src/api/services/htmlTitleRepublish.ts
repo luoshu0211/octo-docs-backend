@@ -274,15 +274,18 @@ export async function republishHtmlTitle(input: HtmlRepublishInput): Promise<Htm
     if (typeof version !== 'number' || !Number.isInteger(version) || version <= 0) {
       return { ok: false, reason: 'invalid_response' }
     }
-    // publish_seq is optional (older HTML instances omit it) but must be a
-    // positive integer when present: a malformed value cannot order the write.
+    // publish_seq is optional (older HTML instances omit it, and a receipt
+    // persisted before the sequence existed replays as 0) but must be a positive
+    // integer when it carries information: a malformed value cannot order the
+    // write. 0 means "unknown" and falls back to the version watermark — rejecting
+    // it would fail a rename whose publish already succeeded.
     const rawSeq = payload.publish_seq
     let publishSeq: number | null = null
     if (rawSeq !== undefined && rawSeq !== null) {
-      if (typeof rawSeq !== 'number' || !Number.isInteger(rawSeq) || rawSeq <= 0) {
+      if (typeof rawSeq !== 'number' || !Number.isInteger(rawSeq) || rawSeq < 0) {
         return { ok: false, reason: 'invalid_response' }
       }
-      publishSeq = rawSeq
+      publishSeq = rawSeq > 0 ? rawSeq : null
     }
     return { ok: true, version, publishSeq }
   } catch {

@@ -1261,3 +1261,52 @@ describe('HTML rename journal — publish-order fence', () => {
     expect(h.state.docs.get('d1')!.html_publish_seq).toBe(22)
   })
 })
+
+describe('HTML rename journal — reverse interleaving (older rename vs newer callback)', () => {
+  /**
+   * Reviewer's reverse-order case: a rename of A→B publishes (seq 2) but its
+   * response is delayed; HTML then publishes back to A (seq 3) and Docs applies
+   * that callback first. When the delayed rename finally commits, the current
+   * title already equals its `from_title` (A), so the ordinary optimistic check
+   * would pass and write the OLD title B while the watermark stays at 3 — Docs
+   * would report a title no HTML version contains.
+   */
+  it('refuses to write the title when a newer applied publish already superseded it', async () => {
+    seedDoc('A')
+    fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as { title: string }
+      // The rename publishes seq 2 (A→B) …
+      return upstream(2, body, 2)
+    })
+    setRepublish(fetchMock)
+
+    // … but a later HTML publish (seq 3) lands first and sets the title back to A.
+    h.state.docs.get('d1')!.title = 'A'
+    h.state.docs.get('d1')!.html_publish_seq = 3
+    h.state.docs.get('d1')!.html_publish_version = 3
+
+    const result = await renameHtmlDoc(input('B'))
+    expect(result).toMatchObject({ ok: false, status: 409, error: 'rename_superseded' })
+    // The newer title wins; the stale rename must not resurrect B.
+    expect(h.state.docs.get('d1')!.title).toBe('A')
+    expect(h.state.docs.get('d1')!.html_publish_seq).toBe(3)
+    // The journal is closed as superseded, so the operation is not left pending.
+    expect(h.state.ops[0]!.status).toBe(2)
+  })
+
+  it('still applies a rename whose own publish is the newest one', async () => {
+    seedDoc('A')
+    fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as { title: string }
+      return upstream(2, body, 5)
+    })
+    setRepublish(fetchMock)
+    // An OLDER applied publish must not block this rename.
+    h.state.docs.get('d1')!.html_publish_seq = 4
+
+    const result = await renameHtmlDoc(input('B'))
+    expect(result).toMatchObject({ ok: true, title: 'B' })
+    expect(h.state.docs.get('d1')!.title).toBe('B')
+    expect(h.state.docs.get('d1')!.html_publish_seq).toBe(5)
+  })
+})

@@ -44,9 +44,22 @@ afterEach(() => {
   warnSpy.mockRestore()
 })
 
-function body(version: unknown, title = 'New Title', slug = 'html_slug_1'): Response {
+function body(
+  version: unknown,
+  title = 'New Title',
+  slug = 'html_slug_1',
+  publishSeq?: unknown,
+): Response {
   return {
-    ok: true, status: 200, json: async () => ({ slug, title, version }), text: async () => '',
+    ok: true,
+    status: 200,
+    json: async () => ({
+      slug,
+      title,
+      version,
+      ...(publishSeq !== undefined ? { publish_seq: publishSeq } : {}),
+    }),
+    text: async () => '',
   } as unknown as Response
 }
 
@@ -163,5 +176,42 @@ describe('closeHtmlRepublishReceipt — identity binding', () => {
         }),
       }),
     )
+  })
+})
+
+describe('republishHtmlTitle — publish sequence compatibility', () => {
+  /**
+   * A receipt persisted before the sequence existed replays as publish_seq 0 (or
+   * omits it). That must NOT be invalid_response: the HTML side already published,
+   * so failing here would strand a rename that has nothing left to do.
+   */
+  it('treats publish_seq 0 as unknown and falls back to the version watermark', async () => {
+    fetchMock.mockResolvedValueOnce(body(2, 'New Title', 'html_slug_1', 0))
+    await expect(republishHtmlTitle(input)).resolves.toMatchObject({
+      ok: true, version: 2, publishSeq: null,
+    })
+  })
+
+  it('omitted publish_seq is equally unknown (older HTML instances)', async () => {
+    fetchMock.mockResolvedValueOnce(body(2))
+    await expect(republishHtmlTitle(input)).resolves.toMatchObject({
+      ok: true, version: 2, publishSeq: null,
+    })
+  })
+
+  it('carries a positive publish sequence through', async () => {
+    fetchMock.mockResolvedValueOnce(body(2, 'New Title', 'html_slug_1', 7))
+    await expect(republishHtmlTitle(input)).resolves.toMatchObject({
+      ok: true, version: 2, publishSeq: 7,
+    })
+  })
+
+  it.each([
+    ['negative', -1],
+    ['fractional', 1.5],
+    ['string', '3'],
+  ])('rejects a malformed publish_seq (%s)', async (_label, seq) => {
+    fetchMock.mockResolvedValueOnce(body(2, 'New Title', 'html_slug_1', seq as never))
+    await expect(republishHtmlTitle(input)).resolves.toEqual({ ok: false, reason: 'invalid_response' })
   })
 })
