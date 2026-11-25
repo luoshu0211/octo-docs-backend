@@ -153,6 +153,13 @@ spec:
                   name: octo-docs-backend-secret
                   key: DRIVE_INTERNAL_TOKEN
                   optional: true
+            # Outbound document activity uses its own Drive write credential.
+            - name: DOCS_ACTIVITY_INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: octo-docs-backend-secret
+                  key: DOCS_ACTIVITY_INTERNAL_TOKEN
+                  optional: true
           readinessProbe:
             httpGet:
               path: /healthz
