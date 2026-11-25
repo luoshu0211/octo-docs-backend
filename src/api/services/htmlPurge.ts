@@ -9,8 +9,9 @@
  *
  *   POST {OCTO_DOCS_HTML_INTERNAL_URL}/internal/html/purge
  *   X-Internal-Token: {OCTO_DOCS_HTML_INTERNAL_TOKEN}
- *   { "slug": "<doc_meta.octo_doc_slug>" }
- *   → 2xx 成功；404 视为「内容已不存在」（幂等重试）；其余按失败处理。
+ *   { "slug": "...", "doc_id": "...", "space_id": "..." }
+ *   → 2xx 成功；404 **且** 响应体是业务码 `content_gone` 才表示「内容已不存在」
+ *     （幂等重试）；普通路由 404 / 其他体一律按失败处理，保留 doc_meta。
  *
  * 失败策略由调用方决定：
  *   - 前端触发的 `POST /api/v1/docs/{docId}/purge`：strict —— 失败回 503 且
@@ -29,6 +30,32 @@ export type HtmlPurgeResult =
   | { ok: true; skipped?: false }
   | { ok: true; skipped: true; reason: 'config_missing' }
   | { ok: false; reason: 'invalid_slug' | 'network_error' | 'upstream_error'; status?: number }
+
+/**
+ * Business-level "there is no content to delete any more".
+ *
+ * A bare 404 is ambiguous: an OLD html instance that does not expose
+ * `/internal/html/purge` at all answers a plain router 404, and accepting that as
+ * success would delete doc_meta while versions and assets survive. Only the
+ * handler's own envelope proves the content is really gone.
+ */
+export function isContentGonePayload(payload: unknown): boolean {
+  if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) return false
+  const root = payload as Record<string, unknown>
+  const codeOf = (value: unknown): string =>
+    (typeof value === 'string' ? value : '').toLowerCase()
+  if (codeOf(root.error) === 'content_gone' || codeOf(root.code) === 'content_gone') return true
+  const error = root.error
+  if (error !== null && typeof error === 'object' && !Array.isArray(error)) {
+    const nested = error as Record<string, unknown>
+    if (codeOf(nested.code) === 'content_gone') return true
+    const details = nested.details
+    if (details !== null && typeof details === 'object' && !Array.isArray(details)) {
+      if (codeOf((details as Record<string, unknown>).code) === 'content_gone') return true
+    }
+  }
+  return false
+}
 
 /** 远端 purge 是否已配置（URL + 共享 token 都非空）。 */
 export function htmlPurgeConfigured(): boolean {
@@ -62,10 +89,15 @@ export async function purgeHtmlDocument(slug: string, docId = '', spaceId = ''):
       // 固定路径 + 自定义内部 token header：跟随重定向等于把共享密钥交给任意主机。
       redirect: 'manual',
     })
-    // 204/200/202 都表示远端已完成；404 表示内容已不存在，对「彻底删除」而言
-    // 同样是目标状态，重试安全。
-    if (res.status === 404) return { ok: true }
+    // 204/200/202 都表示远端已完成。
     if (res.status >= 200 && res.status < 300) return { ok: true }
+    // Idempotent retry: the content is already gone. ONLY the handler's own
+    // envelope counts — a plain-text router 404 comes from an html instance that
+    // has no purge endpoint, and treating it as success would strand the versions.
+    if (res.status === 404) {
+      const body: unknown = await res.json().catch(() => null)
+      return isContentGonePayload(body) ? { ok: true } : { ok: false, reason: 'upstream_error', status: 404 }
+    }
     return { ok: false, reason: 'upstream_error', status: res.status }
   } catch {
     return { ok: false, reason: 'network_error' }

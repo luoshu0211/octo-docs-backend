@@ -22,6 +22,7 @@
  */
 import { config } from '../config/env.js'
 import { docTrashRepo } from '../db/repos/docTrashRepo.js'
+import { TRASH_RETENTION_DAYS } from '../permission/docRetention.js'
 import { purgeDocument } from './purgeDocument.js'
 
 const DAY_MS = 24 * 60 * 60 * 1000
@@ -186,7 +187,10 @@ export function startTrashCleanup(overrides: Partial<TrashCleanupOptions> = {}):
   const scheduler = createTrashCleanupScheduler({
     enabled: config.trashCleanup.enabled,
     intervalMs: config.trashCleanup.intervalMs,
-    retentionDays: config.trashCleanup.retentionDays,
+    // Same constant the listing/status projections and the restore check use.
+    // Reading the env var here independently is what made a 7-day deployment
+    // delete documents whose UI still promised 23 more days.
+    retentionDays: TRASH_RETENTION_DAYS,
     ...overrides,
   })
   scheduler.start()

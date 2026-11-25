@@ -43,9 +43,33 @@ describe('purgeHtmlDocument', () => {
     expect(init.redirect).toBe('manual')
   })
 
-  it('maps 404 (content already gone) to success so retries are idempotent', async () => {
-    fetchMock.mockResolvedValueOnce(new Response('', { status: 404 }))
+  it('maps a business 404 (content_gone) to success so retries are idempotent', async () => {
+    fetchMock.mockResolvedValueOnce(new Response(
+      JSON.stringify({ error: { code: 'content_gone', message: 'document content not found' } }),
+      { status: 404 },
+    ))
     expect(await purgeHtmlDocument('slug-1', 'd1', 'org1')).toEqual({ ok: true })
+  })
+
+  it('accepts the flat content_gone variants too (mixed-version rollout)', async () => {
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ code: 'content_gone' }), { status: 404 }))
+    expect(await purgeHtmlDocument('slug-1', 'd1', 'org1')).toEqual({ ok: true })
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ error: 'content_gone' }), { status: 404 }))
+    expect(await purgeHtmlDocument('slug-1', 'd1', 'org1')).toEqual({ ok: true })
+  })
+
+  it('does NOT treat a plain router 404 as success (old html without the endpoint)', async () => {
+    // Gin/httpx answers an unmatched route with a plain-text 404: the versions and
+    // assets of this document still exist, so docs must keep doc_meta.
+    fetchMock.mockResolvedValueOnce(new Response('404 page not found', { status: 404 }))
+    expect(await purgeHtmlDocument('slug-1', 'd1', 'org1')).toEqual({
+      ok: false, reason: 'upstream_error', status: 404,
+    })
+    // A JSON body with an unrelated code is equally not proof.
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ error: { code: 'not_found' } }), { status: 404 }))
+    expect(await purgeHtmlDocument('slug-1', 'd1', 'org1')).toEqual({
+      ok: false, reason: 'upstream_error', status: 404,
+    })
   })
 
   it('maps a non-2xx to upstream_error with the status', async () => {

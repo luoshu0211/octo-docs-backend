@@ -23,6 +23,11 @@ function meta(overrides: Record<string, unknown> = {}) {
 function deps(overrides: Partial<PurgeDeps> = {}): PurgeDeps {
   return {
     getMeta: vi.fn(async () => meta() as never),
+    claimPurge: vi.fn(async () => ({
+      ok: true, resumed: false,
+      doc: { documentName: 'octo:s1:f1:d1', attachObjectKeys: [] },
+    }) as never),
+    releasePurgeClaim: vi.fn(async () => {}),
     purgeHtml: vi.fn(async () => ({ ok: true }) as never),
     purgeRepo: vi.fn(async () => ({
       ok: true,
@@ -74,14 +79,61 @@ describe('purgeDocument', () => {
     expect(d.purgeRepo).not.toHaveBeenCalled()
   })
 
-  it('best_effort: html purge failure is logged and the DB purge still runs', async () => {
+  it('best_effort: a failed html purge keeps doc_meta as the retry basis', async () => {
     const d = deps({
       getMeta: vi.fn(async () => meta({ doc_type: 'html', octo_doc_slug: 'slug-1' }) as never),
       purgeHtml: vi.fn(async () => ({ ok: false, reason: 'network_error' }) as never),
     })
     const result = await purgeDocument('d1', { mode: 'best_effort', deps: d })
+    // The row is the ONLY thing that lets the next cleanup run find this doc
+    // again; deleting it would strand the remote versions and attachments.
+    expect(result).toEqual({ ok: false, status: 503, error: 'html_purge_failed' })
+    expect(d.purgeRepo).not.toHaveBeenCalled()
+    expect(d.releasePurgeClaim).not.toHaveBeenCalled()
+  })
+
+  it('releases the purge claim when the html backend is not configured', async () => {
+    const d = deps({
+      getMeta: vi.fn(async () => meta({ doc_type: 'html', octo_doc_slug: 'slug-1' }) as never),
+      purgeHtml: vi.fn(async () => ({ ok: true, skipped: true, reason: 'config_missing' }) as never),
+    })
+    const result = await purgeDocument('d1', { mode: 'best_effort', deps: d })
+    expect(result).toEqual({ ok: false, status: 503, error: 'html_purge_failed' })
+    expect(d.purgeRepo).not.toHaveBeenCalled()
+    // Nothing was deleted remotely, so the document must stay restorable.
+    expect(d.releasePurgeClaim).toHaveBeenCalledWith('d1')
+  })
+
+  it('claims the purge before calling html and resumes an already-claimed doc', async () => {
+    const order: string[] = []
+    const d = deps({
+      getMeta: vi.fn(async () => meta({ doc_type: 'html', octo_doc_slug: 'slug-1' }) as never),
+      claimPurge: vi.fn(async () => {
+        order.push('claim')
+        return { ok: true, resumed: true, doc: { documentName: 'octo:s1:f1:d1', attachObjectKeys: [] } }
+      }) as never,
+      purgeHtml: vi.fn(async () => {
+        order.push('html')
+        return { ok: true }
+      }) as never,
+      purgeRepo: vi.fn(async () => {
+        order.push('db')
+        return { ok: true, doc: { documentName: 'octo:s1:f1:d1', attachObjectKeys: [] } }
+      }) as never,
+    })
+    const result = await purgeDocument('d1', { mode: 'strict', deps: d })
     expect(result.ok).toBe(true)
-    expect(d.purgeRepo).toHaveBeenCalledWith('d1')
+    expect(order).toEqual(['claim', 'html', 'db'])
+  })
+
+  it('refuses a doc whose purge claim was lost to a purge/restore race', async () => {
+    const d = deps({
+      claimPurge: vi.fn(async () => ({ ok: false, reason: 'not_deleted' }) as never),
+    })
+    expect(await purgeDocument('d1', { mode: 'strict', deps: d })).toEqual({
+      ok: false, status: 409, error: 'not_deleted',
+    })
+    expect(d.purgeHtml).not.toHaveBeenCalled()
   })
 
   it('skips the remote call for non-html docs and for html without a slug', async () => {

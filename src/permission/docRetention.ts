@@ -13,12 +13,26 @@
  *   - 比较统一用应用时钟；`deleted_at` 由 DB 的 NOW(3) 写入，mysql2 以同一
  *     会话/进程时区读回 Date，两边是同一绝对时刻。
  *
- * 这里刻意不读 `config`：内部 `/internal/docs/status` 的灰行投影在单测里会用
- * 精简的 config mock，保留期字段必须是一个纯函数才能保持那些测试离线可跑。
+ * 保留期只有**一个**来源：`TRASH_RETENTION_DAYS`（env，默认 30）。清理任务的
+ * cutoff、列表/状态投影的 `expireAt`/`retentionDays`、恢复的到期判定全部用它，
+ * 否则把 env 调成 7 天时用户界面仍显示 30 天、文档却已被物理删除。
+ *
+ * 为什么读取时要容错：内部 `/internal/docs/status` 的灰行投影在单测里会用精简的
+ * config mock，缺少该字段时必须回退到契约默认值，而不是在模块加载时抛错。
  */
+import { config } from '../config/env.js'
 
-/** 回收站保留天数（对外契约值，写入 `retentionDays` / `retention_days`）。 */
-export const TRASH_RETENTION_DAYS = 30
+function configuredRetentionDays(): number {
+  const raw = (config as { trashCleanup?: { retentionDays?: unknown } }).trashCleanup?.retentionDays
+  const value = typeof raw === 'number' ? raw : Number(raw)
+  return Number.isFinite(value) && value >= 1 ? Math.floor(value) : 30
+}
+
+/**
+ * 回收站保留天数（对外契约值，写入 `retentionDays` / `retention_days`）。
+ * 同时是清理任务的 cutoff 依据 —— 展示、判定、清理共用同一个数。
+ */
+export const TRASH_RETENTION_DAYS = configuredRetentionDays()
 
 /** 保留期毫秒数（`deleted_at + 30d`）。 */
 export const TRASH_RETENTION_MS = TRASH_RETENTION_DAYS * 24 * 60 * 60 * 1000

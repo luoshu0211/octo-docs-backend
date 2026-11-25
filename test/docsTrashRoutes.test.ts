@@ -270,3 +270,56 @@ describe('POST /api/v1/docs/trash/{restore,purge} (batch)', () => {
     })
   })
 })
+
+describe('restore state machine shared by single and batch entry points', () => {
+  it('410s an expired document instead of restoring it', async () => {
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValueOnce({
+      ...meta,
+      deleted_at: new Date('2026-09-01T00:00:00.000Z'),
+    } as never)
+    const res = response()
+    await restoreDocHandler(request() as never, res as never)
+    expect(res.statusCode).toBe(410)
+    expect(res.body).toEqual({ error: 'trash_expired' })
+    expect(docTrashRepo.restoreDoc).not.toHaveBeenCalled()
+  })
+
+  it('409s purge_in_progress while a purge holds the claim', async () => {
+    vi.mocked(docTrashRepo.restoreDoc).mockResolvedValueOnce({ ok: false, reason: 'purging' } as never)
+    const res = response()
+    await restoreDocHandler(request() as never, res as never)
+    expect(res.statusCode).toBe(409)
+    expect(res.body).toEqual({ error: 'purge_in_progress' })
+    expect(refreshAndPublish).not.toHaveBeenCalled()
+  })
+
+  it('batch restore reports the SAME per-item errors instead of reactivating expired docs', async () => {
+    vi.mocked(docMetaRepo.getByDocId).mockImplementation(async (docId: string) => {
+      if (docId === 'expired') {
+        return { ...meta, doc_id: 'expired', deleted_at: new Date('2026-09-01T00:00:00.000Z') } as never
+      }
+      if (docId === 'purging') return { ...meta, doc_id: 'purging', status: 0 } as never
+      return { ...meta, doc_id: docId } as never
+    })
+    vi.mocked(docTrashRepo.restoreDoc).mockImplementation(async (docId: string) => {
+      if (docId === 'purging') return { ok: false, reason: 'purging' } as never
+      return { ok: true, doc: { documentName: `octo:s1:f1:${docId}`, permissionEpoch: 6, changed: true } } as never
+    })
+
+    const res = response()
+    await batchRestoreHandler(
+      request({ body: { doc_ids: ['expired', 'purging', 'ok'] } }) as never,
+      res as never,
+    )
+    expect(res.statusCode).toBe(200)
+    expect(res.body).toEqual({
+      items: [
+        { docId: 'expired', status: 'failed', error: 'trash_expired' },
+        { docId: 'purging', status: 'failed', error: 'purge_in_progress' },
+        { docId: 'ok', status: 'restored', error: null },
+      ],
+    })
+    // The expired row must never be flipped back to active.
+    expect(vi.mocked(docTrashRepo.restoreDoc).mock.calls.map(([id]) => id)).not.toContain('expired')
+  })
+})

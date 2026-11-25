@@ -49,12 +49,16 @@ export interface RestoredDoc {
 
 export type RestoreOutcome =
   | { ok: true; doc: RestoredDoc }
-  | { ok: false; reason: 'not_found' | 'archived' }
+  | { ok: false; reason: 'not_found' | 'archived' | 'purging' | 'expired' }
 
 export interface PurgedDoc {
   documentName: string
   attachObjectKeys: string[]
 }
+
+export type PurgeClaimOutcome =
+  | { ok: true; doc: PurgedDoc; resumed: boolean }
+  | { ok: false; reason: 'not_found' | 'archived' | 'not_deleted' }
 
 export type PurgeOutcome =
   | { ok: true; doc: PurgedDoc }
@@ -166,15 +170,60 @@ export const docTrashRepo = {
    * 映射 409 doc_archived（恢复归档需要走取消归档链路，不是回收站恢复）。
    * 已经是 active 的行按幂等成功处理（重复恢复不报错，也不重复 bump epoch）。
    */
-  async restoreDoc(docId: string): Promise<RestoreOutcome> {
+  /**
+   * Claim one document for a physical purge: `purge_state=1` marks that its
+   * remote content deletion may be in flight. It is persisted BEFORE the html
+   * call so a concurrent restore (or a retry after a crash) sees the same state
+   * under the row lock — otherwise a restore could commit and the purge would
+   * still delete the content, leaving an ACTIVE document with no body.
+   *
+   * A row that is already claimed resumes (`resumed=true`), which is what makes
+   * a failed remote deletion retryable instead of leaving the document stuck.
+   */
+  async claimPurge(docId: string): Promise<PurgeClaimOutcome> {
     return transaction(async (tx) => {
-      const [meta] = await tx.query<{ status: number; document_name: string }>(
-        'SELECT status, document_name FROM doc_meta WHERE doc_id = ? FOR UPDATE',
+      const [meta] = await tx.query<{ status: number; document_name: string; purge_state: number | null }>(
+        'SELECT status, document_name, purge_state FROM doc_meta WHERE doc_id = ? FOR UPDATE',
         [docId],
       )
       if (!meta) return { ok: false, reason: 'not_found' } as const
       const status = Number(meta.status)
       if (status === 2) return { ok: false, reason: 'archived' } as const
+      if (status !== 0) return { ok: false, reason: 'not_deleted' } as const
+      const resumed = Number(meta.purge_state ?? 0) === 1
+      if (!resumed) {
+        await tx.query('UPDATE doc_meta SET purge_state = 1 WHERE doc_id = ?', [docId])
+      }
+      return {
+        ok: true,
+        resumed,
+        doc: { documentName: String(meta.document_name), attachObjectKeys: [] },
+      } as const
+    })
+  },
+
+  /**
+   * Release a purge claim that never got as far as deleting remote content (for
+   * example the HTML backend is not configured). Without it, a deployment with
+   * content purge switched off would leave every expired document permanently
+   * un-restorable.
+   */
+  async releasePurgeClaim(docId: string): Promise<void> {
+    await query('UPDATE doc_meta SET purge_state = 0 WHERE doc_id = ? AND purge_state = 1', [docId])
+  },
+
+  async restoreDoc(docId: string): Promise<RestoreOutcome> {
+    return transaction(async (tx) => {
+      const [meta] = await tx.query<{ status: number; document_name: string; purge_state: number | null }>(
+        'SELECT status, document_name, purge_state FROM doc_meta WHERE doc_id = ? FOR UPDATE',
+        [docId],
+      )
+      if (!meta) return { ok: false, reason: 'not_found' } as const
+      const status = Number(meta.status)
+      if (status === 2) return { ok: false, reason: 'archived' } as const
+      // A purge has claimed this document: its content may already be gone, so it
+      // must never be reactivated. The caller answers 409 instead.
+      if (Number(meta.purge_state ?? 0) === 1) return { ok: false, reason: 'purging' } as const
       const changed = status === 0
       if (changed) {
         await tx.query('UPDATE doc_meta SET status = 1, deleted_at = NULL WHERE doc_id = ?', [docId])

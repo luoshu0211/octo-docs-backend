@@ -50,6 +50,9 @@ CREATE TABLE doc_meta (
   updated_by    VARCHAR(64)  NOT NULL DEFAULT '',
   -- 最后一次已应用的 HTML 发布回调版本（用于忽略乱序到达的旧回调）。
   html_publish_version BIGINT NOT NULL DEFAULT 0,
+  -- 彻底删除的认领状态：0=正常 1=已认领（远端内容删除可能在进行/可重试）。
+  -- 恢复与重试必须在行锁内看到同一状态，否则会出现「元数据已恢复、正文已删」。
+  purge_state TINYINT NOT NULL DEFAULT 0,
   PRIMARY KEY (doc_id),
   UNIQUE KEY uk_document_name (document_name),    -- document_name 全局唯一
   -- octo_doc_slug is unique PER SPACE, not globally (P0 tenant isolation): the

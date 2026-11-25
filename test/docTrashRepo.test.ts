@@ -224,3 +224,48 @@ describe('trash cursor + retention constants', () => {
     expect(MAX_TRASH_BATCH).toBe(50)
   })
 })
+
+describe('docTrashRepo.claimPurge / restoreDoc purge fence', () => {
+  it('persists purge_state=1 in the row lock BEFORE any remote work', async () => {
+    const { tx, calls } = txWith([
+      (sql) => (sql.startsWith('SELECT status')
+        ? [{ status: 0, document_name: 'octo:s1:f1:d1', purge_state: 0 }]
+        : undefined),
+    ])
+    mockTransaction.mockImplementationOnce(async (fn: never) => (fn as never as (t: unknown) => unknown)(tx))
+
+    const claim = await docTrashRepo.claimPurge('d1')
+    expect(claim.ok).toBe(true)
+    expect(claim.ok && claim.resumed).toBe(false)
+    // The claim is durable state, written inside the same transaction as the
+    // status check — not an in-memory flag the restore path cannot see.
+    expect(calls.some((c) => c.sql.includes('SET purge_state = 1'))).toBe(true)
+  })
+
+  it('resumes an already-claimed purge instead of failing (retry basis)', async () => {
+    const { tx, calls } = txWith([
+      (sql) => (sql.startsWith('SELECT status')
+        ? [{ status: 0, document_name: 'octo:s1:f1:d1', purge_state: 1 }]
+        : undefined),
+    ])
+    mockTransaction.mockImplementationOnce(async (fn: never) => (fn as never as (t: unknown) => unknown)(tx))
+
+    const claim = await docTrashRepo.claimPurge('d1')
+    expect(claim.ok).toBe(true)
+    expect(claim.ok && claim.resumed).toBe(true)
+    expect(calls.some((c) => c.sql.includes('SET purge_state = 1'))).toBe(false)
+  })
+
+  it('refuses to restore a purge-claimed row, even while it is still status=0', async () => {
+    const { tx, calls } = txWith([
+      (sql) => (sql.startsWith('SELECT status')
+        ? [{ status: 0, document_name: 'octo:s1:f1:d1', purge_state: 1 }]
+        : undefined),
+    ])
+    mockTransaction.mockImplementationOnce(async (fn: never) => (fn as never as (t: unknown) => unknown)(tx))
+
+    expect(await docTrashRepo.restoreDoc('d1')).toEqual({ ok: false, reason: 'purging' })
+    expect(calls.some((c) => c.sql.includes('SET status = 1'))).toBe(false)
+    expect(mockBumpEpochTx).not.toHaveBeenCalled()
+  })
+})

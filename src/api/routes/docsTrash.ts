@@ -160,6 +160,55 @@ export async function listTrashHandler(req: Request, res: Response): Promise<voi
   res.status(200).json({ items: page.items.map(trashItem), next_cursor: page.nextCursor })
 }
 
+/**
+ * One restore, shared by the single and batch entry points so they cannot
+ * diverge on the state machine:
+ *
+ *   missing            → 404 not_found
+ *   archived           → 409 doc_archived
+ *   already active     → 404 not_found  (final contract: repeated restore 404)
+ *   purge claimed      → 409 purge_in_progress
+ *   past retention     → 410 trash_expired
+ *
+ * The purge claim and the retention check are evaluated under the SAME row lock
+ * as the write (restoreDoc), so a document whose content deletion already started
+ * can never be reactivated by the batch path.
+ */
+type RestoreOneResult =
+  | { ok: true }
+  | { ok: false; status: 400 | 403 | 404 | 409 | 410; error: string }
+
+async function restoreOne(
+  docId: string,
+  actor: TrashActor,
+  opts: { meta?: DocMeta; role?: ResolvedRole } = {},
+): Promise<RestoreOneResult> {
+  const meta = opts.meta ?? (await docMetaRepo.getByDocId(docId))
+  if (!meta) return { ok: false, status: 404, error: 'not_found' }
+  const role = opts.role ?? (await directRole(meta, actor))
+  if (!roleAtLeast(role, 'admin')) return { ok: false, status: 403, error: 'forbidden' }
+  if (meta.status === 2) return { ok: false, status: 409, error: 'doc_archived' }
+  if (isTrashExpired(meta.deleted_at)) return { ok: false, status: 410, error: 'trash_expired' }
+  if (meta.status === 1) return { ok: false, status: 404, error: 'not_found' }
+  const restored = await docTrashRepo.restoreDoc(docId)
+  if (!restored.ok) {
+    switch (restored.reason) {
+      case 'archived':
+        return { ok: false, status: 409, error: 'doc_archived' }
+      case 'purging':
+        return { ok: false, status: 409, error: 'purge_in_progress' }
+      case 'expired':
+        return { ok: false, status: 410, error: 'trash_expired' }
+      default:
+        return { ok: false, status: 404, error: 'not_found' }
+    }
+  }
+  if (restored.doc.changed) {
+    await afterRestored(restored.doc.documentName, restored.doc.permissionEpoch)
+  }
+  return { ok: true }
+}
+
 /** POST /api/v1/docs/{docId}/restore */
 export async function restoreDocHandler(req: Request, res: Response): Promise<void> {
   const actor = await resolveTrashActor(req, res)
@@ -167,30 +216,12 @@ export async function restoreDocHandler(req: Request, res: Response): Promise<vo
   const docId = req.params.docId!
   const meta = await loadAdminDoc(req, res, docId, actor)
   if (!meta) return
-  if (meta.status === 2) {
-    res.status(409).json({ error: 'doc_archived' })
+  // Reuse the row the authorization step already loaded: a second read could see
+  // a different state and contradict the 403/409 the handler just decided.
+  const result = await restoreOne(docId, actor, { meta })
+  if (!result.ok) {
+    res.status(result.status).json({ error: result.error })
     return
-  }
-  // Retention: a trashed doc older than 30 days is no longer restorable even if
-  // the cleanup job has not physically removed it yet (v1.3 contract).
-  if (isTrashExpired(meta.deleted_at)) {
-    res.status(410).json({ error: 'trash_expired' })
-    return
-  }
-  // Already active: not in the trash any more. The final contract answers 404
-  // for a repeated restore, matching "已恢复后再次调用 404".
-  if (meta.status === 1) {
-    res.status(404).json({ error: 'not_found' })
-    return
-  }
-  const restored = await docTrashRepo.restoreDoc(docId)
-  if (!restored.ok) {
-    if (restored.reason === 'archived') res.status(409).json({ error: 'doc_archived' })
-    else res.status(404).json({ error: 'not_found' })
-    return
-  }
-  if (restored.doc.changed) {
-    await afterRestored(restored.doc.documentName, restored.doc.permissionEpoch)
   }
   res.status(200).json({
     docId,
@@ -262,29 +293,10 @@ export async function batchRestoreHandler(req: Request, res: Response): Promise<
 
   const items: BatchItem[] = []
   for (const docId of docIds) {
-    const meta = await docMetaRepo.getByDocId(docId)
-    if (!meta) {
-      items.push(failed(docId, 'not_found'))
-      continue
-    }
-    const role = await directRole(meta, actor)
-    if (!roleAtLeast(role, 'admin')) {
-      items.push(failed(docId, 'forbidden'))
-      continue
-    }
-    if (meta.status === 2) {
-      items.push(failed(docId, 'doc_archived'))
-      continue
-    }
-    const restored = await docTrashRepo.restoreDoc(docId)
-    if (!restored.ok) {
-      items.push(failed(docId, restored.reason === 'archived' ? 'doc_archived' : 'not_found'))
-      continue
-    }
-    if (restored.doc.changed) {
-      await afterRestored(restored.doc.documentName, restored.doc.permissionEpoch)
-    }
-    items.push({ docId, status: 'restored', error: null })
+    // Same checks as the single entry point: an expired document or one whose
+    // content purge already started must be refused per item, never reactivated.
+    const restored = await restoreOne(docId, actor)
+    items.push(restored.ok ? { docId, status: 'restored', error: null } : failed(docId, restored.error))
   }
   res.status(200).json({ items })
 }

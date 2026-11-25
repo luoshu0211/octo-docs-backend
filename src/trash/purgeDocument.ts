@@ -11,18 +11,18 @@
  * 顺序：
  *   1. 读 doc_meta，只接受 `status=0`（回收站）。active => not_deleted，
  *      archived => doc_archived。
- *   2. html 文档（doc_type='html' 且有 octo_doc_slug）先调 octo-docs-html 的
- *      `/internal/html/purge`；未配置时跳过（部署未启用远端回收）。
- *   3. 数据库事务物理删除全部从属行 + doc_meta（docTrashRepo.purgeDoc）。
- *   4. best-effort：删对象存储里的附件二进制、投递一条索引失效信号
+ *   2. **先**在行锁内持久化清理认领（`doc_meta.purge_state=1`）。远端调用之前
+ *      落库是关键：恢复在锁内看到该状态会拒绝，重试看到该状态会继续，因此不会
+ *      出现「元数据被恢复、正文已删」或「正文已删但没人再重试」。
+ *   3. html 文档（doc_type='html' 且有 octo_doc_slug）调 octo-docs-html 的
+ *      `/internal/html/purge`。任何失败（含未配置）都**保留 doc_meta**：行是唯一
+ *      的重试依据，下一轮清理任务或用户重试还能沿这条链路继续。
+ *   4. 数据库事务物理删除全部从属行 + doc_meta（docTrashRepo.purgeDoc）。
+ *   5. best-effort：删对象存储里的附件二进制、投递一条索引失效信号
  *      （indexer 重读不到行即清理 OS 文档）。
- *
- * 注意：html 远端 purge 发生在 DB 事务之前，极端并发下（同一瞬间 restore）
- * 可能出现「内容已删、doc_meta 被恢复」；彻底删除与恢复本就是互斥的用户操作，
- * 这里不为跨服务调用长期持有 DB 行锁（与改名链路的取舍一致）。
  */
 import { docMetaRepo, type DocMeta } from '../db/repos/docMetaRepo.js'
-import { docTrashRepo, type PurgeOutcome } from '../db/repos/docTrashRepo.js'
+import { docTrashRepo, type PurgeClaimOutcome, type PurgeOutcome } from '../db/repos/docTrashRepo.js'
 import { getObjectStore } from '../storage/objectStore.js'
 import { enqueueDocIndex, isSearchIndexedDoc } from '../search/docIndexQueue.js'
 import { HTML_DOC_TYPE } from '../db/docType.js'
@@ -32,6 +32,8 @@ export type PurgeMode = 'strict' | 'best_effort'
 
 export interface PurgeDeps {
   getMeta(docId: string): Promise<DocMeta | null>
+  claimPurge(docId: string): Promise<PurgeClaimOutcome>
+  releasePurgeClaim(docId: string): Promise<void>
   purgeHtml(slug: string, docId: string, spaceId: string): Promise<HtmlPurgeResult>
   purgeRepo(docId: string): Promise<PurgeOutcome>
   deleteObject(objectKey: string): Promise<void>
@@ -40,6 +42,8 @@ export interface PurgeDeps {
 
 const defaultDeps: PurgeDeps = {
   getMeta: (docId) => docMetaRepo.getByDocId(docId),
+  claimPurge: (docId) => docTrashRepo.claimPurge(docId),
+  releasePurgeClaim: (docId) => docTrashRepo.releasePurgeClaim(docId),
   purgeHtml: (slug, docId, spaceId) => purgeHtmlDocument(slug, docId, spaceId),
   purgeRepo: (docId) => docTrashRepo.purgeDoc(docId),
   deleteObject: (objectKey) => getObjectStore().delete(objectKey),
@@ -48,11 +52,26 @@ const defaultDeps: PurgeDeps = {
 
 export type PurgeDocumentResult =
   | { ok: true; documentName: string }
-  | { ok: false; status: 404 | 409 | 503; error: 'not_found' | 'doc_archived' | 'not_deleted' | 'html_purge_failed' }
+  | {
+    ok: false
+    status: 404 | 409 | 503
+    error: 'not_found' | 'doc_archived' | 'not_deleted' | 'html_purge_failed'
+  }
 
 function logHtmlPurgeFailure(slug: string, result: HtmlPurgeResult): void {
   // eslint-disable-next-line no-console
   console.warn('[octo-docs] html purge failed for slug:', slug, result)
+}
+
+function mapClaim(claim: Extract<PurgeClaimOutcome, { ok: false }>): PurgeDocumentResult {
+  switch (claim.reason) {
+    case 'archived':
+      return { ok: false, status: 409, error: 'doc_archived' }
+    case 'not_deleted':
+      return { ok: false, status: 409, error: 'not_deleted' }
+    default:
+      return { ok: false, status: 404, error: 'not_found' }
+  }
 }
 
 function mapOutcome(outcome: PurgeOutcome): PurgeDocumentResult {
@@ -98,17 +117,26 @@ export async function purgeDocument(
   if (meta.status === 2) return { ok: false, status: 409, error: 'doc_archived' }
   if (meta.status !== 0) return { ok: false, status: 409, error: 'not_deleted' }
 
+  // Persist the claim BEFORE the remote call. Restore refuses a claimed row, and a
+  // retry resumes it, so the two operations can never interleave into
+  // "restored metadata + deleted content".
+  const claim = await deps.claimPurge(docId)
+  if (!claim.ok) return mapClaim(claim)
+
   if (meta.doc_type === HTML_DOC_TYPE && meta.octo_doc_slug) {
     const purged = await deps.purgeHtml(meta.octo_doc_slug, meta.doc_id, meta.space_id)
     if (!purged.ok || purged.skipped) {
       logHtmlPurgeFailure(meta.octo_doc_slug, purged)
-      // Strict (user-triggered purge): an unconfigured HTML backend is NOT a
-      // reason to delete only doc_meta — the published content would stay
-      // reachable behind its share link. Fail closed; the operator must
-      // either configure OCTO_DOCS_HTML_INTERNAL_* or purge after it is set.
-      if (opts.mode === 'strict') {
-        return { ok: false, status: 503, error: 'html_purge_failed' }
+      if (purged.ok && purged.skipped) {
+        // Nothing was deleted remotely (endpoint not configured): release the
+        // claim so the document stays restorable.
+        await deps.releasePurgeClaim(docId).catch(() => undefined)
       }
+      // BOTH modes keep doc_meta. For strict it is fail-closed for the caller; for
+      // best_effort the row is the only thing that lets the next cleanup run find
+      // this document again. Physically deleting it here would strand the remote
+      // versions/assets with nothing left to retry from.
+      return { ok: false, status: 503, error: 'html_purge_failed' }
     }
   }
 
