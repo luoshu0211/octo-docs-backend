@@ -43,8 +43,8 @@ import { parseDocumentName } from '../permission/documentName.js'
 import { enqueueDocIndex } from '../search/docIndexQueue.js'
 import { attachWhiteboardRepair, coldRepairLiveDoc } from '../whiteboard/repair.js'
 import { attachSheetDataValidationGuard } from './sheetDataValidationGuard.js'
-import { trackDocumentBodyEdits } from './documentActivity.js'
-import { documentActivityEnabled } from '../drive/documentActivity.js'
+import { markDocumentSyncFrame, trackDocumentBodyEdits } from './documentActivity.js'
+import { documentActivityEnabled, stageDocumentEdit } from '../drive/documentActivity.js'
 
 /**
  * Per-node epoch watermark (§4.5 step 4): beforeHandleMessage reads this local
@@ -452,6 +452,7 @@ export function createServer(redis = createCollabRedis(config.redis)) {
     },
 
     async beforeSync(data) {
+      if (documentActivityEnabled()) markDocumentSyncFrame(data.connection, data.type)
       const ctx = data.context as AuthContext | undefined
       if (!ctx) return
       const generation = stateGenerationOf(data.document)
@@ -640,7 +641,10 @@ export function createServer(redis = createCollabRedis(config.redis)) {
         return
       }
       if (kind === 'document') {
-        if (documentActivityEnabled()) trackDocumentBodyEdits(data.document)
+        // The document room format also covers sheets, whose load binds a generation.
+        if (documentActivityEnabled() && !stateGenerationOf(data.document)) {
+          trackDocumentBodyEdits(data.document, edit => stageDocumentEdit(data.documentName, edit))
+        }
         repairDisposers.set(data.documentName, attachSheetDataValidationGuard(data.document, {
           maxRules: config.sheetWrite.maxDataValidations,
           maxBytes: config.sheetWrite.maxDataValidationBytes,

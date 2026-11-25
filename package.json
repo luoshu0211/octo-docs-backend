@@ -24,7 +24,6 @@
     "license:check": "license-checker --onlyAllow 'MIT;ISC;BSD-2-Clause;BSD-3-Clause;Apache-2.0;CC0-1.0' --production"
   },
   "dependencies": {
-    "@hocuspocus/common": "^4.4.0",
     "@hocuspocus/extension-database": "^4.3.0",
     "@hocuspocus/extension-logger": "^4.3.0",
     "@hocuspocus/extension-redis": "^4.3.0",

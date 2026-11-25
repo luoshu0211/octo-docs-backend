@@ -1,23 +1,16 @@
 import { fenceRedisGenerations } from './generationRedis.js'
 import { Redis } from 'ioredis'
 import { Redis as HocuspocusRedis } from '@hocuspocus/extension-redis'
-import { SkipFurtherHooksError } from '@hocuspocus/common'
-import type { onStoreDocumentPayload } from '@hocuspocus/server'
+import type { onChangePayload } from '@hocuspocus/server'
 import type { RedisConnectionConfig } from '../config/redis.js'
 import { buildRedisOptions } from '../db/redisOptions.js'
 import { observeRedisErrors } from '../db/redisLifecycle.js'
-import { hasPendingDocumentBodyEdits } from './documentActivity.js'
+import { waitForDocumentEditEvidence } from './documentActivity.js'
 
 class CollabRedis extends HocuspocusRedis {
-  override async onStoreDocument(data: onStoreDocumentPayload): Promise<void> {
-    try {
-      await super.onStoreDocument(data)
-    } catch (error) {
-      if (!(error instanceof SkipFurtherHooksError) || !hasPendingDocumentBodyEdits(data.document)) throw error
-      // The other replica can persist our Yjs update but cannot know its
-      // author. Let the SQL row lock and generation fence serialize this save
-      // so the original replica also commits the edit evidence.
-    }
+  override async onChange(data: onChangePayload): Promise<void> {
+    await waitForDocumentEditEvidence(data.document)
+    await super.onChange(data)
   }
 }
 

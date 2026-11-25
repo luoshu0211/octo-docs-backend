@@ -213,6 +213,7 @@ export async function editDocBody(input: EditDocBodyInput): Promise<EditDocBodyR
       input.clientBaseVersion,
       input.ops,
       schema,
+      input.principalSpaceId,
     )
     bytes = committed.bytes
     newSV = committed.newSV
