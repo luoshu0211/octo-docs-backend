@@ -81,10 +81,7 @@ import { docsTrashRouter } from './routes/docsTrash.js'
 import { internalHtmlRegistrationRouter } from './routes/internalHtmlRegistration.js'
 import { createInternalDocRoleRouter } from './routes/internalDocRole.js'
 import { createInternalDocsLibraryRouter } from './routes/internalDocsLibrary.js'
-<<<<<<< HEAD
 import { createInternalDocsUnreadRouter } from './routes/internalDocsUnread.js'
-=======
->>>>>>> f491b30
 import { internalSourceInvalidationsRouter } from './routes/internalSourceInvalidations.js'
 import { membersRouter } from './routes/members.js'
 import { memberNotificationsRouter } from './routes/memberNotifications.js'
@@ -380,13 +377,10 @@ export function createApp(
   // never consume the library budget and vice versa.
   if (serveInternal) {
     app.use('/internal/docs', createInternalDocsLibraryRouter(createRateLimiter(opts.rateLimit)))
-<<<<<<< HEAD
     // OCTO-456 P0: batch "member-added unread" lookup backing drive's
     // `unread_only`. Same prefix, own route-scoped limiter so the three internal
     // surfaces never spend each other's budget.
     app.use('/internal/docs', createInternalDocsUnreadRouter(createRateLimiter(opts.rateLimit)))
-=======
->>>>>>> f491b30
     app.use('/internal/docs', createInternalDocRoleRouter(createRateLimiter(opts.rateLimit)))
   }
 

@@ -71,10 +71,7 @@ import { effectiveRole } from '../../permission/shareScope.js'
 import { docCapabilitiesFor, type DocCapabilities } from '../../permission/docCapabilities.js'
 import { roleAtLeast, roleFromNumber, type ResolvedRole } from '../../permission/role.js'
 import { config } from '../../config/env.js'
-<<<<<<< HEAD
 import { TRASH_RETENTION_DAYS, trashExpireAtIso } from '../../permission/docRetention.js'
-=======
->>>>>>> f491b30
 
 /**
  * Route-scoped limiter (OCTO-456 F2): every route in this router shares ONE
@@ -409,13 +406,10 @@ export async function internalDocStatusHandler(req: Request, res: Response): Pro
         updated_at: iso(meta.updated_at),
         deleted: true,
         deleted_at: isoOrNull(meta.deleted_at),
-<<<<<<< HEAD
         // OCTO-456 P1: 保留期投影，drive 据此渲染灰行的「将于 X 清理」。
         // 期限未知（deleted_at IS NULL）时 expire_at:null，且永不自动清理。
         expire_at: trashExpireAtIso(meta.deleted_at),
         retention_days: TRASH_RETENTION_DAYS,
-=======
->>>>>>> f491b30
         expired: isDeletionExpired(meta.deleted_at),
         can_read: false,
       }

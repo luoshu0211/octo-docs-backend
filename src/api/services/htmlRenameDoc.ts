@@ -552,11 +552,8 @@ export interface HtmlPublishTitleCallbackInput {
   botOwnerUid?: string | null
   title: string
   expectedTitle?: string | null
-<<<<<<< HEAD
-=======
   /** Published version of the callback; >0 enables stale-callback fencing. */
   version?: number | null
->>>>>>> f491b30
 }
 
 export type HtmlPublishTitleCallbackResult =
@@ -611,8 +608,6 @@ export async function applyHtmlPublishTitle(
       if (expectedTitle !== '' && currentTitle !== expectedTitle) {
         return { ok: false, status: 409, error: 'title_changed', currentTitle }
       }
-<<<<<<< HEAD
-=======
       // HTML releases its lock before notifying us, so v3 may arrive before v2.
       // A callback at or below the applied watermark must never roll the title
       // back; only a strictly newer published version may write.
@@ -628,7 +623,6 @@ export async function applyHtmlPublishTitle(
         )
         return { ok: true, changed: currentTitle !== input.title, title: input.title, beforeTitle: currentTitle }
       }
->>>>>>> f491b30
       if (currentTitle === input.title) {
         return { ok: true, changed: false, title: currentTitle, beforeTitle: currentTitle }
       }
