@@ -245,6 +245,7 @@ async function commit(
   input: HtmlRenameInput,
   opId: string,
   version: number | null,
+  publishSeq: number | null,
 ): Promise<CommitOutcome> {
   return transaction(async (tx): Promise<CommitOutcome> => {
     // P2-1: SAME lock order as prepare — doc_meta row first, then the operation
@@ -318,8 +319,29 @@ async function commit(
       return { ok: false, status: 409, error: 'rename_superseded', closeReceipt: true }
     }
 
+    /**
+     * Record the publish order this rename committed, in the SAME transaction as
+     * the title. A late post-publish callback from an older HTML write would
+     * otherwise still be newer than the last callback watermark and roll the
+     * library title back; the callback path fences on this sequence.
+     *
+     * Runs in the "title already correct" branch too: the html side has committed
+     * a new publish sequence even when doc_meta.title did not change.
+     */
+    const recordAppliedPublish = async (): Promise<void> => {
+      if (publishSeq === null && version === null) return
+      await tx.query(
+        `UPDATE doc_meta
+            SET html_publish_seq = GREATEST(html_publish_seq, ?),
+                html_publish_version = GREATEST(html_publish_version, ?)
+          WHERE doc_id = ?`,
+        [publishSeq ?? 0, version ?? 0, meta.doc_id],
+      )
+    }
+
     const currentTitle = meta.title ?? ''
     if (currentTitle === input.title) {
+      await recordAppliedPublish()
       await docRenameOperationRepo.markCompletedTx(tx, opId, version)
       return {
         ok: true,
@@ -337,6 +359,7 @@ async function commit(
       return { ok: false, status: 409, error: 'title_changed', currentTitle }
     }
     await docMetaRepo.rename(input.docId, input.title, input.uid, tx)
+    await recordAppliedPublish()
     await docRenameOperationRepo.markCompletedTx(tx, opId, version)
     return {
       ok: true,
@@ -507,7 +530,7 @@ export async function renameHtmlDoc(input: HtmlRenameInput): Promise<HtmlRenameR
 
   let committed: CommitOutcome
   try {
-    committed = await commit(input, prepared.opId, republished.version)
+    committed = await commit(input, prepared.opId, republished.version, republished.publishSeq)
   } catch {
     return failure(503, 'rename_failed')
   }
@@ -554,6 +577,13 @@ export interface HtmlPublishTitleCallbackInput {
   expectedTitle?: string | null
   /** Published version of the callback; >0 enables stale-callback fencing. */
   version?: number | null
+  /**
+   * Monotonic publish sequence of the callback's write. Preferred over `version`
+   * for ordering: an explicit republish can give two different titles the same
+   * content version, so only the sequence tells which one is newer. Older HTML
+   * instances omit it and fall back to the version watermark.
+   */
+  publishSeq?: number | null
 }
 
 export type HtmlPublishTitleCallbackResult =
@@ -610,8 +640,30 @@ export async function applyHtmlPublishTitle(
       }
       // HTML releases its lock before notifying us, so v3 may arrive before v2.
       // A callback at or below the applied watermark must never roll the title
-      // back; only a strictly newer published version may write.
+      // back; only a strictly newer write may commit.
+      //
+      // The sequence is the primary fence: a library rename may have committed a
+      // later publish (recorded in the same transaction as its title), and an
+      // explicit republish can give two titles the same content version — only
+      // the sequence orders those. Version remains the fallback for HTML
+      // instances that do not send one yet.
+      const incomingSeq = Number(input.publishSeq ?? 0)
       const incomingVersion = Number(input.version ?? 0)
+      const appliedSeq = Number((meta as { html_publish_seq?: number | string }).html_publish_seq ?? 0)
+      if (incomingSeq > 0) {
+        if (incomingSeq <= appliedSeq) {
+          return { ok: true, changed: false, title: currentTitle, beforeTitle: currentTitle }
+        }
+        await tx.query(
+          `UPDATE doc_meta
+              SET title = ?, updated_by = ?,
+                  html_publish_seq = ?,
+                  html_publish_version = GREATEST(html_publish_version, ?)
+            WHERE doc_id = ?`,
+          [input.title, input.uid, incomingSeq, incomingVersion > 0 ? incomingVersion : 0, meta.doc_id],
+        )
+        return { ok: true, changed: currentTitle !== input.title, title: input.title, beforeTitle: currentTitle }
+      }
       if (incomingVersion > 0) {
         const applied = Number((meta as { html_publish_version?: number | string }).html_publish_version ?? 0)
         if (incomingVersion <= applied) {

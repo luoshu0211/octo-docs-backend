@@ -1226,6 +1226,9 @@ async function applyHtmlPublishTitleHandler(req: Request, res: Response, docId: 
     title: parsedTitle.title,
     expectedTitle: parsedExpected.expectedTitle,
     version: Number((req.body ?? {}).version ?? (req.body ?? {}).publish_version ?? 0),
+    // Preferred ordering key: distinguishes two titles published under the same
+    // content version (explicit republish), which the version watermark cannot.
+    publishSeq: Number((req.body ?? {}).publish_seq ?? 0),
   })
   if (!outcome.ok) {
     res.status(outcome.status).json({

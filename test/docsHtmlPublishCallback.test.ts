@@ -20,6 +20,8 @@ const h = vi.hoisted(() => {
     space_id: string
     octo_doc_slug: string | null
     status: number
+    html_publish_seq?: number
+    html_publish_version?: number
   }
   const state = { docs: new Map<string, Doc>() }
   function execute(sql: string, args: unknown[] = []): unknown[] {
@@ -27,6 +29,15 @@ const h = vi.hoisted(() => {
     if (q.startsWith('SELECT * FROM doc_meta WHERE doc_id = ? FOR UPDATE')) {
       const doc = state.docs.get(String(args[0]))
       return doc ? [{ ...doc }] : []
+    }
+    if (q.startsWith('UPDATE doc_meta SET title = ?, updated_by = ?, html_publish_seq = ?, html_publish_version = GREATEST(html_publish_version, ?) WHERE doc_id = ?')) {
+      const doc = state.docs.get(String(args[4]))
+      if (doc) {
+        doc.title = String(args[0])
+        doc.html_publish_seq = Number(args[2])
+        doc.html_publish_version = Math.max(doc.html_publish_version ?? 0, Number(args[3]))
+      }
+      return []
     }
     if (q.startsWith('UPDATE doc_meta SET title = ?, updated_by = ? WHERE doc_id = ?')) {
       const doc = state.docs.get(String(args[2]))
@@ -148,5 +159,40 @@ describe('applyHtmlPublishTitle — publish callback converges metadata only', (
     const match = await applyHtmlPublishTitle(input({ expectedTitle: 'Old Title' }))
     expect(match).toMatchObject({ ok: true, changed: true })
     expect(h.state.docs.get('d1')!.title).toBe('Published v2 Title')
+  })
+})
+
+describe('applyHtmlPublishTitle — publish ORDER, not just version', () => {
+  /**
+   * An explicit republish can give two different titles the SAME content version
+   * (republish v2 under title B, then v2 under title C). A version-only fence
+   * would drop the second, valid update; the monotonic publish sequence is what
+   * orders them.
+   */
+  it('applies both writes that share a content version when the sequence increases', async () => {
+    seed()
+    const first = await applyHtmlPublishTitle(input({ title: 'Title B', version: 2, publishSeq: 11 }))
+    expect(first).toMatchObject({ ok: true, changed: true, title: 'Title B' })
+    expect(h.state.docs.get('d1')!.html_publish_seq).toBe(11)
+
+    const second = await applyHtmlPublishTitle(input({ title: 'Title C', version: 2, publishSeq: 12 }))
+    expect(second).toMatchObject({ ok: true, changed: true, title: 'Title C' })
+    expect(h.state.docs.get('d1')!.title).toBe('Title C')
+    expect(h.state.docs.get('d1')!.html_publish_seq).toBe(12)
+  })
+
+  it('ignores a callback whose publish sequence is not newer, even with a newer version', async () => {
+    seed({ title: 'Title C', html_publish_seq: 12, html_publish_version: 2 })
+    const stale = await applyHtmlPublishTitle(input({ title: 'Title B', version: 3, publishSeq: 11 }))
+    expect(stale).toMatchObject({ ok: true, changed: false, title: 'Title C' })
+    expect(h.state.docs.get('d1')!.title).toBe('Title C')
+    expect(h.state.docs.get('d1')!.html_publish_seq).toBe(12)
+  })
+
+  it('falls back to the version watermark when an older HTML sends no sequence', async () => {
+    seed({ title: 'Title C', html_publish_version: 3 })
+    const legacy = await applyHtmlPublishTitle(input({ title: 'Title B', version: 2 }))
+    expect(legacy).toMatchObject({ ok: true, changed: false, title: 'Title C' })
+    expect(h.state.docs.get('d1')!.title).toBe('Title C')
   })
 })
