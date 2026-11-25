@@ -98,11 +98,14 @@ paths:
           $ref: '#/components/responses/UpstreamUnavailable'
     post:
       operationId: docs.create
-      summary: Create a document or a presentation from a template
+      summary: Create a document, canonical HTML document or presentation
       description: >-
-        Create a document in the verified caller Space. Use docType=html_ppt, title, optional templateId (blank by
-        default), and Idempotency-Key for PPT. Content initialization, metadata and member grants commit
-        atomically.
+        Create a document in the verified caller Space. For doc_type=html, supply a body idempotency_key for
+        canonical allocation, or octo_doc_slug plus mount_type to update a previously registered, active HTML
+        handle owned by the caller in that Space. Unregistered handles return 404.
+        The Token user owns the returned document. Replaying a canonical key in the same Space returns its original
+        doc_id and octo_doc_slug. A deleted canonical row returns 404 with details.reason=canonical_document_deleted.
+        For doc_type=html_ppt, use title, optional template_id and the Idempotency-Key header.
       x-octo-risk: write
       requestBody:
         required: false
@@ -150,6 +153,63 @@ paths:
       x-octo-principal: token_user
       x-octo-action: docs.documents:write
       x-octo-retry: never
+  /v2/cli/docs/{doc_id}/published:
+    post:
+      operationId: docs.html.published
+      summary: Confirm HTML publication
+      description: The owner confirms the HTML content is durable in the verified Space and requests indexing.
+      tags: [docs]
+      x-octo-action: docs.documents:write
+      x-octo-principal: token_user
+      x-octo-risk: write
+      x-octo-cli-hidden: true
+      x-octo-retry: never
+      parameters:
+        - name: doc_id
+          in: path
+          required: true
+          schema: { type: string, minLength: 1 }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                title: { type: string, maxLength: 512 }
+      responses:
+        '200':
+          description: Publication acknowledgement for the existing document.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: object
+                    required: [doc_id, title, indexed]
+                    properties:
+                      doc_id: { type: string }
+                      title: { type: string }
+                      indexed: { type: boolean }
+        '400':
+          $ref: '#/components/responses/VALIDATION_ERROR'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          $ref: '#/components/responses/FORBIDDEN'
+        '404':
+          $ref: '#/components/responses/NOT_FOUND'
+        '409':
+          $ref: '#/components/responses/CONFLICT'
+        '413':
+          $ref: '#/components/responses/PAYLOAD_TOO_LARGE'
+        '429':
+          $ref: '#/components/responses/RATE_LIMITED'
+        '500':
+          $ref: '#/components/responses/INTERNAL_ERROR'
+        '503':
+          $ref: '#/components/responses/UPSTREAM_UNAVAILABLE'
   /v2/cli/docs/_metadata:
     post:
       tags:
@@ -3325,6 +3385,20 @@ components:
           type: string
           description: document type (optional; defaults to 'doc')
           x-octo-flag: docType
+        idempotency_key:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: Canonical HTML creation key scoped to the verified user and Space. Leading and trailing whitespace are rejected. Mutually exclusive with octo_doc_slug.
+          x-octo-flag: html-idempotency-key
+        octo_doc_slug:
+          type: string
+          maxLength: 128
+          description: Previously registered, active HTML handle owned by the Token user. Mutually exclusive with idempotency_key.
+        mount_type:
+          type: string
+          enum: [group, space, thread]
+          description: HTML mount type. Required when updating an existing handle.
         template_id:
           type: string
           x-octo-enum-hint: >-
@@ -3393,7 +3467,16 @@ components:
               description: Editor URL; returned for html_ppt only.
             share_url:
               type: string
-              description: Presentation URL subject to document access rules; returned for html_ppt only.
+              description: Document URL subject to access rules.
+            octo_doc_slug:
+              type: string
+              description: Registered HTML handle. For canonical allocation it equals doc_id.
+            publisher_uid:
+              type: string
+              description: Verified user who owns the HTML document.
+            created:
+              type: boolean
+              description: True for the initial HTML allocation and false on replay.
           example:
             docId: d_000000000000000000000001
             docType: html_ppt

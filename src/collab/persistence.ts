@@ -21,6 +21,8 @@ import { encodeStorageState, StorageBudgetError } from './storageCodec.js'
 import { captureStoreUpdate, recordStoreCheckpoint } from './storeCheckpoint.js'
 import { storeWorkerPool } from './storeWorkerPool.js'
 import { CapacityLane } from './capacityLane.js'
+import { captureDocumentActivitySnapshot, confirmDocumentBodyEdits, snapshotIncludesDocumentEdit } from './documentActivity.js'
+import { confirmPersistedDocumentEdits } from '../drive/documentActivity.js'
 
 const storeAdmission = new CapacityLane()
 
@@ -171,6 +173,7 @@ async function storeSnapshot(documentName: string, liveDoc: Y.Doc, context?: Sto
     const background = config.yjsBackgroundStore
     let receipt = captureDurableSnapshot(liveDoc)
     let captured = captureStoreUpdate(documentName, liveDoc, background)
+    let activity = captureDocumentActivitySnapshot(liveDoc)
     const { state: incoming, encoding } = captured
 
     // §9.5 single-document hard size cap: reject oversized writes (a runaway
@@ -210,6 +213,7 @@ async function storeSnapshot(documentName: string, liveDoc: Y.Doc, context?: Sto
             // and its matching vector while still holding the same row lock.
             receipt = captureDurableSnapshot(liveDoc)
             captured = captureStoreUpdate(documentName, liveDoc, false)
+            activity = captureDocumentActivitySnapshot(liveDoc)
             if (captured.state.length > config.maxDocBytes) {
               throw new StorageBudgetError('decoded', captured.state.length, config.maxDocBytes)
             }
@@ -244,6 +248,12 @@ async function storeSnapshot(documentName: string, liveDoc: Y.Doc, context?: Sto
             documentName,
           ])
         }
+        if (activity) {
+          const { edits, snapshot, generation } = activity
+          await confirmPersistedDocumentEdits(tx, documentName, edits, proof =>
+            snapshotIncludesDocumentEdit(snapshot, generation, proof),
+          )
+        }
       })
     } catch (error) {
       if (error instanceof StorageBudgetError) {
@@ -254,6 +264,7 @@ async function storeSnapshot(documentName: string, liveDoc: Y.Doc, context?: Sto
 
     // Advance only AFTER COMMIT, never after queueing, preparing, or UPSERT.
     recordStoreCheckpoint(documentName, liveDoc, captured.vector)
+    if (activity) confirmDocumentBodyEdits(liveDoc, activity.edits)
     recordDurableReceipt(liveDoc, receipt)
     const notification = durableReceipt(liveDoc)
     // A receipt is emitted only after COMMIT, and describes the captured state, never later edits.

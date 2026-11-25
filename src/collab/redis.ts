@@ -1,12 +1,21 @@
 import { fenceRedisGenerations } from './generationRedis.js'
 import { Redis } from 'ioredis'
 import { Redis as HocuspocusRedis } from '@hocuspocus/extension-redis'
+import type { onChangePayload } from '@hocuspocus/server'
 import type { RedisConnectionConfig } from '../config/redis.js'
 import { buildRedisOptions } from '../db/redisOptions.js'
 import { observeRedisErrors } from '../db/redisLifecycle.js'
+import { waitForDocumentEditEvidence } from './documentActivity.js'
+
+class CollabRedis extends HocuspocusRedis {
+  override async onChange(data: onChangePayload): Promise<void> {
+    await waitForDocumentEditEvidence(data.document)
+    await super.onChange(data)
+  }
+}
 
 export function createCollabRedis(config: RedisConnectionConfig & { prefix: string }): HocuspocusRedis {
-  const extension = new HocuspocusRedis({
+  const extension = new CollabRedis({
     host: config.host,
     port: config.port,
     prefix: config.prefix,
