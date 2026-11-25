@@ -45,6 +45,7 @@ import { assertAppendV1RoleEncoding } from './db/roleEncodingMarker.js'
 import { closeRedis, getRedis, createRedisSubscriber } from './db/redis.js'
 import { closeKafkaProducer } from './db/kafka.js'
 import { broadcastCommentMutation, commentEventsChannel } from './api/services/commentEvents.js'
+import { startDocumentActivityDelivery } from './drive/documentActivity.js'
 
 async function main(): Promise<void> {
   // B1 safety backstop: a stray throw/rejection inside an async hook (e.g. a
@@ -265,6 +266,8 @@ async function main(): Promise<void> {
     console.log('[octo-docs] PPT relay DISABLED (PPT_RELAY_ENABLED=false); /api/v1/ppt/collab is not mounted')
   }
 
+  const stopDocumentActivityDelivery = startDocumentActivityDelivery()
+
   // §9.4 graceful shutdown: flush docs, then release locks, then close infra.
   const shutdown = async (signal: string): Promise<void> => {
     // eslint-disable-next-line no-console
@@ -296,6 +299,7 @@ async function main(): Promise<void> {
       sub.disconnect()
       await closeRedis()
       await closeKafkaProducer()
+      await stopDocumentActivityDelivery()
       await closePool()
     } finally {
       process.exit(0)

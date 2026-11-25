@@ -43,6 +43,8 @@ import { parseDocumentName } from '../permission/documentName.js'
 import { enqueueDocIndex } from '../search/docIndexQueue.js'
 import { attachWhiteboardRepair, coldRepairLiveDoc } from '../whiteboard/repair.js'
 import { attachSheetDataValidationGuard } from './sheetDataValidationGuard.js'
+import { trackDocumentBodyEdits } from './documentActivity.js'
+import { documentActivityEnabled } from '../drive/documentActivity.js'
 
 /**
  * Per-node epoch watermark (§4.5 step 4): beforeHandleMessage reads this local
@@ -638,6 +640,7 @@ export function createServer(redis = createCollabRedis(config.redis)) {
         return
       }
       if (kind === 'document') {
+        if (documentActivityEnabled()) trackDocumentBodyEdits(data.document)
         repairDisposers.set(data.documentName, attachSheetDataValidationGuard(data.document, {
           maxRules: config.sheetWrite.maxDataValidations,
           maxBytes: config.sheetWrite.maxDataValidationBytes,

@@ -1042,6 +1042,8 @@ export const config = {
     // client omits the header, so the derived-access lookup fails closed. No fallback
     // to the inbound token: the two directions are fully independent. NEVER logged.
     outboundToken: str('DRIVE_INTERNAL_TOKEN', ''),
+    // Dedicated Docs-to-Drive write credential. Empty disables edit activity.
+    activityToken: str('DOCS_ACTIVITY_INTERNAL_TOKEN', ''),
   },
 
   // R3-B1 PPT (html_ppt) source/bootstrap loading (XIN-1495 §4 / §8).
