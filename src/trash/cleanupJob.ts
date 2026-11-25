@@ -112,9 +112,16 @@ export function createTrashCleanupScheduler(options: TrashCleanupOptions): Trash
     let failed = 0
 
     let cursor: { deletedAt: Date; docId: string } | undefined = resumeFrom
+    // Only a run that stops because it ran out of BUDGET carries its cursor
+    // forward. Walking off the end of the queue must reset it, otherwise a row
+    // that failed once transiently is skipped by every later run.
+    let exhaustedBudget = false
     for (let batch = 0; batch < maxBatchesPerRun; batch += 1) {
       const rows = await listExpired(cutoff, batchSize, cursor)
-      if (rows.length === 0) break
+      if (rows.length === 0) {
+        cursor = undefined
+        break
+      }
       scanned += rows.length
       for (const row of rows) {
         try {
@@ -132,17 +139,21 @@ export function createTrashCleanupScheduler(options: TrashCleanupOptions): Trash
       // Advance by (deleted_at, doc_id) instead of stopping at the first failing
       // page: a permanently failing row must not block every document behind it.
       const last = rows[rows.length - 1]!
-      if (last.deleted_at) {
-        cursor = { deletedAt: last.deleted_at, docId: last.doc_id }
-      } else {
+      if (!last.deleted_at) {
+        cursor = undefined
         break
       }
-      if (rows.length < batchSize) break
+      cursor = { deletedAt: last.deleted_at, docId: last.doc_id }
+      if (rows.length < batchSize) {
+        // Short page = the queue is exhausted, not a budget stop.
+        cursor = undefined
+        break
+      }
+      // Reaching here on the last allowed batch means the budget is what stopped
+      // us, so the cursor is the resume point for the next run.
+      if (batch === maxBatchesPerRun - 1) exhaustedBudget = true
     }
-    // Remember where this run stopped so the next one continues instead of
-    // re-scanning the same failing head. Reaching the end of the queue (a short
-    // page or no more rows) resets it to the head for the next sweep.
-    resumeFrom = cursor
+    resumeFrom = exhaustedBudget ? cursor : undefined
 
     return {
       skipped: false,

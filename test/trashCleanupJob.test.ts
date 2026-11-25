@@ -160,6 +160,42 @@ describe('createTrashCleanupScheduler', () => {
     })
   })
 
+  it('retries the head again after a transient failure ends the sweep', async () => {
+    // A single document whose purge fails ONCE and then succeeds. Because the run
+    // ends on a short/empty page (not on the budget), the next run must start from
+    // the head again — persisting that position skipped A forever.
+    const queue = [{ doc_id: 'A', deleted_at: new Date(NOW - 1000) }]
+    const listExpired = vi.fn(async (
+      _cutoff: Date,
+      limit: number,
+      after?: { deletedAt: Date; docId: string },
+    ) => {
+      const start = after
+        ? queue.findIndex((row) => row.deleted_at.getTime() === after.deletedAt.getTime() && row.doc_id === after.docId) + 1
+        : 0
+      return queue.slice(start, start + limit)
+    })
+    let attempts = 0
+    const purge = vi.fn(async () => {
+      attempts += 1
+      return { ok: attempts > 1 }
+    })
+
+    for (const batchSize of [1, 2]) {
+      attempts = 0
+      purge.mockClear()
+      const scheduler = createTrashCleanupScheduler({
+        enabled: true, intervalMs: 1000, retentionDays: 30, now: () => NOW,
+        listExpired, purge, batchSize, maxBatchesPerRun: 4, log: vi.fn(),
+      })
+      const first = await scheduler.runOnce()
+      expect(first).toMatchObject({ scanned: 1, purged: 0, failed: 1 })
+      const second = await scheduler.runOnce()
+      // A is retried on the very next run and now succeeds.
+      expect(second).toMatchObject({ scanned: 1, purged: 1, failed: 0 })
+    }
+  })
+
   it('swallows a thrown purge and keeps going', async () => {
     const listExpired = vi.fn()
       .mockResolvedValueOnce([{ doc_id: 'd1' }, { doc_id: 'd2' }])
