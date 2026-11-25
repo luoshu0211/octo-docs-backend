@@ -8,6 +8,8 @@ import { fenceRedisGenerations } from '../src/collab/generationRedis.js'
 import { bindStateGeneration } from '../src/collab/stateGeneration.js'
 import { captureDurableSnapshot, durableReceipt, recordDurableReceipt } from '../src/collab/durableReceipt.js'
 import { createServer } from '../src/collab/server.js'
+import { trackDocumentBodyEdits } from '../src/collab/documentActivity.js'
+import { COLLAB_FIELD } from '../src/schema/index.js'
 
 // The real connected hook also updates presence and emits an advisory cache notice.
 // Isolate those external services; keep receipt retention and delivery real.
@@ -63,21 +65,44 @@ async function fixture(beforeLoad?: (send: (payload: string) => void) => void) {
   const sendStateless = vi.fn()
   vi.spyOn(document, 'getConnections').mockReturnValue([{ sendStateless, messageAddress: name, send: vi.fn() }] as unknown as ReturnType<Document['getConnections']>)
   fenceRedisGenerations(extension)
-  function send(payload: string, channelGeneration = generation, identifier = 'node-A') {
+  function sendMessage(message: OutgoingMessage, channelGeneration = generation, identifier = 'node-A') {
     const peer = Buffer.from(identifier)
-    const message = new OutgoingMessage(name).writeBroadcastStateless(payload).toUint8Array()
     clients[1]!.emit('messageBuffer', Buffer.from(`receipt-test:generation:${channelGeneration}:${name}`),
-      Buffer.concat([Buffer.from([peer.length]), peer, Buffer.from(message)]))
+      Buffer.concat([Buffer.from([peer.length]), peer, Buffer.from(message.toUint8Array())]))
+  }
+  function send(payload: string, channelGeneration = generation, identifier = 'node-A') {
+    sendMessage(new OutgoingMessage(name).writeBroadcastStateless(payload), channelGeneration, identifier)
   }
   if (beforeLoad) {
     documents.delete(name)
     clients[0]!.publish.mockImplementationOnce(async () => { beforeLoad(send); return 0 })
   }
   await extension.afterLoadDocument({ documentName: name, document, instance } as Parameters<HocuspocusRedis['afterLoadDocument']>[0])
-  return { extension, document, documents, instance, sendStateless, send }
+  return { extension, document, documents, instance, sendStateless, send, sendMessage, publish: clients[0]!.publish }
 }
 
 describe('Redis generation receipts retained for later connections', () => {
+  it('holds a peer sync response until the local edit author is staged', async () => {
+    const f = await fixture()
+    const peer = new Document(name)
+    cleanups.push(() => peer.destroy())
+    let release!: () => void
+    const promise = new Promise<void>(resolve => { release = resolve })
+    const stage = vi.fn(() => promise)
+    trackDocumentBodyEdits(f.document, stage)
+    f.document.transact(() => {
+      f.document.getXmlFragment(COLLAB_FIELD).push([new Y.XmlText('edit')])
+    }, { source: 'local', context: { documentEditActor: { actorUid: 'alice', principalSpaceId: 'space' } } })
+    expect(stage).toHaveBeenCalledOnce()
+
+    f.publish.mockClear()
+    f.sendMessage(new OutgoingMessage(name).createSyncMessage().writeFirstSyncStepFor(peer))
+    await new Promise(resolve => setImmediate(resolve))
+    expect(f.publish).not.toHaveBeenCalled()
+    release()
+    await vi.waitFor(() => expect(f.publish).toHaveBeenCalled())
+  })
+
   it('forwards a peer receipt and retains exactly its saved snapshot, excluding live unsaved edits', async () => {
     const f = await fixture(), peer = makeDoc()
     recordDurableReceipt(f.document, captureDurableSnapshot(f.document))

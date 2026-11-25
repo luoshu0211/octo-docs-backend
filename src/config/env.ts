@@ -1036,11 +1036,9 @@ export const config = {
     // fully independent. NEVER logged.
     inboundToken: str('DOCS_INTERNAL_TOKEN', ''),
 
-    // Outbound token: sent as X-Internal-Token on the outbound derived-access
-    // lookup to the drive service. Authority is on the DRIVE side — docs only holds
-    // a copy that must match drive's top-level internal_token. Empty => the outbound
-    // client omits the header, so the derived-access lookup fails closed. No fallback
-    // to the inbound token: the two directions are fully independent. NEVER logged.
+    // Outbound token: sent as X-Internal-Token for derived-access lookups and
+    // document edit activity delivery. Must match Drive's top-level internal_token.
+    // Empty fails derived-access closed and disables activity delivery. NEVER logged.
     outboundToken: str('DRIVE_INTERNAL_TOKEN', ''),
   },
 
