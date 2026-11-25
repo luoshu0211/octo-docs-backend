@@ -23,6 +23,9 @@ const h = vi.hoisted(() => {
     space_id: string
     status: number
     permission_epoch: number
+    octo_doc_slug?: string
+    html_publish_seq?: number
+    html_publish_version?: number
   }
   type Op = {
     id: string
@@ -52,6 +55,14 @@ const h = vi.hoisted(() => {
     if (q.startsWith('SELECT * FROM doc_meta WHERE doc_id = ?')) {
       const doc = state.docs.get(String(args[0]))
       return doc ? [{ ...doc }] : []
+    }
+    if (q.startsWith('UPDATE doc_meta SET html_publish_seq = GREATEST(html_publish_seq, ?), html_publish_version = GREATEST(html_publish_version, ?) WHERE doc_id = ?')) {
+      const doc = state.docs.get(String(args[2]))
+      if (doc) {
+        doc.html_publish_seq = Math.max(doc.html_publish_seq ?? 0, Number(args[0]))
+        doc.html_publish_version = Math.max(doc.html_publish_version ?? 0, Number(args[1]))
+      }
+      return []
     }
     if (q.startsWith('UPDATE doc_meta SET title = ?, updated_by = ? WHERE doc_id = ?')) {
       if (state.failDocMetaUpdate) throw new Error('doc_meta update failed')
@@ -187,11 +198,20 @@ import { renameHtmlDoc, RENAME_OPERATION_PENDING_TTL_MS } from '../src/api/servi
 import { isStaleRevisionPayload } from '../src/api/services/htmlTitleRepublish.js'
 import { docRenameOperationRepo } from '../src/db/repos/docRenameOperationRepo.js'
 
-function upstream(version: number, req: { slug?: unknown; title?: unknown } = {}): Response {
+function upstream(
+  version: number,
+  req: { slug?: unknown; title?: unknown } = {},
+  publishSeq?: number,
+): Response {
   return {
     ok: true,
     status: 200,
-    json: async () => ({ slug: req.slug ?? 'html_slug_1', version, title: req.title ?? 'ignored' }),
+    json: async () => ({
+      slug: req.slug ?? 'html_slug_1',
+      version,
+      title: req.title ?? 'ignored',
+      ...(publishSeq !== undefined ? { publish_seq: publishSeq } : {}),
+    }),
     text: async () => '',
   } as unknown as Response
 }
@@ -288,6 +308,7 @@ function seedDoc(title: string, overrides: Record<string, unknown> = {}) {
     space_id: 's1',
     status: 1,
     permission_epoch: 3,
+    octo_doc_slug: 'html_slug_1',
     ...overrides,
   })
 }
@@ -1183,5 +1204,60 @@ describe('HTML rename journal — CLI lock recheck', () => {
     }))
     expect(result).toMatchObject({ ok: false, status: 409, error: 'conflict' })
     expect(fetchMock).not.toHaveBeenCalled()
+  })
+})
+
+describe('HTML rename journal — publish-order fence', () => {
+  /**
+   * The library rename commits the html publish it made. A LATER-arriving
+   * callback from an OLDER publish must not roll the title back, so the rename
+   * transaction records the applied publish sequence and the callback path
+   * fences on it.
+   */
+  it('records the committed publish sequence so an older late callback cannot roll the title back', async () => {
+    const { applyHtmlPublishTitle } = await import('../src/api/services/htmlRenameDoc.js')
+    seedDoc('A')
+    fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as { title: string }
+      return upstream(3, body, 21)
+    })
+    setRepublish(fetchMock)
+
+    const renamed = await renameHtmlDoc(input('C'))
+    expect(renamed).toMatchObject({ ok: true, title: 'C', version: 3 })
+    expect(h.state.docs.get('d1')!.html_publish_seq).toBe(21)
+
+    // v2's title callback arrives after the library rename committed v3.
+    const late = await applyHtmlPublishTitle({
+      docId: 'd1',
+      slug: 'html_slug_1',
+      spaceId: 's1',
+      uid: 'author',
+      title: 'B',
+      version: 2,
+      publishSeq: 19,
+    } as never)
+
+    expect(late).toMatchObject({ ok: true, changed: false, title: 'C' })
+    expect(h.state.docs.get('d1')!.title).toBe('C')
+    expect(h.state.docs.get('d1')!.html_publish_seq).toBe(21)
+  })
+
+  it('records the publish sequence even when the title is already correct at commit time', async () => {
+    seedDoc('A')
+    fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as { title: string }
+      // Another writer sets the same target title while html publishes, so the
+      // commit lands in the "title already matches" branch. That branch must
+      // still record the publish order, or an older late callback becomes newer
+      // than the last watermark and rolls the title back.
+      h.state.docs.get('d1')!.title = body.title
+      return upstream(4, body, 22)
+    })
+    setRepublish(fetchMock)
+
+    const renamed = await renameHtmlDoc(input('Same'))
+    expect(renamed).toMatchObject({ ok: true, title: 'Same' })
+    expect(h.state.docs.get('d1')!.html_publish_seq).toBe(22)
   })
 })

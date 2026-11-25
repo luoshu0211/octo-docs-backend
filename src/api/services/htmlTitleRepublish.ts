@@ -38,7 +38,18 @@ import { config } from '../../config/env.js'
 import { trimTitleWhitespace } from '../../util/title.js'
 
 export type HtmlRepublishResult =
-  | { ok: true; version: number | null }
+  | {
+    ok: true
+    version: number | null
+    /**
+     * Monotonic publish sequence of the commit this republish made, when the html
+     * service reports one. The caller records it as the applied title order in the
+     * SAME transaction as doc_meta.title, so a later — older — post-publish
+     * callback cannot roll the title back. null for HTML instances that predate
+     * the sequence (rolling deploy); their callbacks fall back to `version`.
+     */
+    publishSeq: number | null
+  }
   | { ok: false; reason: 'config_missing'; missing: string[] }
   | { ok: false; reason: 'upstream_error'; status: number }
   | { ok: false; reason: 'stale_revision'; status: 409 }
@@ -263,7 +274,17 @@ export async function republishHtmlTitle(input: HtmlRepublishInput): Promise<Htm
     if (typeof version !== 'number' || !Number.isInteger(version) || version <= 0) {
       return { ok: false, reason: 'invalid_response' }
     }
-    return { ok: true, version }
+    // publish_seq is optional (older HTML instances omit it) but must be a
+    // positive integer when present: a malformed value cannot order the write.
+    const rawSeq = payload.publish_seq
+    let publishSeq: number | null = null
+    if (rawSeq !== undefined && rawSeq !== null) {
+      if (typeof rawSeq !== 'number' || !Number.isInteger(rawSeq) || rawSeq <= 0) {
+        return { ok: false, reason: 'invalid_response' }
+      }
+      publishSeq = rawSeq
+    }
+    return { ok: true, version, publishSeq }
   } catch {
     return { ok: false, reason: 'network_error' }
   } finally {
