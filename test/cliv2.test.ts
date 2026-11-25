@@ -26,7 +26,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { docsOperations } from '../src/api/cliv2/operations.js'
 import { createApp } from '../src/api/app.js'
 import { docMemberRepo } from '../src/db/repos/docMemberRepo.js'
-import { docMetaRepo, type DocMeta } from '../src/db/repos/docMetaRepo.js'
+import { CanonicalHtmlDeletedError, docMetaRepo, type DocMeta } from '../src/db/repos/docMetaRepo.js'
 import * as pool from '../src/db/pool.js'
 import * as epoch from '../src/permission/epoch.js'
 
@@ -241,8 +241,96 @@ describe('Docs CLI v2 read pilot', () => {
     expect(query.mock.calls.every(([sql]) => sql.startsWith('SELECT'))).toBe(true)
   })
 
+  const canonicalHtml = { ...doc, doc_type: 'html', octo_doc_slug: doc.doc_id, html_idempotency_key_hash: Buffer.alloc(32, 1) }
+
+  it('allocates canonical HTML for the Token user and replays the existing identity', async () => {
+    const create = vi.spyOn(docMetaRepo, 'createCanonicalHtml')
+      .mockResolvedValueOnce({ meta: canonicalHtml, created: true })
+      .mockResolvedValueOnce({ meta: canonicalHtml, created: false })
+      .mockRejectedValueOnce(new CanonicalHtmlDeletedError())
+    const body = JSON.stringify({ doc_type: 'html', title: 'Draft', idempotency_key: 'request-one' })
+    for (const created of [true, false]) {
+      const response = await post('', body, 'application/json', 'valid')
+      expect(response.status).toBe(201)
+      expect(await response.json()).toMatchObject({ data: {
+        doc_id: doc.doc_id, octo_doc_slug: doc.doc_id, publisher_uid: 'user_a', space_id: 'space_a',
+        share_url: expect.stringContaining('/d/' + doc.doc_id), created,
+      } })
+    }
+    expect(create).toHaveBeenCalledWith(expect.objectContaining({
+      idempotencyKey: 'request-one', spaceId: 'space_a', ownerId: 'user_a', createdBy: 'user_a', humanOwnerUid: undefined,
+    }))
+    const gone = await post('', body, 'application/json', 'valid')
+    expect(gone.status).toBe(404)
+    expect(await gone.json()).toMatchObject({ error: { code: 'NOT_FOUND', details: { reason: 'canonical_document_deleted' } } })
+  })
+
+  it('rejects invalid registration modes and client-selected identity before allocation', async () => {
+    const create = vi.spyOn(docMetaRepo, 'createCanonicalHtml')
+    for (const supplied of [{}, { idempotency_key: ' ' }, ...['slug', 'octo_doc_slug', 'owner_id', 'space_id'].map(key => ({
+      idempotency_key: 'request-one', [key]: 'other',
+    }))]) {
+      const response = await post('', JSON.stringify({ doc_type: 'html', ...supplied }), 'application/json', 'valid')
+      expect(response.status).toBe(400)
+    }
+    expect(create).not.toHaveBeenCalled()
+  })
+
+  const namedHtml = { ...canonicalHtml, octo_doc_slug: 'named', html_idempotency_key_hash: null }
+  const namedRequest = JSON.stringify({ doc_type: 'html', title: 'Updated', octo_doc_slug: 'named', mount_type: 'space' })
+
+  it('updates an owned active registration by handle under the same lock', async () => {
+    const { query } = mockRenameTransaction(namedHtml)
+    const response = await post('', namedRequest, 'application/json', 'valid')
+    expect(response.status).toBe(201)
+    expect(await response.json()).toMatchObject({ data: {
+      doc_id: doc.doc_id, octo_doc_slug: 'named', publisher_uid: 'user_a', title: 'Updated', created: false,
+    } })
+    expect(query).toHaveBeenNthCalledWith(1, expect.stringMatching(/octo_doc_slug = .* FOR UPDATE$/), ['space_a', 'named'])
+    expect(query).toHaveBeenNthCalledWith(2, expect.stringContaining('UPDATE doc_meta SET title'), ['Updated', 'user_a', doc.doc_id])
+  })
+
+  it.each([
+    ['absent', null, 404],
+    ['non-owner', { ...namedHtml, owner_id: 'other' }, 404],
+    ['other owner Space', { ...namedHtml, owner_space_id: 'space_b' }, 404],
+    ['deleted', { ...namedHtml, status: 0 }, 404],
+    ['archived', { ...namedHtml, status: 2 }, 404],
+    ['canonical', { ...namedHtml, html_idempotency_key_hash: Buffer.alloc(32) }, 409],
+  ] as const)('refuses a named registration for %s without creating or reviving a row', async (_label, row, status) => {
+    const { query } = mockRenameTransaction(row)
+    const legacy = vi.spyOn(docMetaRepo, 'upsertHtmlByOctoDocSlug')
+    const response = await post('', namedRequest, 'application/json', 'valid')
+    expect(response.status).toBe(status)
+    expect(query).toHaveBeenCalledTimes(1)
+    expect(legacy).not.toHaveBeenCalled()
+  })
+
+  it('confirms durable canonical HTML under the owner and Space lock', async () => {
+    const { query } = mockRenameTransaction(canonicalHtml)
+    const response = await post('/' + doc.doc_id + '/published', '{"title":"Published"}', 'application/json', 'valid')
+    expect(response.status).toBe(200)
+    expect(await response.json()).toEqual({ data: { doc_id: doc.doc_id, title: 'Published', indexed: false } })
+    expect(query).toHaveBeenCalledWith(expect.stringMatching(/FOR UPDATE$/), [doc.doc_id])
+    expect(query).toHaveBeenCalledWith(expect.stringContaining('UPDATE doc_meta SET title'), ['Published', 'user_a', doc.doc_id])
+  })
+
+  it.each([
+    ['foreign Space', { space_id: 'space_b' }, 404],
+    ['other owner', { owner_id: 'other' }, 404],
+    ['other owner Space', { owner_space_id: 'space_b' }, 404],
+    ['deleted', { status: 0 }, 404],
+    ['archived', { status: 2 }, 409],
+    ['wrong type', { doc_type: 'sheet' }, 409],
+  ] as const)('rejects publication for %s', async (_label, change, status) => {
+    const { query } = mockRenameTransaction({ ...canonicalHtml, ...change })
+    const response = await post('/' + doc.doc_id + '/published', '{"title":"Published"}', 'application/json', 'valid')
+    expect(response.status).toBe(status)
+    expect(query).toHaveBeenCalledTimes(1)
+  })
+
   it('gates generated and workflow routes with the same authentication', async () => {
-    expect(docsOperations).toHaveLength(49)
+    expect(docsOperations).toHaveLength(50)
     const responses = await Promise.all(docsOperations.map(async ([method, path]) =>
       fetch(appOrigin + '/v2/cli' + path.replace(/:[a-z_]+/g, 'fixture_id'), { method: method.toUpperCase() })))
     expect(responses.map(response => response.status)).toEqual(docsOperations.map(() => 401))
