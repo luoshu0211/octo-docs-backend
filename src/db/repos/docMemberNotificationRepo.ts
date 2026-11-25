@@ -39,6 +39,46 @@ export const docMemberNotificationRepo = {
     return { unreadCount: Number(rows[0]?.unread_count ?? 0), rows }
   },
 
+  /**
+   * 批量未读查询（OCTO-456 P0，供 drive 的「与我共享」`unread_only` 使用）。
+   *
+   * `doc_member_notification` 只有一类事件——「被加入文档」提醒（直接添加成员时
+   * 写入；邀请接受不写这张表），所以这里按表本身的语义返回即可，不需要再区分
+   * 事件类型。谓词与 `listUnread` 完全一致：
+   *   - `read_at IS NULL`：未读；
+   *   - 仍存在 Space-qualified 的 `doc_member` 行：成员被移除后提醒已删除，
+   *     JOIN 是第二道防线；
+   *   - `doc_meta.status = 1`：已软删文档的提醒在 softDelete 同一事务里删除，
+   *     JOIN 只防历史残留。
+   *
+   * 只返回**未读**的 doc：调用方按 `doc_id` 建集合，请求里其余 doc 视为
+   * `unread:false`。`docIds` 由路由限制在 ≤200，`IN (?,…)` 是安全的。
+   */
+  async listUnreadForDocs(params: {
+    recipientUid: string
+    recipientSpaceId: string
+    docIds: readonly string[]
+  }): Promise<Array<{ doc_id: string; event_at: Date }>> {
+    const docIds = params.docIds.filter((id) => typeof id === 'string' && id !== '')
+    if (docIds.length === 0) return []
+    const placeholders = docIds.map(() => '?').join(', ')
+    return query<{ doc_id: string; event_at: Date }>(
+      `SELECT n.doc_id, n.event_at
+       FROM doc_member_notification n
+       JOIN doc_member dm
+         ON dm.doc_id = n.doc_id
+        AND dm.uid = n.recipient_uid
+        AND dm.principal_space_id = n.recipient_space_id
+       JOIN doc_meta m ON m.doc_id = n.doc_id AND m.status = 1
+       WHERE n.recipient_uid = ?
+         AND n.recipient_space_id = ?
+         AND n.read_at IS NULL
+         AND n.doc_id IN (${placeholders})
+       ORDER BY n.event_at DESC, n.doc_id DESC`,
+      [params.recipientUid, params.recipientSpaceId, ...docIds],
+    )
+  },
+
   async markRead(params: {
     recipientUid: string
     recipientSpaceId: string

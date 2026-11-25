@@ -11,6 +11,12 @@ servers:
 tags:
   - name: docs
     description: Document metadata.
+  - name: trash
+    description: >-
+      OCTO-456 P1 online-document original trash: list / restore / purge. Only the document owner
+      (uid + owner Space) or an admin (doc_member.role=admin) may see or act on a trashed document.
+  - name: internal
+    description: Service-to-service (in-network only), authenticated by the shared X-Internal-Token.
 security:
   - bearerAuth: []
 paths:
@@ -2857,11 +2863,309 @@ paths:
       x-octo-principal: token_user
       x-octo-action: docs.attachments:read
       description: Returns signatures for attachments associated with the readable document and identifies missing IDs.
+  # ── OCTO-456 P1 在线文档原件回收（trash） ─────────────────────────────────────
+  # 只对文档 owner（uid + owner Space 复合主体）或 admin 开放；软删文档的
+  # reader/writer/commenter 观察者既不可见也不可操作。保留期 = 30 天：
+  # expireAt = deletedAt + 30d；deletedAt 为 NULL 的历史删除行 expireAt=null，
+  # 期限未知、不自动清理，但仍可 restore/purge。
+  /api/v1/docs/trash:
+    get:
+      tags:
+        - trash
+      operationId: docs.trash.list
+      summary: 回收站列表（owner/admin 的软删除在线文档）
+      description: >-
+        按 deleted_at DESC、doc_id DESC 游标分页（deleted_at 为 NULL 的历史行排在最后）。
+        items 只包含调用者 owner 或 admin 的 status=0 文档；不可见的文档不会出现（也不报 404）。
+      parameters:
+        - name: cursor
+          in: query
+          required: false
+          description: 上一页响应里的 next_cursor；首屏省略。
+          schema:
+            type: string
+        - name: page_size
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: q
+          in: query
+          required: false
+          description: 标题子串过滤（大小写不敏感；% / _ / \ 按字面量匹配）。
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 回收站分页。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocsTrashListResponse'
+        '400':
+          description: invalid_cursor（游标格式非法）或 space_required（缺少已验证的 X-Space-Id）。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          $ref: '#/components/responses/FORBIDDEN'
+  /api/v1/docs/trash/restore:
+    post:
+      tags:
+        - trash
+      operationId: docs.trash.restore
+      summary: 批量恢复回收站文档（≤50，逐项返回）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DocsTrashBatchRequest'
+      responses:
+        '200':
+          description: 逐项结果；部分成功不会报成全部成功。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocsTrashBatchResponse'
+        '400':
+          description: invalid_request / too_many_doc_ids（>50）。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+  /api/v1/docs/trash/purge:
+    post:
+      tags:
+        - trash
+      operationId: docs.trash.purge
+      summary: 批量彻底删除回收站文档（≤50，逐项返回；不可逆）
+      description: >-
+        html 文档会先请求 octo-docs-html 的 POST /internal/html/purge {slug}；失败时该项
+        status=failed、error=html_purge_failed，且对应 doc_meta 不会被删除。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DocsTrashBatchRequest'
+      responses:
+        '200':
+          description: 逐项结果。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocsTrashBatchResponse'
+        '400':
+          description: invalid_request / too_many_doc_ids（>50）。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+  /api/v1/docs/{docId}/restore:
+    post:
+      tags:
+        - trash
+      operationId: docs.trash.restoreOne
+      summary: 恢复一篇回收站文档
+      description: >-
+        置 status=1、deleted_at=NULL 并 bump permission_epoch（广播失效事件，live 会话重新校验）。
+        已归档（status=2）不是回收站恢复：返回 409 doc_archived。已经是 active 的行幂等返回 200。
+      parameters:
+        - name: docId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 已恢复。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocsTrashRestoreResponse'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          description: forbidden（存在但不是 owner/admin，含被删文档的成员观察者）。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: not_found。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: doc_archived。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /api/v1/docs/{docId}/purge:
+    post:
+      tags:
+        - trash
+      operationId: docs.trash.purgeOne
+      summary: 彻底删除一篇回收站文档（不可逆）
+      description: >-
+        只接受 status=0（回收站）文档：active => 409 not_deleted，archived => 409 doc_archived。
+        物理删除 doc_meta/成员/邀请/申请/通知/附件引用/评论/版本/浏览记录/PPT/协同态/Yjs 持久化态。
+        html 文档先调 octo-docs-html 内部 purge；失败 => 503 html_purge_failed 且不删 doc_meta。
+      parameters:
+        - name: docId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - confirm
+              properties:
+                confirm:
+                  type: boolean
+                  const: true
+      responses:
+        '204':
+          description: 已彻底删除（无响应体）。
+        '400':
+          description: confirm_required（confirm !== true）。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/AUTH_REQUIRED'
+        '403':
+          description: forbidden。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: not_found。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: doc_archived / not_deleted。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: html_purge_failed（doc_meta 保留，可重试）。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  # ── OCTO-456 P0 内部批量未读（drive「与我共享」unread_only） ─────────────────
+  /internal/docs/member-added/unread:
+    post:
+      tags:
+        - internal
+      operationId: internal.docs.memberAddedUnread
+      summary: 批量查询「被加入文档」未读提醒
+      description: >-
+        数据源 doc_member_notification（read_at IS NULL；该表只记录 member-added 提醒）。
+        返回请求里每个 doc_id 一项（去重保序），未读项 event_at 为 ISO8601 UTC，否则 null。
+      security:
+        - internalToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InternalMemberAddedUnreadRequest'
+      responses:
+        '200':
+          description: 逐 doc 的未读状态。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InternalMemberAddedUnreadResponse'
+        '400':
+          description: invalid_request / too_many_doc_ids（>200）。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: unauthorized（X-Internal-Token 缺失/不匹配，或服务端未配置）。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  # ── OCTO-456 P1 内部状态投影新增保留期字段 ───────────────────────────────────
+  /internal/docs/status:
+    post:
+      tags:
+        - internal
+      operationId: internal.docs.status
+      summary: 批量读取文档状态（含回收站保留期）
+      description: >-
+        既有内部接口的契约说明：deleted 行新增 expire_at（deleted_at + 30d，NULL=>null）与
+        retention_days:30，供 drive 渲染「将于 X 清理」的灰行。不可读/不存在的 doc 不会出现在 items 中。
+      security:
+        - internalToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InternalDocsStatusRequest'
+      responses:
+        '200':
+          description: 逐 doc 的状态（deleted 行带保留期）。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InternalDocsStatusResponse'
+        '400':
+          description: invalid_request / too_many_doc_ids。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: unauthorized。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
 components:
   securitySchemes:
     bearerAuth:
       type: http
       scheme: bearer
+    internalToken:
+      type: apiKey
+      in: header
+      name: X-Internal-Token
+      description: >-
+        Shared service-to-service secret (DOCS_INTERNAL_TOKEN). In-network only; an empty configured
+        token rejects every caller (fail-closed).
   responses:
     VALIDATION_ERROR:
       description: VALIDATION_ERROR. One or more request values are invalid.
@@ -5146,3 +5450,220 @@ components:
               type: boolean
             permission_epoch:
               type: integer
+    DocsTrashItem:
+      type: object
+      required:
+        - docId
+        - title
+        - docType
+        - owner
+        - role
+        - deletedAt
+        - expireAt
+        - retentionDays
+        - canRestore
+        - canPurge
+      properties:
+        docId:
+          type: string
+        title:
+          type: string
+        docType:
+          type: string
+        owner:
+          type: object
+          required:
+            - uid
+          properties:
+            uid:
+              type: string
+        role:
+          type: string
+          enum:
+            - admin
+          description: 回收站列表只包含 owner/admin，角色恒为 admin。
+        deletedAt:
+          type: [string, 'null']
+          format: date-time
+          description: 软删除时间；NULL = 历史删除（期限未知，不自动清理）。
+        expireAt:
+          type: [string, 'null']
+          format: date-time
+          description: deletedAt + 30d；deletedAt 为 NULL 时 null。
+        retentionDays:
+          type: integer
+          const: 30
+        canRestore:
+          type: boolean
+        canPurge:
+          type: boolean
+    DocsTrashListResponse:
+      type: object
+      required:
+        - items
+        - next_cursor
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/DocsTrashItem'
+        next_cursor:
+          type: [string, 'null']
+          description: 下一页游标；null = 没有更多。
+    DocsTrashRestoreResponse:
+      type: object
+      required:
+        - docId
+        - status
+        - restoredAt
+      properties:
+        docId:
+          type: string
+        status:
+          type: string
+          const: restored
+        restoredAt:
+          type: string
+          format: date-time
+    DocsTrashBatchRequest:
+      type: object
+      required:
+        - doc_ids
+      properties:
+        doc_ids:
+          type: array
+          maxItems: 50
+          items:
+            type: string
+    DocsTrashBatchItem:
+      type: object
+      required:
+        - docId
+        - status
+        - error
+      properties:
+        docId:
+          type: string
+        status:
+          type: string
+          enum:
+            - restored
+            - purged
+            - failed
+        error:
+          type: [string, 'null']
+          description: >-
+            failed 时的错误码：not_found / forbidden / doc_archived / not_deleted /
+            html_purge_failed。
+    DocsTrashBatchResponse:
+      type: object
+      required:
+        - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/DocsTrashBatchItem'
+    InternalMemberAddedUnreadRequest:
+      type: object
+      required:
+        - uid
+        - principal_space_id
+        - doc_ids
+      properties:
+        uid:
+          type: string
+        principal_space_id:
+          type: string
+        doc_ids:
+          type: array
+          maxItems: 200
+          items:
+            type: string
+    InternalMemberAddedUnreadItem:
+      type: object
+      required:
+        - doc_id
+        - unread
+        - event_at
+      properties:
+        doc_id:
+          type: string
+        unread:
+          type: boolean
+        event_at:
+          type: [string, 'null']
+          format: date-time
+    InternalMemberAddedUnreadResponse:
+      type: object
+      required:
+        - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/InternalMemberAddedUnreadItem'
+    InternalDocsStatusRequest:
+      type: object
+      required:
+        - uid
+        - principal_space_id
+        - doc_ids
+      properties:
+        uid:
+          type: string
+        principal_space_id:
+          type: string
+        doc_ids:
+          type: array
+          items:
+            type: string
+    InternalDocStatusItem:
+      type: object
+      required:
+        - doc_id
+        - deleted
+        - role
+        - can_read
+      properties:
+        doc_id:
+          type: string
+        title:
+          type: string
+        doc_type:
+          type: string
+        owner_uid:
+          type: string
+        doc_space_id:
+          type: string
+        role:
+          type: string
+        updated_at:
+          type: string
+          format: date-time
+        deleted:
+          type: boolean
+        deleted_at:
+          type: [string, 'null']
+          format: date-time
+        expire_at:
+          type: [string, 'null']
+          format: date-time
+          description: OCTO-456 P1 —— deleted_at + 30d；deleted_at 为 NULL 时 null（期限未知，不自动清理）。
+        retention_days:
+          type: integer
+          const: 30
+          description: OCTO-456 P1 —— 保留期常量，前端不写死。
+        expired:
+          type: boolean
+        can_read:
+          type: boolean
+    InternalDocsStatusResponse:
+      type: object
+      required:
+        - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/InternalDocStatusItem'

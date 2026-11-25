@@ -40,6 +40,7 @@ import {
   type InvalidateEvent,
 } from './permission/epoch.js'
 import { invalidateCurrentRoleRecheckCacheForSource } from './permission/recheck.js'
+import { startTrashCleanup } from './trash/cleanupJob.js'
 import { closePool, query } from './db/pool.js'
 import { assertAppendV1RoleEncoding } from './db/roleEncodingMarker.js'
 import { closeRedis, getRedis, createRedisSubscriber } from './db/redis.js'
@@ -255,6 +256,10 @@ async function main(): Promise<void> {
     )
   }
 
+  // OCTO-456 P1: 保留期到期的回收站自动清理（默认关闭）。start 内部会打印
+  // ENABLED/DISABLED + interval/retention 的启动日志；关闭时返回 no-op。
+  const stopTrashCleanup = startTrashCleanup()
+
   // PPT uses the existing HTTP listener and shared Redis/MySQL infrastructure.
   if (config.ppt.relay.enabled) {
     pptRelay.attach(httpServer)
@@ -270,6 +275,7 @@ async function main(): Promise<void> {
     // eslint-disable-next-line no-console
     console.log(`[octo-docs] ${signal} received, shutting down...`)
     stopActiveAccessMonitor()
+    stopTrashCleanup()
     try {
       // Stand down from the fleet first: once this key is gone the other
       // replicas stop honouring documents this node used to hold. Doing it
