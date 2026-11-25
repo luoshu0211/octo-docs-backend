@@ -17,6 +17,7 @@ import {
   SHARE_ROLE_EDIT,
 } from '../../permission/shareScope.js'
 import { ROLE_ADMIN, STORED_ROLE_VALUES } from '../../permission/role.js'
+import { TRASH_RETENTION_DAYS } from '../../permission/docRetention.js'
 import { docMemberRepo } from './docMemberRepo.js'
 
 /**
@@ -1051,7 +1052,15 @@ export const docMetaRepo = {
     principalSpaceId: string
     pageSize: number
     cursor?: string
+    /**
+     * Recycle-bin window used to keep deletion grey rows as candidates. MUST come
+     * from the same configured value as every other retention projection: a
+     * 60-day deployment would otherwise hide a still-recoverable document that
+     * was deleted 40 days ago.
+     */
+    retentionDays?: number
   }): Promise<{ items: SharedDocItem[]; nextCursor: string | null }> {
+    const retentionDays = params.retentionDays ?? TRASH_RETENTION_DAYS
     const pageSize = Math.min(
       MAX_LIBRARY_PAGE_SIZE,
       Math.max(1, Number.isInteger(params.pageSize) ? params.pageSize : 200),
@@ -1064,6 +1073,7 @@ export const docMetaRepo = {
       params.principalSpaceId,
       params.uid,
       params.principalSpaceId,
+      retentionDays,
       params.uid,
       params.principalSpaceId,
     ]
@@ -1086,7 +1096,7 @@ export const docMetaRepo = {
        WHERE (m.status = 1
               OR (m.status = 0
                   AND (m.deleted_at IS NULL
-                       OR m.deleted_at >= NOW(3) - INTERVAL 30 DAY)))
+                       OR m.deleted_at >= NOW(3) - INTERVAL ? DAY)))
          AND NOT (m.owner_id = ? AND m.owner_space_id = ?)
          AND (dm.doc_id IS NOT NULL OR dl.doc_id IS NOT NULL)
          ${cursorSql}
