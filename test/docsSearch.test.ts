@@ -264,4 +264,22 @@ describe('POST /api/v1/docs/search — searchDocsHandler', () => {
     // Distinct reason so a client narrows the query instead of blindly retrying.
     expect(res.body).toEqual({ error: 'search unavailable', reason: 'terms_limit_exceeded' })
   })
+
+  it('OCTO-456 §4.3: hits carry indexStatus "ready" (truthful: no index-state source exists) and total stays exact', async () => {
+    vi.mocked(docMetaRepo.listVisibleDocIdSet).mockResolvedValue(['d1', 'd2'])
+    searchDocsMock.mockResolvedValue({
+      total: 42,
+      items: [
+        { docId: 'd1', title: 'One', docType: 'doc', updatedAt: 1000, spaceId: 's_target' },
+        { docId: 'd2', title: 'Two', docType: 'sheet', updatedAt: 2000, spaceId: 's_target' },
+      ],
+      searchAfter: null,
+    })
+    const res = mockRes()
+    await searchDocsHandler(req({ body: { q: 'x' } }), res as never)
+    expect(res.statusCode).toBe(200)
+    const body = res.body as { total: number; items: Array<{ indexStatus: string }> }
+    expect(body.total).toBe(42)
+    expect(body.items.map((it) => it.indexStatus)).toEqual(['ready', 'ready'])
+  })
 })

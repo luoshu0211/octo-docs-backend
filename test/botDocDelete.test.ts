@@ -55,7 +55,7 @@ beforeEach(() => {
     doc_id: 'd_delete', document_name: 'octo:s_docs:f_default:d_delete', title: 'Keep this document',
     owner_id: 'bot_actor', owner_space_id: 's_docs', space_id: 's_docs', folder_id: 'f_default',
     doc_type: 'doc', octo_doc_slug: 'html-slug', html_idempotency_key_hash: null,
-    status: 1, permission_epoch: 3, share_scope: 0, share_role: 1, discoverability_scope: 0,
+    status: 1, deleted_at: null, permission_epoch: 3, share_scope: 0, share_role: 1, discoverability_scope: 0,
     created_at: new Date(0), updated_at: new Date(0), created_by: 'bot_actor', updated_by: 'bot_actor',
   }
   getByDocId.mockImplementation(async () => meta)

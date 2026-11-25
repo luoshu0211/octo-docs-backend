@@ -482,6 +482,21 @@ export const config = {
   // See src/util/docShareLink.ts.
   webOrigin: str('OCTO_WEB_ORIGIN', '') || collaborationWebOrigin(),
 
+  // Drive service connection used ONLY to forward docs view events to Drive's
+  // 最近访问 read model (OCTO-456 §4.5). Both default empty, which makes the
+  // forward a SILENT skip — this is connection information, not a feature
+  // switch, so an unconfigured deployment keeps working unchanged and nothing
+  // is logged per view.
+  //
+  // DRIVE_INTERNAL_TOKEN is the SAME shared secret driveDerived.outboundToken
+  // already sends on /internal/v1/docs/derived-access (drive's
+  // drive.internal_token); it is read here rather than duplicated so one value
+  // configures both directions. DRIVE_INTERNAL_URL is the drive service base
+  // URL (the port that serves /v1/internal/drive/**); deployments may set it to
+  // the same value as DRIVE_INTERNAL_BASE_URL.
+  driveInternalUrl: str('DRIVE_INTERNAL_URL', ''),
+  driveInternalToken: str('DRIVE_INTERNAL_TOKEN', ''),
+
   htmlRegistration: {
     // Dedicated service credential; browser session tokens never authorize this entry.
     token: str('OCTO_DOCS_HTML_REGISTRATION_TOKEN', ''),
@@ -565,6 +580,29 @@ export const config = {
     baseUrl: str('OCTO_DOC_HTML_BASE_URL', ''),
     // 每次请求的超时。转发挂住不能把评论创建拖死。
     timeoutMs: numMin('OCTO_DOC_HTML_TIMEOUT_MS', 5000, 1),
+  },
+
+  /**
+   * octo-docs-html 的**服务间**内部接口(OCTO-456 §4.8)。
+   *
+   * HTML 文档的标题有两个读者:资料库读 docs-backend 的 doc_meta.title,而 HTML 渲染读
+   * octo-docs-html 自己那一版(doc_meta.title 同步过去的那份)。改名必须**先**让 html
+   * 重新 publish 一个 version(version+1)、**再**写 doc_meta —— 两步都成功才回 200。
+   * 否则列表已经是新标题、打开 HTML 还是旧标题,用户看到两份真相。
+   *
+   * 两个值都为空 = 未配置。此时 html 改名一律 fail closed 回 503
+   * rename_failed(只 warn 一次说明缺哪个),绝不静默跳过。
+   *
+   * 注意:和 docHtml.baseUrl(OCTO_DOC_HTML_BASE_URL)是**两套**东西 —— 那个转发的是
+   * 调用方自己的 token,这个走的是 X-Internal-Token 服务间共享密钥。不要合并。
+   */
+  htmlInternal: {
+    // 基址,例如 http://octo-docs-html:8080。空 = 未配置。
+    url: str('OCTO_DOCS_HTML_INTERNAL_URL', ''),
+    // X-Internal-Token 的值。空 = 未配置。共享密钥,任何日志里都不得出现。
+    token: str('OCTO_DOCS_HTML_INTERNAL_TOKEN', ''),
+    // 单次请求上限(默认 5s)。挂住的 html 不能把资料库改名拖死;超时按失败处理。
+    timeoutMs: numMin('OCTO_DOCS_HTML_INTERNAL_TIMEOUT_MS', 5000, 1),
   },
   botMention: {
     // Docs-specific ingress token for POST /v1/internal/bot-mentions, sent as

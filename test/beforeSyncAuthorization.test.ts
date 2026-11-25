@@ -501,6 +501,7 @@ describe('Yjs live-send source-proof deadline', () => {
       })
       setDriveDerivedAccess({
         derivedAccess: async () => null,
+        batchDerivedAccess: async () => null,
         // A matching revision is not a new authorization decision, regardless of this envelope's TTL.
         versions: async bindings => bindings.map(binding => ({
           ...binding, sourceRevision: SOURCE_REVISION, validForMs: 15_000, expiresAt: now + 15_000,
@@ -617,6 +618,7 @@ describe('Yjs live-send source-proof deadline', () => {
     const versions = vi.fn(() => blockedVersions.promise)
     const drive: DriveDerivedAccess = {
       derivedAccess: vi.fn(async () => null),
+      batchDerivedAccess: async () => null,
       versions,
     }
     setDriveDerivedAccess(drive)

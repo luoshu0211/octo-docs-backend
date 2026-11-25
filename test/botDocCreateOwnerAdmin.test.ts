@@ -68,6 +68,14 @@ vi.mock('../src/permission/epoch.js', () => ({
 const { enqueueDocIndexMock } = vi.hoisted(() => ({
   enqueueDocIndexMock: vi.fn(async () => true),
 }))
+const { renameHtmlDocMock, applyHtmlPublishTitleMock } = vi.hoisted(() => ({
+  renameHtmlDocMock: vi.fn(),
+  applyHtmlPublishTitleMock: vi.fn(),
+}))
+vi.mock('../src/api/services/htmlRenameDoc.js', () => ({
+  renameHtmlDoc: renameHtmlDocMock,
+  applyHtmlPublishTitle: applyHtmlPublishTitleMock,
+}))
 vi.mock('../src/search/docIndexQueue.js', () => ({
   enqueueDocIndex: enqueueDocIndexMock,
   isSearchIndexedDoc: vi.fn(() => true),
@@ -698,6 +706,13 @@ describe('bot html doc registration', () => {
     getByOctoDocSlug.mockResolvedValue(htmlMeta as never)
     getByDocId.mockResolvedValue(htmlMeta as never)
 
+    // OCTO-456 §4.8: /octo-doc/:slug is the post-publish CALLBACK, not a rename.
+    // It must converge doc_meta through the metadata-only service and must never
+    // enter the republish journal (that would mint another html version).
+    applyHtmlPublishTitleMock.mockResolvedValue({
+      ok: true, changed: true, title: 'HTML Renamed', beforeTitle: 'HTML Doc',
+    })
+
     const renameRes = await fetch(`${base}/v1/bot/docs/octo-doc/${encodeURIComponent('html-slug-1')}`, {
       method: 'PATCH',
       headers: { authorization: 'Bearer bot-tok', 'content-type': 'application/json' },
@@ -705,7 +720,15 @@ describe('bot html doc registration', () => {
     })
 
     expect(renameRes.status).toBe(200)
-    expect(rename).toHaveBeenCalledWith('d_html', 'HTML Renamed', 's_tmos_bot')
+    expect(applyHtmlPublishTitleMock).toHaveBeenCalledWith(expect.objectContaining({
+      docId: 'd_html',
+      spaceId: 's_1',
+      uid: 's_tmos_bot',
+      slug: 'html-slug-1',
+      title: 'HTML Renamed',
+    }))
+    expect(renameHtmlDocMock).not.toHaveBeenCalled()
+    expect(rename).not.toHaveBeenCalled()
 
     const deleteRes = await fetch(`${base}/v1/bot/docs/octo-doc/${encodeURIComponent('html-slug-1')}`, {
       method: 'DELETE',

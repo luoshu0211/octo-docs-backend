@@ -275,7 +275,22 @@ paths:
       x-octo-principal: token_user
       x-octo-action: docs.documents:write
       x-octo-retry: never
-      description: An administrator can set the title of a document in the token’s Space.
+      description: >-
+        An administrator — or the original author of an html document (reader access is enough) — can set the
+        title of a document in the token’s Space. For an html document the
+        title is first republished through octo-docs-html (version+1); when the republish or the local
+        title write fails the request returns 503 with error=rename_failed and the title is left unchanged.
+        Each logical rename is journaled (doc_rename_operation) and its id is the html idempotency key, so
+        retrying after a partial failure reuses the already published version, while a later rename of the
+        same document publishes a new one. Concurrent renames of one document are serialized: a different
+        target while another rename is pending returns 409 with error=rename_in_progress, and a title that
+        moved between the republish and the local commit returns 409 with error=title_changed. A delayed
+        duplicate of an operation that already completed returns 200 idempotently (reporting the document's
+        current title); an operation superseded by a newer completed rename, or fenced as failed, returns 409
+        with error=rename_superseded and never rewrites the title. If a failed attempt already published a
+        newer html title than doc_meta has (for example the caller lost permission between publish and the
+        local write), a no-op request is refused with 409 error=rename_recovery_required plus pendingTitle
+        and version; retry that pending title once access is restored to converge both stores.
     delete:
       operationId: docs.delete
       summary: Document deletion is disabled for CLI tokens
@@ -2996,6 +3011,45 @@ components:
                   updated_at:
                     type: string
                     format: date-time
+                  role:
+                    type: string
+                    enum:
+                      - reader
+                      - commenter
+                      - writer
+                      - admin
+                    description: >-
+                      The caller's effective role on this document (OCTO-456). Present whenever the document is
+                      readable; additive field.
+                  capabilities:
+                    $ref: '#/components/schemas/DocsCapabilities'
+                    description: >-
+                      Per-document action matrix for the caller (OCTO-456). Present whenever the document is readable.
+    DocsCapabilities:
+      type: object
+      description: Online-document action matrix (OCTO-456 §3.3 doc 段).
+      properties:
+        can_read:
+          type: boolean
+        can_comment:
+          type: boolean
+        can_edit:
+          type: boolean
+        can_share:
+          type: boolean
+        can_export:
+          type: boolean
+          description: Equivalent to can_read — there is no independent export grant.
+        can_copy:
+          type: boolean
+        can_rename_original:
+          type: boolean
+          description: >-
+            admin for doc/sheet/board/html_ppt; for html also the original author (doc_meta.owner_id = caller).
+        can_delete_original:
+          type: boolean
+        can_download_original:
+          type: boolean
     DocsImportDocxResponse:
       type: object
       properties:
@@ -3409,6 +3463,18 @@ components:
                   - 'null'
               space_id:
                 type: string
+              index_status:
+                type: string
+                enum:
+                  - ready
+                  - processing
+                  - failed
+                  - unsupported
+                description: >-
+                  Per-hit index freshness (OCTO-456 §4.3). The business handler returns `indexStatus`;
+                  the CLI response adapter snake-cases every DTO key, so the CLI wire field is `index_status`.
+                  Only `ready` is produced today (a returned hit is indexed by definition); the other enum
+                  members are reserved for a future indexer-reported state and are never synthesized.
               highlight:
                 type: string
         pagination:
@@ -3431,6 +3497,12 @@ components:
         title:
           type: string
           description: new non-empty title
+        expected_title:
+          type: string
+          description: >-
+            OCTO-456 §4.8 optimistic lock. When supplied and non-empty, the rename only proceeds if the
+            document's current title still equals this value; otherwise 409 with error=title_changed and
+            currentTitle, and nothing is written. Absent/empty preserves the historical behavior.
     DocsRenameResponse:
       type: object
       properties:
@@ -3441,6 +3513,11 @@ components:
               type: string
             title:
               type: string
+            before_title:
+              type: string
+              description: >-
+                Title recorded before this rename (OCTO-456 rename receipt). Consumers use it to decide whether a
+                cached list/snapshot needs refreshing.
       required:
         - data
     DocsContentGetResponse:

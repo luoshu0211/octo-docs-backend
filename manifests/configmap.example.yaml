@@ -59,6 +59,10 @@ data:
   # when enabled, so a half-configured deploy fails closed instead of erroring on
   # every read. In-network only; must never be browser-reachable.
   DRIVE_INTERNAL_BASE_URL: "http://octo-drive-{{BRANCH}}:8080"
+  # Base URL used to forward view events (OCTO-456 §4.5):
+  # POST <base>/v1/internal/drive/library/view after a successful doc open.
+  # Empty => forward silently skipped. May equal DRIVE_INTERNAL_BASE_URL.
+  DRIVE_INTERNAL_URL: "http://octo-drive-{{BRANCH}}:8080"
   # Per-request timeout (ms) for the derived-access lookup: it sits on the
   # read/authorize hot path, so a hung drive service aborts fast and fails closed.
   DRIVE_DERIVED_TIMEOUT_MS: "500"
@@ -77,11 +81,13 @@ data:
   #     Docs generates and rotates; drive syncs its docs_backend.internal_token
   #     to the same value. Compared (timing-safe) on GET /internal/docs/:docId/role
   #     (internal listener 9090). Empty ⇒ every caller rejected (fail-closed).
-  #   • DRIVE_INTERNAL_TOKEN – outbound (docs → drive derived-access),
-  #     drive-side authoritative. Drive generates and rotates; docs syncs.
-  #     Sent as X-Internal-Token on POST <DRIVE_INTERNAL_BASE_URL>/internal/v1/docs/derived-access.
+  #   • DRIVE_INTERNAL_TOKEN – outbound (docs → drive derived-access AND the
+  #     OCTO-456 view-event forward), drive-side authoritative. Drive generates
+  #     and rotates; docs syncs. Sent as X-Internal-Token on
+  #     POST <DRIVE_INTERNAL_BASE_URL>/internal/v1/docs/derived-access and
+  #     POST <DRIVE_INTERNAL_URL>/v1/internal/drive/library/view.
   #     Empty ⇒ docs omits the header, drive returns 401, derived viewer degrades
-  #     to 'none' (fail-closed).
+  #     to 'none' (fail-closed) and view forwarding is skipped.
   # See manifests/deploy.yaml env: entries and docs/DEPLOYMENT.md §3.1.2 for the
   # secretKeyRef wiring. Never logged, never printed, never in ConfigMap.
   # ─────────────────────────────────────────────────────────────

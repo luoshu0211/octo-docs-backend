@@ -63,6 +63,19 @@ describe('GET /api/v1/docs/manageable — listManageableHandler', () => {
     expect(arg.cursor).toBeUndefined()
   })
 
+  it('OCTO-456: forwards a trimmed `q` title filter and no q for a blank one', async () => {
+    await listManageableHandler(req({ q: '  Quarterly Report  ' }), mockRes() as never)
+    expect(vi.mocked(docMetaRepo.listManageable).mock.calls[0]![0]).toMatchObject({
+      q: 'Quarterly Report',
+    })
+
+    await listManageableHandler(req({ q: '   ' }), mockRes() as never)
+    expect(vi.mocked(docMetaRepo.listManageable).mock.calls[1]![0].q).toBeUndefined()
+
+    await listManageableHandler(req({}), mockRes() as never)
+    expect(vi.mocked(docMetaRepo.listManageable).mock.calls[2]![0].q).toBeUndefined()
+  })
+
   it('maps rows to the picker DTO (optional octoDocSlug, ISO updatedAt) and passes nextCursor through', async () => {
     vi.mocked(docMetaRepo.listManageable).mockResolvedValue({
       items: [
