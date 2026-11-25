@@ -255,29 +255,37 @@ describe('extractHtmlExcerpt — ReDoS 防护', () => {
   // 二次路径复发时的耗时(实测 256KiB 二次路径 ~500ms),若二次回来必然翻车。
   const FETCH_CAP = 256 * 1024
   const linearBudgetMs = 150
+  // Shared CI runners are noisy: one build measured 153ms against the 150ms
+  // budget while every earlier run was far below it. Take the MINIMUM of a few
+  // runs — noise (scheduler/GC/JIT) can only add time, so the minimum is the
+  // stable estimate of the algorithm's own cost. The O(n²) regression this
+  // guards against cost ~500ms at this size, still far above the budget.
+  const measure = (body: () => unknown): number => {
+    let best = Number.POSITIVE_INFINITY
+    for (let i = 0; i < 5; i++) {
+      const t0 = process.hrtime.bigint()
+      body()
+      best = Math.min(best, Number(process.hrtime.bigint() - t0) / 1e6)
+    }
+    return best
+  }
 
   it('256KiB 的 <svg> 栈 + </math> 洪水不触发栈回溯(仍是线性)', () => {
     // `<svg>`×k 压满栈,`</math>`×k 每个都不匹配 —— 修复前每个都回溯整栈。
     const unit = '<svg></math>'
     const evil = unit.repeat(Math.floor(FETCH_CAP / unit.length))
-    const t0 = Date.now()
-    const out = extractHtmlExcerpt(evil)
-    const elapsed = Date.now() - t0
     // 全是标签、无正文:heading 为空、paragraphs 为空。
-    expect(out).toEqual({ paragraphs: [] })
-    expect(elapsed).toBeLessThan(linearBudgetMs)
+    expect(extractHtmlExcerpt(evil)).toEqual({ paragraphs: [] })
+    expect(measure(() => extractHtmlExcerpt(evil))).toBeLessThan(linearBudgetMs)
   })
 
   it('256KiB 的 <svg><title>t</title></svg> 重复不触发 inRanges 全扫(仍是线性)', () => {
     const unit = '<svg><title>t</title></svg>'
     const evil = unit.repeat(Math.floor(FETCH_CAP / unit.length))
-    const t0 = Date.now()
-    const out = extractHtmlExcerpt(evil)
-    const elapsed = Date.now() - t0
     // 每个 <title> 都在 svg foreign 区间内 —— 不当 heading;SVG title 文本是可见正文,
     // 会作为普通段落留下(现状契约),这里只钉时间与"标题不来自 svg title"。
-    expect(out.heading).toBeUndefined()
-    expect(elapsed).toBeLessThan(linearBudgetMs)
+    expect(extractHtmlExcerpt(evil).heading).toBeUndefined()
+    expect(measure(() => extractHtmlExcerpt(evil))).toBeLessThan(linearBudgetMs)
   })
 })
 

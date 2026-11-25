@@ -12,7 +12,14 @@
  * caller holds a `doc_meta ... FOR UPDATE` row lock while it looks this up, and a
  * second target is rejected instead of racing the first write.
  *
- * status: 0 = pending, 1 = completed, 2 = failed.
+ * status: 0 = pending, 1 = completed, 2 = failed, 3 = superseded.
+ *
+ * `failed` with a recorded version is a HALF-SUCCESS: html published but the
+ * local write was refused, so a later retry resumes the same id. `superseded`
+ * is the opposite situation — a newer write (a completed rename or a higher
+ * publish sequence) already owns the title, so the operation can never be
+ * resumed. Keeping it out of status 2 is what stops the recovery branch from
+ * blocking the next independent rename with rename_recovery_required.
  *
  * All functions take the caller's transaction so the journal decision and the
  * doc_meta lock commit or roll back together.
@@ -22,6 +29,7 @@ import type { Tx } from '../pool.js'
 export const RENAME_OP_PENDING = 0
 export const RENAME_OP_COMPLETED = 1
 export const RENAME_OP_FAILED = 2
+export const RENAME_OP_SUPERSEDED = 3
 
 export interface DocRenameOperation {
   id: string
@@ -155,6 +163,21 @@ export const docRenameOperationRepo = {
   async markFailedWithVersionTx(tx: Tx, id: string, version: number | null): Promise<void> {
     await tx.query(
       `UPDATE doc_rename_operation SET status = ${RENAME_OP_FAILED}, version = ?
+        WHERE id = ? AND status = ${RENAME_OP_PENDING}`,
+      [version, id],
+    )
+  },
+
+  /**
+   * Terminal state for a PROVEN-superseded operation: a newer completed rename
+   * or a higher applied publish sequence already owns this document's title.
+   * The published version is kept for audit, but the row is deliberately NOT
+   * status 2: half-success recovery must not pick it up and demand that the
+   * caller restore a title that a newer write legitimately replaced.
+   */
+  async markSupersededTx(tx: Tx, id: string, version: number | null): Promise<void> {
+    await tx.query(
+      `UPDATE doc_rename_operation SET status = ${RENAME_OP_SUPERSEDED}, version = ?
         WHERE id = ? AND status = ${RENAME_OP_PENDING}`,
       [version, id],
     )
