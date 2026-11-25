@@ -191,6 +191,10 @@ export async function createDocHandler(req: Request, res: Response) {
   }
   if (resolvedDocType === HTML_DOC_TYPE) {
     if (req.docSpaceScope?.mode === 'cli') {
+      // Go's Unicode whitespace includes NEL; ECMAScript whitespace includes BOM.
+      if (typeof idempotencyKey === 'string' && /^[\s\u0085]|[\s\u0085]$/u.test(idempotencyKey)) {
+        throw new CliError('VALIDATION_ERROR')
+      }
       // The CLI middleware supplies the owner and Space for both HTML modes.
       if (['owner', 'ownerId', 'ownerSpaceId', 'spaceId', 'publisherUid', 'uid', 'slug', 'docId'].some(
         key => Object.hasOwn(req.body, key),
@@ -267,7 +271,7 @@ export async function createDocHandler(req: Request, res: Response) {
       } else if (req.docSpaceScope?.mode === 'cli') {
         // A supplied handle may be HTML-owned content without a Docs registration.
         // Only the HTML service can vouch for its owner on first registration.
-        const meta = await docMetaRepo.updateOwnedHtmlBySlug(octoDocSlug, spaceId, uid, createInput.title)
+        const meta = await docMetaRepo.updateOwnedHtmlBySlug(octoDocSlug, spaceId, uid, typeof title === 'string' ? title : undefined)
         if (!meta) throw new CliError('NOT_FOUND')
         writeResult = { meta, created: false }
       } else {

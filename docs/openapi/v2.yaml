@@ -3335,7 +3335,8 @@ components:
           type: string
           minLength: 1
           maxLength: 128
-          description: Canonical HTML creation key scoped to the verified user and Space. Mutually exclusive with octo_doc_slug.
+          description: Canonical HTML creation key scoped to the verified user and Space. Leading and trailing whitespace are rejected. Mutually exclusive with octo_doc_slug.
+          x-octo-flag: html-idempotency-key
         octo_doc_slug:
           type: string
           maxLength: 128

@@ -302,7 +302,7 @@ export const docMetaRepo = {
   },
 
   /** A user can update an owned, active legacy registration; an unbound handle proves no ownership. */
-  async updateOwnedHtmlBySlug(slug: string, spaceId: string, uid: string, title: string): Promise<DocMeta | null> {
+  async updateOwnedHtmlBySlug(slug: string, spaceId: string, uid: string, title?: string): Promise<DocMeta | null> {
     return transaction(async tx => {
       const [meta] = await tx.query<DocMeta>(
         "SELECT * FROM doc_meta WHERE space_id = ? AND octo_doc_slug = ? AND doc_type = 'html' FOR UPDATE",
@@ -311,6 +311,7 @@ export const docMetaRepo = {
       if (!meta || meta.octo_doc_slug !== slug || meta.space_id !== spaceId ||
           meta.owner_space_id !== spaceId || meta.owner_id !== uid || meta.status !== 1) return null
       if (meta.html_idempotency_key_hash != null) throw new CanonicalHtmlLegacyConflictError()
+      if (title === undefined) return meta
       await docMetaRepo.rename(meta.doc_id, title, uid, tx)
       return { ...meta, title, updated_by: uid }
     })

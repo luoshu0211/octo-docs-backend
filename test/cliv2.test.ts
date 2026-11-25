@@ -267,7 +267,8 @@ describe('Docs CLI v2 read pilot', () => {
 
   it('rejects invalid registration modes and client-selected identity before allocation', async () => {
     const create = vi.spyOn(docMetaRepo, 'createCanonicalHtml')
-    for (const supplied of [{}, { idempotency_key: ' ' }, ...['slug', 'octo_doc_slug', 'owner_id', 'space_id'].map(key => ({
+    const invalidKeys = [' ', ' request-one', 'request-one\t', '\u0085request-one', 'request-one\uFEFF']
+    for (const supplied of [{}, ...invalidKeys.map(idempotency_key => ({ idempotency_key })), ...['slug', 'octo_doc_slug', 'owner_id', 'space_id'].map(key => ({
       idempotency_key: 'request-one', [key]: 'other',
     }))]) {
       const response = await post('', JSON.stringify({ doc_type: 'html', ...supplied }), 'application/json', 'valid')
@@ -278,6 +279,23 @@ describe('Docs CLI v2 read pilot', () => {
 
   const namedHtml = { ...canonicalHtml, octo_doc_slug: 'named', html_idempotency_key_hash: null }
   const namedRequest = JSON.stringify({ doc_type: 'html', title: 'Updated', octo_doc_slug: 'named', mount_type: 'space' })
+
+  it('keeps an omitted title without writing and accepts an explicitly empty title', async () => {
+    const { query } = mockRenameTransaction(namedHtml)
+    const handle = { doc_type: 'html', octo_doc_slug: 'named', mount_type: 'space' }
+    const unchanged = await post('', JSON.stringify(handle), 'application/json', 'valid')
+    expect(unchanged.status).toBe(201)
+    expect(await unchanged.json()).toMatchObject({ data: { doc_id: doc.doc_id, title: namedHtml.title, created: false } })
+    expect(query).toHaveBeenCalledTimes(1)
+    expect(query).toHaveBeenCalledWith(expect.stringMatching(/^SELECT .* FOR UPDATE$/), ['space_a', 'named'])
+
+    query.mockClear()
+    const cleared = await post('', JSON.stringify({ ...handle, title: '' }), 'application/json', 'valid')
+    expect(cleared.status).toBe(201)
+    expect(await cleared.json()).toMatchObject({ data: { doc_id: doc.doc_id, title: '', created: false } })
+    expect(query).toHaveBeenCalledTimes(2)
+    expect(query).toHaveBeenNthCalledWith(2, expect.stringContaining('UPDATE doc_meta SET title'), ['', 'user_a', doc.doc_id])
+  })
 
   it('updates an owned active registration by handle under the same lock', async () => {
     const { query } = mockRenameTransaction(namedHtml)
