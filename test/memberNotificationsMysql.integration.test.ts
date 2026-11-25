@@ -4,6 +4,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { closePool, getPool, query, transaction } from '../src/db/pool.js'
 import { docMemberRepo } from '../src/db/repos/docMemberRepo.js'
 import { docMemberNotificationRepo } from '../src/db/repos/docMemberNotificationRepo.js'
+import { docMetaRepo } from '../src/db/repos/docMetaRepo.js'
 
 const mysqlDescribe = process.env.RUN_MEMBER_NOTIFICATION_MYSQL_TESTS === '1' ? describe.sequential : describe.skip
 const principal = { recipientUid: 'recipient', recipientSpaceId: 'space' }
@@ -89,6 +90,29 @@ mysqlDescribe('member notifications against isolated MySQL 8', () => {
       }))).rejects.toThrow('forced event failure')
       expect(await docMemberRepo.getRole('role_event', principal.recipientUid, principal.recipientSpaceId)).toBe('writer')
     } finally { await getPool().query('DROP TRIGGER fail_role_event') }
+  })
+
+  it('drops the member-added unread badge when the doc is soft-deleted, exactly once (§3.3)', async () => {
+    await document('deleted_doc')
+    await document('kept_doc')
+    await docMemberRepo.upsertDirectWithNotification(grant('deleted_doc'))
+    await docMemberRepo.upsertDirectWithNotification(grant('kept_doc'))
+    expect((await docMemberNotificationRepo.listUnread(principal)).unreadCount).toBe(2)
+
+    await docMetaRepo.softDelete('deleted_doc')
+    const afterDelete = await docMemberNotificationRepo.listUnread(principal)
+    expect(afterDelete.unreadCount).toBe(1)
+    expect(afterDelete.rows.map((row) => row.doc_id)).toEqual(['kept_doc'])
+    // The reminder row itself is consumed, not merely filtered by status=1.
+    expect(await query('SELECT 1 FROM doc_member_notification WHERE doc_id=?', ['deleted_doc'])).toHaveLength(0)
+    expect(await query<{ deleted_at: Date | null }>('SELECT deleted_at FROM doc_meta WHERE doc_id=?', ['deleted_doc']))
+      .toEqual([{ deleted_at: expect.any(Date) }])
+
+    // Re-entrant: a repeated delete changes neither the count nor the row.
+    await docMetaRepo.softDelete('deleted_doc')
+    expect((await docMemberNotificationRepo.listUnread(principal)).unreadCount).toBe(1)
+    expect(await query('SELECT deleted_at FROM doc_meta WHERE doc_id=?', ['deleted_doc']))
+      .toHaveLength(1)
   })
 
   it('returns a consistent count while additions commit, including totals above the page limit', async () => {

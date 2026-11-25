@@ -159,7 +159,13 @@ export async function resolveEffectiveRoleWithMembership(
   return { role, spaceMember: member }
 }
 
-export async function resolveEffectiveRole(
+/**
+ * Sources 1+2 only: direct role + the space-share grant. Exposed so a batch
+ * caller (internal status/capabilities) can resolve the share half for many docs
+ * and then fold in the drive-derived reader from ONE batched Drive decision,
+ * instead of paying one Drive round-trip per document.
+ */
+export async function resolveShareRole(
   uid: string,
   direct: ResolvedRole,
   meta: ShareResolvable,
@@ -189,6 +195,20 @@ export async function resolveEffectiveRole(
     base = effectiveRole(direct, member, meta.share_scope, meta.share_role)
   }
 
+  return base
+}
+
+export async function resolveEffectiveRole(
+  uid: string,
+  direct: ResolvedRole,
+  meta: ShareResolvable,
+  caller: ShareCaller = {},
+): Promise<ResolvedRole> {
+  const base = await resolveShareRole(uid, direct, meta, caller)
+  // The CLI-space gate must also suppress the drive-derived reader: a CLI actor
+  // outside the document's Space cannot gain access from a different library.
+  const cliSpace = verifiedCliSpace(uid)
+  if (cliSpace !== undefined && cliSpace !== meta.space_id) return 'none'
   // Source 3 (TES-131) — drive-library-derived reader. Delegated to the shared
   // merge so every effective-role seam folds drive in identically (short-circuit
   // when base >= reader, fail-closed, byte-identical when the flag is OFF).

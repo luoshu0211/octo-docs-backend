@@ -65,7 +65,13 @@ function snake(key: string): string {
   return key.replace('HyperLinks', 'Hyperlinks').replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase()
 }
 
-function mapKeys(body: unknown, decode: boolean, id: string): unknown {
+/**
+ * Convert the business DTO between the CLI wire convention (snake_case) and the
+ * internal handler DTO (camelCase). Exported so the search response contract can
+ * be pinned against docs/openapi/v2.yaml directly (the CLI adapter, not the
+ * handler, owns the wire naming).
+ */
+export function mapKeys(body: unknown, decode: boolean, id: string): unknown {
   if (Array.isArray(body)) return body.map(value => mapKeys(value, decode, id))
   if (!plainObject(body)) return body
   const entries = Object.entries(body).map(([key, value]) => {
@@ -95,6 +101,9 @@ export function errorForStatus(status: number, body: JsonRecord) {
     for (const key of ['payloadBytes', 'limit']) {
       if (typeof body[key] === 'number' && Number.isFinite(body[key])) details[snake(key)] = body[key]
     }
+  }
+  if (status === 409 && details?.reason === 'title_changed' && typeof body.currentTitle === 'string') {
+    details.current_title = body.currentTitle
   }
   if (status === 409 && details?.reason === 'ambiguous_sheet_name' && Array.isArray(body.candidates)) {
     details.candidates = body.candidates.flatMap(candidate => {

@@ -3,7 +3,8 @@ import { docMemberRepo, memberTransaction } from '../../db/repos/docMemberRepo.j
 import { docMetaRepo, type DocMeta } from '../../db/repos/docMetaRepo.js'
 import type { Tx } from '../../db/pool.js'
 import { refreshAndPublish } from '../../permission/epoch.js'
-import { isMemberRole, roleToNumber } from '../../permission/role.js'
+import { isMemberRole, roleToNumber, type ResolvedRole } from '../../permission/role.js'
+import { canRenameOriginal } from '../../permission/docCapabilities.js'
 import { DISCOVERABILITY_SPACE, SHARE_SCOPE_AUTHENTICATED } from '../../permission/shareScope.js'
 import { requireDocRole } from '../guard.js'
 import { grantForwardAccess } from '../services/grantForward.js'
@@ -45,10 +46,62 @@ async function requireCliAdminTx(tx: Tx, req: Request, authorized: DocMeta): Pro
   return meta
 }
 
-export async function renameCliDoc(req: Request, authorized: DocMeta, title: string): Promise<void> {
-  await memberTransaction(async tx => {
-    const meta = await requireCliAdminTx(tx, req, authorized)
+/**
+ * Rename-specific locked recheck (OCTO-456 F3).
+ *
+ * The shared `lockCliAdminDoc` helper gates member/share mutations and must keep
+ * requiring admin. Rename is different: §4.8 allows the original author of an
+ * html doc to rename it with only READ access, and the human path already grants
+ * that via canRenameOriginal. Reusing the admin-only helper here 403'd exactly
+ * that caller on the CLI path (e.g. the html author holding a reader grant in a
+ * different principal Space).
+ *
+ * Everything that is not rename policy stays byte-identical: the row is re-read
+ * FOR UPDATE, non-active/deleted rows keep their existing error mapping
+ * (status=0 -> NOT_FOUND, status=2 -> CONFLICT later; the human guard already
+ * emits 409 doc_archived before this branch), the doc must belong to the token's
+ * Space, the epoch must be unchanged, and only then does the rename run. Role is
+ * resolved under the lock with the SAME owner-is-admin rule as the admin helper
+ * (owner row => admin, else the direct doc_member role; no share-scope
+ * expansion — mutation authority is never granted by a link).
+ */
+async function lockCliRenameDoc(tx: Tx, req: Request, authorized: DocMeta): Promise<DocMeta> {
+  const [meta] = await tx.query<DocMeta>('SELECT * FROM doc_meta WHERE doc_id = ? FOR UPDATE', [authorized.doc_id])
+  if (!meta || meta.status === 0 || meta.space_id !== req.spaceId) throw new CliError('NOT_FOUND')
+  // §4.8 rename uses the compound author identity (uid, owner Space); a
+  // cross-Space owner keeps only the direct member role. Scoped to rename:
+  // member/share mutations keep the admin helper's existing owner semantics.
+  const owner = meta.owner_id === req.uid && meta.owner_space_id === req.principalSpaceId
+  const role: ResolvedRole = owner
+    ? 'admin'
+    : (await docMemberRepo.getRoleTx(tx, meta.doc_id, req.uid!, req.principalSpaceId!, true)) ?? 'none'
+  if (!canRenameOriginal(
+    role, meta.doc_type, meta.owner_id, meta.owner_space_id, req.uid!, req.principalSpaceId ?? '',
+  )) throw new CliError('FORBIDDEN')
+  if (meta.status !== 1) throw new CliError('CONFLICT')
+  if (Number(meta.permission_epoch) !== Number(authorized.permission_epoch)) {
+    throw new CliError('CONFLICT', { reason: 'epoch_changed' })
+  }
+  return meta
+}
+
+export type CliRenameOutcome = { ok: true } | { ok: false; currentTitle: string }
+
+export async function renameCliDoc(
+  req: Request,
+  authorized: DocMeta,
+  title: string,
+  expectedTitle?: string,
+): Promise<CliRenameOutcome> {
+  return memberTransaction(async (tx): Promise<CliRenameOutcome> => {
+    const meta = await lockCliRenameDoc(tx, req, authorized)
+    // §4.8 optimistic lock, under the same FOR UPDATE row lock as the write.
+    const currentTitle = meta.title ?? ''
+    if (expectedTitle !== undefined && expectedTitle !== '' && currentTitle !== expectedTitle) {
+      return { ok: false, currentTitle }
+    }
     await docMetaRepo.rename(meta.doc_id, title, req.uid!, tx)
+    return { ok: true }
   })
 }
 

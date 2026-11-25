@@ -12,14 +12,14 @@ import { query, transaction, type Tx } from '../src/db/pool.js'
 import { requireDocRole } from '../src/api/guard.js'
 import { refreshAndPublish } from '../src/permission/epoch.js'
 import { postCliService } from '../src/api/cliv2/auth.js'
-import { setCliMember, forwardCliGrant, removeCliMember } from '../src/api/cliv2/access.js'
+import { setCliMember, forwardCliGrant, removeCliMember, renameCliDoc } from '../src/api/cliv2/access.js'
 import { roleFromNumber, roleRank } from '../src/permission/role.js'
 import type { DocMeta } from '../src/db/repos/docMetaRepo.js'
 
 const doc: DocMeta = {
   doc_id: 'd1', document_name: 'octo:s1:f_default:d1', title: 'Document',
   owner_id: 'owner', owner_space_id: 's1', space_id: 's1', folder_id: 'f_default',
-  doc_type: 'doc', status: 1, permission_epoch: 7, share_scope: 0, share_role: 1,
+  doc_type: 'doc', status: 1, deleted_at: null, permission_epoch: 7, share_scope: 0, share_role: 1,
   discoverability_scope: 0, created_at: new Date(0), updated_at: new Date(0),
   created_by: 'owner', updated_by: 'owner', octo_doc_slug: null, html_idempotency_key_hash: null,
 }
@@ -87,6 +87,7 @@ beforeEach(() => {
     if (sql.startsWith('DELETE FROM doc_member_notification')) { notifications = notifications.filter(uid => uid !== args[1]); return [] }
     if (sql.startsWith('DELETE FROM doc_member WHERE')) { members.delete(principal(args[1], args[2])); return [] }
     if (sql.startsWith('UPDATE doc_meta SET permission_epoch')) { meta.permission_epoch += 1; return [] }
+    if (sql.startsWith('UPDATE doc_meta SET title')) { meta.title = String(args[0]); return [] }
     if (sql.startsWith('SELECT permission_epoch')) return [{ permission_epoch: meta.permission_epoch }]
     throw new Error('Unexpected query ' + sql)
   })
@@ -105,7 +106,89 @@ const grants = [
   ['forward', forwardCliGrant, 'writer'],
 ] as const
 
+/** CLI rename calls carry no Body fields; the guarded `authorized` meta is passed explicitly. */
+function renameRequest(uid: string, principalSpaceId = 's_other'): Request {
+  return { uid, spaceId: 's1', principalSpaceId, params: { docId: 'd1' } } as unknown as Request
+}
+
 afterEach(() => { vi.unstubAllEnvs() })
+
+describe('CLI rename policy rechecks canRenameOriginal under the lock (OCTO-456 F3)', () => {
+  it('allows the html ORIGINAL AUTHOR in the same Space (compound author identity)', async () => {
+    meta = { ...meta, doc_type: 'html', owner_id: 'author', owner_space_id: 's1' }
+    const authorized = { ...meta }
+
+    await renameCliDoc(renameRequest('author', 's1'), authorized, 'Renamed by author')
+
+    expect(meta.title).toBe('Renamed by author')
+    // The row is re-read FOR UPDATE before the policy decision, then written.
+    expect(tx.query.mock.calls[0]![0]).toContain('doc_meta WHERE doc_id = ? FOR UPDATE')
+    expect(tx.query.mock.calls.some(([sql]) => String(sql).startsWith('UPDATE doc_meta SET title'))).toBe(true)
+  })
+
+  it('rejects the author UID from another principal Space even with a reader grant', async () => {
+    meta = { ...meta, doc_type: 'html', owner_id: 'author', owner_space_id: 's1' }
+    members.set('author@s_other', 1)
+    const authorized = { ...meta }
+
+    await expect(renameCliDoc(renameRequest('author'), authorized, 'Nope'))
+      .rejects.toMatchObject({ code: 'FORBIDDEN', status: 403 })
+    expect(meta.title).toBe('Document')
+  })
+
+  it('rejects an html reader who is NOT the original author', async () => {
+    meta = { ...meta, doc_type: 'html', owner_id: 'author' }
+    members.set('reader@s_other', 1)
+    await expect(renameCliDoc(renameRequest('reader'), { ...meta }, 'Nope'))
+      .rejects.toMatchObject({ code: 'FORBIDDEN', status: 403 })
+    expect(meta.title).toBe('Document')
+  })
+
+  it('rejects a plain doc reader (non-html author branch does not apply)', async () => {
+    members.set('reader@s_other', 1)
+    await expect(renameCliDoc(renameRequest('reader'), { ...meta }, 'Nope'))
+      .rejects.toMatchObject({ code: 'FORBIDDEN', status: 403 })
+    expect(meta.title).toBe('Document')
+  })
+
+  it('keeps admin authority and owner-is-admin for a non-html doc', async () => {
+    members.set('admin@s1', 3)
+    await renameCliDoc(renameRequest('admin', 's1'), { ...meta }, 'Admin rename')
+    expect(meta.title).toBe('Admin rename')
+
+    // Owner row, even without a doc_member grant, stays admin under the lock.
+    meta = { ...meta, owner_id: 'author', owner_space_id: 's1', title: 'Document' }
+    await renameCliDoc(renameRequest('author', 's1'), { ...meta }, 'Owner rename')
+    expect(meta.title).toBe('Owner rename')
+  })
+
+  it('expected_title mismatch under the lock answers title_changed and writes nothing', async () => {
+    const outcome = await renameCliDoc(renameRequest('admin', 's1'), { ...meta }, 'Renamed', 'Stale Title')
+    expect(outcome).toEqual({ ok: false, currentTitle: 'Document' })
+    expect(meta.title).toBe('Document')
+    expect(tx.query.mock.calls.some(([sql]) => String(sql).startsWith('UPDATE doc_meta SET title'))).toBe(false)
+  })
+
+  it('expected_title match writes atomically; a second caller with the same expectation loses', async () => {
+    const first = await renameCliDoc(renameRequest('admin', 's1'), { ...meta }, 'First', 'Document')
+    expect(first).toEqual({ ok: true })
+    expect(meta.title).toBe('First')
+
+    const second = await renameCliDoc(renameRequest('admin', 's1'), { ...meta }, 'Second', 'Document')
+    expect(second).toEqual({ ok: false, currentTitle: 'First' })
+    expect(meta.title).toBe('First')
+  })
+
+  it('rejects when the epoch changed while the caller is still the html author', async () => {
+    meta = { ...meta, doc_type: 'html', owner_id: 'author', owner_space_id: 's1' }
+    const authorized = { ...meta }
+    meta.permission_epoch += 1
+
+    await expect(renameCliDoc(renameRequest('author', 's1'), authorized, 'Nope'))
+      .rejects.toMatchObject({ code: 'CONFLICT', details: { reason: 'epoch_changed' } })
+    expect(meta.title).toBe('Document')
+  })
+})
 
 describe('CLI access mutations recheck authorization in their write transaction', () => {
   describe.each(grants)('CLI %s recipient eligibility', (_name, grant, role) => {
