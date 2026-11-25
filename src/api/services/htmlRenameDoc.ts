@@ -339,6 +339,31 @@ async function commit(
       )
     }
 
+    /**
+     * Is THIS rename's published write already superseded by a newer applied
+     * title write?
+     *
+     * The ordering fence has to run BEFORE the title is written, not only on the
+     * watermark. `GREATEST` keeps the largest sequence, but a rename that started
+     * earlier can still reach this branch after a newer HTML callback already
+     * committed a different title: its `from_title` still matches the current row,
+     * so the ordinary optimistic check passes and the OLD title would be written
+     * back while the watermark stays at the newer sequence — Docs then reports a
+     * title that no HTML version contains.
+     *
+     * A rename whose sequence is at/below the applied one is superseded: the
+     * journal is closed without writing, and the caller gets 409 rename_superseded
+     * (the same terminal answer as "a later logical rename already completed").
+     * Renames with no sequence (older HTML instances) keep the previous behaviour.
+     */
+    const appliedSeq = Number((meta as { html_publish_seq?: number | string }).html_publish_seq ?? 0)
+    if (publishSeq !== null && publishSeq > 0 && publishSeq <= appliedSeq) {
+      await docRenameOperationRepo.markFailedWithVersionTx(tx, opId, version)
+      // The html receipt for this operation is spent: a retry must allocate a new
+      // operation (with a higher revision) instead of replaying a superseded one.
+      return { ok: false, status: 409, error: 'rename_superseded', closeReceipt: true }
+    }
+
     const currentTitle = meta.title ?? ''
     if (currentTitle === input.title) {
       await recordAppliedPublish()

@@ -2,6 +2,7 @@ import type { Redis as HocuspocusRedis } from '@hocuspocus/extension-redis'
 import { IncomingMessage, MessageType, type Document } from '@hocuspocus/server'
 import { stateGenerationOf } from './stateGeneration.js'
 import { retainPeerDurableReceipt } from './durableReceipt.js'
+import { waitForDocumentEditEvidence } from './documentActivity.js'
 
 /**
  * The pinned Redis extension derives every pub/sub/lock channel through getKey.
@@ -49,10 +50,22 @@ export function fenceRedisGenerations(extension: HocuspocusRedis): void {
       const name = message.readVarString()
       if (!generations.has(name) || incomingChannel.toString() !== channel(name)) return
       const document = documents.get(name)
-      if (document && message.readVarUint() === MessageType.BroadcastStateless) {
+      const type = message.readVarUint()
+      if (document && type === MessageType.BroadcastStateless) {
         retainPeerDurableReceipt(document, message.readVarString())
       }
-      void receive(incomingChannel, data).catch(error => console.error('[collab-generation] Redis receive failed', error))
+      // A peer's sync request can cause this replica to send state without
+      // going through our onChange hook. Apply the same evidence fence.
+      const receiveAfterEvidence = async () => {
+        if (document && (type === MessageType.Sync || type === MessageType.SyncReply)) {
+          await waitForDocumentEditEvidence(document)
+        }
+        if (documents.get(name) === document) await receive(incomingChannel, data)
+      }
+      void receiveAfterEvidence().catch(error => {
+        // eslint-disable-next-line no-console -- Redis callbacks cannot surface rejected promises to the caller
+        console.error('[collab-generation] Redis receive failed', error)
+      })
     } catch { /* malformed transport messages never reach Yjs */ }
   })
 }

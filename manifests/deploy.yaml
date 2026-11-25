@@ -144,9 +144,9 @@ spec:
                   name: octo-docs-backend-secret
                   key: DOCS_INTERNAL_TOKEN
                   optional: true
-            # Outbound (docs → drive derived-access, X-Internal-Token):
+            # Outbound (docs → drive derived access and edit activity):
             # drive-side authoritative; must equal drive top-level internal_token.
-            # Empty ⇒ docs omits the header; drive 401 ⇒ derived viewer 'none'.
+            # Empty ⇒ derived viewer 'none' and edit activity disabled.
             - name: DRIVE_INTERNAL_TOKEN
               valueFrom:
                 secretKeyRef:

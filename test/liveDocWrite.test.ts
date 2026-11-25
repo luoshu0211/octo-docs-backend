@@ -12,9 +12,9 @@ const h = vi.hoisted(() => ({ liveDoc: null as unknown as Y.Doc }))
 vi.mock('../src/collab/server.js', () => ({
   getCollabServer: () => ({
     hocuspocus: {
-      openDirectConnection: async () => ({
+      openDirectConnection: async (_name: string, context: unknown) => ({
         transact: async (cb: (doc: Y.Doc) => void) => {
-          h.liveDoc.transact(() => cb(h.liveDoc))
+          h.liveDoc.transact(() => cb(h.liveDoc), { source: 'local', context })
         },
         disconnect: async () => {},
       }),
@@ -25,6 +25,7 @@ vi.mock('../src/collab/server.js', () => ({
 import { readLiveForEdit, commitLiveEdit } from '../src/collab/liveDocWrite.js'
 import { schema, BaseVersionStaleError, type DocEditOp } from '../src/collab/docBodyEdit.js'
 import { computeFinalState } from '../src/collab/persistence.js'
+import { captureDocumentBodyEdits, trackDocumentBodyEdits } from '../src/collab/documentActivity.js'
 
 function para(text: string) {
   return { type: 'paragraph', content: [{ type: 'text', text }] }
@@ -48,6 +49,18 @@ function topTexts(doc: Y.Doc): string[] {
 
 beforeEach(() => {
   h.liveDoc = liveFrom([para('A'), para('B')])
+})
+
+it('records the authenticated API editor only when the body changes', async () => {
+  trackDocumentBodyEdits(h.liveDoc)
+  const first = await commitLiveEdit('doc:1', 'api-user', Y.encodeStateVector(h.liveDoc), [
+    { type: 'replace', range: { from: { path: [0] }, to: { path: [0] } }, content: [para('A')] },
+  ], schema, 'principal-space')
+  expect(captureDocumentBodyEdits(h.liveDoc)).toEqual([])
+  await commitLiveEdit('doc:1', 'api-user', first.newSV, [
+    { type: 'delete', range: { from: { path: [0] }, to: { path: [0] } } },
+  ], schema, 'principal-space')
+  expect(captureDocumentBodyEdits(h.liveDoc)).toMatchObject([{ actorUid: 'api-user', principalSpaceId: 'principal-space' }])
 })
 
 describe('readLiveForEdit', () => {

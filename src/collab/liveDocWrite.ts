@@ -112,9 +112,13 @@ export async function commitLiveEdit(
   clientBaseVersion: Uint8Array,
   ops: DocEditOp[],
   schema: Schema,
+  principalSpaceId?: string,
 ): Promise<{ newSV: Uint8Array; bytes: number }> {
   const server = getCollabServer()
-  const connection = await server.hocuspocus.openDirectConnection(documentName, { user: { id: uid } })
+  const connection = await server.hocuspocus.openDirectConnection(documentName, {
+    user: { id: uid },
+    ...(principalSpaceId ? { documentEditActor: { actorUid: uid, principalSpaceId } } : {}),
+  })
   let newSV!: Uint8Array
   let bytes = 0
   try {
@@ -133,7 +137,7 @@ export async function commitLiveEdit(
       // (3) Resolve anchors + apply ops (still pre-mutation; throws map to 4xx).
       const newDoc = applyIncrementalOps(currentDoc, ops, schema)
       // (4) The single, last content mutation.
-      reconcileFragment(newDoc, fragment)
+      if (!newDoc.eq(currentDoc)) reconcileFragment(newDoc, fragment)
       // (5) Advance the edit-version counter so a delete-only edit also moves the
       //     state vector forward (defect ②); the token is read AFTER this bump.
       advanceEditVersion(doc)

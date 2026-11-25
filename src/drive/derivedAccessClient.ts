@@ -4,6 +4,7 @@
  * source projection through the batch versions endpoint.
  */
 import { config } from '../config/env.js'
+import { driveInternalUrl } from './internalUrl.js'
 import { Singleflight } from '../util/singleflight.js'
 import { roleAtLeast, roleRank, type ResolvedRole } from '../permission/role.js'
 
@@ -356,7 +357,7 @@ export class HttpDriveDerivedAccess implements DriveDerivedAccess {
     try {
       let response: Response
       try {
-        response = await fetch(`${this.baseUrl}${path}`, {
+        response = await fetch(driveInternalUrl(this.baseUrl, path), {
           method: 'POST',
           signal: ac.signal,
           redirect: 'error',
