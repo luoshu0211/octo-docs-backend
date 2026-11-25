@@ -17,6 +17,7 @@ vi.mock('../src/db/pool.js', () => ({
 }))
 
 import { docMetaRepo, escapeLikeSubstring, MAX_LIBRARY_PAGE_SIZE } from '../src/db/repos/docMetaRepo.js'
+import { TRASH_RETENTION_DAYS } from '../src/permission/docRetention.js'
 import { docMemberRepo } from '../src/db/repos/docMemberRepo.js'
 import { query } from '../src/db/pool.js'
 
@@ -51,12 +52,29 @@ describe('docMetaRepo.listSharedWithUser', () => {
     // before Drive ever saw them.
     expect(sql).toContain('m.status = 0')
     expect(sql).toContain('(m.deleted_at IS NULL')
-    expect(sql).toContain('m.deleted_at >= NOW(3) - INTERVAL 30 DAY')
+    // The window comes from the configured retention (never a hard-coded 30):
+    // a 60-day deployment must still list a document deleted 40 days ago.
+    expect(sql).toContain('m.deleted_at >= NOW(3) - INTERVAL ? DAY')
     expect(sql).toContain('ORDER BY m.updated_at DESC, m.doc_id DESC')
     expect(sql).toContain('LIMIT 201')
     // JOIN dm.uid, dm.principal_space_id; JOIN dl.uid, dl.principal_space;
-    // owner_id + owner_space_id (compound owner exclusion).
-    expect(lastParams()).toEqual(['u1', 's1', 'u1', 's1', 'u1', 's1'])
+    // retention window; owner_id + owner_space_id (compound owner exclusion).
+    expect(lastParams()).toEqual(['u1', 's1', 'u1', 's1', TRASH_RETENTION_DAYS, 'u1', 's1'])
+  })
+
+  it('defaults the window to the same configured retention every other projection uses', async () => {
+    await docMetaRepo.listSharedWithUser({ uid: 'u1', principalSpaceId: 's1', pageSize: 200 })
+    // Not a literal: the configured value, so display / restore / cleanup and this
+    // candidate filter can never disagree.
+    expect(lastParams()[4]).toBe(TRASH_RETENTION_DAYS)
+  })
+
+  it('binds the configured retention window instead of a hard-coded 30 days', async () => {
+    await docMetaRepo.listSharedWithUser({
+      uid: 'u1', principalSpaceId: 's1', pageSize: 200, retentionDays: 60,
+    })
+    expect(lastSql()).toContain('m.deleted_at >= NOW(3) - INTERVAL ? DAY')
+    expect(lastParams()[4]).toBe(60)
   })
 
   it('clamps pageSize to the 500 cap', async () => {

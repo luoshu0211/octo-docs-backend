@@ -1,0 +1,231 @@
+import { afterEach, describe, expect, it, vi } from 'vitest'
+
+/**
+ * OCTO-456 P1 — 保留期到期自动清理任务。
+ * 用固定时钟 + 假仓储验证：
+ *   - 开关关闭：runOnce 不触达仓储、start 只打 DISABLED 日志；
+ *   - 筛选 cutoff = now - retentionDays；
+ *   - 分批直到空批；同一批一个都没删掉就停手；
+ *   - 删除失败只计数，不抛出。
+ */
+import { createTrashCleanupScheduler } from '../src/trash/cleanupJob.js'
+
+const NOW = new Date('2026-12-01T00:00:00.000Z').getTime()
+const DAY = 24 * 60 * 60 * 1000
+
+afterEach(() => {
+  vi.restoreAllMocks()
+})
+
+describe('createTrashCleanupScheduler', () => {
+  it('is a hard no-op while disabled (no repo access, DISABLED log)', async () => {
+    const listExpired = vi.fn(async () => [])
+    const purge = vi.fn(async () => ({ ok: true }))
+    const log = vi.fn()
+    const scheduler = createTrashCleanupScheduler({
+      enabled: false, intervalMs: 1000, retentionDays: 30, now: () => NOW, listExpired, purge, log,
+    })
+
+    expect(await scheduler.runOnce()).toEqual({
+      skipped: true, cutoff: null, scanned: 0, purged: 0, failed: 0,
+    })
+    scheduler.start()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(listExpired).not.toHaveBeenCalled()
+    expect(purge).not.toHaveBeenCalled()
+    expect(log.mock.calls.some(([message]) => String(message).includes('DISABLED'))).toBe(true)
+    scheduler.stop()
+  })
+
+  it('passes now - retentionDays as the cutoff and purges each expired doc', async () => {
+    const listExpired = vi.fn()
+      .mockResolvedValueOnce([
+        { doc_id: 'd1', deleted_at: new Date('2026-11-01T00:00:00.000Z') },
+        { doc_id: 'd2', deleted_at: new Date('2026-11-02T00:00:00.000Z') },
+      ])
+      .mockResolvedValueOnce([])
+    const purge = vi.fn(async () => ({ ok: true }))
+    const scheduler = createTrashCleanupScheduler({
+      enabled: true, intervalMs: 1000, retentionDays: 30, now: () => NOW, listExpired, purge,
+      log: vi.fn(),
+    })
+
+    const summary = await scheduler.runOnce()
+    expect(summary).toEqual({
+      skipped: false,
+      cutoff: new Date(NOW - 30 * DAY).toISOString(),
+      scanned: 2,
+      purged: 2,
+      failed: 0,
+    })
+    expect(listExpired).toHaveBeenNthCalledWith(1, new Date(NOW - 30 * DAY), 100, undefined)
+    expect(purge).toHaveBeenCalledWith('d1')
+    expect(purge).toHaveBeenCalledWith('d2')
+  })
+
+  it('keeps paging until a short/empty batch and respects page bounds', async () => {
+    const full = Array.from({ length: 100 }, (_, i) => ({
+      doc_id: `d${i}`,
+      deleted_at: new Date(NOW - (1000 - i) * 1000),
+    }))
+    const listExpired = vi.fn()
+      .mockResolvedValueOnce(full)
+      .mockResolvedValueOnce([{ doc_id: 'd100', deleted_at: new Date(NOW - 1000) }])
+    const purge = vi.fn(async () => ({ ok: true }))
+    const scheduler = createTrashCleanupScheduler({
+      enabled: true, intervalMs: 1000, retentionDays: 30, now: () => NOW,
+      listExpired, purge, batchSize: 100, log: vi.fn(),
+    })
+
+    const summary = await scheduler.runOnce()
+    expect(summary.scanned).toBe(101)
+    expect(summary.purged).toBe(101)
+    // 第二批只有 1 条（< batchSize）=> 停止，不再发第三次查询。
+    expect(listExpired).toHaveBeenCalledTimes(2)
+    // 第二页从上一页最后一条的 (deleted_at, doc_id) 之后开始。
+    expect(listExpired).toHaveBeenNthCalledWith(2, new Date(NOW - 30 * DAY), 100, {
+      deletedAt: full[full.length - 1]!.deleted_at,
+      docId: 'd99',
+    })
+  })
+
+  it('pages past a permanently failing batch instead of retrying it forever', async () => {
+    // The first page always fails; without keyset paging every run re-read the
+    // same 100 rows and the 101st document was never attempted.
+    const failing = Array.from({ length: 100 }, (_, i) => ({
+      doc_id: `bad${i}`,
+      deleted_at: new Date(NOW - (2000 - i) * 1000),
+    }))
+    const listExpired = vi.fn()
+      .mockResolvedValueOnce(failing)
+      .mockResolvedValueOnce([{ doc_id: 'good', deleted_at: new Date(NOW - 1000) }])
+    const purge = vi.fn(async (docId: string) => ({ ok: docId === 'good' }))
+    const scheduler = createTrashCleanupScheduler({
+      enabled: true, intervalMs: 1000, retentionDays: 30, now: () => NOW,
+      listExpired, purge, batchSize: 100, log: vi.fn(),
+    })
+
+    const summary = await scheduler.runOnce()
+    expect(summary).toMatchObject({ scanned: 101, purged: 1, failed: 100 })
+    expect(purge).toHaveBeenCalledWith('good')
+    expect(listExpired).toHaveBeenCalledTimes(2)
+  })
+
+  it('counts per-doc failures and stops immediately when a whole batch made no progress', async () => {
+    const listExpired = vi.fn(async () => [{ doc_id: 'd1' }, { doc_id: 'd2' }])
+    const purge = vi.fn(async () => ({ ok: false }))
+    const scheduler = createTrashCleanupScheduler({
+      enabled: true, intervalMs: 1000, retentionDays: 30, now: () => NOW,
+      listExpired, purge, log: vi.fn(),
+    })
+
+    const summary = await scheduler.runOnce()
+    expect(summary).toMatchObject({ scanned: 2, purged: 0, failed: 2 })
+    // 同批仍然失败 => 不能无限重试同一批。
+    expect(listExpired).toHaveBeenCalledTimes(1)
+  })
+
+  it('carries the scan cursor across runs so a failing head cannot starve the tail', async () => {
+    // Budget: one page of two rows per run. A and B keep failing; C is cleanable.
+    // With a per-run cursor the order was A,B / A,B / A,B and C was never tried.
+    const queue = [
+      { doc_id: 'A', deleted_at: new Date(NOW - 3000) },
+      { doc_id: 'B', deleted_at: new Date(NOW - 2000) },
+      { doc_id: 'C', deleted_at: new Date(NOW - 1000) },
+    ]
+    const listExpired = vi.fn(async (
+      _cutoff: Date,
+      limit: number,
+      after?: { deletedAt: Date; docId: string },
+    ) => {
+      const start = after
+        ? queue.findIndex((row) => row.deleted_at.getTime() === after.deletedAt.getTime() && row.doc_id === after.docId) + 1
+        : 0
+      return queue.slice(start, start + limit)
+    })
+    const purge = vi.fn(async (docId: string) => ({ ok: docId === 'C' }))
+    const scheduler = createTrashCleanupScheduler({
+      enabled: true, intervalMs: 1000, retentionDays: 30, now: () => NOW,
+      listExpired, purge, batchSize: 2, maxBatchesPerRun: 1, log: vi.fn(),
+    })
+
+    const first = await scheduler.runOnce()
+    expect(first).toMatchObject({ scanned: 2, purged: 0, failed: 2 })
+    const second = await scheduler.runOnce()
+    expect(second).toMatchObject({ scanned: 1, purged: 1, failed: 0 })
+    expect(purge).toHaveBeenCalledWith('C')
+    expect(listExpired).toHaveBeenNthCalledWith(2, expect.any(Date), 2, {
+      deletedAt: queue[1]!.deleted_at,
+      docId: 'B',
+    })
+  })
+
+  it('retries the head again after a transient failure ends the sweep', async () => {
+    // A single document whose purge fails ONCE and then succeeds. Because the run
+    // ends on a short/empty page (not on the budget), the next run must start from
+    // the head again — persisting that position skipped A forever.
+    const queue = [{ doc_id: 'A', deleted_at: new Date(NOW - 1000) }]
+    const listExpired = vi.fn(async (
+      _cutoff: Date,
+      limit: number,
+      after?: { deletedAt: Date; docId: string },
+    ) => {
+      const start = after
+        ? queue.findIndex((row) => row.deleted_at.getTime() === after.deletedAt.getTime() && row.doc_id === after.docId) + 1
+        : 0
+      return queue.slice(start, start + limit)
+    })
+    let attempts = 0
+    const purge = vi.fn(async () => {
+      attempts += 1
+      return { ok: attempts > 1 }
+    })
+
+    for (const batchSize of [1, 2]) {
+      attempts = 0
+      purge.mockClear()
+      const scheduler = createTrashCleanupScheduler({
+        enabled: true, intervalMs: 1000, retentionDays: 30, now: () => NOW,
+        listExpired, purge, batchSize, maxBatchesPerRun: 4, log: vi.fn(),
+      })
+      const first = await scheduler.runOnce()
+      expect(first).toMatchObject({ scanned: 1, purged: 0, failed: 1 })
+      const second = await scheduler.runOnce()
+      // A is retried on the very next run and now succeeds.
+      expect(second).toMatchObject({ scanned: 1, purged: 1, failed: 0 })
+    }
+  })
+
+  it('swallows a thrown purge and keeps going', async () => {
+    const listExpired = vi.fn()
+      .mockResolvedValueOnce([{ doc_id: 'd1' }, { doc_id: 'd2' }])
+      .mockResolvedValueOnce([])
+    const purge = vi.fn()
+      .mockRejectedValueOnce(new Error('boom'))
+      .mockResolvedValueOnce({ ok: true })
+    const scheduler = createTrashCleanupScheduler({
+      enabled: true, intervalMs: 1000, retentionDays: 30, now: () => NOW,
+      listExpired, purge, log: vi.fn(),
+    })
+
+    const summary = await scheduler.runOnce()
+    expect(summary).toMatchObject({ scanned: 2, purged: 1, failed: 1 })
+  })
+
+  it('logs ENABLED with interval/retention and runs one pass immediately on start', async () => {
+    const listExpired = vi.fn(async () => [])
+    const log = vi.fn()
+    const scheduler = createTrashCleanupScheduler({
+      enabled: true, intervalMs: 6 * 60 * 60 * 1000, retentionDays: 30, now: () => NOW,
+      listExpired, purge: vi.fn(async () => ({ ok: true })), log,
+    })
+
+    const setIntervalSpy = vi.spyOn(globalThis, 'setInterval')
+    scheduler.start()
+    await vi.waitFor(() => expect(listExpired).toHaveBeenCalled())
+    expect(log.mock.calls.some(([message]) =>
+      String(message).includes('trash cleanup enabled') && String(message).includes('retention 30d'))).toBe(true)
+    expect(setIntervalSpy).toHaveBeenCalledWith(expect.any(Function), 6 * 60 * 60 * 1000)
+    scheduler.stop()
+  })
+})

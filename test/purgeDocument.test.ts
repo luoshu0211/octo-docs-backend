@@ -1,0 +1,202 @@
+import { describe, expect, it, vi } from 'vitest'
+
+/**
+ * OCTO-456 P1 — 彻底删除服务：html 远端 purge 与 DB 物理删除的顺序/失败策略。
+ * 注入假 deps，不触达 config/对象存储/DB。
+ */
+import { purgeDocument, type PurgeDeps } from '../src/trash/purgeDocument.js'
+
+function meta(overrides: Record<string, unknown> = {}) {
+  return {
+    doc_id: 'd1',
+    space_id: 'org1',
+    document_name: 'octo:s1:f1:d1',
+    title: 'Doc',
+    doc_type: 'doc',
+    octo_doc_slug: null,
+    status: 0,
+    deleted_at: new Date('2026-11-10T00:00:00.000Z'),
+    ...overrides,
+  }
+}
+
+function deps(overrides: Partial<PurgeDeps> = {}): PurgeDeps {
+  return {
+    getMeta: vi.fn(async () => meta() as never),
+    // The instance CAN reach the html backend by default; only the dedicated
+    // "not configured" case flips this.
+    htmlPurgeConfigured: () => true,
+    claimPurge: vi.fn(async () => ({
+      ok: true, resumed: false,
+      doc: { documentName: 'octo:s1:f1:d1', attachObjectKeys: [] },
+    }) as never),
+    releasePurgeClaim: vi.fn(async () => {}),
+    purgeHtml: vi.fn(async () => ({ ok: true }) as never),
+    purgeRepo: vi.fn(async () => ({
+      ok: true,
+      doc: { documentName: 'octo:s1:f1:d1', attachObjectKeys: ['att/1'] },
+    }) as never),
+    deleteObject: vi.fn(async () => {}),
+    enqueueIndex: vi.fn(async () => true),
+    ...overrides,
+  }
+}
+
+describe('purgeDocument', () => {
+  it('404s a missing doc', async () => {
+    const d = deps({ getMeta: vi.fn(async () => null) })
+    expect(await purgeDocument('d1', { mode: 'strict', deps: d })).toEqual({
+      ok: false, status: 404, error: 'not_found',
+    })
+    expect(d.purgeRepo).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    [1, 'not_deleted'],
+    [2, 'doc_archived'],
+  ] as const)('refuses a status=%i doc with %s', async (status, error) => {
+    const d = deps({ getMeta: vi.fn(async () => meta({ status }) as never) })
+    const result = await purgeDocument('d1', { mode: 'strict', deps: d })
+    expect(result).toEqual({ ok: false, status: 409, error })
+    expect(d.purgeRepo).not.toHaveBeenCalled()
+  })
+
+  it('strict: html purge failure => 503 and doc_meta is NOT deleted', async () => {
+    const d = deps({
+      getMeta: vi.fn(async () => meta({ doc_type: 'html', octo_doc_slug: 'slug-1' }) as never),
+      purgeHtml: vi.fn(async () => ({ ok: false, reason: 'upstream_error', status: 500 }) as never),
+    })
+    const result = await purgeDocument('d1', { mode: 'strict', deps: d })
+    expect(result).toEqual({ ok: false, status: 503, error: 'html_purge_failed' })
+    expect(d.purgeHtml).toHaveBeenCalledWith('slug-1', 'd1', 'org1')
+    expect(d.purgeRepo).not.toHaveBeenCalled()
+  })
+
+  it('strict: unconfigured html backend fails closed instead of deleting only doc_meta', async () => {
+    const d = deps({
+      getMeta: vi.fn(async () => meta({ doc_type: 'html', octo_doc_slug: 'slug-1' }) as never),
+      purgeHtml: vi.fn(async () => ({ ok: true, skipped: true, reason: 'config_missing' }) as never),
+    })
+    const result = await purgeDocument('d1', { mode: 'strict', deps: d })
+    expect(result).toEqual({ ok: false, status: 503, error: 'html_purge_failed' })
+    expect(d.purgeRepo).not.toHaveBeenCalled()
+  })
+
+  it('best_effort: a failed html purge keeps doc_meta as the retry basis', async () => {
+    const d = deps({
+      getMeta: vi.fn(async () => meta({ doc_type: 'html', octo_doc_slug: 'slug-1' }) as never),
+      purgeHtml: vi.fn(async () => ({ ok: false, reason: 'network_error' }) as never),
+    })
+    const result = await purgeDocument('d1', { mode: 'best_effort', deps: d })
+    // The row is the ONLY thing that lets the next cleanup run find this doc
+    // again; deleting it would strand the remote versions and attachments.
+    expect(result).toEqual({ ok: false, status: 503, error: 'html_purge_failed' })
+    expect(d.purgeRepo).not.toHaveBeenCalled()
+    expect(d.releasePurgeClaim).not.toHaveBeenCalled()
+  })
+
+  it('never takes a claim when the html backend is not configured', async () => {
+    const d = deps({
+      getMeta: vi.fn(async () => meta({ doc_type: 'html', octo_doc_slug: 'slug-1' }) as never),
+      htmlPurgeConfigured: () => false,
+    })
+    const result = await purgeDocument('d1', { mode: 'best_effort', deps: d })
+    expect(result).toEqual({ ok: false, status: 503, error: 'html_purge_failed' })
+    // The claim is taken only when it can be discharged: an undischargeable claim
+    // would leave the document un-restorable for no reason.
+    expect(d.claimPurge).not.toHaveBeenCalled()
+    expect(d.releasePurgeClaim).not.toHaveBeenCalled()
+    expect(d.purgeRepo).not.toHaveBeenCalled()
+  })
+
+  it('keeps a RESUMED claim when the retry cannot reach html: prior content may be gone', async () => {
+    const d = deps({
+      getMeta: vi.fn(async () => meta({ doc_type: 'html', octo_doc_slug: 'slug-1' }) as never),
+      claimPurge: vi.fn(async () => ({
+        ok: true, resumed: true,
+        doc: { documentName: 'octo:s1:f1:d1', attachObjectKeys: [] },
+      }) as never),
+      purgeHtml: vi.fn(async () => ({ ok: true, skipped: true, reason: 'config_missing' }) as never),
+    })
+    const result = await purgeDocument('d1', { mode: 'best_effort', deps: d })
+    expect(result).toEqual({ ok: false, status: 503, error: 'html_purge_failed' })
+    // Releasing here would let the user restore a record whose body an earlier run
+    // already deleted.
+    expect(d.releasePurgeClaim).not.toHaveBeenCalled()
+    expect(d.purgeRepo).not.toHaveBeenCalled()
+  })
+
+  it('releases the purge claim when the html backend is not configured', async () => {
+    const d = deps({
+      getMeta: vi.fn(async () => meta({ doc_type: 'html', octo_doc_slug: 'slug-1' }) as never),
+      purgeHtml: vi.fn(async () => ({ ok: true, skipped: true, reason: 'config_missing' }) as never),
+    })
+    const result = await purgeDocument('d1', { mode: 'best_effort', deps: d })
+    expect(result).toEqual({ ok: false, status: 503, error: 'html_purge_failed' })
+    expect(d.purgeRepo).not.toHaveBeenCalled()
+    // Nothing was deleted remotely, so the document must stay restorable.
+    expect(d.releasePurgeClaim).toHaveBeenCalledWith('d1')
+  })
+
+  it('claims the purge before calling html and resumes an already-claimed doc', async () => {
+    const order: string[] = []
+    const d = deps({
+      getMeta: vi.fn(async () => meta({ doc_type: 'html', octo_doc_slug: 'slug-1' }) as never),
+      claimPurge: vi.fn(async () => {
+        order.push('claim')
+        return { ok: true, resumed: true, doc: { documentName: 'octo:s1:f1:d1', attachObjectKeys: [] } }
+      }) as never,
+      purgeHtml: vi.fn(async () => {
+        order.push('html')
+        return { ok: true }
+      }) as never,
+      purgeRepo: vi.fn(async () => {
+        order.push('db')
+        return { ok: true, doc: { documentName: 'octo:s1:f1:d1', attachObjectKeys: [] } }
+      }) as never,
+    })
+    const result = await purgeDocument('d1', { mode: 'strict', deps: d })
+    expect(result.ok).toBe(true)
+    expect(order).toEqual(['claim', 'html', 'db'])
+  })
+
+  it('refuses a doc whose purge claim was lost to a purge/restore race', async () => {
+    const d = deps({
+      claimPurge: vi.fn(async () => ({ ok: false, reason: 'not_deleted' }) as never),
+    })
+    expect(await purgeDocument('d1', { mode: 'strict', deps: d })).toEqual({
+      ok: false, status: 409, error: 'not_deleted',
+    })
+    expect(d.purgeHtml).not.toHaveBeenCalled()
+  })
+
+  it('skips the remote call for non-html docs and for html without a slug', async () => {
+    for (const subject of [meta(), meta({ doc_type: 'html', octo_doc_slug: null })]) {
+      const d = deps({ getMeta: vi.fn(async () => subject as never) })
+      await purgeDocument('d1', { mode: 'strict', deps: d })
+      expect(d.purgeHtml).not.toHaveBeenCalled()
+      expect(d.purgeRepo).toHaveBeenCalled()
+    }
+  })
+
+  it('treats a concurrently-purged row as not_found', async () => {
+    const d = deps({ purgeRepo: vi.fn(async () => ({ ok: false, reason: 'not_found' }) as never) })
+    expect(await purgeDocument('d1', { mode: 'strict', deps: d })).toEqual({
+      ok: false, status: 404, error: 'not_found',
+    })
+  })
+
+  it('deletes attachment objects and re-signals the index after the DB commit', async () => {
+    const d = deps()
+    const result = await purgeDocument('d1', { mode: 'strict', deps: d })
+    expect(result.ok).toBe(true)
+    expect(d.deleteObject).toHaveBeenCalledWith('att/1')
+    expect(d.enqueueIndex).toHaveBeenCalledWith('octo:s1:f1:d1')
+  })
+
+  it('never fails a committed purge because an attachment object delete failed', async () => {
+    const d = deps({ deleteObject: vi.fn(async () => { throw new Error('storage down') }) })
+    const result = await purgeDocument('d1', { mode: 'strict', deps: d })
+    expect(result.ok).toBe(true)
+  })
+})

@@ -1039,6 +1039,23 @@ export const config = {
     retainDays: num('DOC_VIEW_RETAIN_DAYS', 90),
   },
 
+  // OCTO-456 P1 — 回收站保留期到期自动清理（在线文档原件物理删除）。
+  //
+  // 每天类任务：扫描 `doc_meta.status=0 AND deleted_at IS NOT NULL AND
+  // deleted_at < NOW() - retentionDays`，调用与 `POST /api/v1/docs/{docId}/purge`
+  // 相同的服务物理删除（html 内容 best-effort）。**默认关闭**：物理删除不可逆，
+  // 必须由部署显式开启并确认保留期。`deleted_at IS NULL` 的历史删除行永远不清理
+  // （期限未知，见 permission/docRetention.ts）。
+  trashCleanup: {
+    // 总开关。strictBool：运营写成 TRASH_CLEANUP_ENABLED=ture 时启动即失败，
+    // 而不是被悄悄当成 false（静默不清理/静默清理都不可接受）。
+    enabled: strictBool('TRASH_CLEANUP_ENABLED', false),
+    // 两轮间隔（ms）。默认 6h；下限 60s，避免手滑写成 0 把数据库打满。
+    intervalMs: numMin('TRASH_CLEANUP_INTERVAL_MS', 6 * 60 * 60 * 1000, 60_000),
+    // 保留天数。默认 30；下限 1（0 会让 cutoff = NOW()，把刚删的文档也清掉）。
+    retentionDays: numMin('TRASH_RETENTION_DAYS', 30, 1),
+  },
+
   // Drive-library-derived viewer access (TES-131). A THIRD, supplementary read
   // permission source: when a doc lives inside a drive library the caller can
   // reach, the drive service grants a derived reader role even with no

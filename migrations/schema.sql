@@ -53,6 +53,9 @@ CREATE TABLE doc_meta (
   -- 最后一次已应用的发布序号。同一内容版本可以发布成不同标题，只有序号能
   -- 区分两次写入的先后；版本水位是其回退（旧版 HTML 实例只带 version）。
   html_publish_seq BIGINT NOT NULL DEFAULT 0,
+  -- 彻底删除的认领状态：0=正常 1=已认领（远端内容删除可能在进行/可重试）。
+  -- 恢复与重试必须在行锁内看到同一状态，否则会出现「元数据已恢复、正文已删」。
+  purge_state TINYINT NOT NULL DEFAULT 0,
   PRIMARY KEY (doc_id),
   UNIQUE KEY uk_document_name (document_name),    -- document_name 全局唯一
   -- octo_doc_slug is unique PER SPACE, not globally (P0 tenant isolation): the

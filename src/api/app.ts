@@ -77,9 +77,11 @@ import { humanDocSpaceScopeMiddleware } from './middleware/docSpaceScope.js'
 import { createRateLimiter, type RateLimiterOptions } from './middleware/rateLimit.js'
 import { collabTokenRouter } from './routes/collabToken.js'
 import { docsRouter, documentResourceRouter, spaceCollectionRouter } from './routes/docs.js'
+import { docsTrashRouter } from './routes/docsTrash.js'
 import { internalHtmlRegistrationRouter } from './routes/internalHtmlRegistration.js'
 import { createInternalDocRoleRouter } from './routes/internalDocRole.js'
 import { createInternalDocsLibraryRouter } from './routes/internalDocsLibrary.js'
+import { createInternalDocsUnreadRouter } from './routes/internalDocsUnread.js'
 import { internalSourceInvalidationsRouter } from './routes/internalSourceInvalidations.js'
 import { membersRouter } from './routes/members.js'
 import { memberNotificationsRouter } from './routes/memberNotifications.js'
@@ -301,6 +303,12 @@ export function createApp(
   //    SpaceCollectionRouter, so `/d/:docId` opens never depend on that header.
   api.use(humanDocSpaceScopeMiddleware)
 
+  // 3b. OCTO-456 P1 在线文档原件回收（trash / restore / purge，人类链路 only）。
+  //     必须挂在 SpaceCollectionRouter / DocumentResourceRouter 之前：GET /trash
+  //     与 POST /trash/restore 是固定路径，晚于 `/:docId` 会被当成 docId。
+  //     回收站操作只给 owner/admin（人类）——不挂到 botApi，Bot 不能删除文档。
+  api.use(docsTrashRouter)
+
   // 4a. SpaceCollectionRouter (remove-sp §6): the Space-scoped collection ops
   //     (create / list / search / recent). Each route carries its OWN
   //     spaceContextMiddleware (X-Space-Id required). Mounted BEFORE the
@@ -369,6 +377,10 @@ export function createApp(
   // never consume the library budget and vice versa.
   if (serveInternal) {
     app.use('/internal/docs', createInternalDocsLibraryRouter(createRateLimiter(opts.rateLimit)))
+    // OCTO-456 P0: batch "member-added unread" lookup backing drive's
+    // `unread_only`. Same prefix, own route-scoped limiter so the three internal
+    // surfaces never spend each other's budget.
+    app.use('/internal/docs', createInternalDocsUnreadRouter(createRateLimiter(opts.rateLimit)))
     app.use('/internal/docs', createInternalDocRoleRouter(createRateLimiter(opts.rateLimit)))
   }
 
