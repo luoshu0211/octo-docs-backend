@@ -1225,6 +1225,7 @@ async function applyHtmlPublishTitleHandler(req: Request, res: Response, docId: 
     botOwnerUid: req.botOwnerUid,
     title: parsedTitle.title,
     expectedTitle: parsedExpected.expectedTitle,
+    version: Number((req.body ?? {}).version ?? (req.body ?? {}).publish_version ?? 0),
   })
   if (!outcome.ok) {
     res.status(outcome.status).json({

@@ -48,6 +48,8 @@ CREATE TABLE doc_meta (
   updated_at    DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
   created_by    VARCHAR(64)  NOT NULL,
   updated_by    VARCHAR(64)  NOT NULL DEFAULT '',
+  -- 最后一次已应用的 HTML 发布回调版本（用于忽略乱序到达的旧回调）。
+  html_publish_version BIGINT NOT NULL DEFAULT 0,
   PRIMARY KEY (doc_id),
   UNIQUE KEY uk_document_name (document_name),    -- document_name 全局唯一
   -- octo_doc_slug is unique PER SPACE, not globally (P0 tenant isolation): the
