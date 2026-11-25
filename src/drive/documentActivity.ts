@@ -22,7 +22,7 @@ const intervalMs = 5_000
 const activityWindowMs = 7 * 24 * 60 * 60 * 1_000
 
 export function documentActivityEnabled(): boolean {
-  return Boolean(config.driveDerived.internalBaseUrl && config.driveDerived.activityToken)
+  return Boolean(config.driveDerived.internalBaseUrl && config.driveDerived.outboundToken)
 }
 
 // Keep the event and the exact Yjs snapshot in the same transaction. Only
@@ -93,7 +93,7 @@ async function flushDocumentEdits(url: string, token: string): Promise<void> {
 export function startDocumentActivityDelivery(): () => Promise<void> {
   if (!documentActivityEnabled()) return async () => {}
   const url = new URL('/internal/v1/docs/document-edits', config.driveDerived.internalBaseUrl).href
-  const token = config.driveDerived.activityToken
+  const token = config.driveDerived.outboundToken
   let inFlight: Promise<void> | undefined
   const timer = setInterval(() => {
     if (inFlight) return
