@@ -76,6 +76,38 @@ export const docMemberRepo = {
     )
   },
 
+  /**
+   * Batch variant of getRole for the OCTO-456 internal projections: resolve the
+   * caller's DIRECT doc_member role for up to 500 documents in ONE query.
+   *
+   * The key is the compound principal (uid, principal_space_id), so one uid can
+   * hold different roles per Space and only the row for the caller's verified
+   * principal Space is returned. A stored value outside the canonical enum is
+   * skipped (fail-closed to "no role") rather than surfaced as an unknown
+   * string; the caller then treats the doc as role 'none'.
+   */
+  async getRoles(
+    docIds: readonly string[],
+    uid: string,
+    principalSpaceId: string,
+  ): Promise<Map<string, Role>> {
+    const ids = [...new Set(docIds.filter((id) => typeof id === 'string' && id !== ''))]
+    const roles = new Map<string, Role>()
+    if (ids.length === 0) return roles
+    if (ids.length > 500) throw new Error('too_many_doc_ids')
+    const rows = await query<{ doc_id: string; role: number }>(
+      `SELECT doc_id, role FROM doc_member
+       WHERE uid = ? AND principal_space_id = ?
+         AND doc_id IN (${ids.map(() => '?').join(', ')})`,
+      [uid, principalSpaceId, ...ids],
+    )
+    for (const row of rows) {
+      const role = roleFromNumber(Number(row.role))
+      if (role !== undefined) roles.set(row.doc_id, role)
+    }
+    return roles
+  },
+
   /** Direct add / update role (§8.4 PUT members). Upsert by (doc_id, uid). */
   async upsertDirect(params: {
     docId: string

@@ -56,7 +56,7 @@ const date = new Date('2026-11-17T00:00:00Z')
 const doc: DocMeta = {
   doc_id: 'd_same', document_name: 'octo:space_a:f_default:d_same', title: 'Same Space',
   owner_id: 'user_a', owner_space_id: 'space_a', space_id: 'space_a', folder_id: 'f_default',
-  doc_type: 'doc', status: 1, permission_epoch: 1, share_scope: 0, share_role: 1,
+  doc_type: 'doc', status: 1, deleted_at: null, permission_epoch: 1, share_scope: 0, share_role: 1,
   discoverability_scope: 0, created_at: date, updated_at: date, created_by: 'user_a',
   updated_by: 'user_a', octo_doc_slug: null, html_idempotency_key_hash: null,
 }
@@ -184,11 +184,11 @@ describe('Docs CLI v2 read pilot', () => {
     expect(requests).toHaveLength(token ? 1 : 0)
   })
 
-  function patchTitle(id: string, token = 'valid') {
+  function patchTitle(id: string, token = 'valid', body: Record<string, unknown> = { title: 'New name' }) {
     return fetch(appOrigin + endpoint + '/' + id, {
       method: 'PATCH',
       headers: { authorization: 'Bearer ' + token, 'content-type': 'application/json', 'x-space-id': 'space_b' },
-      body: JSON.stringify({ title: 'New name' }),
+      body: JSON.stringify(body),
     })
   }
 
@@ -213,7 +213,10 @@ describe('Docs CLI v2 read pilot', () => {
     const { query, transaction } = mockRenameTransaction(doc, 3)
     const ok = await patchTitle(doc.doc_id, token)
     expect(ok.status).toBe(200)
-    expect(await ok.json()).toEqual({ data: { doc_id: doc.doc_id, title: 'New name' } })
+    // OCTO-456: the rename receipt adds the pre-change title (drive diffs it).
+    expect(await ok.json()).toEqual({
+      data: { doc_id: doc.doc_id, title: 'New name', before_title: 'Same Space' },
+    })
     const other = await patchTitle(foreign.doc_id, token)
     expect(other.status).toBe(404)
     expect(transaction).toHaveBeenCalledOnce()
@@ -222,6 +225,27 @@ describe('Docs CLI v2 read pilot', () => {
       expect(query).toHaveBeenNthCalledWith(2, expect.stringMatching(/^SELECT role .* FOR UPDATE$/), [doc.doc_id, uid, 'space_a'])
     }
     expect(query).toHaveBeenLastCalledWith(expect.stringMatching(/^UPDATE doc_meta SET title/), ['New name', uid, doc.doc_id])
+  })
+
+  it('accepts the CLI snake_case expected_title and returns 409 title_changed + current_title', async () => {
+    vi.mocked(docMemberRepo.getRole).mockResolvedValue('admin')
+    mockRenameTransaction(doc, 3)
+
+    const stale = await patchTitle(doc.doc_id, 'valid', {
+      title: 'New name', expected_title: 'Stale title',
+    })
+    expect(stale.status).toBe(409)
+    expect(await stale.json()).toMatchObject({
+      error: { code: 'CONFLICT', details: { reason: 'title_changed', current_title: 'Same Space' } },
+    })
+
+    vi.mocked(docMemberRepo.getRole).mockResolvedValue('admin')
+    const { query } = mockRenameTransaction(doc, 3)
+    const ok = await patchTitle(doc.doc_id, 'valid', {
+      title: 'New name', expected_title: 'Same Space',
+    })
+    expect(ok.status).toBe(200)
+    expect(query).toHaveBeenLastCalledWith(expect.stringMatching(/^UPDATE doc_meta SET title/), ['New name', 'user_a', doc.doc_id])
   })
 
   it.each([
@@ -579,8 +603,16 @@ describe('Docs CLI v2 workflows', () => {
     const body = await response.json() as { data: { items: Array<Record<string, unknown>> } }
     expect(body.data.items).toHaveLength(ids.length)
     expect(body.data.items.map(item => item.doc_id)).toEqual(ids)
+    // OCTO-456: readable metadata items also carry the caller's role + the
+    // per-document action matrix (additive; the actor fields are unchanged).
     expect(body.data.items[0]).toEqual({
       doc_id: ids[0], created_by: 'user_a', updated_by: 'user_a', updated_at: date.toISOString(),
+      role: 'admin',
+      capabilities: {
+        can_read: true, can_comment: true, can_edit: true, can_share: true,
+        can_export: true, can_copy: true, can_rename_original: true,
+        can_delete_original: true, can_download_original: true,
+      },
     })
     expect(requests).toHaveLength(1)
     expect(docMemberRepo.getRole).not.toHaveBeenCalledWith(foreign.doc_id, expect.anything(), expect.anything())
@@ -721,6 +753,13 @@ describe('Docs CLI v2 workflows', () => {
     })
     expect(error.envelope.error.details).toEqual({
       reason: 'ambiguous_sheet_name', candidates: [{ sheet_id: 'sheet_alpha', name: 'Repeated' }],
+    })
+  })
+
+  it('exposes the current title on a rename expected_title conflict', () => {
+    const error = errorForStatus(409, { error: 'title_changed', currentTitle: 'Someone Else' })
+    expect(error.envelope.error.details).toEqual({
+      reason: 'title_changed', current_title: 'Someone Else',
     })
   })
 

@@ -21,6 +21,7 @@ import {
   Router,
   type NextFunction,
   type Request,
+  type RequestHandler,
   type Response,
   type Router as ExpressRouter,
 } from 'express'
@@ -29,7 +30,18 @@ import { docMetaRepo } from '../../db/repos/docMetaRepo.js'
 import { docMemberRepo } from '../../db/repos/docMemberRepo.js'
 import { roleRank, type ResolvedRole } from '../../permission/role.js'
 
-export const internalDocRoleRouter: ExpressRouter = Router()
+/**
+ * Route-scoped limiter (OCTO-456 F2): each router mounts the limiter on its OWN
+ * route chain. A router-level limiter would run for every request that reaches
+ * the router — Express falls through to the next router when no route matches —
+ * so two routers mounted at the same prefix would each burn budget on every
+ * request and exhaust each other.
+ */
+export function createInternalDocRoleRouter(limiter: RequestHandler): ExpressRouter {
+  const router = Router()
+  router.get('/:docId/role', limiter, asyncHandler(internalDocRoleHandler))
+  return router
+}
 
 function credentialMatches(actual: string): boolean {
   const expected = config.driveDerived.inboundToken
@@ -42,6 +54,11 @@ export function authorizeInternalDocRequest(req: Request, res: Response): boolea
   if (credentialMatches(req.header('x-internal-token') ?? '')) return true
   res.status(401).json({ error: 'unauthorized' })
   return false
+}
+
+/** Middleware form: reject before any body parsing happens on the route. */
+export function requireInternalDocToken(req: Request, res: Response, next: NextFunction): void {
+  if (authorizeInternalDocRequest(req, res)) next()
 }
 
 export async function internalDocRoleHandler(req: Request, res: Response): Promise<void> {
@@ -83,5 +100,3 @@ function asyncHandler(handler: (req: Request, res: Response) => Promise<void>) {
     handler(req, res).catch(next)
   }
 }
-
-internalDocRoleRouter.get('/:docId/role', asyncHandler(internalDocRoleHandler))

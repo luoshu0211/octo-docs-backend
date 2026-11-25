@@ -133,11 +133,24 @@ export async function appendPptEditTx(tx: Tx, principal: PptPrincipal, live: Awa
 
 /** Whole JSON input is compiled into ordinary Bento ops. A stale full document
  * is rejected, never silently applied over edits that the caller has not read. */
-export async function editPptLive(principal: PptPrincipal, input: { baseRevision: number; deck: BentoDoc } | { title: string }) {
+export async function editPptLive(
+  principal: PptPrincipal,
+  input: { baseRevision: number; deck: BentoDoc } | { title: string; expectedTitle?: string },
+) {
   return inPptRoom(principal.docId, async () => {
     await preparePptCollab(principal.docId, principal.authorizedEpoch)
     const result = await withPptCompaction(principal.docId, () => withStoreRetry('ppt-rest-edit', () => transaction(async tx => {
-      await lockPptAuthority(tx, principal, 'title' in input ? 'admin' : 'writer')
+      const meta = await lockPptAuthority(tx, principal, 'title' in input ? 'admin' : 'writer')
+      // OCTO-456 §4.8 optimistic lock: the title the caller saw must still be
+      // current under the same FOR UPDATE row lock that authorizes the write.
+      if ('title' in input) {
+        const expected = input.expectedTitle ?? ''
+        if (expected !== '' && (meta.title ?? '') !== expected) {
+          throw new PptApiError('CONFLICT', 'title changed', {
+            details: { reason: 'title_changed', currentTitle: meta.title ?? '' },
+          })
+        }
+      }
       const live = await lockPptLive(tx, principal.docId)
       if ('baseRevision' in input && live.revision !== input.baseRevision) {
         throw new PptApiError('CONFLICT', 'PPT changed; read the current deck and reapply your changes', { details: { revision: live.revision } })

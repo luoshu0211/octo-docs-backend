@@ -78,7 +78,8 @@ import { createRateLimiter, type RateLimiterOptions } from './middleware/rateLim
 import { collabTokenRouter } from './routes/collabToken.js'
 import { docsRouter, documentResourceRouter, spaceCollectionRouter } from './routes/docs.js'
 import { internalHtmlRegistrationRouter } from './routes/internalHtmlRegistration.js'
-import { internalDocRoleRouter } from './routes/internalDocRole.js'
+import { createInternalDocRoleRouter } from './routes/internalDocRole.js'
+import { createInternalDocsLibraryRouter } from './routes/internalDocsLibrary.js'
 import { internalSourceInvalidationsRouter } from './routes/internalSourceInvalidations.js'
 import { membersRouter } from './routes/members.js'
 import { memberNotificationsRouter } from './routes/memberNotifications.js'
@@ -234,6 +235,12 @@ export function createApp(
   const jsonBodyParser = express.json({ limit: '1mb' })
   const sheetWriteJsonBodyParser = express.json({ limit: config.sheetWrite.maxRequestBytes })
   app.use((req, res, next) => {
+    // Internal library POSTs (status/capabilities) authenticate and pass their
+    // route limiter INSIDE the router, and parse their own 64 KiB body there.
+    // Skipping the global parser keeps unauthenticated callers from spending
+    // JSON CPU/memory (or seeing 400 before 401). The role/source-invalidation
+    // routes under this prefix either need no body or already own their parser.
+    if (/^\/internal\/docs(\/|$)/i.test(req.path)) return next()
     // The Excalidraw importer needs the exact application/json bytes so it can
     // reject malformed UTF-8/JSON and enforce its own byte boundary before
     // walking the untrusted scene. Leave only that route for express.raw.
@@ -352,7 +359,18 @@ export function createApp(
   // Internal surface (TES-131): the drive service asks for a caller's DIRECT doc
   // role here (X-Internal-Token) to decide a drive-library-derived grant. Same
   // in-network-only posture as /internal/html — never on a nginx upstream.
-  if (serveInternal) app.use('/internal/docs', createRateLimiter(opts.rateLimit), internalDocRoleRouter)
+  //
+  // OCTO-456 F2: the limiter is attached to the ROUTE chain inside the router,
+  // not to the shared `/internal/docs` prefix. An app-level limiter mounted
+  // before a router runs even when that router has no matching route (Express
+  // then falls through to the next mount), so the role router and the library
+  // router would each decrement a budget on every request to either surface.
+  // Route-scoped limiters make the budgets genuinely independent: role requests
+  // never consume the library budget and vice versa.
+  if (serveInternal) {
+    app.use('/internal/docs', createInternalDocsLibraryRouter(createRateLimiter(opts.rateLimit)))
+    app.use('/internal/docs', createInternalDocRoleRouter(createRateLimiter(opts.rateLimit)))
+  }
 
   // Bot-facing entry (§ v4.3): the SAME nine metadata routers, re-mounted behind
   // a bot identity middleware at a physically distinct prefix so nginx can route

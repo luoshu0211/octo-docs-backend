@@ -39,7 +39,7 @@ describe('HttpDriveDerivedAccess', () => {
   it('POSTs the complete-access contract with the internal token and preserves its proof', async () => {
     const fetchMock = vi.fn(async () => accessResponse('reader'))
     vi.stubGlobal('fetch', fetchMock)
-    let now = 100
+    const now = 100
     const client = makeClient({ nowMs: () => now })
 
     expect(await client.derivedAccess('doc1', 'u1', 's1')).toMatchObject({
@@ -184,6 +184,90 @@ describe('HttpDriveDerivedAccess', () => {
       ] }),
     }) as unknown as Response))
     expect(await makeClient().versions([binding])).toBeNull()
+  })
+
+  it('POSTs the batch full-decision contract and preserves request order', async () => {
+    const bindings: DerivedAccessBinding[] = [
+      { docId: 'd1', uid: 'u1', principalSpaceId: 's1' },
+      { docId: 'd2', uid: 'u2', principalSpaceId: 's2' },
+    ]
+    const fetchMock = vi.fn(async () => ({
+      ok: true, status: 200, json: async () => ({ items: [
+        { doc_id: 'd1', uid: 'u1', principal_space_id: 's1', role: 'reader', source_revision: revision, valid_for_ms: 15_000 },
+        { doc_id: 'd2', uid: 'u2', principal_space_id: 's2', role: 'none', source_revision: revision, valid_for_ms: 15_000 },
+      ] }),
+    }) as unknown as Response)
+    vi.stubGlobal('fetch', fetchMock)
+
+    expect(await makeClient().batchDerivedAccess(bindings)).toEqual([
+      { ...bindings[0], role: 'reader' },
+      { ...bindings[1], role: 'none' },
+    ])
+    const [url, init] = fetchMock.mock.calls[0]! as [string, RequestInit]
+    expect(url).toBe(`${BASE}/internal/v1/docs/derived-access/batch`)
+    expect((init.headers as Record<string, string>)['X-Internal-Token']).toBe('tok')
+    expect(JSON.parse(init.body as string)).toEqual({ items: [
+      { doc_id: 'd1', uid: 'u1', principal_space_id: 's1' },
+      { doc_id: 'd2', uid: 'u2', principal_space_id: 's2' },
+    ] })
+  })
+
+  it('refuses more than 50 bindings, duplicates, and empty fields without IO', async () => {
+    const fetchMock = vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ items: [] }) }) as unknown as Response)
+    vi.stubGlobal('fetch', fetchMock)
+    const client = makeClient()
+    const tooMany = Array.from({ length: 51 }, (_, i) => ({ docId: `d${i}`, uid: 'u1', principalSpaceId: 's1' }))
+    expect(await client.batchDerivedAccess(tooMany)).toBeNull()
+    expect(await client.batchDerivedAccess([binding, binding])).toBeNull()
+    expect(await client.batchDerivedAccess([{ ...binding, uid: '' }])).toBeNull()
+    expect(await client.batchDerivedAccess([])).toBeNull()
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['a mismatched doc_id', { doc_id: 'other', uid: 'u1', principal_space_id: 's1', role: 'reader' }],
+    ['a reordered item', { doc_id: 'd2', uid: 'u1', principal_space_id: 's1', role: 'reader' }],
+    ['a missing role', { doc_id: 'd1', uid: 'u1', principal_space_id: 's1' }],
+    ['an unsupported role', { doc_id: 'd1', uid: 'u1', principal_space_id: 's1', role: 'writer' }],
+  ])('fails the whole batch on %s', async (_name, item) => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: true, status: 200, json: async () => ({ items: [item] }),
+    }) as unknown as Response))
+    expect(await makeClient().batchDerivedAccess([binding])).toBeNull()
+  })
+
+  it('fails the batch on a short item list or a non-2xx response', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: true, status: 200, json: async () => ({ items: [] }),
+    }) as unknown as Response))
+    expect(await makeClient().batchDerivedAccess([binding])).toBeNull()
+
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: false, status: 503, json: async () => ({}),
+    }) as unknown as Response))
+    expect(await makeClient().batchDerivedAccess([binding])).toBeNull()
+  })
+
+  it('bounds the proof cache with LRU eviction and reports hit/miss/evict counters', async () => {
+    let now = 1_000
+    const fetchMock = vi.fn(async () => accessResponse('reader'))
+    vi.stubGlobal('fetch', fetchMock)
+    const client = makeClient({ nowMs: () => now, maxCacheEntries: 2, cacheSweepIntervalMs: 0 })
+
+    await client.derivedAccess('d1', 'u1', 's1')
+    await client.derivedAccess('d1', 'u1', 's1') // hit refreshes d1's recency
+    expect(client.accessCacheStats()).toMatchObject({ size: 1, hits: 1, misses: 1 })
+
+    await client.derivedAccess('d2', 'u1', 's1')
+    await client.derivedAccess('d3', 'u1', 's1') // evicts the oldest (d1)
+    const bounded = client.accessCacheStats()
+    expect(bounded.size).toBe(2)
+    expect(bounded.evictions).toBe(1)
+
+    // Expired proofs are sweepable rather than accumulating forever.
+    now += 20_000 // proof TTL is 15s
+    expect(client.sweepExpiredAccessCache()).toBe(2)
+    expect(client.accessCacheStats().size).toBe(0)
   })
 
   it('coalesces concurrent complete-access calls for the same binding', async () => {

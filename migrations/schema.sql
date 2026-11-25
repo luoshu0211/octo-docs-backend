@@ -36,6 +36,10 @@ CREATE TABLE doc_meta (
   octo_doc_slug VARCHAR(128) NULL DEFAULT NULL, -- octo-doc 正文 slug；doc_type='html' 时用于路由回 octo-doc
   html_idempotency_key_hash BINARY(32) NULL DEFAULT NULL,
   status        TINYINT      NOT NULL DEFAULT 1,  -- 1=正常 0=已删除(软删) 2=归档
+  -- OCTO-456 删除灰态（P0 读取）：软删时间；NULL = 历史删除无法判定删除时间
+  -- （迁移不回填，保留期按“无法判定→未过期”处理）。新增列见
+  -- migrations/upgrades/2026-11-24-add-doc-deleted-at.sql，两处必须保持一致。
+  deleted_at    DATETIME(3)  NULL DEFAULT NULL,
   permission_epoch BIGINT    NOT NULL DEFAULT 0,   -- 权限版本号（单调递增，权威落 DB；v2.0 按 doc_member 变更 +1，见 §4.5）
   share_scope   TINYINT      NOT NULL DEFAULT 0,   -- 0=restricted 1=anyone_in_space 2=authenticated
   share_role    TINYINT      NOT NULL DEFAULT 1,   -- link role: 1=read 2=edit 4=comment; restricted 时忽略（历史值 3 只兼容读取并降级）
@@ -44,6 +48,11 @@ CREATE TABLE doc_meta (
   updated_at    DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
   created_by    VARCHAR(64)  NOT NULL,
   updated_by    VARCHAR(64)  NOT NULL DEFAULT '',
+  -- 最后一次已应用的 HTML 发布回调版本（用于忽略乱序到达的旧回调）。
+  html_publish_version BIGINT NOT NULL DEFAULT 0,
+  -- 最后一次已应用的发布序号。同一内容版本可以发布成不同标题，只有序号能
+  -- 区分两次写入的先后；版本水位是其回退（旧版 HTML 实例只带 version）。
+  html_publish_seq BIGINT NOT NULL DEFAULT 0,
   PRIMARY KEY (doc_id),
   UNIQUE KEY uk_document_name (document_name),    -- document_name 全局唯一
   -- octo_doc_slug is unique PER SPACE, not globally (P0 tenant isolation): the
@@ -114,7 +123,28 @@ CREATE TABLE doc_member_notification (
   event_at           DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   read_at            DATETIME(3) NULL,
   PRIMARY KEY (recipient_uid, recipient_space_id, doc_id),
-  KEY idx_member_notification_unread (recipient_uid, recipient_space_id, read_at, event_at)
+  KEY idx_member_notification_unread (recipient_uid, recipient_space_id, read_at, event_at),
+  KEY idx_doc_member_notification_doc (doc_id)  -- softDelete: DELETE ... WHERE doc_id = ?
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- OCTO-456 HTML rename journal (two-step html publish -> doc_meta write).
+-- One row per LOGICAL rename; its id is reused as the octo-docs-html idempotency
+-- key so retries of the same rename reuse the already-published version, while a
+-- later A->B rename gets a new row/version. status: 0 pending, 1 completed,
+-- 2 failed. (doc_id, status) serves the "latest pending for this doc" probe.
+CREATE TABLE doc_rename_operation (
+  id          VARCHAR(64)  NOT NULL,             -- uuid; html idempotency_key
+  revision    BIGINT       NOT NULL AUTO_INCREMENT, -- 单调顺序,栅栏用(created_at 只有 ms)
+  doc_id      VARCHAR(64)  NOT NULL,
+  from_title  VARCHAR(512) NOT NULL,
+  to_title    VARCHAR(512) NOT NULL,
+  status      TINYINT      NOT NULL DEFAULT 0,
+  version     INT          NULL,
+  created_at  DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at  DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (id),
+  KEY idx_doc_rename_operation_doc_status (doc_id, status),
+  KEY idx_doc_rename_operation_revision (revision)  -- AUTO_INCREMENT 必须是键
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- 链接邀请（v2.0 新增）：一个 token 携带授予 role，仅【已注册 octo 用户】可接受（见 §4.6 接受流程）。
@@ -584,4 +614,17 @@ CREATE TABLE doc_library_event (
   read_at             DATETIME(3) NULL,
   KEY idx_library_inbox (recipient_uid, recipient_space_id, id),
   KEY idx_library_request (recipient_uid, recipient_space_id, doc_id, request_id, kind)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- OCTO-456 资料库二期: legacy ("旧列表") visibility backfill. Pure candidate
+-- provenance for 与我共享 — never an authorization source; rows are re-checked
+-- through the permission layer. Created empty (no producer yet).
+CREATE TABLE doc_legacy_visible (
+  doc_id          VARCHAR(64) NOT NULL,
+  uid             VARCHAR(64) NOT NULL,
+  principal_space VARCHAR(64) NOT NULL,
+  source          VARCHAR(16) NOT NULL DEFAULT 'legacy',
+  last_seen_at    DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (doc_id, uid, principal_space),
+  KEY idx_legacy_principal (uid, principal_space, last_seen_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

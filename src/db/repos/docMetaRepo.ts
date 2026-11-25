@@ -79,6 +79,13 @@ export interface DocMeta {
   octo_doc_slug: string | null
   html_idempotency_key_hash: Buffer | null
   status: number // 1=active 0=deleted 2=archived
+  /**
+   * OCTO-456 deletion grey state: when the row was soft-deleted (status=0).
+   * NULL means the deletion happened before 2026-11-24-add-doc-deleted-at.sql,
+   * i.e. the 30-day retention deadline is UNKNOWN (reported as not expired).
+   * Always null for status=1/2 rows and cleared by a revival.
+   */
+  deleted_at: Date | null
   permission_epoch: number
   /**
    * Share scope (#64): 0=restricted (default), 1=anyone_in_space. A `SELECT *`
@@ -144,16 +151,84 @@ export interface ManageableDocItem {
 }
 
 /**
- * Opaque keyset cursor for listManageable: the (updated_at, doc_id) of the last
- * seen row. Same base64url(JSON) shape docViewHistoryRepo uses; only the server
- * reads it. decode throws 'invalid_cursor' on a malformed value so the route can
+ * One row of the OCTO-456 "与我共享" candidate set (GET /internal/docs/shared):
+ * a doc_member row (direct or invite) and/or a doc_legacy_visible 补录 row for
+ * the caller. `role` is the stored doc_member TINYINT (null for a legacy-only
+ * row, which has no doc_member grant); `member_source` is
+ * doc_member.source (1=direct 2=invite, null without a member row);
+ * `has_legacy` is 1 when doc_legacy_visible has a row for this principal.
+ */
+export interface SharedDocItem {
+  doc_id: string
+  title: string
+  doc_type: string
+  owner_id: string
+  /**
+   * OCTO-456 review follow-up: the row's creator, exposed so Drive can render an
+   * unmounted shared document's creator separately from its owner. An empty
+   * string is preserved (historical rows may lack it) — never coerced to owner.
+   */
+  created_by: string
+  space_id: string
+  updated_at: Date
+  role: number | null
+  member_source: number | null
+  has_legacy: number
+}
+
+/**
+ * Outcome of an optimistic-title rename (`expected_title`). `title_changed`
+ * carries the authoritative title observed under the row lock so the caller can
+ * return `{ error: 'title_changed', currentTitle }` without a second read.
+ */
+export type RenameWithExpectedTitleOutcome =
+  | { ok: true }
+  | { ok: false; reason: 'not_found' }
+  | { ok: false; reason: 'title_changed'; currentTitle: string }
+
+/**
+ * One row of the OCTO-456 readable-document set (GET /internal/docs/readable):
+ * owned OR doc_member OR share-scope visible. `role` is the stored doc_member
+ * TINYINT (null when the only access comes from ownership or a share scope);
+ * the share columns let the caller replay effectiveRole() exactly.
+ */
+export interface ReadableDocItem {
+  doc_id: string
+  title: string
+  doc_type: string
+  owner_id: string
+  owner_space_id: string
+  space_id: string
+  updated_at: Date
+  role: number | null
+  share_scope: number
+  share_role: number
+}
+
+/** Max page size the internal library listings accept (drive's own cap). */
+export const MAX_LIBRARY_PAGE_SIZE = 500
+
+/**
+ * Escape a user-supplied substring for a `LIKE ? ESCAPE '\\'` comparison so
+ * `%` / `_` / `\` in a title search are matched LITERALLY (a bare `%q%` would
+ * otherwise turn a stray `_` into a single-char wildcard).
+ */
+export function escapeLikeSubstring(raw: string): string {
+  return raw.replace(/[\\%_]/g, (ch) => `\\${ch}`)
+}
+
+/**
+ * Opaque keyset cursor over (updated_at DESC, doc_id DESC) — the shared shape of
+ * listManageable and the OCTO-456 library listings (internal shared/readable).
+ * Same base64url(JSON) encoding docViewHistoryRepo uses; only the server reads
+ * it. decode throws 'invalid_cursor' on a malformed value so the route can
  * answer 400 rather than silently restarting from the first page.
  */
-export function encodeManageableCursor(updatedAt: string, docId: string): string {
+export function encodeUpdatedAtCursor(updatedAt: string, docId: string): string {
   return Buffer.from(JSON.stringify({ u: updatedAt, d: docId }), 'utf8').toString('base64url')
 }
 
-export function decodeManageableCursor(raw: string | undefined): { updatedAt: string; docId: string } | null {
+export function decodeUpdatedAtCursor(raw: string | undefined): { updatedAt: string; docId: string } | null {
   if (raw === undefined || raw === '') return null
   let parsed: unknown
   try {
@@ -173,6 +248,11 @@ export function decodeManageableCursor(raw: string | undefined): { updatedAt: st
   if (Number.isNaN(new Date(u).getTime())) throw new Error('invalid_cursor')
   return { updatedAt: u, docId: d }
 }
+
+/** @deprecated name kept for existing callers; identical to encodeUpdatedAtCursor. */
+export const encodeManageableCursor = encodeUpdatedAtCursor
+/** @deprecated name kept for existing callers; identical to decodeUpdatedAtCursor. */
+export const decodeManageableCursor = decodeUpdatedAtCursor
 
 export const docMetaRepo = {
   async create(input: CreateDocInput): Promise<void> {
@@ -246,7 +326,7 @@ export const docMetaRepo = {
       return transaction(async (tx) => {
         await tx.query(
           `UPDATE doc_meta
-           SET title = ?, updated_by = ?, status = 1
+           SET title = ?, updated_by = ?, status = 1, deleted_at = NULL
            WHERE doc_id = ? AND doc_type = 'html' AND space_id = ?`,
           [input.title, input.createdBy, existing.doc_id, input.spaceId],
         )
@@ -377,6 +457,49 @@ export const docMetaRepo = {
     return rows[0] ?? null
   },
 
+  /**
+   * Batch variant of getByDocId for the OCTO-456 internal projections
+   * (status/capabilities). At most 500 ids per call — the drive client already
+   * batches at that size, and the bound keeps the derived `IN (...)` list and
+   * the prepared statement small. Returns rows in no particular order and
+   * WITHOUT filtering status: the caller decides deleted/archived semantics
+   * (internalDocRole.ts's 404 rule does not apply to the status projection).
+   */
+  async getByDocIds(docIds: readonly string[]): Promise<DocMeta[]> {
+    const ids = [...new Set(docIds.filter((id) => typeof id === 'string' && id !== ''))]
+    if (ids.length === 0) return []
+    if (ids.length > 500) throw new Error('too_many_doc_ids')
+    return query<DocMeta>(
+      `SELECT * FROM doc_meta WHERE doc_id IN (${ids.map(() => '?').join(', ')})`,
+      ids,
+    )
+  },
+
+  /**
+   * OCTO-456 deletion grey state: which of `docIds` this principal still sees
+   * in doc_legacy_visible. A surviving legacy 补录 row (any source, including
+   * the im_card/im_link rows the 与我共享 list filters out this期) is enough to
+   * disclose a deleted doc's title + deletion state in /internal/docs/status;
+   * it never grants can_read. Keyed by the same (uid, principal_space) PK the
+   * shared list joins on, bounded to the internal batch size.
+   */
+  async getLegacyVisibleDocIds(
+    docIds: readonly string[],
+    uid: string,
+    principalSpaceId: string,
+  ): Promise<Set<string>> {
+    const ids = [...new Set(docIds.filter((id) => typeof id === 'string' && id !== ''))]
+    if (ids.length === 0 || uid === '' || principalSpaceId === '') return new Set()
+    if (ids.length > 500) throw new Error('too_many_doc_ids')
+    const rows = await query<{ doc_id: string }>(
+      `SELECT doc_id FROM doc_legacy_visible
+       WHERE uid = ? AND principal_space = ?
+         AND doc_id IN (${ids.map(() => '?').join(', ')})`,
+      [uid, principalSpaceId, ...ids],
+    )
+    return new Set(rows.map((row) => row.doc_id))
+  },
+
   async getByDocumentName(documentName: string): Promise<DocMeta | null> {
     const rows = await query<DocMeta>(
       'SELECT * FROM doc_meta WHERE document_name = ? LIMIT 1',
@@ -411,6 +534,45 @@ export const docMetaRepo = {
   async rename(docId: string, title: string, updatedBy = '', tx?: Tx): Promise<void> {
     const db = tx ?? { query }
     await db.query('UPDATE doc_meta SET title = ?, updated_by = ? WHERE doc_id = ?', [title, updatedBy, docId])
+  },
+
+  /**
+   * Optimistic-title rename (OCTO-456 §4.8 `expected_title`).
+   *
+   * The compare and the write MUST hold the same row lock: a read-then-update
+   * outside a transaction lets two concurrent callers both observe the old title
+   * and both overwrite each other. The caller supplies the expected title that
+   * the user saw; a mismatch is a definitive 409 and writes nothing.
+   */
+  async renameWithExpectedTitleTx(
+    tx: Tx,
+    input: { docId: string; title: string; updatedBy: string; expectedTitle: string },
+  ): Promise<RenameWithExpectedTitleOutcome> {
+    const rows = await tx.query<{ title: string }>(
+      'SELECT title FROM doc_meta WHERE doc_id = ? FOR UPDATE',
+      [input.docId],
+    )
+    const row = rows[0]
+    if (!row) return { ok: false, reason: 'not_found' }
+    const currentTitle = row.title ?? ''
+    if (currentTitle !== input.expectedTitle) {
+      return { ok: false, reason: 'title_changed', currentTitle }
+    }
+    await tx.query(
+      'UPDATE doc_meta SET title = ?, updated_by = ? WHERE doc_id = ?',
+      [input.title, input.updatedBy, input.docId],
+    )
+    return { ok: true }
+  },
+
+  /** Transactional wrapper for {@link renameWithExpectedTitleTx}. */
+  async renameWithExpectedTitle(input: {
+    docId: string
+    title: string
+    updatedBy: string
+    expectedTitle: string
+  }): Promise<RenameWithExpectedTitleOutcome> {
+    return transaction((tx) => docMetaRepo.renameWithExpectedTitleTx(tx, input))
   },
 
   /**
@@ -478,7 +640,7 @@ export const docMetaRepo = {
   },
 
   /**
-   * Soft delete (status=0), §8.4.
+   * Soft delete (status=0), §8.4 + OCTO-456 deletion grey state.
    *
    * Flips status AND bumps permission_epoch in the SAME transaction (reusing
    * bumpEpochTx, §4.5). The epoch bump is what severs live collaboration: a
@@ -487,11 +649,31 @@ export const docMetaRepo = {
    * Without the bump the recheck never fires and writers keep editing a deleted
    * doc. Returns the doc's document_name and the new epoch so the caller can
    * publish the invalidation event (mirrors acceptInvite); null if no such doc.
+   *
+   * OCTO-456:
+   *   - `deleted_at` is stamped in the same UPDATE. COALESCE keeps the FIRST
+   *     deletion time on a repeat delete (idempotent re-entry), so the 30-day
+   *     retention clock never restarts. NOW(3) is the repo-wide timestamp
+   *     convention (doc_meta.updated_at / doc_member_notification.event_at);
+   *     mysql2 reads the DATETIME back in the same session/process timezone and
+   *     the internal route emits it as ISO8601 UTC.
+   *   - Every `doc_member_notification` unread reminder for this doc is DELETED
+   *     in the same transaction (§3.3): a confirmed deletion consumes the
+   *     invite badge, so both unread badges drop together and a retry (0 rows)
+   *     can never double-decrement. Row deletion is the repo's existing
+   *     reminder-cleanup shape (docMemberRepo.removePrincipalExact) and stays
+   *     correct even if a repeated delete races another caller.
    */
   async softDelete(docId: string): Promise<{ documentName: string; permissionEpoch: number } | null> {
     return transaction(async (tx) => {
-      await tx.query('UPDATE doc_meta SET status = 0 WHERE doc_id = ?', [docId])
+      await tx.query(
+        `UPDATE doc_meta
+         SET status = 0, deleted_at = COALESCE(deleted_at, NOW(3))
+         WHERE doc_id = ?`,
+        [docId],
+      )
       await docMetaRepo.bumpEpochTx(tx, docId)
+      await tx.query('DELETE FROM doc_member_notification WHERE doc_id = ?', [docId])
       const rows = await tx.query<{ document_name: string; permission_epoch: number }>(
         'SELECT document_name, permission_epoch FROM doc_meta WHERE doc_id = ? LIMIT 1',
         [docId],
@@ -694,6 +876,11 @@ export const docMetaRepo = {
    * page's `nextCursor`; a malformed token throws 'invalid_cursor' (decoded here)
    * so the route answers 400 rather than silently restarting. `nextCursor` is
    * null on the last page.
+   *
+   * `q` (OCTO-456 §4.4) narrows by title with a case-insensitive `%q%` LIKE,
+   * ANDed with the existing predicates. `%` / `_` / `\` in the caller's text are
+   * escaped so they match literally; a blank q adds no clause. Paging semantics
+   * are unchanged — the cursor still keys off the same (updated_at, doc_id).
    */
   async listManageable(params: {
     uid: string
@@ -701,6 +888,7 @@ export const docMetaRepo = {
     principalSpaceId: string
     pageSize: number
     cursor?: string
+    q?: string
   }): Promise<{ items: ManageableDocItem[]; nextCursor: string | null }> {
     // pageSize is inlined into LIMIT (mysql2 .execute rejects a bound ? in LIMIT,
     // errno 1210), so clamp to a provable positive integer 1..100 first.
@@ -708,15 +896,17 @@ export const docMetaRepo = {
     const cursor = decodeManageableCursor(params.cursor)
 
     // owner OR direct admin(3) row, always scoped to the caller's Space. Bind
-    // order: JOIN dm.uid, dm.principal_space_id; then space_id; then owner_id,
-    // owner_space_id; then the optional cursor tuple.
+    // order: JOIN dm.uid, dm.principal_space_id; then space_id; then the optional
+    // title LIKE; then owner_id, owner_space_id; then the optional cursor tuple.
     const args: unknown[] = [
       params.uid,
       params.principalSpaceId,
       params.spaceId,
-      params.uid,
-      params.principalSpaceId,
     ]
+    const title = typeof params.q === 'string' ? params.q.trim() : ''
+    const titleSql = title === '' ? '' : "AND m.title LIKE ? ESCAPE '\\\\'"
+    if (title !== '') args.push(`%${escapeLikeSubstring(title)}%`)
+    args.push(params.uid, params.principalSpaceId)
     let cursorSql = ''
     if (cursor) {
       // Bind the timestamp as a Date so mysql2 serializes it to the column's
@@ -730,6 +920,7 @@ export const docMetaRepo = {
        FROM doc_meta m
        LEFT JOIN doc_member dm ON dm.doc_id = m.doc_id AND dm.uid = ? AND dm.principal_space_id = ?
        WHERE m.status = 1 AND m.space_id = ?
+         ${titleSql}
          AND ((m.owner_id = ? AND m.owner_space_id = ?) OR dm.role = ${ROLE_ADMIN})
          ${cursorSql}
        ORDER BY m.updated_at DESC, m.doc_id DESC
@@ -833,6 +1024,156 @@ export const docMetaRepo = {
     `
     const rows = await query<{ doc_id: string }>(sql, args)
     return rows.map((r) => r.doc_id)
+  },
+
+  /**
+   * OCTO-456 GET /internal/docs/shared — the "与我共享" candidate set.
+   *
+   * Membership comes from doc_member (drive's own direct/invite grant rows) and
+   * the doc_legacy_visible 补录 table (old-list backfill). Both joins are keyed
+   * by PK (doc_id, uid, principal_space), so one doc yields exactly one row and
+   * the two provenances MERGE into one item (the route unions their `sources`)
+   * instead of duplicating the document. The caller's OWN documents are excluded
+   * (`m.owner_id <> uid`) — a doc you own is not "shared with you".
+   *
+   * `im_card` / `im_link` legacy rows are filtered out IN THE JOIN this期
+   * (deliberate scope cut, §4.6): they would claim a share provenance Drive
+   * cannot yet render. A filtered legacy row therefore contributes nothing, and
+   * a doc reaching the set only through such a row is absent (fail-closed).
+   *
+   * Keyset paging on (updated_at DESC, doc_id DESC); `pageSize` clamps to
+   * 1..MAX_LIBRARY_PAGE_SIZE and is inlined into LIMIT (mysql2 rejects a bound
+   * LIMIT). A malformed cursor throws 'invalid_cursor'. nextCursor is null on
+   * the last page.
+   */
+  async listSharedWithUser(params: {
+    uid: string
+    principalSpaceId: string
+    pageSize: number
+    cursor?: string
+  }): Promise<{ items: SharedDocItem[]; nextCursor: string | null }> {
+    const pageSize = Math.min(
+      MAX_LIBRARY_PAGE_SIZE,
+      Math.max(1, Number.isInteger(params.pageSize) ? params.pageSize : 200),
+    )
+    const cursor = decodeUpdatedAtCursor(params.cursor)
+    // Bind order: JOIN dm.uid, dm.principal_space_id; JOIN dl.uid,
+    // dl.principal_space; WHERE owner_id; then the optional cursor tuple.
+    const args: unknown[] = [
+      params.uid,
+      params.principalSpaceId,
+      params.uid,
+      params.principalSpaceId,
+      params.uid,
+      params.principalSpaceId,
+    ]
+    let cursorSql = ''
+    if (cursor) {
+      cursorSql = 'AND (m.updated_at < ? OR (m.updated_at = ? AND m.doc_id < ?))'
+      const at = new Date(cursor.updatedAt)
+      args.push(at, at, cursor.docId)
+    }
+    const rows = await query<SharedDocItem>(
+      `SELECT m.doc_id, m.title, m.doc_type, m.owner_id, m.created_by, m.owner_space_id, m.space_id, m.updated_at,
+              dm.role AS role, dm.source AS member_source,
+              CASE WHEN dl.doc_id IS NULL THEN 0 ELSE 1 END AS has_legacy
+       FROM doc_meta m
+       LEFT JOIN doc_member dm
+         ON dm.doc_id = m.doc_id AND dm.uid = ? AND dm.principal_space_id = ?
+       LEFT JOIN doc_legacy_visible dl
+         ON dl.doc_id = m.doc_id AND dl.uid = ? AND dl.principal_space = ?
+        AND dl.source NOT IN ('im_card', 'im_link')
+       WHERE (m.status = 1
+              OR (m.status = 0
+                  AND (m.deleted_at IS NULL
+                       OR m.deleted_at >= NOW(3) - INTERVAL 30 DAY)))
+         AND NOT (m.owner_id = ? AND m.owner_space_id = ?)
+         AND (dm.doc_id IS NOT NULL OR dl.doc_id IS NOT NULL)
+         ${cursorSql}
+       ORDER BY m.updated_at DESC, m.doc_id DESC
+       LIMIT ${pageSize + 1}`,
+      args,
+    )
+    const hasMore = rows.length > pageSize
+    const items = hasMore ? rows.slice(0, pageSize) : rows
+    const last = items[items.length - 1]
+    const nextCursor = hasMore && last
+      ? encodeUpdatedAtCursor(new Date(last.updated_at).toISOString(), last.doc_id)
+      : null
+    return { items, nextCursor }
+  },
+
+  /**
+   * OCTO-456 GET /internal/docs/readable — every document the caller can read,
+   * used by drive to backfill full-library search for docs with NO drive mount.
+   *
+   * Predicate = owner (uid + owner Space) OR direct doc_member OR the #64 share
+   * scopes: `authenticated` is org-wide and `anyone_in_space` counts when the
+   * caller's principal Space IS the document's home Space (the internally
+   * verified equivalent of resolveEffectiveRole's verifiedSpaceId branch). It is
+   * intentionally NOT limited to discoverable docs: discoverability governs
+   * LISTING/search discovery, while holding the doc id still opens a readable
+   * anyone_in_space doc.
+   *
+   * Drive-derived reader access is NOT enumerated here: it is computed by Drive
+   * itself for docs already mounted into a library, so those docs need no
+   * "unmounted backfill" — and enumerating it would require one Drive round-trip
+   * per document inside a 500-row page. The authoritative per-doc can_read
+   * (including that derived source) is /internal/docs/status.
+   *
+   * Keyset paging/limit/cursor semantics match listSharedWithUser.
+   */
+  async listReadableForUser(params: {
+    uid: string
+    principalSpaceId: string
+    pageSize: number
+    cursor?: string
+  }): Promise<{ items: ReadableDocItem[]; nextCursor: string | null }> {
+    const pageSize = Math.min(
+      MAX_LIBRARY_PAGE_SIZE,
+      Math.max(1, Number.isInteger(params.pageSize) ? params.pageSize : 200),
+    )
+    const cursor = decodeUpdatedAtCursor(params.cursor)
+    // Bind order: JOIN dm.uid, dm.principal_space_id; WHERE owner_id,
+    // owner_space_id; share-space scope; then the optional cursor tuple.
+    const args: unknown[] = [
+      params.uid,
+      params.principalSpaceId,
+      params.uid,
+      params.principalSpaceId,
+      params.principalSpaceId,
+    ]
+    let cursorSql = ''
+    if (cursor) {
+      cursorSql = 'AND (m.updated_at < ? OR (m.updated_at = ? AND m.doc_id < ?))'
+      const at = new Date(cursor.updatedAt)
+      args.push(at, at, cursor.docId)
+    }
+    const rows = await query<ReadableDocItem>(
+      `SELECT m.doc_id, m.title, m.doc_type, m.owner_id, m.owner_space_id, m.space_id,
+              m.updated_at, m.share_scope, m.share_role, dm.role AS role
+       FROM doc_meta m
+       LEFT JOIN doc_member dm
+         ON dm.doc_id = m.doc_id AND dm.uid = ? AND dm.principal_space_id = ?
+       WHERE m.status = 1
+         AND (
+           (m.owner_id = ? AND m.owner_space_id = ?)
+           OR dm.doc_id IS NOT NULL
+           OR m.share_scope = ${SHARE_SCOPE_AUTHENTICATED}
+           OR (m.share_scope = ${SHARE_SCOPE_ANYONE} AND m.space_id = ?)
+         )
+         ${cursorSql}
+       ORDER BY m.updated_at DESC, m.doc_id DESC
+       LIMIT ${pageSize + 1}`,
+      args,
+    )
+    const hasMore = rows.length > pageSize
+    const items = hasMore ? rows.slice(0, pageSize) : rows
+    const last = items[items.length - 1]
+    const nextCursor = hasMore && last
+      ? encodeUpdatedAtCursor(new Date(last.updated_at).toISOString(), last.doc_id)
+      : null
+    return { items, nextCursor }
   },
 
   /** Bump permission_epoch within an existing transaction (§4.5). */

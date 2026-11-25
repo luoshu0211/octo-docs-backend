@@ -42,15 +42,36 @@ export type DocRoleResolution =
   | { ok: true; guard: DocGuard }
   | { ok: false; status: number; error: string }
 
+/**
+ * Optional per-route behaviour. The defaults are the historical contract every
+ * existing caller relies on, so only the OCTO-456 rename opts in.
+ */
+export interface DocRoleOptions {
+  /**
+   * OCTO-456 deletion grey state (PATCH rename only).
+   *
+   * When true a NON-ACTIVE doc resolves to `409 doc_archived` (the code drive
+   * maps verbatim) instead of the generic `404 not_found` (status=0) /
+   * `409 conflict` (status=2). A deleted doc is still disclosed ONLY to a
+   * principal that can observe it — the owner, any surviving doc_member row, or
+   * a doc_legacy_visible row; everyone else keeps the existence-hiding 404, so
+   * the state answer never becomes a document oracle. share_scope alone is
+   * deliberately not enough (a deleted doc is not readable by link).
+   */
+  inactiveAsDocArchived?: boolean
+}
+
 export async function resolveDocRole(
   req: Request,
   docId: string,
   minRole: Role,
+  options: DocRoleOptions = {},
 ): Promise<DocRoleResolution> {
   if (!req.docSpaceScope) return { ok: false, status: 404, error: 'not_found' }
   const scope = docScopeOf(req)
   const meta = await docMetaRepo.getByDocId(docId)
-  if (!meta || meta.status === 0 || (scope.mode === 'cli' && meta.space_id !== scope.spaceId)) {
+  const deletedAsArchived = options.inactiveAsDocArchived === true && meta?.status === 0
+  if (!meta || (meta.status === 0 && !deletedAsArchived) || (scope.mode === 'cli' && meta.space_id !== scope.spaceId)) {
     return { ok: false, status: 404, error: 'not_found' }
   }
   if (scope.mode === 'human') {
@@ -62,6 +83,20 @@ export async function resolveDocRole(
   const principalSpaceId = await resolveRequestPrincipalSpace(req)
   if (!principalSpaceId) return { ok: false, status: 403, error: 'principal_space_unverified' }
   const direct = await resolveRole(req.uid!, docId, principalSpaceId)
+  // Deleted rows are never readable, so only DIRECT observability counts: the
+  // owner (uid + owner Space — the same compound identity resolveRole and
+  // directRoleOf use), any doc_member grant, or a legacy 补录 row. Checked before
+  // the role threshold — a surviving reader still gets the state instead of a
+  // misleading 403. Comparing uid alone would disclose title/deleted_at to the
+  // same user id acting from a different principal Space.
+  if (deletedAsArchived) {
+    const observable = (req.uid! === meta.owner_id && principalSpaceId === meta.owner_space_id)
+      || direct !== 'none'
+      || (await docMetaRepo.getLegacyVisibleDocIds([meta.doc_id], req.uid!, principalSpaceId)).has(meta.doc_id)
+    return observable
+      ? { ok: false, status: 409, error: 'doc_archived' }
+      : { ok: false, status: 404, error: 'not_found' }
+  }
   const crossSpaceBot = scope.mode === 'bot' && scope.spaceId !== meta.space_id
   if (crossSpaceBot) {
     // Explicit direct grant only. Keep 404 for both absent and insufficient grants so
@@ -84,7 +119,9 @@ export async function resolveDocRole(
   // State is disclosed only after authorization. This preserves the Phase-1
   // contract: an existing doc with no effective role is 403, while 409 is
   // visible only to an authorized caller.
-  if (meta.status === 2) return { ok: false, status: 409, error: 'conflict' }
+  if (meta.status === 2) {
+    return { ok: false, status: 409, error: options.inactiveAsDocArchived === true ? 'doc_archived' : 'conflict' }
+  }
   return { ok: true, guard: { meta, role } }
 }
 
@@ -97,8 +134,9 @@ export async function requireDocRole(
   res: Response,
   docId: string,
   minRole: Role,
+  options: DocRoleOptions = {},
 ): Promise<DocGuard | null> {
-  const result = await resolveDocRole(req, docId, minRole)
+  const result = await resolveDocRole(req, docId, minRole, options)
   if (!result.ok) {
     res.status(result.status).json({ error: result.error })
     return null

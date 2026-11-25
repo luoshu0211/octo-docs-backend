@@ -41,12 +41,17 @@ import { requireDocRole, resolveDocRole } from '../guard.js'
 import { resolveRole } from '../../permission/resolveRole.js'
 import { resolveRequestPrincipalSpace } from '../../permission/principalSpace.js'
 import { editPptLive } from '../../ppt/liveEdit.js'
+import { renameHtmlDoc, applyHtmlPublishTitle } from '../services/htmlRenameDoc.js'
 import { PptApiError, PPT_ERROR_STATUS } from '../ppt/envelope.js'
 import { renameCliDoc, setCliShareSettings } from '../cliv2/access.js'
 import { CliError } from '../cliv2/auth.js'
 import { resolveEffectiveRole } from '../../permission/resolveEffectiveRole.js'
+import { canRenameOriginal, docCapabilitiesFor } from '../../permission/docCapabilities.js'
+import { trimTitleWhitespace, titleRuneLength } from '../../util/title.js'
+import { type ResolvedRole } from '../../permission/role.js'
 import { issueCollabTokenByDocId } from '../../auth/issueCollabToken.js'
 import { recordVerifiedRecentView } from '../services/recordRecentView.js'
+import { scheduleDriveViewForward } from '../../drive/viewEventForwarder.js'
 import { requireSpaceMembership, spaceContextMiddleware } from '../middleware/spaceContext.js'
 import { requireVerifiedHumanCurrentSpace, resolveHumanCurrentSpace } from '../middleware/docSpaceScope.js'
 import { searchDocs, VisibleTermsTooLargeError, encodeSearchCursor, decodeSearchCursor } from '../../search/osClient.js'
@@ -549,7 +554,7 @@ const MAX_METADATA_DOC_IDS = 500
 const METADATA_ROLE_LOOKUP_CONCURRENCY = 100
 
 /** Return metadata only for documents the caller can read, without per-doc HTTP errors. */
-async function docsMetadataHandler(req: Request, res: Response): Promise<void> {
+export async function docsMetadataHandler(req: Request, res: Response): Promise<void> {
   const rawDocIds: unknown = req.body?.docIds
   if (
     !Array.isArray(rawDocIds)
@@ -572,10 +577,21 @@ async function docsMetadataHandler(req: Request, res: Response): Promise<void> {
   }
 
   // Preserve input order while bounding ACL fan-out below the 500-item batch cap.
+  // OCTO-456: each readable item also carries the caller's role + action matrix.
+  // They are computed from the SAME guard result that proved readability, so the
+  // projection can never disagree with the ACL check; nothing is returned for a
+  // doc the caller cannot read (unchanged "skip unreadable" semantics).
+  interface MetadataItem {
+    docId: string
+    createdBy: string
+    updatedBy: string
+    updatedAt: Date
+    role: ResolvedRole
+    capabilities: ReturnType<typeof docCapabilitiesFor>
+  }
 
   const docIds = [...new Set(rawDocIds as string[])]
-  const itemsByIndex: Array<{ docId: string; createdBy: string; updatedBy: string; updatedAt: Date } | undefined> =
-    new Array(docIds.length)
+  const itemsByIndex: Array<MetadataItem | undefined> = new Array(docIds.length)
   let nextIndex = 0
   const workers = Math.min(METADATA_ROLE_LOOKUP_CONCURRENCY, docIds.length)
   await Promise.all(Array.from({ length: workers }, async () => {
@@ -591,16 +607,33 @@ async function docsMetadataHandler(req: Request, res: Response): Promise<void> {
         createdBy: meta.created_by,
         updatedBy: meta.updated_by,
         updatedAt: meta.updated_at,
+        role: result.guard.role,
+        capabilities: docCapabilitiesFor(result.guard.role, meta, req.uid!, req.principalSpaceId ?? ''),
       }
     }
   }))
-  const items = itemsByIndex.filter(
-    (item): item is { docId: string; createdBy: string; updatedBy: string; updatedAt: Date } => item !== undefined,
-  )
+  const items = itemsByIndex.filter((item): item is MetadataItem => item !== undefined)
   res.status(200).json({ items })
 }
 
 docsRouter.post('/metadata', documentAsync(docsMetadataHandler))
+
+/**
+ * OCTO-456 §4.3 — per-hit index freshness for the front-end badge.
+ *
+ * The enum is ready | processing | failed | unsupported. docs-backend stores NO
+ * per-document indexing state anywhere: the indexer is a separate service
+ * consuming a Kafka change signal and writing OpenSearch, and neither the doc
+ * row nor the OS `_source` carries an index-status column. Any other value here
+ * would be invented, so every hit that OpenSearch actually RETURNED (by
+ * definition it was indexed) is reported `ready`. The other enum members are
+ * reserved for a future indexer-reported state; they are never synthesized.
+ */
+export type SearchIndexStatus = 'ready' | 'processing' | 'failed' | 'unsupported'
+
+export function searchIndexStatus(): SearchIndexStatus {
+  return 'ready'
+}
 
 /**
  * POST /api/v1/docs/search — full-text search with permission down-push (P4).
@@ -710,7 +743,8 @@ export async function searchDocsHandler(req: Request, res: Response) {
   // Hits are already within the visibility constraint and carry their own display
   // metadata from OS _source — no MySQL round-trip, no role (§6.3 response).
   // nextCursor is present only when searchDocs reported a further page; the client
-  // stops paginating as soon as it is absent.
+  // stops paginating as soon as it is absent. `indexStatus` is additive
+  // (OCTO-456 §4.3) and truthful: see searchIndexStatus().
   res.status(200).json({
     total: result.total,
     items: result.items.map((it) => ({
@@ -719,6 +753,7 @@ export async function searchDocsHandler(req: Request, res: Response) {
       docType: it.docType,
       updatedAt: it.updatedAt,
       spaceId: it.spaceId,
+      indexStatus: searchIndexStatus(),
       ...(it.highlight ? { highlight: it.highlight } : {}),
     })),
     ...(result.searchAfter ? { nextCursor: encodeSearchCursor(result.searchAfter) } : {}),
@@ -740,7 +775,7 @@ export async function recordDocViewHandler(req: Request, res: Response) {
   const docId = req.params.docId!
   const guard = await requireDocRole(req, res, docId, 'reader')
   if (!guard) return
-  const viewedAt = await recordVerifiedRecentView({
+  const recorded = await recordVerifiedRecentView({
     scope: req.docSpaceScope ?? { mode: 'human' },
     uid,
     docId,
@@ -748,9 +783,28 @@ export async function recordDocViewHandler(req: Request, res: Response) {
     token: req.octoToken,
     verifiedViewerSpaceId: req.verifiedViewerSpaceId,
   })
+  // OCTO-456 §4.5: mirror a SUCCESSFUL view into Drive's 最近访问 read model.
+  // Fire-and-forget on purpose — the open response must never wait on, or fail
+  // because of, Drive. An unconfigured DRIVE_INTERNAL_URL/TOKEN silently skips.
+  // The recorded viewedAt is forwarded verbatim so both recent lists agree.
+  //
+  // The forwarded principal space MUST be the Space the docs row was actually
+  // written under (`recorded.spaceId`), NOT `req.principalSpaceId`: a human's
+  // identity Space (S1) and the verified viewer Space (X-Space-Id: S2) can
+  // differ, and docs just wrote S2. Using the principal Space would leave S2
+  // missing and insert a phantom record into S1 in Drive's 最近访问.
+  if (recorded) {
+    scheduleDriveViewForward({
+      uid,
+      principalSpaceId: recorded.spaceId,
+      docId: guard.meta.doc_id,
+      spaceId: guard.meta.space_id,
+      viewedAt: recorded.viewedAt,
+    })
+  }
   res
     .status(200)
-    .json(viewedAt ? { ok: true, viewedAt: viewedAt.toISOString() } : { ok: true, recorded: false })
+    .json(recorded ? { ok: true, viewedAt: recorded.viewedAt.toISOString() } : { ok: true, recorded: false })
 }
 
 docsRouter.post('/:docId/view', recordDocViewHandler)
@@ -833,10 +887,14 @@ export async function listManageableHandler(req: Request, res: Response) {
   const uid = req.uid!
   const spaceId = req.spaceId!
   const cursor = typeof req.query.cursor === 'string' ? req.query.cursor : undefined
+  // OCTO-456 §4.4: optional title substring filter (`%q%`, case-insensitive),
+  // ANDed with the existing owner/direct-admin + Space predicates. A blank q is
+  // "no filter", so every pre-existing caller keeps its exact result set.
+  const q = typeof req.query.q === 'string' && req.query.q.trim() !== '' ? req.query.q.trim() : undefined
   const pageSize = Math.min(100, Math.max(1, Number(req.query.page_size ?? 20) || 20))
   let result
   try {
-    result = await docMetaRepo.listManageable({ uid, spaceId, principalSpaceId: req.principalSpaceId!, pageSize, cursor })
+    result = await docMetaRepo.listManageable({ uid, spaceId, principalSpaceId: req.principalSpaceId!, pageSize, cursor, q })
   } catch (err) {
     if (err instanceof Error && err.message === 'invalid_cursor') {
       res.status(400).json({ error: 'invalid_cursor' })
@@ -937,30 +995,201 @@ async function resolveCanonicalDeleteBySlug(req: Request, res: Response): Promis
   return { docId: meta.doc_id, deleted: false }
 }
 
-async function renameDocById(req: Request, res: Response, docId: string): Promise<void> {
-  const guard = await requireDocRole(req, res, docId, 'admin')
-  if (!guard) return
-  const { title } = req.body ?? {}
-  if (typeof title !== 'string' || title === '') {
+/**
+ * Parse and validate the rename title exactly once at the entry point.
+ *
+ * Trimming happens HERE (before any journal/html/doc_meta work): octo-docs-html
+ * TrimSpaces the title, so a raw " New Title " would make the strict response
+ * comparison fail with a permanent 503. Both stores, the journal from/to and the
+ * idempotency key must use the same normalized value.
+ */
+function readRenameTitle(req: Request, res: Response): { ok: true; title: string } | { ok: false } {
+  const rawTitle = (req.body ?? {}).title
+  if (typeof rawTitle !== 'string') {
     res.status(400).json({ error: 'title required' })
-    return
+    return { ok: false }
   }
-  if (title.length > 512) {
+  const title = trimTitleWhitespace(rawTitle)
+  if (title === '') {
+    res.status(400).json({ error: 'title required' })
+    return { ok: false }
+  }
+  // Count Unicode code points (rune), matching the utf8mb4 VARCHAR(512) bound.
+  if (titleRuneLength(title) > 512) {
     res.status(400).json({ error: 'title too long' })
+    return { ok: false }
+  }
+  return { ok: true, title }
+}
+
+/**
+ * Optional §4.8 optimistic lock. Empty/absent means "no check" and preserves the
+ * historical request behavior; a non-string or over-long value is a 400.
+ */
+function readExpectedTitle(req: Request, res: Response): { ok: true; expectedTitle?: string } | { ok: false } {
+  const body = req.body ?? {}
+  // Direct HTTP uses snake_case; the CLI adapter decodes snake_case into
+  // camelCase before the handler runs, so accept both spellings.
+  const raw = body.expected_title !== undefined ? body.expected_title : body.expectedTitle
+  if (raw === undefined || raw === null) return { ok: true }
+  if (typeof raw !== 'string' || titleRuneLength(raw) > 512) {
+    res.status(400).json({ error: 'invalid_expected_title' })
+    return { ok: false }
+  }
+  const expectedTitle = trimTitleWhitespace(raw)
+  return { ok: true, ...(expectedTitle !== '' ? { expectedTitle } : {}) }
+}
+
+async function renameDocById(
+  req: Request,
+  res: Response,
+  docId: string,
+  options: { inactiveAsDocArchived?: boolean } = {},
+): Promise<void> {
+  // READ gate first, then the §4.8 rename rule. The owner branch below means an
+  // html doc's ORIGINAL AUTHOR may rename it even when they are not its admin,
+  // so the historical `requireDocRole(..., 'admin')` gate would 403 exactly the
+  // caller §4.8 wants to allow. Reader is the weakest gate that still proves the
+  // caller may see the doc at all, and it keeps the 404 (missing/deleted) /
+  // 409 (archived) / 403 (no access) semantics byte-identical for everyone else.
+  //
+  // OCTO-456 deleted grey state: the plain PATCH opts into "inactive as
+  // doc_archived" so BOTH a deleted (status=0) and an archived (status=2) doc
+  // answer 409 {error:'doc_archived'} — drive's rename proxy maps that code
+  // verbatim. A deleted doc is disclosed only to a principal that can still
+  // observe it (owner / doc_member / legacy); everyone else keeps the 404.
+  const guard = await requireDocRole(req, res, docId, 'reader', options)
+  if (!guard) return
+  // Defense-in-depth for guards that hand back a non-active row (e.g. a mock or
+  // a future relaxation): never rename anything that is not live.
+  if (guard.meta.status !== 1) {
+    res.status(409).json({ error: 'doc_archived' })
     return
   }
-  if (guard.meta.doc_type === 'html_ppt') {
+  // §4.8: doc/sheet/board/html_ppt => admin; html => admin OR the original
+  // author (doc_meta.owner_id). Shared with the capability projection so the UI
+  // and the enforcement cannot disagree.
+  if (!canRenameOriginal(
+    guard.role,
+    guard.meta.doc_type,
+    guard.meta.owner_id,
+    guard.meta.owner_space_id,
+    req.uid!,
+    req.principalSpaceId ?? '',
+  )) {
+    res.status(403).json({ error: 'forbidden' })
+    return
+  }
+  // Captured BEFORE the update: drive's rename receipt diffs it against the new
+  // title to decide whether it must refresh its snapshot. The html branch replaces
+  // it with the title observed under the rename journal's row lock.
+  let beforeTitle = guard.meta.title ?? ''
+  const parsedTitle = readRenameTitle(req, res)
+  if (!parsedTitle.ok) return
+  const title = parsedTitle.title
+  // §4.8 optimistic lock: optional `expected_title` must still be the current
+  // title when the write actually happens (under its row lock). Absent keeps the
+  // old behavior unchanged.
+  const parsedExpected = readExpectedTitle(req, res)
+  if (!parsedExpected.ok) return
+  const expectedTitle = parsedExpected.expectedTitle
+  // §4.8 html 改名是**两步**:先让 octo-docs-html 重新 publish 新版本(version+1,
+  // 它渲染标题读的是自己那份),成功后才写 doc_meta。renameHtmlDoc 用持久化的
+  // doc_rename_operation journal 串行化同一文档的改名,并让重试复用同一个 op id
+  // (即 html 的 idempotency_key):
+  //   · 同一次逻辑改名的重试(本地写失败/响应丢失) → 同一 id → html 返回同一版本;
+  //   · 新的一次改名(含 A→B→A→B) → 新 id → html 真实 +1;
+  //   · 并发不同目标 → pending 检测 → 409 rename_in_progress,不会反向提交。
+  //
+  // 触发条件严格限定 `doc_type === 'html'` + 有 slug:html_ppt 有 PPT 服务自己的
+  // 约定(走下面 editPptLive),doc/sheet/board 完全没有这个上游,流程必须一字不变。
+  // slug 为空的 html 行(历史旁路数据)没有可发布的版本,保持原行为。
+  const htmlSlug = guard.meta.octo_doc_slug
+  if (guard.meta.doc_type === 'html' && typeof htmlSlug === 'string' && htmlSlug !== '') {
+    const outcome = await renameHtmlDoc({
+      docId: guard.meta.doc_id,
+      docSpaceId: guard.meta.space_id,
+      uid: req.uid!,
+      principalSpaceId: req.principalSpaceId ?? null,
+      mode: req.docSpaceScope?.mode ?? 'human',
+      expectedEpoch: Number(guard.meta.permission_epoch),
+      slug: htmlSlug,
+      title,
+      ...(expectedTitle !== undefined ? { expectedTitle } : {}),
+    })
+    if (!outcome.ok) {
+      res.status(outcome.status).json({
+        error: outcome.error,
+        // 409 rename_recovery_required: tell the caller which remote title the
+        // document actually has, so they can finish that rename first.
+        ...(outcome.pendingTitle !== undefined ? { pendingTitle: outcome.pendingTitle } : {}),
+        // 409 title_changed: the authoritative title observed under the lock.
+        ...(outcome.currentTitle !== undefined ? { currentTitle: outcome.currentTitle } : {}),
+        ...(outcome.version !== undefined ? { version: outcome.version } : {}),
+      })
+      return
+    }
+    beforeTitle = outcome.beforeTitle
+    if (outcome.alreadyApplied) {
+      // 当前标题已经等于请求值(响应丢失后的重试/重复提交),或者这个 op 早已
+      // 完成(延迟到达的重复请求,期间可能已被后续改名移走):200 且不再发版。
+      // 标题用 outcome.title —— 延迟重复时它是 doc_meta 的当前值,不是请求值。
+      res.status(200).json({ docId: guard.meta.doc_id, title: outcome.title, beforeTitle })
+      return
+    }
+    // version 只落内部日志:响应体形状是 drive rename receipt 的合同
+    // ({docId,title,beforeTitle}),不在这里扩张。
+    // eslint-disable-next-line no-console
+    console.log('[octo-docs] html republished before rename', {
+      docId: guard.meta.doc_id,
+      slug: htmlSlug,
+      version: outcome.version,
+    })
+  } else if (guard.meta.doc_type === 'html_ppt') {
     const spaceId = await resolveRequestPrincipalSpace(req)
     if (!spaceId) { res.status(403).json({ error: 'principal_space_unverified' }); return }
     try {
       await editPptLive({ docId: guard.meta.doc_id, uid: req.uid!, spaceId, authorizedEpoch: Number(guard.meta.permission_epoch),
-        isBot: req.docSpaceScope?.mode === 'bot' }, { title })
+        isBot: req.docSpaceScope?.mode === 'bot' },
+        { title, ...(expectedTitle !== undefined ? { expectedTitle } : {}) })
     } catch (error) {
-      if (error instanceof PptApiError) { res.status(error.httpStatus).json({ error: error.code.toLowerCase(), message: error.message }); return }
+      if (error instanceof PptApiError) {
+        // §4.8 optimistic-lock refusal from the PPT write transaction: keep the
+        // docs-rename wire shape (bare {error,currentTitle}), not the PPT enum.
+        const details = error.details as { reason?: unknown; currentTitle?: unknown } | undefined
+        if (error.code === 'CONFLICT' && details?.reason === 'title_changed') {
+          res.status(409).json({
+            error: 'title_changed',
+            currentTitle: typeof details.currentTitle === 'string' ? details.currentTitle : '',
+          })
+          return
+        }
+        res.status(error.httpStatus).json({ error: error.code.toLowerCase(), message: error.message })
+        return
+      }
       throw error
     }
   } else if (req.docSpaceScope?.mode === 'cli') {
-    await renameCliDoc(req, guard.meta, title)
+    const renamed = await renameCliDoc(req, guard.meta, title, expectedTitle)
+    if (!renamed.ok) {
+      res.status(409).json({ error: 'title_changed', currentTitle: renamed.currentTitle })
+      return
+    }
+  } else if (expectedTitle !== undefined) {
+    // doc/sheet/board (and html without a slug) have no upstream: one transaction
+    // locks the row, compares expected_title and writes, so two callers that both
+    // expect A cannot both overwrite.
+    const renamed = await docMetaRepo.renameWithExpectedTitle({
+      docId, title, updatedBy: req.uid!, expectedTitle,
+    })
+    if (!renamed.ok) {
+      if (renamed.reason === 'not_found') {
+        res.status(404).json({ error: 'not_found' })
+        return
+      }
+      res.status(409).json({ error: 'title_changed', currentTitle: renamed.currentTitle })
+      return
+    }
   } else {
     await docMetaRepo.rename(docId, title, req.uid!)
   }
@@ -978,7 +1207,10 @@ async function renameDocById(req: Request, res: Response, docId: string): Promis
       void enqueueDocIndex(documentName)
     }
   }
-  res.status(200).json({ docId, title })
+  // Canonical id (not the raw path param) + the pre-change title: drive's
+  // internal/docsapi/rename.go reads {docId, title, beforeTitle}. Additive —
+  // existing callers read the same docId/title fields as before.
+  res.status(200).json({ docId: guard.meta.doc_id, title, beforeTitle })
 }
 
 function requireHumanDocDeletion(req: Request, res: Response): boolean {
@@ -1001,9 +1233,68 @@ async function deleteDocById(req: Request, res: Response, docId: string): Promis
   res.status(200).json({ docId, status: 'deleted' })
 }
 
+/**
+ * Bot-only PATCH /octo-doc/:slug.
+ *
+ * Two distinct callers share the slug surface:
+ *   · octo-docs-html, immediately AFTER it has already published a new version,
+ *     reports the rendered title. That callback must converge doc_meta only — it
+ *     must never re-enter the rename journal, or every publish would mint yet
+ *     another html version;
+ *   · nothing else in production: humans rename through the canonical docId
+ *     route (see DocumentResourceRouter).
+ *
+ * The callback therefore takes a dedicated metadata-only path after the same
+ * verified Bot authentication + slug resolution, and validates the published
+ * identity under its own row lock.
+ */
+async function applyHtmlPublishTitleHandler(req: Request, res: Response, docId: string): Promise<void> {
+  const guard = await requireDocRole(req, res, docId, 'reader')
+  if (!guard) return
+  const parsedTitle = readRenameTitle(req, res)
+  if (!parsedTitle.ok) return
+  const parsedExpected = readExpectedTitle(req, res)
+  if (!parsedExpected.ok) return
+  const outcome = await applyHtmlPublishTitle({
+    docId: guard.meta.doc_id,
+    slug: req.params.octoDocSlug!,
+    spaceId: guard.meta.space_id,
+    uid: req.uid!,
+    botOwnerUid: req.botOwnerUid,
+    title: parsedTitle.title,
+    expectedTitle: parsedExpected.expectedTitle,
+    version: Number((req.body ?? {}).version ?? (req.body ?? {}).publish_version ?? 0),
+    // Preferred ordering key: distinguishes two titles published under the same
+    // content version (explicit republish), which the version watermark cannot.
+    publishSeq: Number((req.body ?? {}).publish_seq ?? 0),
+  })
+  if (!outcome.ok) {
+    res.status(outcome.status).json({
+      error: outcome.error,
+      ...(outcome.currentTitle !== undefined ? { currentTitle: outcome.currentTitle } : {}),
+    })
+    return
+  }
+  if (outcome.changed && config.search.indexEnabled) {
+    const documentName = await docMetaRepo.resolveDocumentName(guard.meta.doc_id)
+    if (documentName && isSearchIndexedDoc(documentName)) {
+      void enqueueDocIndex(documentName)
+    }
+  }
+  res.status(200).json({
+    docId: guard.meta.doc_id,
+    title: outcome.title,
+    beforeTitle: outcome.beforeTitle,
+  })
+}
+
 export async function octoDocRenameHandler(req: Request, res: Response): Promise<void> {
   const docId = await resolveDocIdBySlug(req, res)
   if (!docId) return
+  if (req.docSpaceScope?.mode === 'bot') {
+    await applyHtmlPublishTitleHandler(req, res, docId)
+    return
+  }
   await renameDocById(req, res, docId)
 }
 
@@ -1020,7 +1311,7 @@ export async function octoDocDeleteHandler(req: Request, res: Response): Promise
 
 /** PATCH /api/v1/docs/{docId} — rename (needs admin). */
 export async function renameDocHandler(req: Request, res: Response): Promise<void> {
-  await renameDocById(req, res, req.params.docId!)
+  await renameDocById(req, res, req.params.docId!, { inactiveAsDocArchived: true })
 }
 
 /** DELETE /api/v1/docs/{docId} — soft delete (needs admin). */
