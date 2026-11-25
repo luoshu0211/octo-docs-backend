@@ -3,7 +3,8 @@
  * Mounted under /api/v1/docs.
  */
 import { Router, type Router as ExpressRouter, type Request, type Response } from 'express'
-import { docMetaRepo } from '../../db/repos/docMetaRepo.js'
+import { docMetaRepo, type DocMeta } from '../../db/repos/docMetaRepo.js'
+import { transaction, type Tx } from '../../db/pool.js'
 import {
   CanonicalHtmlArchivedError,
   CanonicalHtmlDeletedError,
@@ -189,7 +190,16 @@ export async function createDocHandler(req: Request, res: Response) {
     return
   }
   if (resolvedDocType === HTML_DOC_TYPE) {
-    if (!req.botToken) {
+    if (req.docSpaceScope?.mode === 'cli') {
+      // Go's Unicode whitespace includes NEL; ECMAScript whitespace includes BOM.
+      if (typeof idempotencyKey === 'string' && /^[\s\u0085]|[\s\u0085]$/u.test(idempotencyKey)) {
+        throw new CliError('VALIDATION_ERROR')
+      }
+      // The CLI middleware supplies the owner and Space for both HTML modes.
+      if (['owner', 'ownerId', 'ownerSpaceId', 'spaceId', 'publisherUid', 'uid', 'slug', 'docId'].some(
+        key => Object.hasOwn(req.body, key),
+      )) throw new CliError('VALIDATION_ERROR')
+    } else if (!req.botToken) {
       res.status(400).json({ error: 'html registration requires bot mount' })
       return
     }
@@ -251,18 +261,26 @@ export async function createDocHandler(req: Request, res: Response) {
   }
   if (resolvedDocType === HTML_DOC_TYPE) {
     try {
-      writeResult = normalizedIdempotencyKey !== undefined
-        ? await docMetaRepo.createCanonicalHtml({
+      if (normalizedIdempotencyKey !== undefined) {
+        writeResult = await docMetaRepo.createCanonicalHtml({
           ...createInput,
           octoDocSlug: docId,
           idempotencyKey: normalizedIdempotencyKey,
           humanOwnerUid: req.botOwnerUid,
         })
-        : await docMetaRepo.upsertHtmlByOctoDocSlug({
+      } else if (req.docSpaceScope?.mode === 'cli') {
+        // A supplied handle may be HTML-owned content without a Docs registration.
+        // Only the HTML service can vouch for its owner on first registration.
+        const meta = await docMetaRepo.updateOwnedHtmlBySlug(octoDocSlug, spaceId, uid, typeof title === 'string' ? title : undefined)
+        if (!meta) throw new CliError('NOT_FOUND')
+        writeResult = { meta, created: false }
+      } else {
+        writeResult = await docMetaRepo.upsertHtmlByOctoDocSlug({
           ...createInput,
           octoDocSlug,
           humanOwnerUid: req.botOwnerUid,
         })
+      }
     } catch (err) {
       if (err instanceof CanonicalHtmlDeletedError) {
         res.status(410).json({ error: 'canonical_document_deleted' })
@@ -354,14 +372,16 @@ export async function createDocHandler(req: Request, res: Response) {
 // See api/middleware/spaceContext.ts for why this is per-route, not global.
 docsRouter.post('/', requireSpaceMembership, documentAsync(createDocHandler))
 
-/** Notify the backend after HTML content is durably published. */
-export async function publishHtmlHandler(req: Request, res: Response) {
-  if (req.botToken === undefined) {
-    res.status(403).json({ error: 'forbidden' })
+async function prepareHtmlPublication(req: Request, res: Response, tx?: Tx) {
+  const docId = req.params.docId!
+  const meta = tx
+    ? (await tx.query<DocMeta>('SELECT * FROM doc_meta WHERE doc_id = ? FOR UPDATE', [docId]))[0]
+    : await docMetaRepo.getByDocId(docId)
+  if (!meta || meta.space_id !== req.spaceId) {
+    res.status(404).json({ error: 'not_found' })
     return
   }
-  const meta = await docMetaRepo.getByDocId(req.params.docId!)
-  if (!meta || meta.space_id !== req.spaceId) {
+  if (tx && (meta.owner_space_id !== req.principalSpaceId || meta.owner_id !== req.uid)) {
     res.status(404).json({ error: 'not_found' })
     return
   }
@@ -382,12 +402,30 @@ export async function publishHtmlHandler(req: Request, res: Response) {
     res.status(400).json({ error: typeof title === 'string' ? 'title too long' : 'invalid_title' })
     return
   }
-  if (typeof title === 'string') await docMetaRepo.rename(meta.doc_id, title, req.uid!)
+  if (typeof title === 'string') {
+    if (tx) await docMetaRepo.rename(meta.doc_id, title, req.uid!, tx)
+    else await docMetaRepo.rename(meta.doc_id, title, req.uid!)
+  }
+  return { meta, title: typeof title === 'string' ? title : meta.title }
+}
+
+/** Notify the backend after HTML content is durably published. */
+export async function publishHtmlHandler(req: Request, res: Response) {
+  const cli = req.docSpaceScope?.mode === 'cli'
+  if (!cli && req.botToken === undefined) {
+    res.status(403).json({ error: 'forbidden' })
+    return
+  }
+  const prepared = cli
+    ? await transaction(tx => prepareHtmlPublication(req, res, tx))
+    : await prepareHtmlPublication(req, res)
+  if (!prepared) return
+  const { meta, title } = prepared
   let indexed = false
   if (config.search.indexEnabled && isSearchIndexedDoc(meta.document_name)) {
     indexed = await enqueueDocIndex(meta.document_name)
   }
-  res.status(200).json({ docId: meta.doc_id, title: typeof title === 'string' ? title : meta.title, indexed })
+  res.status(200).json({ docId: meta.doc_id, title, indexed })
 }
 
 docsRouter.post('/:docId/published', publishHtmlHandler)

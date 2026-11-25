@@ -6,6 +6,7 @@ export type DocsOperation = readonly [
 
 export const docsOperations: readonly DocsOperation[] = [
   ["post", "/docs", "docs.documents:write", "docs.create", "create", "/", undefined, undefined],
+  ["post", "/docs/:doc_id/published", "docs.documents:write", "docs.html.published", "docs", "/:docId/published", { docId: "doc_id" }],
   ["post", "/docs/_search", "docs.documents:read", "docs.search", "search", "/search", undefined, undefined],
   ["post", "/docs/_metadata", "docs.documents:read", "docs.metadata.get", "docs", "/metadata"],
   ["patch", "/docs/:doc_id", "docs.documents:write", "docs.rename", "docs", "/:docId", { docId: "doc_id" }, undefined],

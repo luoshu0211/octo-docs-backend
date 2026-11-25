@@ -121,7 +121,11 @@ function responseAdapter(res: Response, id: string) {
     const body = plainObject(value) ? value : {}
     if (res.statusCode >= 400) {
       if (plainObject(body.error) && typeof body.error.code === 'string') return jsonResponse(value)
-      const error = errorForStatus(res.statusCode, body)
+      // The owner-scoped HTML operations distinguish a consumed key on retry.
+      const error = res.statusCode === 410 && body.error === 'canonical_document_deleted' &&
+        (id === 'docs.create' || id === 'docs.html.published')
+        ? new CliError('NOT_FOUND', { reason: 'canonical_document_deleted' })
+        : errorForStatus(res.statusCode, body)
       return jsonResponse.call(res.status(error.status), error.envelope)
     }
     let data: unknown = value
