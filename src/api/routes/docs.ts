@@ -1759,6 +1759,10 @@ documentResourceRouter.put('/:docId/share', putShareHandler)
 // `/octo-doc/:slug` is intentionally bot-only on `docsRouter`: a slug is unique
 // only within a server-resolved Bot Space and cannot be made docId-first safely
 // on the human mount. Humans rename/delete through canonical `/:docId` routes.
+// §4.4 复制: the human chain mounts single-document operations on THIS router,
+// so the duplicate entry point must live here too (the bot mount keeps the one
+// on `docsRouter`). Same handler, same requireDocRole('reader') gate.
+documentResourceRouter.post('/:docId/duplicate', documentAsync(duplicateDocHandler))
 documentResourceRouter.get('/:docId', getDocHandler)
 documentResourceRouter.patch('/:docId', renameDocHandler)
 documentResourceRouter.delete('/:docId', deleteDocHandler)
