@@ -14,6 +14,7 @@ import {
 import { documentAsync } from '../services/documentRoute.js'
 import { createDocument } from '../services/createDocument.js'
 import { createPptDocument } from '../ppt/docs.js'
+import { yjsDocumentRepo } from '../../db/repos/yjsDocumentRepo.js'
 import { docViewHistoryRepo } from '../../db/repos/docViewHistoryRepo.js'
 import { normalizeTypeFilter, isDocType, HTML_DOC_TYPE, HTML_PPT_DOC_TYPE } from '../../db/docType.js'
 import { buildDocumentName, buildHtmlDocumentName, DocumentNameError } from '../../permission/documentName.js'
@@ -434,6 +435,120 @@ export async function publishHtmlHandler(req: Request, res: Response) {
 }
 
 docsRouter.post('/:docId/published', publishHtmlHandler)
+
+/**
+ * POST /api/v1/docs/{docId}/duplicate — mint an INDEPENDENT copy of a document
+ * (§4.4 复制：「复制」产生新的 docId，与原文档后续修改互不影响).
+ *
+ * This is the deep-copy primitive the Drive "复制到" flow calls. It is NOT a
+ * second mount of the source doc: the duplicate gets its own `doc_id`, its own
+ * `document_name`, its own `yjs_document` row and its own ACL (the caller owns
+ * it; the source's `doc_member` rows are NOT copied, so a copy never silently
+ * re-grants anyone).
+ *
+ * Authorization: `reader` on the source (mirrors "可读即可复制" at the docs
+ * layer — the source directory's edit right and the target library's write
+ * right are Drive-side concerns and are checked there before this call).
+ *
+ * Only the Yjs-backed kinds (`doc` / `sheet` / `board`) can be duplicated here:
+ * their whole body IS the `yjs_document` row, so copying that row yields a
+ * faithful independent document. `html` (body lives in octo-doc) and `html_ppt`
+ * (Bento) own their bodies in sibling services and answer 422 until those expose
+ * a copy of their own.
+ *
+ * Body (all optional):
+ *   - title:    the copy's title. Defaults to `${source.title}-副本`.
+ *   - spaceId:  must equal the source document's space when present. The copy
+ *               stays in the document's home space; moving it between *Drive*
+ *               libraries is the mount layer's job, not the doc's.
+ */
+export async function duplicateDocHandler(req: Request, res: Response) {
+  const sourceDocId = req.params.docId!
+  const guard = await requireDocRole(req, res, sourceDocId, 'reader')
+  if (!guard) return
+  const { meta } = guard
+  const uid = req.uid!
+  const body = (req.body ?? {}) as { title?: unknown; spaceId?: unknown }
+
+  if (meta.doc_type === HTML_DOC_TYPE || meta.doc_type === HTML_PPT_DOC_TYPE) {
+    res.status(422).json({ error: 'unsupported_document_type' })
+    return
+  }
+  if (typeof body.spaceId === 'string' && body.spaceId !== '' && body.spaceId !== meta.space_id) {
+    res.status(400).json({ error: 'space_mismatch' })
+    return
+  }
+  const requestedTitle = typeof body.title === 'string' ? body.title.trim() : ''
+  if (requestedTitle.length > 512) {
+    res.status(400).json({ error: 'title too long' })
+    return
+  }
+  const title = requestedTitle !== '' ? requestedTitle : `${meta.title}-副本`
+
+  const docId = newDocId()
+  let documentName: string
+  try {
+    documentName = buildCreatedDocumentName(meta.space_id, meta.folder_id, docId, meta.doc_type)
+  } catch (err) {
+    if (err instanceof DocumentNameError || err instanceof WhiteboardNameError) {
+      res.status(400).json({ error: err.message })
+      return
+    }
+    throw err
+  }
+
+  // Read BEFORE opening the tx: a source that was never opened or stored has no
+  // yjs_document row (persistence only materialises on first store), and the
+  // duplicate then legitimately starts empty — exactly like a fresh doc.
+  const sourceState = await yjsDocumentRepo.fetchState(meta.document_name)
+
+  await transaction(async (tx) => {
+    await docMetaRepo.createTx(tx, {
+      docId,
+      documentName,
+      title,
+      ownerId: uid,
+      spaceId: meta.space_id,
+      folderId: meta.folder_id,
+      docType: meta.doc_type,
+      createdBy: uid,
+    })
+    if (sourceState && sourceState.state.length > 0) {
+      // fetchState already decoded the storage encoding, so re-encode on write
+      // with the SAME generation: a copy must be byte-compatible with how the
+      // source is read today, not silently downgraded to the current default.
+      await yjsDocumentRepo.upsertStateTx(
+        tx,
+        documentName,
+        Buffer.from(sourceState.state),
+        sourceState.encoding,
+      )
+    }
+  })
+
+  // The body was copied behind the collab server's back, so its afterStoreDocument
+  // index feed will not fire for this documentName. Enqueue it exactly like the
+  // html registration path does. Best-effort: the queue swallows its own errors.
+  if (config.search.indexEnabled && isSearchIndexedDoc(documentName)) {
+    void enqueueDocIndex(documentName)
+  }
+
+  const created = await docMetaRepo.getByDocId(docId)
+  res.status(201).json({
+    docId,
+    documentName,
+    title,
+    spaceId: meta.space_id,
+    folderId: meta.folder_id,
+    ownerId: uid,
+    docType: meta.doc_type,
+    role: 'admin',
+    createdAt: created?.created_at,
+    shareUrl: buildDocShareUrl(config.webOrigin, docId, meta.space_id),
+  })
+}
+
+docsRouter.post('/:docId/duplicate', documentAsync(duplicateDocHandler))
 
 /** GET /api/v1/docs/{docId} — fetch one doc's metadata (needs reader). */
 export async function getDocHandler(req: Request, res: Response) {
