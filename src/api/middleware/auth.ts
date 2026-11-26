@@ -52,7 +52,14 @@ export function extractOctoToken(req: Request): string {
 export async function authMiddleware(req: Request, res: Response, next: NextFunction): Promise<void> {
   const token = extractOctoToken(req)
   if (token.startsWith('uk_')) {
-    if (!(req.method === 'POST' && /^\/metadata\/?$/i.test(req.path))) {
+    // Native user API keys are deliberately narrow: the docs metadata endpoint
+    // (drive's ids-only lookup) and the copy primitive drive calls on the
+    // user's behalf. Everything else keeps session-token authentication.
+    // `req.path` is router-relative here, so the copy route mounted at
+    // `/:docId/duplicate` appears as `/<docId>/duplicate`.
+    const allowed = req.method === 'POST'
+      && (/^\/metadata\/?$/i.test(req.path) || /^\/[^/]+\/duplicate\/?$/i.test(req.path))
+    if (!allowed) {
       res.status(401).json({ error: 'unauthorized' })
       return
     }

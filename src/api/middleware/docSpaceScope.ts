@@ -45,6 +45,16 @@ export function humanDocSpaceScopeMiddleware(req: Request, _res: Response, next:
   const raw = req.header('X-Space-Id')
   const viewer = typeof raw === 'string' ? raw.trim() : ''
   if (viewer !== '') req.viewerSpaceId = viewer
+  // Native API-key requests (uk_) carry NO X-Space-Id requirement: authMiddleware
+  // has already pinned their identity Space server-side into
+  // `verifiedViewerSpaceId`. Mirror spaceContextMiddleware's documented
+  // api-key rule by adopting that proof as the current Space, so an allowed
+  // uk_ route that locates a doc by id (POST /:docId/duplicate) can verify the
+  // caller instead of failing with `space_required`. Human session requests
+  // never have this field set, so their behaviour is unchanged.
+  else if (req.verifiedViewerSpaceId !== undefined && req.verifiedViewerSpaceId !== '') {
+    req.viewerSpaceId = req.verifiedViewerSpaceId
+  }
   next()
 }
 

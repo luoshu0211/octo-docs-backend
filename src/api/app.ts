@@ -81,6 +81,7 @@ import { docsTrashRouter } from './routes/docsTrash.js'
 import { internalHtmlRegistrationRouter } from './routes/internalHtmlRegistration.js'
 import { createInternalDocRoleRouter } from './routes/internalDocRole.js'
 import { createInternalDocsLibraryRouter } from './routes/internalDocsLibrary.js'
+import { createInternalDocsCopyCompensationRouter } from './routes/internalDocsCopyCompensation.js'
 import { createInternalDocsUnreadRouter } from './routes/internalDocsUnread.js'
 import { internalSourceInvalidationsRouter } from './routes/internalSourceInvalidations.js'
 import { membersRouter } from './routes/members.js'
@@ -377,6 +378,10 @@ export function createApp(
   // never consume the library budget and vice versa.
   if (serveInternal) {
     app.use('/internal/docs', createInternalDocsLibraryRouter(createRateLimiter(opts.rateLimit)))
+    // §4.4 copy compensation: drive discards a copy it could not link. Separate
+    // router so its 8 KiB body limit and route-scoped limiter stay independent of
+    // the batch library routes.
+    app.use('/internal/docs', createInternalDocsCopyCompensationRouter(createRateLimiter(opts.rateLimit)))
     // OCTO-456 P0: batch "member-added unread" lookup backing drive's
     // `unread_only`. Same prefix, own route-scoped limiter so the three internal
     // surfaces never spend each other's budget.

@@ -11,9 +11,21 @@ import {
   CanonicalHtmlLegacyConflictError,
   DocOwnershipError,
 } from '../../db/repos/docMetaRepo.js'
+import * as Y from 'yjs'
 import { documentAsync } from '../services/documentRoute.js'
 import { createDocument } from '../services/createDocument.js'
 import { createPptDocument } from '../ppt/docs.js'
+import { duplicateHtmlDoc } from '../services/htmlDuplicate.js'
+import { purgeHtmlDocument } from '../services/htmlPurge.js'
+import { signDiscardToken } from '../services/discardToken.js'
+import {
+  cleanupCopiedAttachments,
+  collectReferencedAttachIds,
+  copyReferencedAttachments,
+  isEffectivelyEmptyYjsUpdate,
+} from '../services/duplicateAttachments.js'
+import { yjsDocumentRepo } from '../../db/repos/yjsDocumentRepo.js'
+import { readLiveDocState } from '../../collab/liveDocRead.js'
 import { docViewHistoryRepo } from '../../db/repos/docViewHistoryRepo.js'
 import { normalizeTypeFilter, isDocType, HTML_DOC_TYPE, HTML_PPT_DOC_TYPE } from '../../db/docType.js'
 import { buildDocumentName, buildHtmlDocumentName, DocumentNameError } from '../../permission/documentName.js'
@@ -434,6 +446,324 @@ export async function publishHtmlHandler(req: Request, res: Response) {
 }
 
 docsRouter.post('/:docId/published', publishHtmlHandler)
+
+/**
+ * POST /api/v1/docs/{docId}/duplicate — mint an INDEPENDENT copy of a document
+ * (§4.4 复制：「复制」产生新的 docId，与原文档后续修改互不影响).
+ *
+ * This is the deep-copy primitive the Drive "复制到" flow calls. It is NOT a
+ * second mount of the source doc: the duplicate gets its own `doc_id`, its own
+ * `document_name`, its own `yjs_document` row and its own ACL (the caller owns
+ * it; the source's `doc_member` rows are NOT copied, so a copy never silently
+ * re-grants anyone).
+ *
+ * Authorization: `reader` on the source (mirrors "可读即可复制" at the docs
+ * layer — the source directory's edit right and the target library's write
+ * right are Drive-side concerns and are checked there before this call).
+ *
+ * Only the Yjs-backed kinds (`doc` / `sheet` / `board`) can be duplicated here:
+ * their whole body IS the `yjs_document` row, so copying that row yields a
+ * faithful independent document. `html` (body lives in octo-doc) and `html_ppt`
+ * (Bento) own their bodies in sibling services and answer 422 until those expose
+ * a copy of their own.
+ *
+ * Body (all optional):
+ *   - title:    the copy's title. Defaults to `${source.title}-副本`.
+ *   - spaceId:  must equal the source document's space when present. The copy
+ *               stays in the document's home space; moving it between *Drive*
+ *               libraries is the mount layer's job, not the doc's.
+ */
+/**
+ * Read the copy source body: prefer the LIVE collab state (Hocuspocus writes the
+ * persistence row with a 2s debounce / 10s ceiling, so the row can lag the
+ * document a user just edited), and fall back to the persisted row when no collab
+ * server is running in this process (CLI/test deployments, migrate-only pods).
+ * The fallback is what keeps a copy correct-albeit-possibly-stale instead of
+ * turning into a 500.
+ */
+/**
+ * Decide what the copy stores and which attachments it carries.
+ *
+ * A body that cannot be decoded (corrupt/garbage state, or a fixture written
+ * before the lib0 encoder) must never fail the copy: the document is still
+ * copyable byte-for-byte, it simply cannot reference attachments we could map.
+ * So a decode error degrades to a verbatim copy instead of a 500.
+ */
+async function planCopyBody(
+  state: Uint8Array,
+  sourceDocId: string,
+  targetDocId: string,
+  uid: string,
+): Promise<{ state: Uint8Array; copied: Array<{ attachId: string }> }> {
+  // ONLY the decode is best-effort. A body we cannot parse cannot name
+  // attachments we could map, so a verbatim copy is still correct.
+  let referenced: string[]
+  try {
+    referenced = isEffectivelyEmptyYjsUpdate(state) ? [] : collectReferencedAttachIds(state)
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn('[octo-docs] duplicate: body could not be decoded, copying verbatim', {
+      sourceDocId,
+      error: err instanceof Error ? err.message : String(err),
+    })
+    return { state, copied: [] }
+  }
+  if (referenced.length === 0) {
+    return { state, copied: [] }
+  }
+  // Attachment bytes/rows are part of the copy: if any read, write or registry
+  // insert fails, the whole copy fails. Returning "success" with the source's
+  // attachIds would hand the reader a document whose images 404 forever.
+  return copyReferencedAttachments({ state, sourceDocId, targetDocId, uid })
+}
+
+async function readCopySourceState(documentName: string): Promise<Uint8Array> {
+  try {
+    return await readLiveDocState(documentName)
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn('[octo-docs] duplicate: live state unavailable, falling back to persisted state', {
+      documentName,
+      error: err instanceof Error ? err.message : String(err),
+    })
+    const stored = await yjsDocumentRepo.fetchState(documentName)
+    if (!stored) return new Uint8Array([0, 0])
+    // fetchState already decoded the storage encoding, so re-encode with the
+    // same generation: the copy must be readable exactly like the source is.
+    if (stored.encoding === 2) {
+      // Convert the persisted v2 update back to a v1 update: everything
+      // downstream (attachment scan/remap, emptiness probe) speaks lib0 v1, and
+      // a v2 blob handed to a v1 decoder reads as an empty document.
+      const doc = new Y.Doc()
+      Y.applyUpdateV2(doc, stored.state)
+      return Y.encodeStateAsUpdate(doc)
+    }
+    return stored.state
+  }
+}
+
+export async function duplicateDocHandler(req: Request, res: Response) {
+  const sourceDocId = req.params.docId!
+  const guard = await requireDocRole(req, res, sourceDocId, 'reader')
+  if (!guard) return
+  const { meta } = guard
+  const uid = req.uid!
+  const body = (req.body ?? {}) as { title?: unknown; spaceId?: unknown }
+
+  if (meta.doc_type === HTML_PPT_DOC_TYPE) {
+    res.status(422).json({ error: 'unsupported_document_type' })
+    return
+  }
+  if (typeof body.spaceId === 'string' && body.spaceId !== '' && body.spaceId !== meta.space_id) {
+    res.status(400).json({ error: 'space_mismatch' })
+    return
+  }
+  const requestedTitle = typeof body.title === 'string' ? body.title.trim() : ''
+  if (requestedTitle.length > 512) {
+    res.status(400).json({ error: 'title too long' })
+    return
+  }
+  const title = requestedTitle !== '' ? requestedTitle : `${meta.title}-副本`
+  // P1-1 (cross-Space copy): keep the two Space concepts apart.
+  //   · spaceId      — the document's HOME space (doc_meta.space_id and the
+  //                    documentName segment). A copy stays in the source's home
+  //                    space; moving it between Drive libraries is the mount
+  //                    layer's job.
+  //   · ownerSpaceId — the CALLER's server-verified principal Space. This is
+  //                    the same value the doc guard just authorized with
+  //                    (resolveRequestPrincipalSpace / authMiddleware for uk_
+  //                    keys / createCliV2Router for CLI). Owner authority is
+  //                    keyed on (owner_id, owner_space_id), so registering the
+  //                    source space here would leave the copier unable to
+  //                    manage the copy from their own identity space.
+  // requireDocRole() only returns after that principal Space was resolved, so
+  // it is non-empty on every path that reaches this point.
+  const ownerSpaceId = req.principalSpaceId!
+
+  // html (§4.4: 「在线 HTML 等已存在且可读的在线文档沿用此复制规则」): the body
+  // lives in octo-docs-html, so the copy is one internal call that writes the
+  // latest published version + assets under the new slug this handler mints.
+  // docs-backend then owns the doc_meta row, exactly like its internal html
+  // registration path — no second round trip back into this service.
+  if (meta.doc_type === HTML_DOC_TYPE) {
+    const sourceSlug = (meta.octo_doc_slug ?? '').trim()
+    if (sourceSlug === '') {
+      // A legacy/unregistered html row has no content pointer to copy.
+      res.status(409).json({ error: 'html_document_unregistered' })
+      return
+    }
+    const htmlDocId = newDocId()
+    const copied = await duplicateHtmlDoc({
+      sourceSlug,
+      sourceDocId: meta.doc_id,
+      sourceSpaceId: meta.space_id,
+      targetSlug: htmlDocId,
+      title,
+      spaceId: meta.space_id,
+      ownerUid: uid,
+    })
+    if (!copied.ok) {
+      if (copied.reason === 'not_found') {
+        res.status(404).json({ error: 'not_found' })
+      } else if (copied.reason === 'conflict') {
+        res.status(409).json({ error: 'copy_conflict' })
+      } else {
+        res.status(503).json({ error: 'copy_unavailable' })
+      }
+      return
+    }
+    let htmlDocumentName: string
+    try {
+      htmlDocumentName = buildCreatedDocumentName(meta.space_id, meta.folder_id, htmlDocId, HTML_DOC_TYPE)
+    } catch (err) {
+      if (err instanceof DocumentNameError) {
+        res.status(400).json({ error: err.message })
+        return
+      }
+      throw err
+    }
+    try {
+      await docMetaRepo.create({
+        docId: htmlDocId,
+        documentName: htmlDocumentName,
+        title,
+        ownerId: uid,
+        spaceId: meta.space_id,
+        ownerSpaceId,
+        folderId: meta.folder_id,
+        docType: HTML_DOC_TYPE,
+        octoDocSlug: htmlDocId,
+        createdBy: uid,
+      })
+    } catch (err) {
+      // P2-1: the html copy already exists remote-side, but docs has no doc_meta
+      // row for it. Leaving it behind would leak content + assets that no
+      // client can ever see or delete, and a retry would mint yet another slug.
+      // Compensate through the EXISTING html internal purge contract
+      // (POST /internal/html/purge — the same endpoint OCD-456 full deletion
+      // uses), then rethrow the ORIGINAL error so the caller still sees the
+      // failure. Cleanup is best-effort: its failure is logged, never allowed
+      // to mask the registration error.
+      const cleanup = await purgeHtmlDocument(htmlDocId, htmlDocId, meta.space_id)
+      if (!cleanup.ok) {
+        // eslint-disable-next-line no-console
+        console.warn('[octo-docs] html duplicate cleanup failed after doc_meta error', {
+          docId: htmlDocId,
+          reason: cleanup.reason,
+          ...(cleanup.status === undefined ? {} : { status: cleanup.status }),
+        })
+      }
+      throw err
+    }
+    if (config.search.indexEnabled && isSearchIndexedDoc(htmlDocumentName)) {
+      void enqueueDocIndex(htmlDocumentName)
+    }
+    const htmlCreated = await docMetaRepo.getByDocId(htmlDocId)
+    res.status(201).json({
+      docId: htmlDocId,
+      documentName: htmlDocumentName,
+      title,
+      spaceId: meta.space_id,
+      folderId: meta.folder_id,
+      ownerId: uid,
+      docType: HTML_DOC_TYPE,
+      octoDocSlug: htmlDocId,
+      role: 'admin',
+      createdAt: htmlCreated?.created_at,
+      shareUrl: buildDocShareUrl(config.webOrigin, htmlDocId, meta.space_id),
+      discardToken: signDiscardToken(htmlDocId, uid),
+    })
+    return
+  }
+
+  const docId = newDocId()
+  let documentName: string
+  try {
+    documentName = buildCreatedDocumentName(meta.space_id, meta.folder_id, docId, meta.doc_type)
+  } catch (err) {
+    if (err instanceof DocumentNameError || err instanceof WhiteboardNameError) {
+      res.status(400).json({ error: err.message })
+      return
+    }
+    throw err
+  }
+
+  // P1-2: read the CURRENT live authoritative state, never the persisted row.
+  // Hocuspocus stores with a 2s debounce (max 10s), so a doc/board edited a
+  // moment ago — or a brand-new whiteboard whose scene never reached
+  // yjs_document — would otherwise be copied stale/empty. This is the exact
+  // read the version-snapshot path uses (readLiveDocState): it opens a
+  // read-only direct connection, and for an unloaded document hydrates from
+  // persistence first, so an untouched source still reads back its stored body.
+  const liveState = await readCopySourceState(meta.document_name)
+
+  // P1-3: migrate the attachments the body actually references. They are
+  // registered under the SOURCE docId, so a copy that kept the old attachIds
+  // would 404 on every image/file read through the copy. The helper copies only
+  // referenced bytes into this docId and rewrites those references in the body.
+  const copyBody = await planCopyBody(liveState, meta.doc_id, docId, uid)
+
+  try {
+    await transaction(async (tx) => {
+      await docMetaRepo.createTx(tx, {
+        docId,
+        documentName,
+        title,
+        ownerId: uid,
+        spaceId: meta.space_id,
+        ownerSpaceId,
+        folderId: meta.folder_id,
+        docType: meta.doc_type,
+        createdBy: uid,
+      })
+      if (!isEffectivelyEmptyYjsUpdate(copyBody.state)) {
+        // readLiveDocState returns `Y.encodeStateAsUpdate` bytes — the lib0 v1
+        // update format, the same payload a version snapshot captures. Label
+        // them encoding=1 so the row is decoded with the matching decoder
+        // (v2 bytes mislabelled as v1 would decode as an empty document).
+        await yjsDocumentRepo.upsertStateTx(
+          tx,
+          documentName,
+          Buffer.from(copyBody.state),
+          1,
+        )
+      }
+    })
+  } catch (err) {
+    // The copy's attachment rows/bytes were written before this transaction;
+    // a failed registration must not leave them orphaned under a docId that
+    // has no doc_meta row.
+    await cleanupCopiedAttachments(copyBody.copied.map((item: { attachId: string }) => item.attachId))
+    throw err
+  }
+
+  // The body was copied behind the collab server's back, so its afterStoreDocument
+  // index feed will not fire for this documentName. Enqueue it exactly like the
+  // html registration path does. Best-effort: the queue swallows its own errors.
+  if (config.search.indexEnabled && isSearchIndexedDoc(documentName)) {
+    void enqueueDocIndex(documentName)
+  }
+
+  const created = await docMetaRepo.getByDocId(docId)
+  res.status(201).json({
+    docId,
+    documentName,
+    title,
+    spaceId: meta.space_id,
+    folderId: meta.folder_id,
+    ownerId: uid,
+    docType: meta.doc_type,
+    role: 'admin',
+    createdAt: created?.created_at,
+    shareUrl: buildDocShareUrl(config.webOrigin, docId, meta.space_id),
+    // Proof that THIS response minted THIS copy for THIS owner. Drive passes it
+    // back when compensating a failed link, so discard-copy cannot be aimed at a
+    // document that was never created by a copy request.
+    discardToken: signDiscardToken(docId, uid),
+  })
+}
+
+docsRouter.post('/:docId/duplicate', documentAsync(duplicateDocHandler))
 
 /** GET /api/v1/docs/{docId} — fetch one doc's metadata (needs reader). */
 export async function getDocHandler(req: Request, res: Response) {
@@ -1644,6 +1974,10 @@ documentResourceRouter.put('/:docId/share', putShareHandler)
 // `/octo-doc/:slug` is intentionally bot-only on `docsRouter`: a slug is unique
 // only within a server-resolved Bot Space and cannot be made docId-first safely
 // on the human mount. Humans rename/delete through canonical `/:docId` routes.
+// §4.4 复制: the human chain mounts single-document operations on THIS router,
+// so the duplicate entry point must live here too (the bot mount keeps the one
+// on `docsRouter`). Same handler, same requireDocRole('reader') gate.
+documentResourceRouter.post('/:docId/duplicate', documentAsync(duplicateDocHandler))
 documentResourceRouter.get('/:docId', getDocHandler)
 documentResourceRouter.patch('/:docId', renameDocHandler)
 documentResourceRouter.delete('/:docId', deleteDocHandler)
