@@ -123,7 +123,23 @@ export interface CreateDocInput {
   documentName: string
   title: string
   ownerId: string
+  /**
+   * The document's HOME space (documentName's `{space}` segment, and the
+   * doc_meta.space_id multi-tenant dimension). For ordinary creation this is
+   * also the owner's Space; a copy of a cross-Space source keeps the source's
+   * home space here while its owner lives elsewhere.
+   */
   spaceId: string
+  /**
+   * The owner's SERVER-VERIFIED principal Space (doc_meta.owner_space_id).
+   * Defaults to `spaceId` so every existing caller keeps the historical
+   * "owner lives where the document lives" behaviour. A cross-Space duplicate
+   * passes the copier's verified principal Space here — owner authorization is
+   * keyed on the compound (owner_id, owner_space_id), so registering the source
+   * space would make the new owner unable to manage the copy from their own
+   * Space.
+   */
+  ownerSpaceId?: string
   folderId: string
   docType: string
   octoDocSlug?: string
@@ -266,7 +282,7 @@ export const docMetaRepo = {
         input.documentName,
         input.title,
         input.ownerId,
-        input.spaceId,
+        input.ownerSpaceId ?? input.spaceId,
         input.spaceId,
         input.folderId,
         input.docType,
@@ -297,7 +313,7 @@ export const docMetaRepo = {
         input.documentName,
         input.title,
         input.ownerId,
-        input.spaceId,
+        input.ownerSpaceId ?? input.spaceId,
         input.spaceId,
         input.folderId,
         input.docType,

@@ -14,6 +14,15 @@ import { config } from '../../config/env.js'
 
 export interface HtmlDuplicateInput {
   sourceSlug: string
+  /**
+   * Identity of the source document, REQUIRED by the html service since its
+   * copy contract tightened: the slug alone is not proof that it belongs to the
+   * docId/Space the caller claims, so html verifies the local binding and
+   * answers 409 source_identity_mismatch / source_identity_unverified otherwise.
+   * docs passes its own authoritative row, never a client-supplied pair.
+   */
+  sourceDocId: string
+  sourceSpaceId: string
   targetSlug: string
   title: string
   spaceId: string
@@ -58,6 +67,8 @@ export async function duplicateHtmlDoc(input: HtmlDuplicateInput): Promise<HtmlD
       },
       body: JSON.stringify({
         source_slug: input.sourceSlug,
+        source_doc_id: input.sourceDocId,
+        source_space_id: input.sourceSpaceId,
         target_slug: input.targetSlug,
         title: input.title,
         space_id: input.spaceId,
@@ -67,6 +78,18 @@ export async function duplicateHtmlDoc(input: HtmlDuplicateInput): Promise<HtmlD
       redirect: 'manual',
     })
     if (res.status !== 201) {
+      // 409 copy_conflict means the target slug is already taken; the identity
+      // refusals (source_identity_mismatch / source_identity_unverified) are
+      // also 409 but are NOT a target-name conflict — the copy did not happen
+      // for a different reason. Read only the business code so the caller's
+      // existing 503 copy_unavailable branch handles them.
+      const body = (await res.json().catch(() => null)) as { error?: unknown; code?: unknown } | null
+      const code = typeof body?.error === 'string'
+        ? body.error
+        : typeof body?.code === 'string' ? body.code : ''
+      if (res.status === 409 && code !== '' && code !== 'copy_conflict') {
+        return { ok: false, reason: 'upstream', status: res.status }
+      }
       return {
         ok: false,
         reason: res.status === 404 ? 'not_found' : res.status === 409 ? 'conflict' : 'upstream',

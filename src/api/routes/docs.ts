@@ -15,7 +15,14 @@ import { documentAsync } from '../services/documentRoute.js'
 import { createDocument } from '../services/createDocument.js'
 import { createPptDocument } from '../ppt/docs.js'
 import { duplicateHtmlDoc } from '../services/htmlDuplicate.js'
+import { purgeHtmlDocument } from '../services/htmlPurge.js'
+import {
+  cleanupCopiedAttachments,
+  copyReferencedAttachments,
+  isEffectivelyEmptyYjsUpdate,
+} from '../services/duplicateAttachments.js'
 import { yjsDocumentRepo } from '../../db/repos/yjsDocumentRepo.js'
+import { readLiveDocState } from '../../collab/liveDocRead.js'
 import { docViewHistoryRepo } from '../../db/repos/docViewHistoryRepo.js'
 import { normalizeTypeFilter, isDocType, HTML_DOC_TYPE, HTML_PPT_DOC_TYPE } from '../../db/docType.js'
 import { buildDocumentName, buildHtmlDocumentName, DocumentNameError } from '../../permission/documentName.js'
@@ -485,6 +492,21 @@ export async function duplicateDocHandler(req: Request, res: Response) {
     return
   }
   const title = requestedTitle !== '' ? requestedTitle : `${meta.title}-副本`
+  // P1-1 (cross-Space copy): keep the two Space concepts apart.
+  //   · spaceId      — the document's HOME space (doc_meta.space_id and the
+  //                    documentName segment). A copy stays in the source's home
+  //                    space; moving it between Drive libraries is the mount
+  //                    layer's job.
+  //   · ownerSpaceId — the CALLER's server-verified principal Space. This is
+  //                    the same value the doc guard just authorized with
+  //                    (resolveRequestPrincipalSpace / authMiddleware for uk_
+  //                    keys / createCliV2Router for CLI). Owner authority is
+  //                    keyed on (owner_id, owner_space_id), so registering the
+  //                    source space here would leave the copier unable to
+  //                    manage the copy from their own identity space.
+  // requireDocRole() only returns after that principal Space was resolved, so
+  // it is non-empty on every path that reaches this point.
+  const ownerSpaceId = req.principalSpaceId!
 
   // html (§4.4: 「在线 HTML 等已存在且可读的在线文档沿用此复制规则」): the body
   // lives in octo-docs-html, so the copy is one internal call that writes the
@@ -501,6 +523,8 @@ export async function duplicateDocHandler(req: Request, res: Response) {
     const htmlDocId = newDocId()
     const copied = await duplicateHtmlDoc({
       sourceSlug,
+      sourceDocId: meta.doc_id,
+      sourceSpaceId: meta.space_id,
       targetSlug: htmlDocId,
       title,
       spaceId: meta.space_id,
@@ -526,17 +550,39 @@ export async function duplicateDocHandler(req: Request, res: Response) {
       }
       throw err
     }
-    await docMetaRepo.create({
-      docId: htmlDocId,
-      documentName: htmlDocumentName,
-      title,
-      ownerId: uid,
-      spaceId: meta.space_id,
-      folderId: meta.folder_id,
-      docType: HTML_DOC_TYPE,
-      octoDocSlug: htmlDocId,
-      createdBy: uid,
-    })
+    try {
+      await docMetaRepo.create({
+        docId: htmlDocId,
+        documentName: htmlDocumentName,
+        title,
+        ownerId: uid,
+        spaceId: meta.space_id,
+        ownerSpaceId,
+        folderId: meta.folder_id,
+        docType: HTML_DOC_TYPE,
+        octoDocSlug: htmlDocId,
+        createdBy: uid,
+      })
+    } catch (err) {
+      // P2-1: the html copy already exists remote-side, but docs has no doc_meta
+      // row for it. Leaving it behind would leak content + assets that no
+      // client can ever see or delete, and a retry would mint yet another slug.
+      // Compensate through the EXISTING html internal purge contract
+      // (POST /internal/html/purge — the same endpoint OCD-456 full deletion
+      // uses), then rethrow the ORIGINAL error so the caller still sees the
+      // failure. Cleanup is best-effort: its failure is logged, never allowed
+      // to mask the registration error.
+      const cleanup = await purgeHtmlDocument(htmlDocId, htmlDocId, meta.space_id)
+      if (!cleanup.ok) {
+        // eslint-disable-next-line no-console
+        console.warn('[octo-docs] html duplicate cleanup failed after doc_meta error', {
+          docId: htmlDocId,
+          reason: cleanup.reason,
+          ...(cleanup.status === undefined ? {} : { status: cleanup.status }),
+        })
+      }
+      throw err
+    }
     if (config.search.indexEnabled && isSearchIndexedDoc(htmlDocumentName)) {
       void enqueueDocIndex(htmlDocumentName)
     }
@@ -569,34 +615,61 @@ export async function duplicateDocHandler(req: Request, res: Response) {
     throw err
   }
 
-  // Read BEFORE opening the tx: a source that was never opened or stored has no
-  // yjs_document row (persistence only materialises on first store), and the
-  // duplicate then legitimately starts empty — exactly like a fresh doc.
-  const sourceState = await yjsDocumentRepo.fetchState(meta.document_name)
+  // P1-2: read the CURRENT live authoritative state, never the persisted row.
+  // Hocuspocus stores with a 2s debounce (max 10s), so a doc/board edited a
+  // moment ago — or a brand-new whiteboard whose scene never reached
+  // yjs_document — would otherwise be copied stale/empty. This is the exact
+  // read the version-snapshot path uses (readLiveDocState): it opens a
+  // read-only direct connection, and for an unloaded document hydrates from
+  // persistence first, so an untouched source still reads back its stored body.
+  const liveState = await readLiveDocState(meta.document_name)
 
-  await transaction(async (tx) => {
-    await docMetaRepo.createTx(tx, {
-      docId,
-      documentName,
-      title,
-      ownerId: uid,
-      spaceId: meta.space_id,
-      folderId: meta.folder_id,
-      docType: meta.doc_type,
-      createdBy: uid,
-    })
-    if (sourceState && sourceState.state.length > 0) {
-      // fetchState already decoded the storage encoding, so re-encode on write
-      // with the SAME generation: a copy must be byte-compatible with how the
-      // source is read today, not silently downgraded to the current default.
-      await yjsDocumentRepo.upsertStateTx(
-        tx,
+  // P1-3: migrate the attachments the body actually references. They are
+  // registered under the SOURCE docId, so a copy that kept the old attachIds
+  // would 404 on every image/file read through the copy. The helper copies only
+  // referenced bytes into this docId and rewrites those references in the body.
+  const copyBody = isEffectivelyEmptyYjsUpdate(liveState)
+    ? { state: liveState, copied: [] as const }
+    : await copyReferencedAttachments({
+        state: liveState,
+        sourceDocId: meta.doc_id,
+        targetDocId: docId,
+        uid,
+      })
+
+  try {
+    await transaction(async (tx) => {
+      await docMetaRepo.createTx(tx, {
+        docId,
         documentName,
-        Buffer.from(sourceState.state),
-        sourceState.encoding,
-      )
-    }
-  })
+        title,
+        ownerId: uid,
+        spaceId: meta.space_id,
+        ownerSpaceId,
+        folderId: meta.folder_id,
+        docType: meta.doc_type,
+        createdBy: uid,
+      })
+      if (!isEffectivelyEmptyYjsUpdate(copyBody.state)) {
+        // readLiveDocState returns `Y.encodeStateAsUpdate` bytes — the lib0 v1
+        // update format, the same payload a version snapshot captures. Label
+        // them encoding=1 so the row is decoded with the matching decoder
+        // (v2 bytes mislabelled as v1 would decode as an empty document).
+        await yjsDocumentRepo.upsertStateTx(
+          tx,
+          documentName,
+          Buffer.from(copyBody.state),
+          1,
+        )
+      }
+    })
+  } catch (err) {
+    // The copy's attachment rows/bytes were written before this transaction;
+    // a failed registration must not leave them orphaned under a docId that
+    // has no doc_meta row.
+    await cleanupCopiedAttachments(copyBody.copied.map((item: { attachId: string }) => item.attachId))
+    throw err
+  }
 
   // The body was copied behind the collab server's back, so its afterStoreDocument
   // index feed will not fire for this documentName. Enqueue it exactly like the
