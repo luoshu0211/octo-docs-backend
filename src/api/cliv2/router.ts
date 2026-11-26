@@ -1,4 +1,4 @@
-import { Router, type Request, type Response, type NextFunction, type RequestHandler } from 'express'
+import { Router, json as jsonBodyParser, type Request, type Response, type NextFunction, type RequestHandler } from 'express'
 import { rateLimit } from 'express-rate-limit'
 import { withVerifiedCliSpace } from '../../permission/cliSpace.js'
 import { docsBusinessHandlers, errorForStatus } from './adapter.js'
@@ -13,6 +13,7 @@ import { shareRoleName, shareScopeName, DISCOVERABILITY_SPACE } from '../../perm
 import { buildDocShareUrl } from '../../util/docShareLink.js'
 import { createRateLimiter, type RateLimiterOptions } from '../middleware/rateLimit.js'
 import { CliError, createAuthResolver, hasAction, type CliPrincipal } from './auth.js'
+import { duplicateDocHandler } from '../routes/docs.js'
 
 const readDocuments = 'docs.documents:read'
 
@@ -74,6 +75,19 @@ function buildCliRouter(rateOptions: RateLimiterOptions): Router | null {
   }
   register('get', '/docs', readDocuments, pilot(listDocs))
   register('get', '/docs/:doc_id', readDocuments, pilot(getDoc))
+  // §4.4 复制 for the CLI surface. Same handler as the human route (so the copy
+  // semantics, title rule and error codes cannot drift); what differs is the
+  // entry point: CLI callers hold their business credential in a Bearer token
+  // and never send `token`/`X-Space-Id`, which is why drive routes CLI copies
+  // here instead of the human mount. Body is parsed AFTER auth (the global
+  // express.json is mounted later and never reaches /v2/cli).
+  register(
+    'post',
+    '/docs/:doc_id/duplicate',
+    'docs.documents:write',
+    jsonBodyParser({ limit: '64kb' }),
+    (req, res, next) => { void duplicateDocHandler(req, res).catch(next) },
+  )
   const handlers = docsBusinessHandlers()
   for (const operation of docsOperations) {
     const [method, path, action] = operation

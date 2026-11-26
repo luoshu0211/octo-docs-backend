@@ -12,6 +12,19 @@ vi.mock('../src/api/services/htmlDuplicate.js', () => ({ duplicateHtmlDoc: vi.fn
 vi.mock('../src/db/repos/yjsDocumentRepo.js', () => ({
   yjsDocumentRepo: { fetchState: vi.fn(), upsertStateTx: vi.fn() },
 }))
+vi.mock('../src/collab/liveDocRead.js', () => ({ readLiveDocState: vi.fn() }))
+vi.mock('../src/api/services/htmlPurge.js', () => ({ purgeHtmlDocument: vi.fn() }))
+// Keep the real emptiness predicate (the copy skips upsert only for a真正 empty
+// update) but stub the attachment I/O: the attachment behaviour has its own
+// dedicated suite (duplicateAttachments.test.ts).
+vi.mock('../src/api/services/duplicateAttachments.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/api/services/duplicateAttachments.js')>()
+  return {
+    ...actual,
+    copyReferencedAttachments: vi.fn(async ({ state }: { state: Uint8Array }) => ({ state, copied: [] })),
+    cleanupCopiedAttachments: vi.fn(async () => undefined),
+  }
+})
 vi.mock('../src/db/pool.js', () => ({
   transaction: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn({ query: vi.fn() })),
   query: vi.fn(),
@@ -28,6 +41,9 @@ import { requireDocRole } from '../src/api/guard.js'
 import { docMetaRepo } from '../src/db/repos/docMetaRepo.js'
 import { yjsDocumentRepo } from '../src/db/repos/yjsDocumentRepo.js'
 import { duplicateHtmlDoc } from '../src/api/services/htmlDuplicate.js'
+import { readLiveDocState } from '../src/collab/liveDocRead.js'
+import { copyReferencedAttachments, cleanupCopiedAttachments } from '../src/api/services/duplicateAttachments.js'
+import { purgeHtmlDocument } from '../src/api/services/htmlPurge.js'
 
 interface MockRes {
   statusCode: number
@@ -73,7 +89,8 @@ function req(extra: Record<string, unknown> = {}) {
 beforeEach(() => {
   vi.clearAllMocks()
   vi.mocked(docMetaRepo.getByDocId).mockResolvedValue({ created_at: '2026-11-26T10:00:00.000Z' } as never)
-  vi.mocked(yjsDocumentRepo.fetchState).mockResolvedValue({ state: new Uint8Array([1, 2, 3]), encoding: 1 } as never)
+  vi.mocked(readLiveDocState).mockResolvedValue(new Uint8Array([1, 2, 3]) as never)
+  vi.mocked(purgeHtmlDocument).mockResolvedValue({ ok: true, slug: 'd_new' } as never)
 })
 
 describe('POST /api/v1/docs/:docId/duplicate', () => {
@@ -121,7 +138,8 @@ describe('POST /api/v1/docs/:docId/duplicate', () => {
 
   it('starts empty when the source body was never persisted', async () => {
     vi.mocked(requireDocRole).mockResolvedValue({ meta: sourceMeta(), role: 'reader' } as never)
-    vi.mocked(yjsDocumentRepo.fetchState).mockResolvedValue(null)
+    // A never-stored document reads back as the empty Yjs update (lib0: [0,0]).
+    vi.mocked(readLiveDocState).mockResolvedValue(new Uint8Array([0, 0]) as never)
     const res = mockRes()
 
     await duplicateDocHandler(req(), res as never)
@@ -176,7 +194,7 @@ describe('POST /api/v1/docs/:docId/duplicate', () => {
     })
     // The Yjs path must not run for html.
     expect(docMetaRepo.createTx).not.toHaveBeenCalled()
-    expect(yjsDocumentRepo.fetchState).not.toHaveBeenCalled()
+    expect(readLiveDocState).not.toHaveBeenCalled()
   })
 
   it('surfaces html copy failures instead of writing a dangling row', async () => {
@@ -231,5 +249,53 @@ describe('POST /api/v1/docs/:docId/duplicate', () => {
 
     expect(res.statusCode).toBe(400)
     expect(res.body).toEqual({ error: 'title too long' })
+  })
+
+  it('registers the copy in the CALLER space while keeping the source home space (cross-Space copy)', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue({ meta: sourceMeta(), role: 'reader' } as never)
+    const res = mockRes()
+
+    // The guard already verified the caller's identity space; the copy must use
+    // it for owner_space_id, otherwise (owner_id, owner_space_id) authorization
+    // would key the copy to the SOURCE space and the copier could not manage it.
+    await duplicateDocHandler(req({ principalSpaceId: 's2' }), res as never)
+
+    expect(res.statusCode).toBe(201)
+    const createArg = vi.mocked(docMetaRepo.createTx).mock.calls[0]![1] as Record<string, unknown>
+    expect(createArg.spaceId).toBe('s1')
+    expect(createArg.ownerSpaceId).toBe('s2')
+  })
+
+  it('copies the attachments the body references and maps them onto the new doc', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue({ meta: sourceMeta(), role: 'reader' } as never)
+    const res = mockRes()
+
+    await duplicateDocHandler(req(), res as never)
+
+    expect(res.statusCode).toBe(201)
+    const call = vi.mocked(copyReferencedAttachments).mock.calls[0]![0] as Record<string, unknown>
+    expect(call).toMatchObject({ sourceDocId: 'd_src', targetDocId: 'd_new', uid: 'u_reader' })
+  })
+
+  it('cleans up copied attachments when the doc_meta registration fails', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue({ meta: sourceMeta(), role: 'reader' } as never)
+    vi.mocked(copyReferencedAttachments).mockResolvedValue({ state: new Uint8Array([9, 9]), copied: [{ attachId: 'a1' }] } as never)
+    vi.mocked(docMetaRepo.createTx).mockRejectedValueOnce(new Error('duplicate key') as never)
+    const res = mockRes()
+
+    await expect(duplicateDocHandler(req(), res as never)).rejects.toThrow('duplicate key')
+    expect(cleanupCopiedAttachments).toHaveBeenCalledWith(['a1'])
+  })
+
+  it('purges the html copy when registering its doc_meta row fails', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue({
+      meta: sourceMeta({ doc_type: 'html', octo_doc_slug: 'slug-src' }), role: 'reader',
+    } as never)
+    vi.mocked(duplicateHtmlDoc).mockResolvedValue({ ok: true, slug: 'd_new', version: 1, size: 42 })
+    vi.mocked(docMetaRepo.create).mockRejectedValueOnce(new Error('insert failed') as never)
+    const res = mockRes()
+
+    await expect(duplicateDocHandler(req(), res as never)).rejects.toThrow('insert failed')
+    expect(purgeHtmlDocument).toHaveBeenCalledWith('d_new', 'd_new', 's1')
   })
 })

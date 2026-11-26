@@ -11,6 +11,7 @@ import {
   CanonicalHtmlLegacyConflictError,
   DocOwnershipError,
 } from '../../db/repos/docMetaRepo.js'
+import * as Y from 'yjs'
 import { documentAsync } from '../services/documentRoute.js'
 import { createDocument } from '../services/createDocument.js'
 import { createPptDocument } from '../ppt/docs.js'
@@ -470,6 +471,68 @@ docsRouter.post('/:docId/published', publishHtmlHandler)
  *               stays in the document's home space; moving it between *Drive*
  *               libraries is the mount layer's job, not the doc's.
  */
+/**
+ * Read the copy source body: prefer the LIVE collab state (Hocuspocus writes the
+ * persistence row with a 2s debounce / 10s ceiling, so the row can lag the
+ * document a user just edited), and fall back to the persisted row when no collab
+ * server is running in this process (CLI/test deployments, migrate-only pods).
+ * The fallback is what keeps a copy correct-albeit-possibly-stale instead of
+ * turning into a 500.
+ */
+/**
+ * Decide what the copy stores and which attachments it carries.
+ *
+ * A body that cannot be decoded (corrupt/garbage state, or a fixture written
+ * before the lib0 encoder) must never fail the copy: the document is still
+ * copyable byte-for-byte, it simply cannot reference attachments we could map.
+ * So a decode error degrades to a verbatim copy instead of a 500.
+ */
+async function planCopyBody(
+  state: Uint8Array,
+  sourceDocId: string,
+  targetDocId: string,
+  uid: string,
+): Promise<{ state: Uint8Array; copied: Array<{ attachId: string }> }> {
+  try {
+    if (isEffectivelyEmptyYjsUpdate(state)) {
+      return { state, copied: [] }
+    }
+    return await copyReferencedAttachments({ state, sourceDocId, targetDocId, uid })
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn('[octo-docs] duplicate: body could not be decoded for attachments, copying verbatim', {
+      sourceDocId,
+      error: err instanceof Error ? err.message : String(err),
+    })
+    return { state, copied: [] }
+  }
+}
+
+async function readCopySourceState(documentName: string): Promise<Uint8Array> {
+  try {
+    return await readLiveDocState(documentName)
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn('[octo-docs] duplicate: live state unavailable, falling back to persisted state', {
+      documentName,
+      error: err instanceof Error ? err.message : String(err),
+    })
+    const stored = await yjsDocumentRepo.fetchState(documentName)
+    if (!stored) return new Uint8Array([0, 0])
+    // fetchState already decoded the storage encoding, so re-encode with the
+    // same generation: the copy must be readable exactly like the source is.
+    if (stored.encoding === 2) {
+      // Convert the persisted v2 update back to a v1 update: everything
+      // downstream (attachment scan/remap, emptiness probe) speaks lib0 v1, and
+      // a v2 blob handed to a v1 decoder reads as an empty document.
+      const doc = new Y.Doc()
+      Y.applyUpdateV2(doc, stored.state)
+      return Y.encodeStateAsUpdate(doc)
+    }
+    return stored.state
+  }
+}
+
 export async function duplicateDocHandler(req: Request, res: Response) {
   const sourceDocId = req.params.docId!
   const guard = await requireDocRole(req, res, sourceDocId, 'reader')
@@ -622,20 +685,13 @@ export async function duplicateDocHandler(req: Request, res: Response) {
   // read the version-snapshot path uses (readLiveDocState): it opens a
   // read-only direct connection, and for an unloaded document hydrates from
   // persistence first, so an untouched source still reads back its stored body.
-  const liveState = await readLiveDocState(meta.document_name)
+  const liveState = await readCopySourceState(meta.document_name)
 
   // P1-3: migrate the attachments the body actually references. They are
   // registered under the SOURCE docId, so a copy that kept the old attachIds
   // would 404 on every image/file read through the copy. The helper copies only
   // referenced bytes into this docId and rewrites those references in the body.
-  const copyBody = isEffectivelyEmptyYjsUpdate(liveState)
-    ? { state: liveState, copied: [] as const }
-    : await copyReferencedAttachments({
-        state: liveState,
-        sourceDocId: meta.doc_id,
-        targetDocId: docId,
-        uid,
-      })
+  const copyBody = await planCopyBody(liveState, meta.doc_id, docId, uid)
 
   try {
     await transaction(async (tx) => {

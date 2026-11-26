@@ -2,6 +2,7 @@ import '../src/config/loadEnv.ts'
 
 import { randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
+import { readdir } from 'node:fs/promises'
 import type { Server as HttpServer } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import mysql from 'mysql2/promise'
@@ -80,9 +81,31 @@ mysqlDescribe('POST /api/v1/docs/:docId/duplicate against real MySQL', () => {
     }
     const bootstrap = await mysql.createConnection({ ...config.mysql, multipleStatements: true })
     try {
+      // A fresh database must end up at the SAME schema the service expects:
+      // schema.sql alone predates later columns (yjs_document.encoding among
+      // them), which made two of these cases fail for the wrong reason. The
+      // upgrade files are contractually idempotent, so applying them always is
+      // safe on a reused test database.
       const [tables] = await bootstrap.query('SHOW TABLES')
       if ((tables as unknown[]).length === 0) {
         await bootstrap.query(readFileSync(new URL('../migrations/schema.sql', import.meta.url), 'utf8'))
+      }
+      const upgradesDir = new URL('../migrations/upgrades/', import.meta.url)
+      const upgradeFiles = (await readdir(upgradesDir)).filter((name) => name.endsWith('.sql')).sort()
+      for (const name of upgradeFiles) {
+        const sql = readFileSync(new URL(name, upgradesDir), 'utf8')
+        // A few upgrades define stored procedures with DELIMITER blocks, which a
+        // single mysql2 statement stream cannot parse. They are unrelated to the
+        // copy schema, so skip them instead of failing the whole fixture.
+        if (/^\s*DELIMITER\b/m.test(sql)) continue
+        try {
+          await bootstrap.query(sql)
+        } catch (err) {
+          // Re-running an upgrade on a database that already has it must not
+          // fail the fixture: treat "already applied" DDL errors as a no-op.
+          const code = (err as { errno?: number }).errno
+          if (code !== 1050 && code !== 1060 && code !== 1061 && code !== 1091) throw err
+        }
       }
     } finally {
       await bootstrap.end()
@@ -189,8 +212,18 @@ mysqlDescribe('POST /api/v1/docs/:docId/duplicate against real MySQL', () => {
     })
     expect(denied.status).toBe(403)
 
+    // An html row without a registered octo_doc_slug has no content pointer to
+    // copy: 409 html_document_unregistered (NOT 422 — 422 is reserved for the
+    // html_ppt body that lives in Bento).
     const html = await seedDoc({ spaceId: 'space-a', ownerId: 'owner_uid', docType: 'html' })
-    const unsupported = await request(`/api/v1/docs/${html.docId}/duplicate`, {
+    const unregistered = await request(`/api/v1/docs/${html.docId}/duplicate`, {
+      method: 'POST', token: 'owner-token', spaceId: 'space-a', body: {},
+    })
+    expect(unregistered.status).toBe(409)
+    expect(unregistered.body).toEqual({ error: 'html_document_unregistered' })
+
+    const ppt = await seedDoc({ spaceId: 'space-a', ownerId: 'owner_uid', docType: 'html_ppt' })
+    const unsupported = await request(`/api/v1/docs/${ppt.docId}/duplicate`, {
       method: 'POST', token: 'owner-token', spaceId: 'space-a', body: {},
     })
     expect(unsupported.status).toBe(422)
