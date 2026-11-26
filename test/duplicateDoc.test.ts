@@ -21,6 +21,7 @@ vi.mock('../src/api/services/duplicateAttachments.js', async (importOriginal) =>
   const actual = await importOriginal<typeof import('../src/api/services/duplicateAttachments.js')>()
   return {
     ...actual,
+    collectReferencedAttachIds: vi.fn(() => ['a1']),
     copyReferencedAttachments: vi.fn(async ({ state }: { state: Uint8Array }) => ({ state, copied: [] })),
     cleanupCopiedAttachments: vi.fn(async () => undefined),
   }
@@ -107,6 +108,11 @@ describe('POST /api/v1/docs/:docId/duplicate', () => {
     expect(body.ownerId).toBe('u_reader')
     expect(body.spaceId).toBe('s1')
     expect(body.docType).toBe('doc')
+    // A copy response carries the proof that drive needs to compensate a failed
+    // link; without it discard-copy would refuse (and could not be aimed at an
+    // arbitrary docId).
+    expect(typeof body.discardToken).toBe('string')
+    expect(String(body.discardToken)).not.toBe('')
     expect(String(body.documentName)).toContain('d_new')
 
     const createArg = vi.mocked(docMetaRepo.createTx).mock.calls[0]![1] as Record<string, unknown>

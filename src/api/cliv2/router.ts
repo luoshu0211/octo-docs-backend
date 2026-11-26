@@ -19,6 +19,20 @@ const readDocuments = 'docs.documents:read'
 
 type Handler = (req: Request, res: Response, principal: CliPrincipal) => Promise<void>
 
+/**
+ * Map the CLI path parameter spelling onto the shared handler's.
+ *
+ * The generated CLI adapter already maps `doc_id` → `docId` for its operations;
+ * this hand-registered route did not, so `duplicateDocHandler` read
+ * `req.params.docId === undefined`, looked up a non-existent document and
+ * answered 404 for valid copy requests.
+ */
+export function applyCliDocIdParam(params: Record<string, string | undefined>): void {
+  if (params.docId === undefined && params.doc_id !== undefined) {
+    params.docId = params.doc_id
+  }
+}
+
 export function createCliV2Router(rateOptions: RateLimiterOptions = {}): Router | null {
   try {
     return buildCliRouter(rateOptions)
@@ -86,7 +100,10 @@ function buildCliRouter(rateOptions: RateLimiterOptions): Router | null {
     '/docs/:doc_id/duplicate',
     'docs.documents:write',
     jsonBodyParser({ limit: '64kb' }),
-    (req, res, next) => { void duplicateDocHandler(req, res).catch(next) },
+    (req, res, next) => {
+      applyCliDocIdParam(req.params as Record<string, string | undefined>)
+      void duplicateDocHandler(req, res).catch(next)
+    },
   )
   const handlers = docsBusinessHandlers()
   for (const operation of docsOperations) {

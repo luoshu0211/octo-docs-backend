@@ -38,6 +38,7 @@ import { docVersionRepo } from '../../db/repos/docVersionRepo.js'
 import { docCommentRepo } from '../../db/repos/docCommentRepo.js'
 import { requireInternalDocToken } from './internalDocRole.js'
 import { purgeHtmlDocument } from '../services/htmlPurge.js'
+import { verifyDiscardToken } from '../services/discardToken.js'
 import { HTML_DOC_TYPE } from '../../db/docType.js'
 
 /** Copies created by a request are compensated within minutes, not days. */
@@ -54,11 +55,23 @@ export function createInternalDocsCopyCompensationRouter(limiter: RequestHandler
 
 async function discardCopyHandler(req: Request, res: Response): Promise<void> {
   const docId = String(req.params.docId ?? '').trim()
-  const ownerUID = typeof (req.body as Record<string, unknown>)?.owner_uid === 'string'
-    ? ((req.body as Record<string, unknown>).owner_uid as string).trim()
-    : ''
-  if (docId === '' || ownerUID === '') {
+  const body = (req.body ?? {}) as Record<string, unknown>
+  const ownerUID = typeof body.owner_uid === 'string' ? body.owner_uid.trim() : ''
+  const token = typeof body.discard_token === 'string' ? body.discard_token.trim() : ''
+  if (docId === '' || ownerUID === '' || token === '') {
     res.status(400).json({ error: 'invalid_request' })
+    return
+  }
+
+  // The token is the proof that THIS docId came out of a copy request by THIS
+  // owner. Without it, a stray/guessed id could be aimed at a live document.
+  const proof = verifyDiscardToken(token)
+  if (!proof || proof.docId !== docId || proof.ownerUid !== ownerUID) {
+    res.status(409).json({ error: 'not_a_copy_orphan' })
+    return
+  }
+  if (Date.now() - proof.issuedAtMs > COPY_ORPHAN_WINDOW_MS) {
+    res.status(409).json({ error: 'not_a_copy_orphan' })
     return
   }
 

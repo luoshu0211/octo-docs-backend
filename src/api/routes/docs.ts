@@ -17,8 +17,10 @@ import { createDocument } from '../services/createDocument.js'
 import { createPptDocument } from '../ppt/docs.js'
 import { duplicateHtmlDoc } from '../services/htmlDuplicate.js'
 import { purgeHtmlDocument } from '../services/htmlPurge.js'
+import { signDiscardToken } from '../services/discardToken.js'
 import {
   cleanupCopiedAttachments,
+  collectReferencedAttachIds,
   copyReferencedAttachments,
   isEffectivelyEmptyYjsUpdate,
 } from '../services/duplicateAttachments.js'
@@ -493,19 +495,26 @@ async function planCopyBody(
   targetDocId: string,
   uid: string,
 ): Promise<{ state: Uint8Array; copied: Array<{ attachId: string }> }> {
+  // ONLY the decode is best-effort. A body we cannot parse cannot name
+  // attachments we could map, so a verbatim copy is still correct.
+  let referenced: string[]
   try {
-    if (isEffectivelyEmptyYjsUpdate(state)) {
-      return { state, copied: [] }
-    }
-    return await copyReferencedAttachments({ state, sourceDocId, targetDocId, uid })
+    referenced = isEffectivelyEmptyYjsUpdate(state) ? [] : collectReferencedAttachIds(state)
   } catch (err) {
     // eslint-disable-next-line no-console
-    console.warn('[octo-docs] duplicate: body could not be decoded for attachments, copying verbatim', {
+    console.warn('[octo-docs] duplicate: body could not be decoded, copying verbatim', {
       sourceDocId,
       error: err instanceof Error ? err.message : String(err),
     })
     return { state, copied: [] }
   }
+  if (referenced.length === 0) {
+    return { state, copied: [] }
+  }
+  // Attachment bytes/rows are part of the copy: if any read, write or registry
+  // insert fails, the whole copy fails. Returning "success" with the source's
+  // attachIds would hand the reader a document whose images 404 forever.
+  return copyReferencedAttachments({ state, sourceDocId, targetDocId, uid })
 }
 
 async function readCopySourceState(documentName: string): Promise<Uint8Array> {
@@ -662,6 +671,7 @@ export async function duplicateDocHandler(req: Request, res: Response) {
       role: 'admin',
       createdAt: htmlCreated?.created_at,
       shareUrl: buildDocShareUrl(config.webOrigin, htmlDocId, meta.space_id),
+      discardToken: signDiscardToken(htmlDocId, uid),
     })
     return
   }
@@ -746,6 +756,10 @@ export async function duplicateDocHandler(req: Request, res: Response) {
     role: 'admin',
     createdAt: created?.created_at,
     shareUrl: buildDocShareUrl(config.webOrigin, docId, meta.space_id),
+    // Proof that THIS response minted THIS copy for THIS owner. Drive passes it
+    // back when compensating a failed link, so discard-copy cannot be aimed at a
+    // document that was never created by a copy request.
+    discardToken: signDiscardToken(docId, uid),
   })
 }
 

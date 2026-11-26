@@ -33,6 +33,7 @@ import { docMemberRepo } from '../src/db/repos/docMemberRepo.js'
 import { docVersionRepo } from '../src/db/repos/docVersionRepo.js'
 import { docCommentRepo } from '../src/db/repos/docCommentRepo.js'
 import { purgeHtmlDocument } from '../src/api/services/htmlPurge.js'
+import { signDiscardToken } from '../src/api/services/discardToken.js'
 
 const passThrough: express.RequestHandler = (_req, _res, next) => next()
 
@@ -44,6 +45,10 @@ async function start(): Promise<void> {
   app.use('/internal/docs', createInternalDocsCopyCompensationRouter(passThrough))
   await new Promise<void>((resolve) => { server = app.listen(0, '127.0.0.1', resolve) })
   baseURL = `http://127.0.0.1:${(server!.address() as AddressInfo).port}`
+}
+
+function body(over: Record<string, unknown> = {}): Record<string, unknown> {
+  return { owner_uid: 'bot-1', discard_token: signDiscardToken('d_copy', 'bot-1'), ...over }
 }
 
 async function discard(body: Record<string, unknown>, token?: string): Promise<{ status: number; body: any }> {
@@ -90,7 +95,7 @@ beforeEachAlias(() => {
 
 describe('POST /internal/docs/:docId/discard-copy', () => {
   it('soft-deletes an unlinked copy and reports no html cleanup for yjs docs', async () => {
-    const res = await discard({ owner_uid: 'bot-1' }, 'internal-secret')
+    const res = await discard(body(), 'internal-secret')
 
     expect(res.status).toBe(200)
     expect(res.body).toEqual({ discarded: true, html_cleanup: 'skipped' })
@@ -98,8 +103,8 @@ describe('POST /internal/docs/:docId/discard-copy', () => {
   })
 
   it('requires the internal token and an owner_uid', async () => {
-    expect((await discard({ owner_uid: 'bot-1' })).status).toBe(401)
-    const noOwner = await discard({}, 'internal-secret')
+    expect((await discard(body())).status).toBe(401)
+    const noOwner = await discard({ discard_token: signDiscardToken('d_copy', 'bot-1') }, 'internal-secret')
     expect(noOwner.status).toBe(400)
     expect(docMetaRepo.softDelete).not.toHaveBeenCalled()
   })
@@ -112,7 +117,7 @@ describe('POST /internal/docs/:docId/discard-copy', () => {
     ]
     for (const [, override] of cases) {
       vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(meta(override) as never)
-      const res = await discard({ owner_uid: 'bot-1' }, 'internal-secret')
+      const res = await discard(body(), 'internal-secret')
       expect(res.status).toBe(409)
       expect(res.body).toEqual({ error: 'not_a_copy_orphan' })
     }
@@ -121,26 +126,42 @@ describe('POST /internal/docs/:docId/discard-copy', () => {
     // document now: compensation must not delete it.
     vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(meta() as never)
     vi.mocked(docMemberRepo.list).mockResolvedValue([{ uid: 'alice' }] as never)
-    const withMember = await discard({ owner_uid: 'bot-1' }, 'internal-secret')
+    const withMember = await discard(body(), 'internal-secret')
     expect(withMember.status).toBe(409)
 
     vi.mocked(docMemberRepo.list).mockResolvedValue([] as never)
     vi.mocked(docVersionRepo.listByDoc).mockResolvedValue({ items: [{ id: 1 }], nextCursor: null } as never)
-    const withVersion = await discard({ owner_uid: 'bot-1' }, 'internal-secret')
+    const withVersion = await discard(body(), 'internal-secret')
     expect(withVersion.status).toBe(409)
     expect(docMetaRepo.softDelete).not.toHaveBeenCalled()
   })
 
   it('purges html content for an html copy and reports a failed purge without failing', async () => {
     vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(meta({ doc_type: 'html', octo_doc_slug: 'slug' }) as never)
-    const ok = await discard({ owner_uid: 'bot-1' }, 'internal-secret')
+    const ok = await discard(body(), 'internal-secret')
     expect(ok.body.html_cleanup).toBe('done')
     expect(purgeHtmlDocument).toHaveBeenCalledWith('slug', 'd_copy', 's1')
 
     vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(meta({ doc_type: 'html', octo_doc_slug: 'slug' }) as never)
     vi.mocked(purgeHtmlDocument).mockResolvedValue({ ok: false, reason: 'upstream' } as never)
-    const failed = await discard({ owner_uid: 'bot-1' }, 'internal-secret')
+    const failed = await discard(body(), 'internal-secret')
     expect(failed.status).toBe(200)
     expect(failed.body.html_cleanup).toBe('failed')
+  })
+
+  it('refuses a discard without a token minted by this service', async () => {
+    const missing = await discard({ owner_uid: 'bot-1' }, 'internal-secret')
+    expect(missing.status).toBe(400)
+
+    const forged = await discard({ owner_uid: 'bot-1', discard_token: 'v1.forged' }, 'internal-secret')
+    expect(forged.status).toBe(409)
+    expect(forged.body).toEqual({ error: 'not_a_copy_orphan' })
+
+    // A token minted for ANOTHER doc must not authorize this one.
+    const otherDoc = await discard(
+      { owner_uid: 'bot-1', discard_token: signDiscardToken('d_other', 'bot-1') }, 'internal-secret',
+    )
+    expect(otherDoc.status).toBe(409)
+    expect(docMetaRepo.softDelete).not.toHaveBeenCalled()
   })
 })
