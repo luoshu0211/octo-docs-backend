@@ -681,6 +681,45 @@ export const docMetaRepo = {
    *     reminder-cleanup shape (docMemberRepo.removePrincipalExact) and stays
    *     correct even if a repeated delete races another caller.
    */
+  /**
+   * Atomically discard a copy that was never linked (§4.4 copy compensation).
+   *
+   * The eligibility rules ARE the UPDATE's WHERE clause, so "checked" and
+   * "deleted" cannot drift apart: a copy that gained a member, a version or a
+   * comment a moment ago simply does not match and the call reports 0 rows.
+   * A two-step read-then-delete left exactly that window open.
+   *
+   * Guards: still active, still owned by the caller, minted within the orphan
+   * window, and with nothing attached to it.
+   */
+  async discardUnlinkedCopy(input: {
+    docId: string
+    ownerUid: string
+    notBefore: Date
+  }): Promise<{ documentName: string; permissionEpoch: number } | null> {
+    return transaction(async (tx) => {
+      const result = await tx.query(
+        `UPDATE doc_meta
+            SET status = 0, deleted_at = COALESCE(deleted_at, NOW(3))
+          WHERE doc_id = ? AND owner_id = ? AND status = 1 AND created_at >= ?
+            AND NOT EXISTS (SELECT 1 FROM doc_member WHERE doc_id = ?)
+            AND NOT EXISTS (SELECT 1 FROM doc_version WHERE doc_id = ?)
+            AND NOT EXISTS (SELECT 1 FROM doc_comment WHERE doc_id = ?)`,
+        [input.docId, input.ownerUid, input.notBefore, input.docId, input.docId, input.docId],
+      )
+      if (((result as unknown as { affectedRows?: number }).affectedRows ?? 0) < 1) return null
+      await docMetaRepo.bumpEpochTx(tx, input.docId)
+      await tx.query('DELETE FROM doc_member_notification WHERE doc_id = ?', [input.docId])
+      const rows = await tx.query<{ document_name: string; permission_epoch: number }>(
+        'SELECT document_name, permission_epoch FROM doc_meta WHERE doc_id = ? LIMIT 1',
+        [input.docId],
+      )
+      const row = rows[0]
+      if (!row) return null
+      return { documentName: row.document_name, permissionEpoch: Number(row.permission_epoch) }
+    })
+  },
+
   async softDelete(docId: string): Promise<{ documentName: string; permissionEpoch: number } | null> {
     return transaction(async (tx) => {
       await tx.query(

@@ -11,11 +11,9 @@ import type { Server } from 'node:http'
  *     compensation drive uses when it cannot link a freshly minted copy.
  */
 vi.mock('../src/db/repos/docMetaRepo.js', () => ({
-  docMetaRepo: { getByDocId: vi.fn(), softDelete: vi.fn() },
+  docMetaRepo: { getByDocId: vi.fn(), discardUnlinkedCopy: vi.fn() },
 }))
-vi.mock('../src/db/repos/docMemberRepo.js', () => ({ docMemberRepo: { list: vi.fn() } }))
-vi.mock('../src/db/repos/docVersionRepo.js', () => ({ docVersionRepo: { listByDoc: vi.fn() } }))
-vi.mock('../src/db/repos/docCommentRepo.js', () => ({ docCommentRepo: { listByDoc: vi.fn() } }))
+
 vi.mock('../src/api/services/htmlPurge.js', () => ({ purgeHtmlDocument: vi.fn() }))
 vi.mock('../src/api/routes/internalDocRole.js', () => ({
   requireInternalDocToken: (req: express.Request, res: express.Response, next: express.NextFunction) => {
@@ -29,9 +27,6 @@ vi.mock('../src/api/routes/internalDocRole.js', () => ({
 
 import { createInternalDocsCopyCompensationRouter, COPY_ORPHAN_WINDOW_MS } from '../src/api/routes/internalDocsCopyCompensation.js'
 import { docMetaRepo } from '../src/db/repos/docMetaRepo.js'
-import { docMemberRepo } from '../src/db/repos/docMemberRepo.js'
-import { docVersionRepo } from '../src/db/repos/docVersionRepo.js'
-import { docCommentRepo } from '../src/db/repos/docCommentRepo.js'
 import { purgeHtmlDocument } from '../src/api/services/htmlPurge.js'
 import { signDiscardToken } from '../src/api/services/discardToken.js'
 
@@ -86,11 +81,8 @@ afterAll(async () => {
 beforeEachAlias(() => {
   vi.clearAllMocks()
   vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(meta() as never)
-  vi.mocked(docMetaRepo.softDelete).mockResolvedValue({ documentName: 'n', permissionEpoch: 1 } as never)
-  vi.mocked(docMemberRepo.list).mockResolvedValue([] as never)
-  vi.mocked(docVersionRepo.listByDoc).mockResolvedValue({ items: [], nextCursor: null } as never)
-  vi.mocked(docCommentRepo.listByDoc).mockResolvedValue([] as never)
-  vi.mocked(purgeHtmlDocument).mockResolvedValue({ ok: true, slug: 'slug' } as never)
+  vi.mocked(docMetaRepo.discardUnlinkedCopy).mockResolvedValue({ documentName: 'n', permissionEpoch: 1 } as never)
+    vi.mocked(purgeHtmlDocument).mockResolvedValue({ ok: true, slug: 'slug' } as never)
 })
 
 describe('POST /internal/docs/:docId/discard-copy', () => {
@@ -99,41 +91,33 @@ describe('POST /internal/docs/:docId/discard-copy', () => {
 
     expect(res.status).toBe(200)
     expect(res.body).toEqual({ discarded: true, html_cleanup: 'skipped' })
-    expect(docMetaRepo.softDelete).toHaveBeenCalledWith('d_copy')
+    expect(docMetaRepo.discardUnlinkedCopy).toHaveBeenCalledWith(expect.objectContaining({ docId: 'd_copy', ownerUid: 'bot-1' }))
   })
 
   it('requires the internal token and an owner_uid', async () => {
     expect((await discard(body())).status).toBe(401)
     const noOwner = await discard({ discard_token: signDiscardToken('d_copy', 'bot-1') }, 'internal-secret')
     expect(noOwner.status).toBe(400)
-    expect(docMetaRepo.softDelete).not.toHaveBeenCalled()
+    expect(docMetaRepo.discardUnlinkedCopy).not.toHaveBeenCalled()
   })
 
-  it('refuses a document that is not a fresh unlinked copy', async () => {
-    const cases: Array<[string, Record<string, unknown>]> = [
-      ['wrong owner', { owner_id: 'someone-else' }],
-      ['already deleted', { status: 0 }],
-      ['too old', { created_at: new Date(Date.now() - COPY_ORPHAN_WINDOW_MS - 1000) }],
-    ]
-    for (const [, override] of cases) {
-      vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(meta(override) as never)
-      const res = await discard(body(), 'internal-secret')
-      expect(res.status).toBe(409)
-      expect(res.body).toEqual({ error: 'not_a_copy_orphan' })
-    }
+  it('refuses a document whose "still discardable" condition no longer holds', async () => {
+    // The eligibility rules now live in the conditional UPDATE: no member /
+    // version / comment may exist, the copy must still be active and young.
+    // When that WHERE clause matches nothing the repo reports null and the route
+    // answers 409 without touching the document.
+    vi.mocked(docMetaRepo.discardUnlinkedCopy).mockResolvedValueOnce(null as never)
+    const used = await discard(body(), 'internal-secret')
+    expect(used.status).toBe(409)
+    expect(used.body).toEqual({ error: 'not_a_copy_orphan' })
 
-    // A copy someone already collaborates on / edited / commented on is a real
-    // document now: compensation must not delete it.
-    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(meta() as never)
-    vi.mocked(docMemberRepo.list).mockResolvedValue([{ uid: 'alice' }] as never)
-    const withMember = await discard(body(), 'internal-secret')
-    expect(withMember.status).toBe(409)
-
-    vi.mocked(docMemberRepo.list).mockResolvedValue([] as never)
-    vi.mocked(docVersionRepo.listByDoc).mockResolvedValue({ items: [{ id: 1 }], nextCursor: null } as never)
-    const withVersion = await discard(body(), 'internal-secret')
-    expect(withVersion.status).toBe(409)
-    expect(docMetaRepo.softDelete).not.toHaveBeenCalled()
+    // A copy someone started collaborating on: the same 0-row outcome, and the
+    // html body must NOT be purged.
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(meta({ doc_type: 'html', octo_doc_slug: 'slug' }) as never)
+    vi.mocked(docMetaRepo.discardUnlinkedCopy).mockResolvedValueOnce(null as never)
+    const raced = await discard(body(), 'internal-secret')
+    expect(raced.status).toBe(409)
+    expect(purgeHtmlDocument).not.toHaveBeenCalled()
   })
 
   it('purges html content for an html copy and reports a failed purge without failing', async () => {
@@ -162,6 +146,6 @@ describe('POST /internal/docs/:docId/discard-copy', () => {
       { owner_uid: 'bot-1', discard_token: signDiscardToken('d_other', 'bot-1') }, 'internal-secret',
     )
     expect(otherDoc.status).toBe(409)
-    expect(docMetaRepo.softDelete).not.toHaveBeenCalled()
+    expect(docMetaRepo.discardUnlinkedCopy).not.toHaveBeenCalled()
   })
 })

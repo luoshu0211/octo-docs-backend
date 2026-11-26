@@ -33,9 +33,6 @@ import {
   type Router as ExpressRouter,
 } from 'express'
 import { docMetaRepo } from '../../db/repos/docMetaRepo.js'
-import { docMemberRepo } from '../../db/repos/docMemberRepo.js'
-import { docVersionRepo } from '../../db/repos/docVersionRepo.js'
-import { docCommentRepo } from '../../db/repos/docCommentRepo.js'
 import { requireInternalDocToken } from './internalDocRole.js'
 import { purgeHtmlDocument } from '../services/htmlPurge.js'
 import { verifyDiscardToken } from '../services/discardToken.js'
@@ -80,15 +77,17 @@ async function discardCopyHandler(req: Request, res: Response): Promise<void> {
     res.status(404).json({ error: 'not_found' })
     return
   }
-  const orphan = await isUnlinkedCopy(docId, meta, ownerUID)
-  if (!orphan) {
-    res.status(409).json({ error: 'not_a_copy_orphan' })
-    return
-  }
-
-  const soft = await docMetaRepo.softDelete(docId)
-  if (!soft) {
-    // Lost a race with a real delete/restore: nothing to discard.
+  // One conditional UPDATE owns BOTH the eligibility check and the write: a copy
+  // that gained a member/version/comment since the request started simply does
+  // not match, so "checked" and "deleted" can never disagree. A read-then-delete
+  // pair left a window where the document became real in between and was still
+  // deleted (and its html body purged).
+  const discarded = await docMetaRepo.discardUnlinkedCopy({
+    docId,
+    ownerUid: ownerUID,
+    notBefore: new Date(Date.now() - COPY_ORPHAN_WINDOW_MS),
+  })
+  if (!discarded) {
     res.status(409).json({ error: 'not_a_copy_orphan' })
     return
   }
@@ -104,31 +103,6 @@ async function discardCopyHandler(req: Request, res: Response): Promise<void> {
   }
 
   res.status(200).json({ discarded: true, html_cleanup: htmlCleanup })
-}
-
-/**
- * A discardable copy is one that never became a real document: the same owner
- * who asked for the copy, still active, young enough to belong to a live
- * request, and with nothing attached to it (no collaborators, no history, no
- * discussion). Every check fails CLOSED into 409.
- */
-async function isUnlinkedCopy(
-  docId: string,
-  meta: { owner_id: string; status: number; created_at: Date },
-  ownerUID: string,
-): Promise<boolean> {
-  if (meta.owner_id !== ownerUID) return false
-  if (meta.status !== 1) return false
-  const created = meta.created_at instanceof Date ? meta.created_at.getTime() : NaN
-  if (!Number.isFinite(created) || Date.now() - created > COPY_ORPHAN_WINDOW_MS) return false
-
-  const members = await docMemberRepo.list(docId)
-  if (members.length > 0) return false
-  const versions = await docVersionRepo.listByDoc(docId, { limit: 1, includeAuto: true })
-  if (versions.items.length > 0) return false
-  const comments = await docCommentRepo.listByDoc(docId)
-  if (comments.length > 0) return false
-  return true
 }
 
 function asyncHandler(handler: (req: Request, res: Response) => Promise<void>): RequestHandler {
