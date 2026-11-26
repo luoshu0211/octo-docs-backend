@@ -5,9 +5,10 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 // queue, then exercises the exported handler directly (no live infra).
 vi.mock('../src/api/guard.js', () => ({ requireDocRole: vi.fn() }))
 vi.mock('../src/db/repos/docMetaRepo.js', () => ({
-  docMetaRepo: { createTx: vi.fn(), getByDocId: vi.fn() },
+  docMetaRepo: { createTx: vi.fn(), create: vi.fn(), getByDocId: vi.fn() },
   DocOwnershipError: class DocOwnershipError extends Error {},
 }))
+vi.mock('../src/api/services/htmlDuplicate.js', () => ({ duplicateHtmlDoc: vi.fn() }))
 vi.mock('../src/db/repos/yjsDocumentRepo.js', () => ({
   yjsDocumentRepo: { fetchState: vi.fn(), upsertStateTx: vi.fn() },
 }))
@@ -26,6 +27,7 @@ import { duplicateDocHandler } from '../src/api/routes/docs.js'
 import { requireDocRole } from '../src/api/guard.js'
 import { docMetaRepo } from '../src/db/repos/docMetaRepo.js'
 import { yjsDocumentRepo } from '../src/db/repos/yjsDocumentRepo.js'
+import { duplicateHtmlDoc } from '../src/api/services/htmlDuplicate.js'
 
 interface MockRes {
   statusCode: number
@@ -139,15 +141,76 @@ describe('POST /api/v1/docs/:docId/duplicate', () => {
     expect(res.statusCode).toBe(0)
   })
 
-  it('rejects html / html_ppt bodies that live in sibling services', async () => {
-    for (const docType of ['html', 'html_ppt']) {
-      vi.mocked(requireDocRole).mockResolvedValue({ meta: sourceMeta({ doc_type: docType }), role: 'reader' } as never)
-      const res = mockRes()
-      await duplicateDocHandler(req(), res as never)
-      expect(res.statusCode).toBe(422)
-      expect(res.body).toEqual({ error: 'unsupported_document_type' })
-    }
+  it('rejects html_ppt, whose body lives in the Bento service', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue({ meta: sourceMeta({ doc_type: 'html_ppt' }), role: 'reader' } as never)
+    const res = mockRes()
+    await duplicateDocHandler(req(), res as never)
+    expect(res.statusCode).toBe(422)
+    expect(res.body).toEqual({ error: 'unsupported_document_type' })
     expect(docMetaRepo.createTx).not.toHaveBeenCalled()
+    expect(duplicateHtmlDoc).not.toHaveBeenCalled()
+  })
+
+  it('copies an html document through the html service and registers the new row', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue({
+      meta: sourceMeta({ doc_type: 'html', octo_doc_slug: 'slug-src' }), role: 'reader',
+    } as never)
+    vi.mocked(duplicateHtmlDoc).mockResolvedValue({ ok: true, slug: 'd_new', version: 1, size: 42 })
+    const res = mockRes()
+
+    await duplicateDocHandler(req(), res as never)
+
+    expect(res.statusCode).toBe(201)
+    const body = res.body as Record<string, unknown>
+    expect(body.docId).toBe('d_new')
+    expect(body.octoDocSlug).toBe('d_new')
+    expect(body.docType).toBe('html')
+    const call = vi.mocked(duplicateHtmlDoc).mock.calls[0]![0] as Record<string, unknown>
+    expect(call).toMatchObject({
+      sourceSlug: 'slug-src', targetSlug: 'd_new', title: '需求文档-副本',
+      spaceId: 's1', ownerUid: 'u_reader',
+    })
+    const createArg = vi.mocked(docMetaRepo.create).mock.calls[0]![0] as Record<string, unknown>
+    expect(createArg).toMatchObject({
+      docId: 'd_new', ownerId: 'u_reader', docType: 'html', octoDocSlug: 'd_new', createdBy: 'u_reader',
+    })
+    // The Yjs path must not run for html.
+    expect(docMetaRepo.createTx).not.toHaveBeenCalled()
+    expect(yjsDocumentRepo.fetchState).not.toHaveBeenCalled()
+  })
+
+  it('surfaces html copy failures instead of writing a dangling row', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue({
+      meta: sourceMeta({ doc_type: 'html', octo_doc_slug: 'slug-src' }), role: 'reader',
+    } as never)
+
+    vi.mocked(duplicateHtmlDoc).mockResolvedValue({ ok: false, reason: 'upstream', status: 500 })
+    let res = mockRes()
+    await duplicateDocHandler(req(), res as never)
+    expect(res.statusCode).toBe(503)
+    expect(res.body).toEqual({ error: 'copy_unavailable' })
+
+    vi.mocked(duplicateHtmlDoc).mockResolvedValue({ ok: false, reason: 'not_found', status: 404 })
+    res = mockRes()
+    await duplicateDocHandler(req(), res as never)
+    expect(res.statusCode).toBe(404)
+
+    vi.mocked(duplicateHtmlDoc).mockResolvedValue({ ok: false, reason: 'conflict', status: 409 })
+    res = mockRes()
+    await duplicateDocHandler(req(), res as never)
+    expect(res.statusCode).toBe(409)
+    expect(docMetaRepo.create).not.toHaveBeenCalled()
+  })
+
+  it('refuses an unregistered html row (no slug to copy)', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue({
+      meta: sourceMeta({ doc_type: 'html', octo_doc_slug: null }), role: 'reader',
+    } as never)
+    const res = mockRes()
+    await duplicateDocHandler(req(), res as never)
+    expect(res.statusCode).toBe(409)
+    expect(res.body).toEqual({ error: 'html_document_unregistered' })
+    expect(duplicateHtmlDoc).not.toHaveBeenCalled()
   })
 
   it('rejects a cross-space duplicate target', async () => {

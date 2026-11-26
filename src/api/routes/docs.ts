@@ -14,6 +14,7 @@ import {
 import { documentAsync } from '../services/documentRoute.js'
 import { createDocument } from '../services/createDocument.js'
 import { createPptDocument } from '../ppt/docs.js'
+import { duplicateHtmlDoc } from '../services/htmlDuplicate.js'
 import { yjsDocumentRepo } from '../../db/repos/yjsDocumentRepo.js'
 import { docViewHistoryRepo } from '../../db/repos/docViewHistoryRepo.js'
 import { normalizeTypeFilter, isDocType, HTML_DOC_TYPE, HTML_PPT_DOC_TYPE } from '../../db/docType.js'
@@ -470,7 +471,7 @@ export async function duplicateDocHandler(req: Request, res: Response) {
   const uid = req.uid!
   const body = (req.body ?? {}) as { title?: unknown; spaceId?: unknown }
 
-  if (meta.doc_type === HTML_DOC_TYPE || meta.doc_type === HTML_PPT_DOC_TYPE) {
+  if (meta.doc_type === HTML_PPT_DOC_TYPE) {
     res.status(422).json({ error: 'unsupported_document_type' })
     return
   }
@@ -484,6 +485,77 @@ export async function duplicateDocHandler(req: Request, res: Response) {
     return
   }
   const title = requestedTitle !== '' ? requestedTitle : `${meta.title}-副本`
+
+  // html (§4.4: 「在线 HTML 等已存在且可读的在线文档沿用此复制规则」): the body
+  // lives in octo-docs-html, so the copy is one internal call that writes the
+  // latest published version + assets under the new slug this handler mints.
+  // docs-backend then owns the doc_meta row, exactly like its internal html
+  // registration path — no second round trip back into this service.
+  if (meta.doc_type === HTML_DOC_TYPE) {
+    const sourceSlug = (meta.octo_doc_slug ?? '').trim()
+    if (sourceSlug === '') {
+      // A legacy/unregistered html row has no content pointer to copy.
+      res.status(409).json({ error: 'html_document_unregistered' })
+      return
+    }
+    const htmlDocId = newDocId()
+    const copied = await duplicateHtmlDoc({
+      sourceSlug,
+      targetSlug: htmlDocId,
+      title,
+      spaceId: meta.space_id,
+      ownerUid: uid,
+    })
+    if (!copied.ok) {
+      if (copied.reason === 'not_found') {
+        res.status(404).json({ error: 'not_found' })
+      } else if (copied.reason === 'conflict') {
+        res.status(409).json({ error: 'copy_conflict' })
+      } else {
+        res.status(503).json({ error: 'copy_unavailable' })
+      }
+      return
+    }
+    let htmlDocumentName: string
+    try {
+      htmlDocumentName = buildCreatedDocumentName(meta.space_id, meta.folder_id, htmlDocId, HTML_DOC_TYPE)
+    } catch (err) {
+      if (err instanceof DocumentNameError) {
+        res.status(400).json({ error: err.message })
+        return
+      }
+      throw err
+    }
+    await docMetaRepo.create({
+      docId: htmlDocId,
+      documentName: htmlDocumentName,
+      title,
+      ownerId: uid,
+      spaceId: meta.space_id,
+      folderId: meta.folder_id,
+      docType: HTML_DOC_TYPE,
+      octoDocSlug: htmlDocId,
+      createdBy: uid,
+    })
+    if (config.search.indexEnabled && isSearchIndexedDoc(htmlDocumentName)) {
+      void enqueueDocIndex(htmlDocumentName)
+    }
+    const htmlCreated = await docMetaRepo.getByDocId(htmlDocId)
+    res.status(201).json({
+      docId: htmlDocId,
+      documentName: htmlDocumentName,
+      title,
+      spaceId: meta.space_id,
+      folderId: meta.folder_id,
+      ownerId: uid,
+      docType: HTML_DOC_TYPE,
+      octoDocSlug: htmlDocId,
+      role: 'admin',
+      createdAt: htmlCreated?.created_at,
+      shareUrl: buildDocShareUrl(config.webOrigin, htmlDocId, meta.space_id),
+    })
+    return
+  }
 
   const docId = newDocId()
   let documentName: string
