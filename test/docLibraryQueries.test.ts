@@ -43,6 +43,17 @@ describe('docMetaRepo.listSharedWithUser', () => {
     expect(sql).toContain('LEFT JOIN doc_legacy_visible dl')
     expect(sql).toContain('NOT (m.owner_id = ? AND m.owner_space_id = ?)')
     expect(sql).toContain("dl.source NOT IN ('im_card', 'im_link')")
+    // 2026-11-27 product rule: 与我共享 also accepts "查看记录 + 当前分享范围".
+    // The caller's view row in the CURRENT principal Space joins in, and the
+    // candidate gate requires a share scope that still allows access:
+    // authenticated (2) org-wide, or anyone_in_space (1) only when the document
+    // home Space matches the view record's Space.
+    expect(sql).toContain('LEFT JOIN doc_view_history v')
+    expect(sql).toContain('v.uid = ? AND v.space_id = ?')
+    expect(sql).toContain('CASE WHEN v.doc_id IS NULL THEN 0 ELSE 1 END AS has_view')
+    expect(sql).toContain('m.share_scope AS share_scope')
+    expect(sql).toContain('m.share_scope = 2')
+    expect(sql).toContain('m.share_scope = 1 AND m.space_id = v.space_id')
     expect(sql).toContain('m.status = 1')
     // v3.1 §3.3: a deleted doc still inside its 30-day retention window stays a
     // candidate so Drive can render it as a grey row to observers. Historical
@@ -58,15 +69,18 @@ describe('docMetaRepo.listSharedWithUser', () => {
     expect(sql).toContain('ORDER BY m.updated_at DESC, m.doc_id DESC')
     expect(sql).toContain('LIMIT 201')
     // JOIN dm.uid, dm.principal_space_id; JOIN dl.uid, dl.principal_space;
-    // retention window; owner_id + owner_space_id (compound owner exclusion).
-    expect(lastParams()).toEqual(['u1', 's1', 'u1', 's1', TRASH_RETENTION_DAYS, 'u1', 's1'])
+    // JOIN v.uid, v.space_id; retention window; owner_id + owner_space_id
+    // (compound owner exclusion).
+    expect(lastParams()).toEqual([
+      'u1', 's1', 'u1', 's1', 'u1', 's1', TRASH_RETENTION_DAYS, 'u1', 's1',
+    ])
   })
 
   it('defaults the window to the same configured retention every other projection uses', async () => {
     await docMetaRepo.listSharedWithUser({ uid: 'u1', principalSpaceId: 's1', pageSize: 200 })
     // Not a literal: the configured value, so display / restore / cleanup and this
     // candidate filter can never disagree.
-    expect(lastParams()[4]).toBe(TRASH_RETENTION_DAYS)
+    expect(lastParams()[6]).toBe(TRASH_RETENTION_DAYS)
   })
 
   it('binds the configured retention window instead of a hard-coded 30 days', async () => {
@@ -74,7 +88,7 @@ describe('docMetaRepo.listSharedWithUser', () => {
       uid: 'u1', principalSpaceId: 's1', pageSize: 200, retentionDays: 60,
     })
     expect(lastSql()).toContain('m.deleted_at >= NOW(3) - INTERVAL ? DAY')
-    expect(lastParams()[4]).toBe(60)
+    expect(lastParams()[6]).toBe(60)
   })
 
   it('clamps pageSize to the 500 cap', async () => {

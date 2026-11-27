@@ -518,6 +518,10 @@ function sharedSources(row: SharedDocItem): string[] {
   // The legacy 补录 row is a separate provenance; when both exist the item is
   // reported ONCE with both sources (drive dedupes by doc_id anyway).
   if (Number(row.has_legacy) === 1) sources.push('legacy')
+  // 2026-11-27 product rule: a doc opened from a link (view history in THIS
+  // Space) whose current share scope still allows access is the second 与我共享
+  // source. It carries no invite provenance, so no unread badge.
+  if (Number(row.has_view) === 1) sources.push('view')
   return sources
 }
 
@@ -527,7 +531,14 @@ function sharedRole(row: SharedDocItem): string | null {
   // A legacy-only row has no doc_member grant; the old-list visibility is the
   // provenance, so it projects at the least-privileged role. The authoritative
   // can_read is still /internal/docs/status — this list is a candidate set.
-  return Number(row.has_legacy) === 1 ? 'reader' : null
+  if (Number(row.has_legacy) === 1) return 'reader'
+  if (Number(row.has_view) === 1) {
+    // 查看记录腿: no doc_member grant, the current share role is the display
+    // role. A NULL/unknown share_role falls back to reader (least privilege).
+    const shareRole = row.share_role === null ? undefined : roleFromNumber(Number(row.share_role))
+    return shareRole ?? 'reader'
+  }
+  return null
 }
 
 /** Green-path gate shared by both list handlers: 400 invalid_cursor on a bad token. */

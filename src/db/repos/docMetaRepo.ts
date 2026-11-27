@@ -191,6 +191,16 @@ export interface SharedDocItem {
   role: number | null
   member_source: number | null
   has_legacy: number
+  /**
+   * OCTO-456 (2026-11-27 review): 1 when the caller has a doc_view_history row
+   * for this doc in the CURRENT principal Space. That record plus the document's
+   * current share scope is the second 与我共享 source ("查看记录 + 当前分享范围").
+   */
+  has_view: number
+  /** doc_meta.share_scope (1=anyone_in_space, 2=authenticated, NULL=off). */
+  share_scope: number | null
+  /** doc_meta.share_role (1=read, 2=edit, 3=admin, 4=comment). */
+  share_role: number | null
 }
 
 /**
@@ -1122,8 +1132,11 @@ export const docMetaRepo = {
     )
     const cursor = decodeUpdatedAtCursor(params.cursor)
     // Bind order: JOIN dm.uid, dm.principal_space_id; JOIN dl.uid,
-    // dl.principal_space; WHERE owner_id; then the optional cursor tuple.
+    // dl.principal_space; JOIN v.uid, v.space_id; WHERE owner_id; then the
+    // optional cursor tuple.
     const args: unknown[] = [
+      params.uid,
+      params.principalSpaceId,
       params.uid,
       params.principalSpaceId,
       params.uid,
@@ -1141,19 +1154,29 @@ export const docMetaRepo = {
     const rows = await query<SharedDocItem>(
       `SELECT m.doc_id, m.title, m.doc_type, m.owner_id, m.created_by, m.owner_space_id, m.space_id, m.updated_at,
               dm.role AS role, dm.source AS member_source,
-              CASE WHEN dl.doc_id IS NULL THEN 0 ELSE 1 END AS has_legacy
+              CASE WHEN dl.doc_id IS NULL THEN 0 ELSE 1 END AS has_legacy,
+              CASE WHEN v.doc_id IS NULL THEN 0 ELSE 1 END AS has_view,
+              m.share_scope AS share_scope, m.share_role AS share_role
        FROM doc_meta m
        LEFT JOIN doc_member dm
          ON dm.doc_id = m.doc_id AND dm.uid = ? AND dm.principal_space_id = ?
        LEFT JOIN doc_legacy_visible dl
          ON dl.doc_id = m.doc_id AND dl.uid = ? AND dl.principal_space = ?
         AND dl.source NOT IN ('im_card', 'im_link')
+       LEFT JOIN doc_view_history v
+         ON v.doc_id = m.doc_id AND v.uid = ? AND v.space_id = ?
        WHERE (m.status = 1
               OR (m.status = 0
                   AND (m.deleted_at IS NULL
                        OR m.deleted_at >= NOW(3) - INTERVAL ? DAY)))
          AND NOT (m.owner_id = ? AND m.owner_space_id = ?)
-         AND (dm.doc_id IS NOT NULL OR dl.doc_id IS NOT NULL)
+         AND (
+           dm.doc_id IS NOT NULL
+           OR dl.doc_id IS NOT NULL
+           OR (v.doc_id IS NOT NULL
+               AND (m.share_scope = ${SHARE_SCOPE_AUTHENTICATED}
+                    OR (m.share_scope = ${SHARE_SCOPE_ANYONE} AND m.space_id = v.space_id)))
+         )
          ${cursorSql}
        ORDER BY m.updated_at DESC, m.doc_id DESC
        LIMIT ${pageSize + 1}`,

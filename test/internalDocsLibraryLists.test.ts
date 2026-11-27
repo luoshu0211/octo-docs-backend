@@ -69,6 +69,9 @@ const row = {
   role: 1,
   member_source: 1,
   has_legacy: 0,
+  has_view: 0,
+  share_scope: null as number | null,
+  share_role: null as number | null,
 }
 
 beforeEach(() => {
@@ -175,6 +178,75 @@ describe('GET /internal/docs/shared', () => {
     )
     expect((res.body as { items: Array<{ role: string; sources: string[] }> }).items[0])
       .toMatchObject({ role: 'reader', sources: ['legacy'] })
+  })
+
+  // 2026-11-27 product rule: the second 与我共享 source is "查看记录 + 当前分享
+  // 范围". A view-only row carries the share role as its display role and shows
+  // NO invite provenance (so no unread badge).
+  it('a view-only row projects sources ["view"] and the current share role', async () => {
+    vi.mocked(docMetaRepo.listSharedWithUser).mockResolvedValue({
+      items: [{
+        ...row,
+        role: null,
+        member_source: null,
+        has_legacy: 0,
+        has_view: 1,
+        share_scope: 2,
+        share_role: 2,
+      }],
+      nextCursor: null,
+    } as never)
+    const res = response()
+    await internalDocsSharedHandler(
+      request({ uid: 'u1', principal_space_id: 's1' }) as never,
+      res as never,
+    )
+    expect((res.body as { items: Array<{ role: string; sources: string[] }> }).items[0])
+      .toMatchObject({ role: 'writer', sources: ['view'] })
+  })
+
+  it('view + legacy on the SAME doc => one item with sources ["legacy","view"]', async () => {
+    vi.mocked(docMetaRepo.listSharedWithUser).mockResolvedValue({
+      items: [{
+        ...row,
+        role: null,
+        member_source: null,
+        has_legacy: 1,
+        has_view: 1,
+        share_scope: 2,
+        share_role: null,
+      }],
+      nextCursor: null,
+    } as never)
+    const res = response()
+    await internalDocsSharedHandler(
+      request({ uid: 'u1', principal_space_id: 's1' }) as never,
+      res as never,
+    )
+    expect((res.body as { items: Array<{ role: string; sources: string[] }> }).items[0])
+      .toMatchObject({ role: 'reader', sources: ['legacy', 'view'] })
+  })
+
+  it('a member record wins over the view leg (role + sources keep the member grant)', async () => {
+    vi.mocked(docMetaRepo.listSharedWithUser).mockResolvedValue({
+      items: [{
+        ...row,
+        role: 1,
+        member_source: 2,
+        has_legacy: 0,
+        has_view: 1,
+        share_scope: 2,
+        share_role: 2,
+      }],
+      nextCursor: null,
+    } as never)
+    const res = response()
+    await internalDocsSharedHandler(
+      request({ uid: 'u1', principal_space_id: 's1' }) as never,
+      res as never,
+    )
+    expect((res.body as { items: Array<{ role: string; sources: string[] }> }).items[0])
+      .toMatchObject({ role: 'reader', sources: ['invite', 'view'] })
   })
 
   it('projects created_by independently from owner (blank stays blank, never owner)', async () => {
